@@ -1,0 +1,8 @@
+# Keep Clippy's configurable thresholds close to our Python lint posture.
+cognitive-complexity-threshold = 18
+
+# Match the repo's testing philosophy: stricter in production code, less noisy
+# in tests where direct assertions and failure probes are expected.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true

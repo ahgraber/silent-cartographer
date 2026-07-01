@@ -1,0 +1,8 @@
+# Keep Rust formatting aligned with the repo's broader style choices:
+# spaces over tabs, LF endings, and a slightly wider line length than the
+# upstream default.
+style_edition = "2024"
+max_width = 119
+hard_tabs = false
+newline_style = "Unix"
+use_small_heuristics = "Default"

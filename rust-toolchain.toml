@@ -1,0 +1,9 @@
+# rustup reads this exact filename (no dotfile form is accepted) to pin the
+# toolchain for everyone working in the repo. Bump `channel` deliberately; it is
+# a pinned dependency under the repo's reproducibility policy.
+[toolchain]
+# 1.85.0 is the floor for edition 2024 / `style_edition = "2024"` (.rustfmt.toml).
+# Raise to the current stable as the project advances.
+channel = "1.85.0"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "minimal"
