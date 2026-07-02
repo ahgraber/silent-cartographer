@@ -59,6 +59,11 @@ keypair = "keypair"
 raison = "raison"
 ba = "ba"
 autonymous = "autonymous"
+# c10r relation/role taxonomy (shared-root directional convention).
+callers = "callers"
+callees = "callees"
+containers = "containers"
+importers = "importers"
 
 ## Specific rules for lockfiles
 [type.lock]

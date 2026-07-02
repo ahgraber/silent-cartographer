@@ -2,8 +2,13 @@
 # toolchain for everyone working in the repo. Bump `channel` deliberately; it is
 # a pinned dependency under the repo's reproducibility policy.
 [toolchain]
-# 1.85.0 is the floor for edition 2024 / `style_edition = "2024"` (.rustfmt.toml).
-# Raise to the current stable as the project advances.
-channel = "1.85.0"
-components = ["rustfmt", "clippy", "rust-src"]
+# 1.88 is the code floor (let-chains, stabilized in Rust 1.88; edition 2024 alone
+# only needs 1.85). Pinned to a recent stable above the floor; raise to the
+# current stable as the project advances.
+channel = "1.95.0"
+# rust-analyzer is a runtime dependency of c10r itself (`c10r build` shells out to
+# `rust-analyzer scip`); pinning it here keeps the analyzer version — which is
+# index provenance — locked to the toolchain, and stops rustup's rust-analyzer
+# proxy from falling back to whatever is on PATH.
+components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]
 profile = "minimal"

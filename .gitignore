@@ -153,9 +153,13 @@ chrome-profile
 /target/
 **/*.rs.bk
 *.pdb
+# Raw SCIP index dumps emitted by `c10r build` / `rust-analyzer scip`
+*.scip
 
 # -------------------------------------------------------
 # Retain (must be last — negations override above)
 # -------------------------------------------------------
 !.gitkeep
 !.gitignore
+# Checked-in SCIP test fixtures are source, not build artifacts.
+!tests/fixtures/*.scip

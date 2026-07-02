@@ -1,0 +1,41 @@
+[package]
+name = "silent-cartographer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A persistent codebase knowledge graph answering precise, type-aware navigation for Rust."
+license = "Apache-2.0"
+
+[lib]
+name = "silent_cartographer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "c10r"
+path = "src/main.rs"
+
+[dependencies]
+# CLI surface (clap derive per project stack mapping).
+clap = { version = "4", features = ["derive"] }
+# (De)serialization for the JSON output contract and config.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Embedded SQLite-core store; bundled so builds do not depend on a system libsqlite3.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# Semantic index model: the SCIP protobuf schema the Rust backend emits.
+scip = "0.9"
+# Protobuf runtime for (de)serializing the SCIP index; version pinned to match `scip`.
+protobuf = "=3.7.2"
+# Syntax oracle: tree-sitter and the Rust grammar.
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+# Content-hash gate over analyzed sources.
+sha2 = "0.11"
+# Error plumbing.
+anyhow = "1"
+thiserror = "2"
+# Descriptive process title for host process identification.
+proctitle = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
