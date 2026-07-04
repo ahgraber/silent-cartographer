@@ -64,6 +64,11 @@ callers = "callers"
 callees = "callees"
 containers = "containers"
 importers = "importers"
+# Rust compiler terminology (operator sugar lowering).
+desugar = "desugar"
+desugars = "desugars"
+desugared = "desugared"
+desugaring = "desugaring"
 
 ## Specific rules for lockfiles
 [type.lock]

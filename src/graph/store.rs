@@ -97,8 +97,74 @@ pub struct OccurrenceRow {
     pub span: (usize, usize),
     /// The role tag (`definition` or `reference`).
     pub role: String,
+    /// The alignment rule that accepted the attribution (`exact`, `crate_root`, `operator_desugar`,
+    /// or `module_span`) — its provenance.
+    pub rule: String,
     /// The nearest enclosing persisted declaration, if attributed.
     pub enclosing_id: Option<CanonicalId>,
+}
+
+/// The maximum number of `found_text` bytes persisted per discrepancy row.
+///
+/// A provisional design constant: name tokens are far shorter than this, and the equality check that
+/// classifies the outcome runs on the full bytes before truncation, so classification is unaffected.
+/// Superseded when the interface-layer pagination change defines the real bounded-output model.
+pub const FOUND_TEXT_MAX_BYTES: usize = 120;
+
+/// The maximum number of groups the default discrepancy summary displays.
+///
+/// A provisional design constant, superseded by the pagination change. When more groups exist, the
+/// summary marks itself truncated; its totals are computed over the full persisted set regardless.
+pub const DISCREPANCY_GROUP_CAP: usize = 50;
+
+/// A persisted join-discrepancy row: one non-aligned occurrence's inspectable detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscrepancyRow {
+    /// The document the occurrence sits in.
+    pub document_path: String,
+    /// The byte span at the occurrence's location, or `None` when the occurrence's coordinates could
+    /// not be normalized onto the source — typed absence, never a fabricated location.
+    pub span: Option<(usize, usize)>,
+    /// The outcome kind tag (`text_mismatch`, `semantic_only`, or `duplicate_ambiguous`).
+    pub outcome: String,
+    /// The expected name token.
+    pub expected_name: String,
+    /// The source text found at the location, truncated to [`FOUND_TEXT_MAX_BYTES`], if any.
+    pub found_text: Option<String>,
+}
+
+/// One group in the bounded discrepancy summary: an `(outcome, expected_name)` key with its count,
+/// the number of distinct documents it spans, and one exemplar location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscrepancyGroup {
+    /// The outcome kind tag.
+    pub outcome: String,
+    /// The expected name token shared by the group.
+    pub expected_name: String,
+    /// How many discrepancies fall in this group.
+    pub count: u64,
+    /// How many distinct documents the group's discrepancies span.
+    pub document_count: u64,
+    /// One exemplar location (document and span) drawn from the group.
+    pub exemplar: DiscrepancyRow,
+}
+
+/// The bounded discrepancy summary: the displayed groups plus the full-set totals it summarizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscrepancySummary {
+    /// The groups shown, most-populous first, capped at [`DISCREPANCY_GROUP_CAP`].
+    pub groups: Vec<DiscrepancyGroup>,
+    /// The total number of distinct `(outcome, expected_name)` groups in the full persisted set.
+    pub total_groups: u64,
+    /// The total number of discrepancy rows in the full persisted set.
+    pub total_discrepancies: u64,
+}
+
+impl DiscrepancySummary {
+    /// Whether the summary withheld groups under the display cap.
+    pub fn truncated(&self) -> bool {
+        self.total_groups > self.groups.len() as u64
+    }
 }
 
 /// The recorded index metadata.
@@ -132,23 +198,91 @@ impl Freshness {
     }
 }
 
+/// An error opening a graph store.
+///
+/// The schema-version guard reads `PRAGMA user_version` before any table access — the pragma is
+/// readable regardless of table shapes, which is exactly why it is the guard mechanism (the in-row
+/// `schema_version` column remains as provenance only).
+#[derive(Debug, thiserror::Error)]
+pub enum StoreOpenError {
+    /// The store was written under a different schema version than this binary expects. A pre-guard
+    /// store carries no stamp and reads as version 0.
+    #[error(
+        "index store at {path} carries schema version {found}, but this binary expects version {expected}; \
+         run `c10r build` to rebuild it (or delete the file)"
+    )]
+    SchemaVersionMismatch {
+        /// The store's path, for the teaching message.
+        path: String,
+        /// The version stamped in the store (0 for an unstamped, pre-guard store).
+        found: i64,
+        /// The version this binary writes.
+        expected: i64,
+    },
+    /// The underlying storage failed.
+    #[error("store error: {0}")]
+    Storage(#[from] rusqlite::Error),
+    /// Deleting an incompatible store for replacement failed at the filesystem.
+    #[error("replacing incompatible index store: {0}")]
+    Replace(#[from] std::io::Error),
+}
+
 /// The SQLite-backed graph store.
 pub struct GraphStore {
     conn: Connection,
 }
 
 impl GraphStore {
-    /// Open (creating if needed) a store at `path`, applying the schema.
-    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+    /// Open a store at `path` for reading, creating a fresh one if none exists.
+    ///
+    /// An existing store's `PRAGMA user_version` stamp is validated against [`SCHEMA_VERSION`]
+    /// before any table is touched; a mismatch (including an unstamped pre-guard store, which reads
+    /// as version 0) refuses with a typed teaching error rather than failing mid-operation on a
+    /// changed table shape.
+    pub fn open(path: &Path) -> Result<Self, StoreOpenError> {
+        if !path.exists() {
+            return Ok(Self::create(path)?);
+        }
         let conn = Connection::open(path)?;
+        let found = stamped_version(&conn)?;
+        if found != SCHEMA_VERSION {
+            return Err(StoreOpenError::SchemaVersionMismatch {
+                path: path.display().to_string(),
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
         conn.execute_batch(SCHEMA_SQL)?;
         Ok(Self { conn })
     }
 
-    /// Open an in-memory store (for tests), applying the schema.
+    /// Open a store at `path` for a build, replacing it wholesale on a schema-version mismatch.
+    ///
+    /// The index is derived, replayable data, so rebuild is the migration: an incompatible store is
+    /// deleted and recreated at the current version, and the build proceeds.
+    pub fn open_or_replace(path: &Path) -> Result<Self, StoreOpenError> {
+        match Self::open(path) {
+            Err(StoreOpenError::SchemaVersionMismatch { .. }) => {
+                remove_store_files(path)?;
+                Ok(Self::create(path)?)
+            }
+            other => other,
+        }
+    }
+
+    /// Create a fresh store at `path`: apply the schema and stamp the version pragma.
+    fn create(path: &Path) -> rusqlite::Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(SCHEMA_SQL)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(Self { conn })
+    }
+
+    /// Open an in-memory store (for tests), applying the schema and version stamp.
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA_SQL)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self { conn })
     }
 
@@ -162,17 +296,24 @@ impl GraphStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO index_metadata
                 (id, schema_version, workspace_id, analyzer_name, analyzer_version, content_hash,
-                 aligned_count, text_mismatch_count, semantic_only_count, syntax_only_count)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 aligned_exact_count, aligned_crate_root_count, aligned_operator_desugar_count,
+                 aligned_module_span_count, aligned_self_keyword_count, text_mismatch_count,
+                 semantic_only_count, duplicate_ambiguous_count, syntax_only_count)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 SCHEMA_VERSION,
                 meta.workspace_id.as_str(),
                 meta.provenance.analyzer_name,
                 meta.provenance.analyzer_version,
                 meta.content_hash,
-                meta.accounting.aligned as i64,
+                meta.accounting.aligned_exact as i64,
+                meta.accounting.aligned_crate_root as i64,
+                meta.accounting.aligned_operator_desugar as i64,
+                meta.accounting.aligned_module_span as i64,
+                meta.accounting.aligned_self_keyword as i64,
                 meta.accounting.text_mismatch as i64,
                 meta.accounting.semantic_only as i64,
+                meta.accounting.duplicate_ambiguous as i64,
                 meta.accounting.syntax_only as i64,
             ],
         )?;
@@ -184,7 +325,9 @@ impl GraphStore {
         self.conn
             .query_row(
                 "SELECT workspace_id, analyzer_name, analyzer_version, content_hash,
-                        aligned_count, text_mismatch_count, semantic_only_count, syntax_only_count
+                        aligned_exact_count, aligned_crate_root_count, aligned_operator_desugar_count,
+                        aligned_module_span_count, aligned_self_keyword_count, text_mismatch_count,
+                        semantic_only_count, duplicate_ambiguous_count, syntax_only_count
                  FROM index_metadata WHERE id = 1",
                 [],
                 |r| {
@@ -196,10 +339,15 @@ impl GraphStore {
                         },
                         content_hash: r.get(3)?,
                         accounting: JoinAccounting {
-                            aligned: r.get::<_, i64>(4)? as u64,
-                            text_mismatch: r.get::<_, i64>(5)? as u64,
-                            semantic_only: r.get::<_, i64>(6)? as u64,
-                            syntax_only: r.get::<_, i64>(7)? as u64,
+                            aligned_exact: r.get::<_, i64>(4)? as u64,
+                            aligned_crate_root: r.get::<_, i64>(5)? as u64,
+                            aligned_operator_desugar: r.get::<_, i64>(6)? as u64,
+                            aligned_module_span: r.get::<_, i64>(7)? as u64,
+                            aligned_self_keyword: r.get::<_, i64>(8)? as u64,
+                            text_mismatch: r.get::<_, i64>(9)? as u64,
+                            semantic_only: r.get::<_, i64>(10)? as u64,
+                            duplicate_ambiguous: r.get::<_, i64>(11)? as u64,
+                            syntax_only: r.get::<_, i64>(12)? as u64,
                         },
                     })
                 },
@@ -231,14 +379,15 @@ impl GraphStore {
     pub fn insert_occurrence(&self, row: &OccurrenceRow) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO occurrences
-                (symbol_id, document_path, span_start, span_end, role, enclosing_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (symbol_id, document_path, span_start, span_end, role, rule, enclosing_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 row.symbol_id.as_str(),
                 row.document_path,
                 row.span.0 as i64,
                 row.span.1 as i64,
                 row.role,
+                row.rule,
                 row.enclosing_id.as_ref().map(|e| e.as_str().to_string()),
             ],
         )?;
@@ -252,6 +401,123 @@ impl GraphStore {
             params![kind.tag(), src.as_str(), dst.as_str(), kind.is_verified() as i64],
         )?;
         Ok(())
+    }
+
+    /// Wholly replace the join-discrepancy detail with `rows`, atomically.
+    ///
+    /// The prior build's rows are deleted and the new set inserted inside one transaction, so a
+    /// concurrent reader sees either the old set or the new one, never a mix, and no stale rows
+    /// survive a rebuild. Each `found_text` is truncated to [`FOUND_TEXT_MAX_BYTES`] on a UTF-8
+    /// boundary before persistence.
+    pub fn rewrite_discrepancies(&mut self, rows: &[DiscrepancyRow]) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM join_discrepancies", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO join_discrepancies
+                    (document_path, span_start, span_end, outcome, expected_name, found_text)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for row in rows {
+                let found = row.found_text.as_deref().map(truncate_on_boundary);
+                stmt.execute(params![
+                    row.document_path,
+                    row.span.map(|s| s.0 as i64),
+                    row.span.map(|s| s.1 as i64),
+                    row.outcome,
+                    row.expected_name,
+                    found,
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// The bounded discrepancy summary: groups by `(outcome, expected_name)` ordered by descending
+    /// count (capped at [`DISCREPANCY_GROUP_CAP`]), with the full-set totals the cap summarizes.
+    pub fn discrepancy_summary(&self) -> rusqlite::Result<DiscrepancySummary> {
+        let mut stmt = self.conn.prepare(
+            "SELECT outcome, expected_name, COUNT(*) AS n, COUNT(DISTINCT document_path) AS docs
+             FROM join_discrepancies
+             GROUP BY outcome, expected_name
+             ORDER BY n DESC, outcome ASC, expected_name ASC
+             LIMIT ?1",
+        )?;
+        let keyed: Vec<(String, String, u64, u64)> = stmt
+            .query_map(params![DISCREPANCY_GROUP_CAP as i64], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u64,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        // The exemplar is a genuine persisted row from the group — never a synthetic pairing of
+        // per-column aggregates — chosen deterministically, preferring a row with a real span so a
+        // typed-absence span appears only when the whole group lacks locations.
+        let mut exemplar_stmt = self.conn.prepare(
+            "SELECT document_path, span_start, span_end, outcome, expected_name, found_text
+             FROM join_discrepancies
+             WHERE outcome = ?1 AND expected_name = ?2
+             ORDER BY span_start IS NULL, document_path, span_start, span_end
+             LIMIT 1",
+        )?;
+        let mut groups = Vec::with_capacity(keyed.len());
+        for (outcome, expected_name, count, document_count) in keyed {
+            let exemplar = exemplar_stmt.query_row(params![outcome, expected_name], Self::map_discrepancy)?;
+            groups.push(DiscrepancyGroup {
+                outcome,
+                expected_name,
+                count,
+                document_count,
+                exemplar,
+            });
+        }
+
+        // Full-set totals: computed over every persisted row, never only the displayed groups.
+        let total_discrepancies: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM join_discrepancies", [], |r| r.get(0))?;
+        let total_groups: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM join_discrepancies GROUP BY outcome, expected_name)",
+            [],
+            |r| r.get(0),
+        )?;
+
+        Ok(DiscrepancySummary {
+            groups,
+            total_groups: total_groups as u64,
+            total_discrepancies: total_discrepancies as u64,
+        })
+    }
+
+    /// Every persisted discrepancy row, ordered deterministically — the explicit full listing.
+    pub fn all_discrepancies(&self) -> rusqlite::Result<Vec<DiscrepancyRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_path, span_start, span_end, outcome, expected_name, found_text
+             FROM join_discrepancies
+             ORDER BY document_path, span_start, span_end, outcome, expected_name",
+        )?;
+        let rows = stmt.query_map([], Self::map_discrepancy)?;
+        rows.collect()
+    }
+
+    fn map_discrepancy(r: &rusqlite::Row) -> rusqlite::Result<DiscrepancyRow> {
+        let span_start: Option<i64> = r.get(1)?;
+        let span_end: Option<i64> = r.get(2)?;
+        let span = match (span_start, span_end) {
+            (Some(s), Some(e)) => Some((s as usize, e as usize)),
+            _ => None,
+        };
+        Ok(DiscrepancyRow {
+            document_path: r.get(0)?,
+            span,
+            outcome: r.get(3)?,
+            expected_name: r.get(4)?,
+            found_text: r.get(5)?,
+        })
     }
 
     /// Fetch a symbol by canonical identity.
@@ -312,7 +578,7 @@ impl GraphStore {
     /// The occurrences of a symbol, ordered deterministically.
     pub fn occurrences_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<OccurrenceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol_id, document_path, span_start, span_end, role, enclosing_id
+            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id
              FROM occurrences WHERE symbol_id = ?1
              ORDER BY document_path, span_start, span_end",
         )?;
@@ -326,7 +592,8 @@ impl GraphStore {
             document_path: r.get(1)?,
             span: (r.get::<_, i64>(2)? as usize, r.get::<_, i64>(3)? as usize),
             role: r.get(4)?,
-            enclosing_id: r.get::<_, Option<String>>(5)?.map(CanonicalId::from_raw),
+            rule: r.get(5)?,
+            enclosing_id: r.get::<_, Option<String>>(6)?.map(CanonicalId::from_raw),
         })
     }
 
@@ -378,7 +645,7 @@ impl GraphStore {
     /// Every reference-role occurrence of `id`, ordered deterministically.
     pub fn references_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<OccurrenceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol_id, document_path, span_start, span_end, role, enclosing_id
+            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id
              FROM occurrences WHERE symbol_id = ?1 AND role = 'reference'
              ORDER BY document_path, span_start, span_end",
         )?;
@@ -402,6 +669,39 @@ impl GraphStore {
         }
         Ok(Some(Freshness::Fresh))
     }
+}
+
+/// The schema version stamped in a store's `PRAGMA user_version` (0 for an unstamped store).
+fn stamped_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+}
+
+/// Delete an incompatible store's file and its SQLite sidecar files, tolerating absent sidecars.
+fn remove_store_files(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        match std::fs::remove_file(std::path::Path::new(&sidecar)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Truncate `s` to at most [`FOUND_TEXT_MAX_BYTES`] bytes, cutting on a UTF-8 character boundary so
+/// the persisted text is always valid UTF-8.
+fn truncate_on_boundary(s: &str) -> String {
+    if s.len() <= FOUND_TEXT_MAX_BYTES {
+        return s.to_string();
+    }
+    let mut end = FOUND_TEXT_MAX_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Escape LIKE wildcards in a literal fragment (using `\` as the escape char).

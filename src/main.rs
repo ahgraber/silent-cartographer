@@ -38,14 +38,31 @@ fn main() -> Result<()> {
             println!("{out}");
         }
         Command::Build(args) => {
-            let accounting = commands::run_build(&cli.db, &cli.workspace, &args.root, &args.rust_analyzer)?;
+            let accounting = commands::run_build(&cli.db, cli.workspace.as_deref(), &args.root, &args.rust_analyzer)?;
             println!(
-                "built: aligned={} text_mismatch={} semantic_only={} syntax_only={}",
-                accounting.aligned, accounting.text_mismatch, accounting.semantic_only, accounting.syntax_only
+                "built: aligned={} (exact={} crate_root={} operator_desugar={} module_span={} \
+                 self_keyword={}) text_mismatch={} semantic_only={} duplicate_ambiguous={} syntax_only={}",
+                accounting.aligned_total(),
+                accounting.aligned_exact,
+                accounting.aligned_crate_root,
+                accounting.aligned_operator_desugar,
+                accounting.aligned_module_span,
+                accounting.aligned_self_keyword,
+                accounting.text_mismatch,
+                accounting.semantic_only,
+                accounting.duplicate_ambiguous,
+                accounting.syntax_only
             );
         }
-        Command::Status => {
-            let out = commands::run_status(&cli.db, &root, &default_analyzer(), cli.json)?;
+        Command::Status(args) => {
+            let out = commands::run_status(
+                &cli.db,
+                &root,
+                &default_analyzer(),
+                cli.json,
+                args.discrepancies,
+                args.all,
+            )?;
             println!("{out}");
         }
     }

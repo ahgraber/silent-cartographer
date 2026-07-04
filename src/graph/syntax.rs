@@ -30,6 +30,18 @@ pub struct SyntaxDeclaration {
     pub full_span: ByteSpan,
 }
 
+/// The syntactic construct located at a byte span: its node kind, full span, and — for
+/// operator-shaped expressions — the operator token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructAt {
+    /// The tree-sitter node kind (e.g. `binary_expression`, `try_expression`, `crate`).
+    pub kind: String,
+    /// The construct's full byte span.
+    pub span: ByteSpan,
+    /// The operator token for binary / compound-assignment / unary expressions, else `None`.
+    pub operator: Option<String>,
+}
+
 /// tree-sitter node kinds that correspond to persisted Rust declarations.
 const DECLARATION_KINDS: &[&str] = &[
     "mod_item",
@@ -162,6 +174,57 @@ impl SyntaxTree {
         out
     }
 
+    /// The syntactic construct at `span`: the smallest **named** node containing it, with the
+    /// operator token for operator-shaped expressions.
+    ///
+    /// Anonymous token nodes (a bare `?`, `==`, `[`) resolve to their named parent, and a span on
+    /// whitespace inside an expression resolves to that expression — which is what lets the
+    /// operator-desugar alignment rule match by construct instead of raw bytes (live operator spans
+    /// are observed sitting adjacent to the sigil). A span inside an operand resolves to the
+    /// operand's own node, never the surrounding expression, so the construct match stays exact.
+    pub fn construct_at(&self, span: ByteSpan) -> Option<ConstructAt> {
+        let root = self.tree.root_node();
+        let end = span.end.max(span.start + 1).min(root.end_byte());
+        let mut node = root.descendant_for_byte_range(span.start, end)?;
+        while !node.is_named() {
+            node = node.parent()?;
+        }
+        let operator = match node.kind() {
+            // Binary and compound-assignment expressions expose the sigil as the `operator` field.
+            "binary_expression" | "compound_assignment_expr" => node
+                .child_by_field_name("operator")
+                .and_then(|op| self.text_at(span_of(op)))
+                .map(str::to_string),
+            // A unary expression's sigil is its leading token (`-`, `!`, `*`).
+            "unary_expression" => node.child(0).and_then(|c| self.text_at(span_of(c))).map(str::to_string),
+            _ => None,
+        };
+        Some(ConstructAt {
+            kind: node.kind().to_string(),
+            span: span_of(node),
+            operator,
+        })
+    }
+
+    /// The self-type text of the nearest `impl` block enclosing `offset`, if any.
+    ///
+    /// Walks the ancestor chain to the innermost `impl_item` and reads its `type` field verbatim
+    /// (generic arguments included — the caller strips them for base-name comparison). `Self`
+    /// inside a trait body has no enclosing `impl` and yields `None`.
+    pub fn enclosing_impl_self_type(&self, offset: usize) -> Option<String> {
+        let root = self.tree.root_node();
+        let mut node = root.descendant_for_byte_range(offset, offset);
+        while let Some(n) = node {
+            if n.kind() == "impl_item"
+                && let Some(ty) = n.child_by_field_name("type")
+            {
+                return self.text_at(span_of(ty)).map(str::to_string);
+            }
+            node = n.parent();
+        }
+        None
+    }
+
     /// Every persisted declaration in the file, each with its name and full span.
     pub fn all_declarations(&self) -> Vec<SyntaxDeclaration> {
         let root = self.tree.root_node();
@@ -259,5 +322,121 @@ mod net {
         let chain = tree.enclosing_declarations(client_ref.start);
         // The outermost declaration is the module `net`.
         assert_eq!(chain.last().map(|d| tree.text_at(d.name_span)), Some(Some("net")));
+    }
+
+    /// The construct at the first occurrence of `token` in `src`.
+    fn construct_at_token(src: &str, token: &str) -> ConstructAt {
+        let tree = SyntaxTree::parse(src).unwrap();
+        let start = src.find(token).expect("token present");
+        tree.construct_at(ByteSpan {
+            start,
+            end: start + token.len(),
+        })
+        .expect("construct present")
+    }
+
+    // The construct kinds the operator-desugar correspondence dispatches on, one per family.
+    #[test]
+    fn construct_at_resolves_operator_families() {
+        let try_c = construct_at_token("fn f(x: Option<u8>) -> Option<u8> { Some(x?) }\n", "?");
+        assert_eq!(try_c.kind, "try_expression");
+
+        let eq = construct_at_token("fn f(a: u8, b: u8) -> bool { a == b }\n", "==");
+        assert_eq!(
+            (eq.kind.as_str(), eq.operator.as_deref()),
+            ("binary_expression", Some("=="))
+        );
+
+        let add_assign = construct_at_token("fn f(mut a: u8) { a += 1; }\n", "+=");
+        assert_eq!(
+            (add_assign.kind.as_str(), add_assign.operator.as_deref()),
+            ("compound_assignment_expr", Some("+="))
+        );
+
+        let neg = construct_at_token("fn f(a: i8) -> i8 { -a }\n", "-a");
+        assert_eq!(
+            (neg.kind.as_str(), neg.operator.as_deref()),
+            ("unary_expression", Some("-"))
+        );
+
+        let index = construct_at_token("fn f(v: &[u8]) -> u8 { v[0] }\n", "[0]");
+        assert_eq!(index.kind, "index_expression");
+
+        let call = construct_at_token("fn f(g: fn()) { g(); }\n", "g()");
+        assert_eq!(call.kind, "call_expression");
+
+        let for_loop = construct_at_token("fn f(v: Vec<u8>) { for _x in v {} }\n", "for");
+        assert_eq!(for_loop.kind, "for_expression");
+    }
+
+    // A single-byte span on whitespace beside a sigil resolves to the surrounding expression (the
+    // live rust-analyzer adjacency case), while a span on an operand resolves to the operand.
+    #[test]
+    fn construct_at_whitespace_beside_sigil_is_the_expression() {
+        let src = "fn f(a: u8, b: u8) -> u8 { a + b }\n";
+        let tree = SyntaxTree::parse(src).unwrap();
+        let space_before_plus = src.find(" + ").unwrap(); // the space between `a` and `+`
+        let c = tree
+            .construct_at(ByteSpan {
+                start: space_before_plus,
+                end: space_before_plus + 1,
+            })
+            .unwrap();
+        assert_eq!(
+            (c.kind.as_str(), c.operator.as_deref()),
+            ("binary_expression", Some("+"))
+        );
+
+        // A span on the operand `a` itself is the identifier, never the surrounding expression.
+        let a_pos = src.find("{ a ").unwrap() + 2;
+        let operand = tree
+            .construct_at(ByteSpan {
+                start: a_pos,
+                end: a_pos + 1,
+            })
+            .unwrap();
+        assert_eq!(operand.kind, "identifier");
+    }
+
+    // The `crate` path keyword is its own named node kind, distinct from identifiers.
+    #[test]
+    fn construct_at_crate_keyword() {
+        let c = construct_at_token("use crate::thing::Thing;\n", "crate");
+        assert_eq!(c.kind, "crate");
+    }
+
+    // `Self` is a name node in both type position and path-segment position, and the nearest
+    // enclosing impl's self type is readable for the cross-check; a trait body has none.
+    #[test]
+    fn self_token_is_a_name_node_and_impl_self_type_is_readable() {
+        let src = "\
+struct A;
+impl<T> A {
+    fn f() -> Self { Self::g() }
+}
+trait Tr {
+    fn t() -> Self;
+}
+";
+        let tree = SyntaxTree::parse(src).unwrap();
+
+        // Both `Self` positions resolve through the name-node path with text `Self`.
+        for pos in [src.find("Self").unwrap(), src.find("Self::").unwrap()] {
+            let name = tree
+                .name_node_containing(ByteSpan {
+                    start: pos,
+                    end: pos + 4,
+                })
+                .expect("Self is a name node");
+            assert_eq!(tree.text_at(name), Some("Self"));
+        }
+
+        // Inside the impl: the self type (verbatim, generics included where written).
+        let in_impl = src.find("Self").unwrap();
+        assert_eq!(tree.enclosing_impl_self_type(in_impl).as_deref(), Some("A"));
+
+        // Inside the trait body: no impl to cross-check against.
+        let in_trait = src.rfind("Self").unwrap();
+        assert_eq!(tree.enclosing_impl_self_type(in_trait), None);
     }
 }

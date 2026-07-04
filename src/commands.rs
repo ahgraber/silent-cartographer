@@ -75,20 +75,44 @@ fn current_state(store: &GraphStore, root: &Path, rust_analyzer: &str) -> Result
     Ok((provenance, hash))
 }
 
+/// Resolve the workspace identity for a build: a supplied identity is used verbatim; otherwise it is
+/// derived deterministically from the canonicalized workspace root's directory name.
+///
+/// The derivation is a pure function of the root path — no git or remote probing — so the default
+/// never shifts when unrelated configuration changes. When canonicalization leaves no name component
+/// (e.g. the filesystem root), the build refuses with a teaching error pointing at `--workspace`
+/// rather than silently sharing a namespace.
+pub fn resolve_workspace(supplied: Option<&str>, root: &Path) -> Result<WorkspaceId> {
+    if let Some(name) = supplied {
+        return Ok(WorkspaceId::new(name));
+    }
+    let canonical =
+        std::fs::canonicalize(root).with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
+    let name = canonical.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        anyhow!(
+            "workspace root {} has no directory name to derive an identity from; pass --workspace <name>",
+            canonical.display()
+        )
+    })?;
+    Ok(WorkspaceId::new(name))
+}
+
 /// `build`: (re)build the index for the workspace via the ingest path.
 pub fn run_build(
     db: &Path,
-    workspace: &str,
+    workspace: Option<&str>,
     root: &Path,
     rust_analyzer: &str,
 ) -> Result<crate::graph::join::JoinAccounting> {
+    let workspace_id = resolve_workspace(workspace, root)?;
     let adapter = RustAdapter::new(rust_analyzer).map_err(|e| anyhow!("rust-analyzer unavailable: {e}"))?;
     let index: ExtractedIndex = adapter.analyze(root).map_err(|e| anyhow!("indexing failed: {e}"))?;
     let sources = collect_rust_sources(root)?;
     ensure_parent_dir(db)?;
-    let mut store = GraphStore::open(db).context("opening index database")?;
-    let accounting = ingest(&mut store, &WorkspaceId::new(workspace), &index, &sources)
-        .map_err(|e| anyhow!("ingest failed: {e}"))?;
+    // The write path replaces an incompatible store outright: the index is derived, replayable
+    // data, so rebuild is the migration.
+    let mut store = GraphStore::open_or_replace(db).context("opening index database")?;
+    let accounting = ingest(&mut store, &workspace_id, &index, &sources).map_err(|e| anyhow!("ingest failed: {e}"))?;
     Ok(accounting)
 }
 
@@ -101,13 +125,22 @@ pub fn build_from_index(
     sources: &[(String, String)],
 ) -> Result<()> {
     ensure_parent_dir(db)?;
-    let mut store = GraphStore::open(db).context("opening index database")?;
+    // Same write-path replacement policy as `run_build`.
+    let mut store = GraphStore::open_or_replace(db).context("opening index database")?;
     ingest(&mut store, &WorkspaceId::new(workspace), index, sources).map_err(|e| anyhow!("ingest failed: {e}"))?;
     Ok(())
 }
 
-/// `status`: report provenance, freshness, and the join-alignment counts.
-pub fn run_status(db: &Path, root: &Path, rust_analyzer: &str, json: bool) -> Result<String> {
+/// `status`: report provenance, freshness, and the join-alignment counts. With `discrepancies`, add
+/// the bounded grouped discrepancy summary; with `all`, add every persisted discrepancy row instead.
+pub fn run_status(
+    db: &Path,
+    root: &Path,
+    rust_analyzer: &str,
+    json: bool,
+    discrepancies: bool,
+    all: bool,
+) -> Result<String> {
     let store = GraphStore::open(db).context("opening index database")?;
     let Some(meta) = store.read_metadata()? else {
         return Ok("no index built".to_string());
@@ -115,7 +148,7 @@ pub fn run_status(db: &Path, root: &Path, rust_analyzer: &str, json: bool) -> Re
     let (provenance, hash) = current_state(&store, root, rust_analyzer)?;
     let freshness = store.freshness(&hash, &provenance)?.expect("metadata present");
 
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "workspace": meta.workspace_id.as_str(),
         "provenance": {
             "analyzer_name": meta.provenance.analyzer_name,
@@ -128,12 +161,69 @@ pub fn run_status(db: &Path, root: &Path, rust_analyzer: &str, json: bool) -> Re
         },
         "stale": freshness.is_stale(),
         "join_alignment": {
-            "aligned": meta.accounting.aligned,
+            // Per-rule acceptance buckets alongside the refusal counts.
+            "aligned": {
+                "exact": meta.accounting.aligned_exact,
+                "crate_root": meta.accounting.aligned_crate_root,
+                "operator_desugar": meta.accounting.aligned_operator_desugar,
+                "module_span": meta.accounting.aligned_module_span,
+                "self_keyword": meta.accounting.aligned_self_keyword,
+                "total": meta.accounting.aligned_total(),
+            },
             "text_mismatch": meta.accounting.text_mismatch,
             "semantic_only": meta.accounting.semantic_only,
+            "duplicate_ambiguous": meta.accounting.duplicate_ambiguous,
             "syntax_only": meta.accounting.syntax_only,
         },
     });
+
+    if all {
+        let rows = store.all_discrepancies()?;
+        report["discrepancies"] = serde_json::json!({
+            "listing": "all",
+            "rows": rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "document_path": r.document_path,
+                        // Typed absence: null when the occurrence's coordinates could not normalize.
+                        "span_start": r.span.map(|s| s.0),
+                        "span_end": r.span.map(|s| s.1),
+                        "outcome": r.outcome,
+                        "expected_name": r.expected_name,
+                        "found_text": r.found_text,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+    } else if discrepancies {
+        let summary = store.discrepancy_summary()?;
+        report["discrepancies"] = serde_json::json!({
+            "listing": "summary",
+            "truncated": summary.truncated(),
+            "total_groups": summary.total_groups,
+            "total_discrepancies": summary.total_discrepancies,
+            "groups": summary
+                .groups
+                .iter()
+                .map(|g| {
+                    serde_json::json!({
+                        "outcome": g.outcome,
+                        "expected_name": g.expected_name,
+                        "count": g.count,
+                        "document_count": g.document_count,
+                        "exemplar": {
+                            "document_path": g.exemplar.document_path,
+                            // Typed absence: null when the exemplar's coordinates could not normalize.
+                            "span_start": g.exemplar.span.map(|s| s.0),
+                            "span_end": g.exemplar.span.map(|s| s.1),
+                        },
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+    }
+
     if json {
         Ok(serde_json::to_string_pretty(&report)?)
     } else {

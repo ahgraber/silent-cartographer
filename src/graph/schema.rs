@@ -6,26 +6,32 @@
 //! over spans — without committing to their form; those arrive as an additive migration.
 
 /// The current schema version. Bumped on any schema-affecting change under the reproducibility
-/// policy.
-pub const SCHEMA_VERSION: i64 = 1;
+/// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
+/// before any table access; the `index_metadata.schema_version` column carries it as provenance.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
 
 -- One row per indexed workspace build. Holds provenance, the content-hash gate, and the
--- join-alignment accounting for the build.
+-- join-alignment accounting: one acceptance count per alignment rule, plus the refusal counts.
 CREATE TABLE IF NOT EXISTS index_metadata (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version      INTEGER NOT NULL,
     workspace_id        TEXT    NOT NULL,
     analyzer_name       TEXT    NOT NULL,
     analyzer_version    TEXT    NOT NULL,
-    content_hash        TEXT    NOT NULL,
-    aligned_count       INTEGER NOT NULL DEFAULT 0,
-    text_mismatch_count INTEGER NOT NULL DEFAULT 0,
-    semantic_only_count INTEGER NOT NULL DEFAULT 0,
-    syntax_only_count   INTEGER NOT NULL DEFAULT 0
+    content_hash                   TEXT    NOT NULL,
+    aligned_exact_count            INTEGER NOT NULL DEFAULT 0,
+    aligned_crate_root_count       INTEGER NOT NULL DEFAULT 0,
+    aligned_operator_desugar_count INTEGER NOT NULL DEFAULT 0,
+    aligned_module_span_count      INTEGER NOT NULL DEFAULT 0,
+    aligned_self_keyword_count     INTEGER NOT NULL DEFAULT 0,
+    text_mismatch_count            INTEGER NOT NULL DEFAULT 0,
+    semantic_only_count            INTEGER NOT NULL DEFAULT 0,
+    duplicate_ambiguous_count      INTEGER NOT NULL DEFAULT 0,
+    syntax_only_count              INTEGER NOT NULL DEFAULT 0
 );
 
 -- One row per persisted symbol. `class` is 'in_workspace' or 'external'; externals carry identity
@@ -44,9 +50,10 @@ CREATE TABLE IF NOT EXISTS symbols (
     embedding      BLOB
 );
 
--- One row per occurrence of a symbol. `role` is 'definition' or 'reference'. Aligned reference
--- occurrences carry `enclosing_id`, the nearest enclosing persisted declaration (NULL means the
--- module/file itself is the attribution).
+-- One row per occurrence of a symbol. `role` is 'definition' or 'reference'. `rule` is the
+-- alignment rule that accepted the attribution ('exact', 'crate_root', 'operator_desugar',
+-- 'module_span') — its provenance. Aligned reference occurrences carry `enclosing_id`, the nearest
+-- enclosing persisted declaration (NULL means the module/file itself is the attribution).
 CREATE TABLE IF NOT EXISTS occurrences (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol_id      TEXT    NOT NULL REFERENCES symbols(canonical_id),
@@ -54,6 +61,7 @@ CREATE TABLE IF NOT EXISTS occurrences (
     span_start     INTEGER NOT NULL,
     span_end       INTEGER NOT NULL,
     role           TEXT    NOT NULL,
+    rule           TEXT    NOT NULL,
     enclosing_id   TEXT    REFERENCES symbols(canonical_id)
 );
 CREATE INDEX IF NOT EXISTS occurrences_by_symbol ON occurrences(symbol_id);
@@ -72,4 +80,22 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS edges_by_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS edges_by_src ON edges(kind, src_id);
 CREATE INDEX IF NOT EXISTS edges_by_dst ON edges(kind, dst_id);
+
+-- One row per non-aligned semantic occurrence, the inspectable detail behind the aggregate join
+-- counts. `outcome` is 'text_mismatch', 'semantic_only', or 'duplicate_ambiguous'. `expected_name`
+-- is the occurrence's expected name token; `found_text` is the source text at the location, truncated
+-- to a bounded length. The span columns are NULL when the occurrence's coordinates could not be
+-- normalized onto the source — typed absence, never a fabricated location. Wholly rewritten in the
+-- same transaction as each build (every prior row is deleted first), so the table reflects only the
+-- most recent build.
+CREATE TABLE IF NOT EXISTS join_discrepancies (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_path  TEXT    NOT NULL,
+    span_start     INTEGER,
+    span_end       INTEGER,
+    outcome        TEXT    NOT NULL,
+    expected_name  TEXT    NOT NULL,
+    found_text     TEXT
+);
+CREATE INDEX IF NOT EXISTS join_discrepancies_by_group ON join_discrepancies(outcome, expected_name);
 "#;

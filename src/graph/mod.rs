@@ -11,12 +11,14 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::identity::{CanonicalId, Descriptor, WorkspaceId, project_all};
+use crate::identity::{CanonicalId, DefinitionSite, ProjectionInput, WorkspaceId, project_all};
 use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SymbolClass, SymbolKind};
 
 use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join};
 use range::ByteSpan;
-use store::{EdgeKind, Freshness, GraphStore, IndexMetadata, OccurrenceRow, PersistedClass, SymbolRow};
+use store::{
+    DiscrepancyRow, EdgeKind, Freshness, GraphStore, IndexMetadata, OccurrenceRow, PersistedClass, SymbolRow,
+};
 
 /// An error during ingest.
 #[derive(Debug, thiserror::Error)]
@@ -70,24 +72,39 @@ fn kind_tag(kind: SymbolKind) -> &'static str {
 /// Local symbols (no descriptor) receive `None` and are excluded from the persisted base; every
 /// other symbol receives an identity via collision-only disambiguation.
 fn project_identities(workspace: &WorkspaceId, index: &ExtractedIndex) -> Vec<Option<CanonicalId>> {
-    // Gather the descriptors of persisted symbols, remembering their positions.
-    let mut descriptors: Vec<Descriptor> = Vec::new();
+    // Gather the projection inputs of persisted symbols, remembering their positions. Each input
+    // carries its definition location so a collision group ranks by where each twin is defined, not
+    // by the order symbols were encountered; the first occurrence is the fallback for a symbol the
+    // backend gave no definition occurrence.
+    let mut inputs: Vec<ProjectionInput> = Vec::new();
     let mut positions: Vec<usize> = Vec::new();
     for (idx, sym) in index.symbols.iter().enumerate() {
         if sym.class == SymbolClass::Local {
             continue;
         }
         if let Some(d) = &sym.descriptor {
-            descriptors.push(d.clone());
+            inputs.push(ProjectionInput {
+                descriptor: d.clone(),
+                definition: sym.definition().map(occurrence_site),
+                fallback: sym.occurrences.first().map(occurrence_site),
+            });
             positions.push(idx);
         }
     }
-    let ids = project_all(workspace, &descriptors);
+    let ids = project_all(workspace, &inputs);
     let mut out = vec![None; index.symbols.len()];
     for (slot, id) in positions.into_iter().zip(ids) {
         out[slot] = Some(id);
     }
     out
+}
+
+/// The definition-ranking site of an occurrence: its document and (encoding-native) range.
+fn occurrence_site(occ: &crate::semantic::model::ExtractedOccurrence) -> DefinitionSite {
+    DefinitionSite {
+        document_path: occ.document_path.clone(),
+        range: occ.range,
+    }
 }
 
 /// Ingest an extracted index and its sources into the store as one build.
@@ -190,6 +207,7 @@ pub fn ingest(
             document_path: aligned.document_path.clone(),
             span: (aligned.name_span.start, aligned.name_span.end),
             role: role.to_string(),
+            rule: aligned.rule.tag().to_string(),
             enclosing_id,
         })?;
     }
@@ -245,6 +263,25 @@ pub fn ingest(
             }
         }
     }
+
+    // Persist the inspectable detail behind every non-aligned outcome (text-mismatch, semantic-only,
+    // and duplicate-ambiguous), wholly superseding the prior build's rows in one transaction. A span
+    // whose coordinates could not normalize is persisted as typed absence, never a fabricated
+    // location. This rewrite happens before the metadata publish below, so the metadata commit is
+    // the final write of a build: a crash mid-build leaves the prior metadata authoritative, and
+    // fresh metadata can never coexist with stale discrepancy rows.
+    let discrepancies: Vec<DiscrepancyRow> = join_result
+        .unaligned
+        .iter()
+        .map(|occ| DiscrepancyRow {
+            document_path: occ.document_path.clone(),
+            span: occ.span.map(|s| (s.start, s.end)),
+            outcome: occ.outcome.tag().to_string(),
+            expected_name: occ.expected_name.clone(),
+            found_text: occ.found_text.clone(),
+        })
+        .collect();
+    store.rewrite_discrepancies(&discrepancies)?;
 
     store.write_metadata(&IndexMetadata {
         workspace_id: workspace.clone(),

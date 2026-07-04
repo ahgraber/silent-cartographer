@@ -25,7 +25,7 @@ pub enum PositionEncoding {
 /// A half-open source range `[start, end)` in a document, in the document's declared encoding.
 ///
 /// Lines and characters are zero-based, matching SCIP and LSP conventions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SourceRange {
     /// Zero-based start line.
     pub start_line: u32,

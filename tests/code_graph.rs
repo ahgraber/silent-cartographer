@@ -103,7 +103,7 @@ fn text_mismatch_is_refused_and_surfaced() {
     let src = vec![("m.rs".to_string(), source.to_string())];
     let accounting = ingest(&mut store, &ws(), &index, &src).unwrap();
     assert_eq!(accounting.text_mismatch, 1, "mismatch should be counted");
-    assert_eq!(accounting.aligned, 0, "mismatched occurrence must not align");
+    assert_eq!(accounting.aligned_total(), 0, "mismatched occurrence must not align");
 
     // Non-ASCII drift: expected name is ASCII but the location spells an accented identifier.
     let nonascii = "let café = 1;\n";
@@ -135,7 +135,7 @@ fn text_mismatch_is_refused_and_surfaced() {
         acc2.text_mismatch, 1,
         "non-ASCII drift is a surfaced mismatch, not aligned"
     );
-    assert_eq!(acc2.aligned, 0);
+    assert_eq!(acc2.aligned_total(), 0);
 }
 
 // _(Guarded positional join — SCIP-only branch)_ — a SCIP occurrence with no syntactic construct at
@@ -168,7 +168,7 @@ fn semantic_only_occurrence_is_unaligned() {
     let src = vec![("m.rs".to_string(), source.to_string())];
     let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
     assert_eq!(acc.semantic_only, 1, "occurrence with no syntax is semantic-only");
-    assert_eq!(acc.aligned, 0);
+    assert_eq!(acc.aligned_total(), 0);
     // Not misattributed: the ghost symbol has no aligned occurrence persisted.
     assert!(
         store
@@ -525,7 +525,7 @@ fn build_records_four_outcome_counts() {
     let meta = store.read_metadata().unwrap().expect("metadata recorded");
     let acc = meta.accounting;
     // The fixture is all-aligned; other counts are zero but present/retrievable.
-    assert!(acc.aligned > 0);
+    assert!(acc.aligned_total() > 0);
     assert_eq!(acc.text_mismatch, 0);
     assert_eq!(acc.semantic_only, 0);
     // Some declarations may be syntax-only (e.g. the impl block), which is fine; the count exists.
@@ -575,7 +575,10 @@ fn accounting_conserves_occurrence_total() {
     let meta = store.read_metadata().unwrap().unwrap();
 
     // Every semantic-side term is non-zero, so the conservation claim is exercised across a real mix.
-    assert!(meta.accounting.aligned > 0, "mixed fixture has aligned occurrences");
+    assert!(
+        meta.accounting.aligned_total() > 0,
+        "mixed fixture has aligned occurrences"
+    );
     assert!(
         meta.accounting.text_mismatch > 0,
         "mixed fixture has a text-mismatch occurrence"
@@ -646,6 +649,430 @@ fn two_workspace_ingest_persists_distinct_symbols() {
     }
 }
 
+/// A source with two structs the semantic backend describes with the identical resolved descriptor
+/// `dupcrate::Widget` — the rust-analyzer true-duplicate defect — plus a reference to that descriptor.
+const DUP_SOURCE: &str = "\
+struct Widget;
+struct Widget;
+fn use_widget() {
+    let _w: Widget = Widget;
+}
+";
+
+/// An index over [`DUP_SOURCE`]: two `Widget` definitions sharing one descriptor, and one reference.
+///
+/// The reference is attached to the first twin symbol (as a backend would, unable to disambiguate);
+/// the join must nonetheless refuse to attribute it to either twin.
+fn duplicate_index() -> ExtractedIndex {
+    let widget_descriptor = || Descriptor::new("dupcrate", vec![DescriptorSegment::new("Widget", SegmentKind::Type)]);
+    // "Widget" name tokens: def at line 0 cols 7..13, def at line 1 cols 7..13; the reference on
+    // line 3 is the second "Widget" there (cols 21..27).
+    let twin_a = ExtractedSymbol {
+        descriptor: Some(widget_descriptor()),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            ExtractedOccurrence {
+                document_path: "dup.rs".to_string(),
+                range: SourceRange::new(0, 7, 0, 13),
+                role: OccurrenceRole::Definition,
+            },
+            // A reference the backend arbitrarily hung on twin_a — must not be attributed to it.
+            ExtractedOccurrence {
+                document_path: "dup.rs".to_string(),
+                range: SourceRange::new(3, 21, 3, 27),
+                role: OccurrenceRole::Reference,
+            },
+        ],
+    };
+    let twin_b = ExtractedSymbol {
+        descriptor: Some(widget_descriptor()),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: "dup.rs".to_string(),
+            range: SourceRange::new(1, 7, 1, 13),
+            role: OccurrenceRole::Definition,
+        }],
+    };
+    ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![SourceDocument {
+            path: "dup.rs".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![twin_a, twin_b],
+    }
+}
+
+// _(Occurrences of duplicated descriptors are never arbitrarily attributed — definition branch)_ —
+// each definition occurrence of a duplicated descriptor attaches to the definition at its own
+// location.
+#[test]
+fn duplicate_definitions_attach_by_co_location() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let index = duplicate_index();
+    let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    // Two definitions aligned (each at its own location); the lone reference did not.
+    assert_eq!(
+        acc.aligned_total(),
+        2,
+        "both duplicate definitions align by co-location"
+    );
+
+    // The two twins carry distinct identities and each persists its own definition span.
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    assert_eq!(twins.len(), 2, "two distinct Widget symbols persisted: {twins:?}");
+    for twin in &twins {
+        let def_occs = store.occurrences_of(&twin.canonical_id).unwrap();
+        // Each twin owns exactly one definition occurrence at its own location; no reference.
+        assert_eq!(def_occs.len(), 1, "twin owns only its own definition: {def_occs:?}");
+        assert_eq!(def_occs[0].role, "definition");
+    }
+    // The two definition spans are distinct (line 0 vs line 1) — co-location, not conflation.
+    let spans: std::collections::HashSet<_> = twins
+        .iter()
+        .flat_map(|t| store.occurrences_of(&t.canonical_id).unwrap())
+        .map(|o| o.span)
+        .collect();
+    assert_eq!(spans.len(), 2, "definitions attach to distinct locations");
+}
+
+// _(Occurrences of duplicated descriptors are never arbitrarily attributed — reference branch)_ — a
+// reference of a duplicated descriptor is recorded duplicate-ambiguous and attributed to no twin.
+#[test]
+fn duplicate_reference_is_ambiguous_and_unattributed() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let index = duplicate_index();
+    let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(acc.duplicate_ambiguous, 1, "the reference is typed duplicate-ambiguous");
+
+    // No twin has a persisted reference occurrence — the reference is attributed to none.
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    for twin in &twins {
+        let refs = store.references_of(&twin.canonical_id).unwrap();
+        assert!(refs.is_empty(), "no twin owns the ambiguous reference: {refs:?}");
+    }
+
+    // It is persisted as an inspectable discrepancy of kind duplicate_ambiguous instead.
+    let rows = store.all_discrepancies().unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.outcome == "duplicate_ambiguous" && r.expected_name == "Widget"),
+        "the ambiguous reference is recorded as a discrepancy: {rows:?}"
+    );
+}
+
+// _(Occurrences of duplicated descriptors are never arbitrarily attributed — unduplicated branch)_ —
+// references of a single-definition descriptor attribute through the ordinary guarded join.
+#[test]
+fn unduplicated_references_are_never_marked_ambiguous() {
+    // The standard fixture has no duplicated descriptors; `connect` is referenced once inside a
+    // closure and must attribute through the guarded join, never duplicate-ambiguous.
+    let store = ingest_fixture();
+    let meta = store.read_metadata().unwrap().unwrap();
+    assert_eq!(
+        meta.accounting.duplicate_ambiguous, 0,
+        "no duplicate-ambiguous outcomes on an unduplicated fixture"
+    );
+    // connect's reference attributed normally (to `open`).
+    let refs = store.references_of(&connect_id()).unwrap();
+    assert_eq!(refs.len(), 1, "the single-definition reference attributes normally");
+    assert_eq!(refs[0].enclosing_id, Some(open_id()));
+    // No discrepancy rows for the all-aligned fixture.
+    assert!(
+        store.all_discrepancies().unwrap().is_empty(),
+        "no discrepancies on an aligned build"
+    );
+}
+
+// _(Join alignment accounting)_ — a build records the duplicate-ambiguous count alongside the other
+// three semantic-side counts and syntax-only.
+#[test]
+fn build_records_duplicate_ambiguous_count() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let index = duplicate_index();
+    let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = store.read_metadata().unwrap().unwrap().accounting;
+    // All four semantic-side buckets plus syntax-only are recorded and retrievable.
+    assert_eq!(acc.aligned_total(), 2);
+    assert_eq!(acc.text_mismatch, 0);
+    assert_eq!(acc.semantic_only, 0);
+    assert_eq!(acc.duplicate_ambiguous, 1);
+    let _ = acc.syntax_only;
+}
+
+// _(Join alignment accounting — conservation)_ — with non-zero counts in all four semantic-side
+// buckets, their sum equals the total occurrences processed.
+#[test]
+fn accounting_conserves_with_four_buckets() {
+    // Extend the duplicate fixture with a text-mismatch and a semantic-only occurrence so every one
+    // of the four semantic-side buckets carries a non-zero term.
+    let mut index = duplicate_index();
+    index.symbols.push(ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "dupcrate",
+            vec![DescriptorSegment::new("drifted", SegmentKind::Term)],
+        )),
+        kind: SymbolKind::Constant,
+        class: SymbolClass::InWorkspace,
+        // Points at "Widget" on line 0, which does not spell "drifted" → text-mismatch.
+        occurrences: vec![ExtractedOccurrence {
+            document_path: "dup.rs".to_string(),
+            range: SourceRange::new(0, 7, 0, 13),
+            role: OccurrenceRole::Definition,
+        }],
+    });
+    index.symbols.push(ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "dupcrate",
+            vec![DescriptorSegment::new("ghost", SegmentKind::Method)],
+        )),
+        kind: SymbolKind::Method,
+        class: SymbolClass::InWorkspace,
+        // Far past the end of the source → semantic-only.
+        occurrences: vec![ExtractedOccurrence {
+            document_path: "dup.rs".to_string(),
+            range: SourceRange::new(90, 0, 90, 5),
+            role: OccurrenceRole::Definition,
+        }],
+    });
+    let total: u64 = index.symbols.iter().map(|s| s.occurrences.len() as u64).sum();
+
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = store.read_metadata().unwrap().unwrap().accounting;
+
+    assert!(acc.aligned_total() > 0, "aligned term non-zero");
+    assert!(acc.text_mismatch > 0, "text-mismatch term non-zero");
+    assert!(acc.semantic_only > 0, "semantic-only term non-zero");
+    assert!(acc.duplicate_ambiguous > 0, "duplicate-ambiguous term non-zero");
+    assert_eq!(
+        acc.total_semantic(),
+        total,
+        "the four semantic counts conserve the occurrence total"
+    );
+}
+
+// _(Join discrepancies are inspectable)_ — a text-mismatch occurrence persists location, kind,
+// expected name, and found source text, retrievable after the build.
+#[test]
+fn text_mismatch_detail_is_persisted() {
+    // `alpha` points at a location spelling `beta` → text-mismatch with a found token.
+    let source = "let alpha = 1;\nlet beta = 2;\n";
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![SourceDocument {
+            path: "m.rs".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "c",
+                vec![DescriptorSegment::new("alpha", SegmentKind::Term)],
+            )),
+            kind: SymbolKind::Constant,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![ExtractedOccurrence {
+                document_path: "m.rs".to_string(),
+                range: SourceRange::new(1, 4, 1, 8),
+                role: OccurrenceRole::Definition,
+            }],
+        }],
+    };
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let rows = store.all_discrepancies().unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.expected_name == "alpha")
+        .expect("the mismatch is persisted");
+    assert_eq!(row.outcome, "text_mismatch");
+    assert_eq!(row.document_path, "m.rs");
+    assert_eq!(row.found_text.as_deref(), Some("beta"), "the found token is persisted");
+    let span = row
+        .span
+        .expect("a mismatch at a normalized location carries a real span");
+    assert!(span.1 > span.0, "a real location span is persisted: {row:?}");
+}
+
+// _(Join discrepancies are inspectable — supersession branch)_ — discrepancy rows from a prior build
+// are absent after a new build of changed sources.
+#[test]
+fn discrepancies_are_superseded_per_build() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+
+    // First build: a text-mismatch on `alpha`.
+    let source1 = "let alpha = 1;\nlet beta = 2;\n";
+    let index1 = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![SourceDocument {
+            path: "m.rs".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "c",
+                vec![DescriptorSegment::new("alpha", SegmentKind::Term)],
+            )),
+            kind: SymbolKind::Constant,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![ExtractedOccurrence {
+                document_path: "m.rs".to_string(),
+                range: SourceRange::new(1, 4, 1, 8),
+                role: OccurrenceRole::Definition,
+            }],
+        }],
+    };
+    ingest(&mut store, &ws(), &index1, &[("m.rs".to_string(), source1.to_string())]).unwrap();
+    assert!(
+        store
+            .all_discrepancies()
+            .unwrap()
+            .iter()
+            .any(|r| r.expected_name == "alpha"),
+        "first build's discrepancy is present"
+    );
+
+    // Second build over an all-aligned source: the prior discrepancy must not survive.
+    let index2 = support::fixture_index();
+    let src2 = vec![(support::DOC.to_string(), support::SOURCE.to_string())];
+    ingest(&mut store, &ws(), &index2, &src2).unwrap();
+    let rows = store.all_discrepancies().unwrap();
+    assert!(
+        !rows.iter().any(|r| r.expected_name == "alpha"),
+        "the prior build's discrepancy is wholly superseded: {rows:?}"
+    );
+}
+
+// _(Join discrepancies are inspectable — unnormalizable branch)_ — a discrepancy whose coordinates
+// cannot be normalized persists its span as typed absence, never a fabricated location; a
+// duplicate-ambiguous row, whose coordinates do normalize, carries its real span.
+#[test]
+fn unnormalizable_span_is_typed_absence_and_ambiguous_span_is_real() {
+    // The duplicate fixture yields one duplicate-ambiguous reference with a real location; add a
+    // symbol whose occurrence lies far past the end of the source, so its coordinates cannot
+    // normalize.
+    let mut index = duplicate_index();
+    index.symbols.push(ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "dupcrate",
+            vec![DescriptorSegment::new("ghost", SegmentKind::Method)],
+        )),
+        kind: SymbolKind::Method,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: "dup.rs".to_string(),
+            range: SourceRange::new(90, 0, 90, 5),
+            role: OccurrenceRole::Definition,
+        }],
+    });
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let rows = store.all_discrepancies().unwrap();
+
+    // The unnormalizable occurrence's span is typed absence — no fabricated (0, 0).
+    let ghost = rows
+        .iter()
+        .find(|r| r.expected_name == "ghost")
+        .expect("the unnormalizable occurrence is persisted");
+    assert_eq!(ghost.outcome, "semantic_only");
+    assert_eq!(ghost.span, None, "unnormalizable coordinates persist as typed absence");
+
+    // The duplicate-ambiguous reference carries its real normalized byte span: the second `Widget`
+    // on the `let` line, i.e. the fourth `Widget` token in the source.
+    let widget_ref = DUP_SOURCE.match_indices("Widget").nth(3).expect("reference token").0;
+    let ambiguous = rows
+        .iter()
+        .find(|r| r.outcome == "duplicate_ambiguous")
+        .expect("the ambiguous reference is persisted");
+    assert_eq!(
+        ambiguous.span,
+        Some((widget_ref, widget_ref + "Widget".len())),
+        "the duplicate-ambiguous row carries its real normalized span"
+    );
+}
+
+// _(Join discrepancies are inspectable — truncation bound)_ — a mismatch whose found text exceeds
+// the persistence bound is classified on the full bytes and truncated on a UTF-8 char boundary.
+#[test]
+fn oversized_found_text_is_classified_on_full_bytes_and_truncated_on_a_boundary() {
+    use silent_cartographer::graph::store::FOUND_TEXT_MAX_BYTES;
+
+    // An identifier of 1 ASCII byte + 60 two-byte `é`s = 121 bytes: one past the bound, with the
+    // 60th `é` straddling the boundary byte. The expected name is exactly the first 119 bytes — so
+    // if classification ran on the truncated text the two would compare equal and the occurrence
+    // would silently align; classification on the full bytes keeps it a mismatch.
+    let found_ident = format!("a{}", "é".repeat(60));
+    assert_eq!(
+        found_ident.len(),
+        FOUND_TEXT_MAX_BYTES + 1,
+        "test setup: one byte past the bound"
+    );
+    let expected_name = format!("a{}", "é".repeat(59));
+    let source = format!("let {found_ident} = 1;\n");
+
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![SourceDocument {
+            path: "m.rs".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "c",
+                vec![DescriptorSegment::new(expected_name.clone(), SegmentKind::Term)],
+            )),
+            kind: SymbolKind::Constant,
+            class: SymbolClass::InWorkspace,
+            // The occurrence covers the oversized identifier (UTF-8 columns are bytes).
+            occurrences: vec![ExtractedOccurrence {
+                document_path: "m.rs".to_string(),
+                range: SourceRange::new(0, 4, 0, 4 + found_ident.len() as u32),
+                role: OccurrenceRole::Definition,
+            }],
+        }],
+    };
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source)];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    // Classified on the full bytes: a mismatch, not a silent alignment against the truncated text.
+    assert_eq!(
+        acc.text_mismatch, 1,
+        "the equality check runs on full bytes before truncation"
+    );
+    assert_eq!(acc.aligned_total(), 0);
+
+    let rows = store.all_discrepancies().unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.expected_name == expected_name)
+        .expect("the mismatch is persisted");
+    let found = row.found_text.as_deref().expect("found text persisted");
+    // Truncated to the bound on a UTF-8 boundary: the straddling `é` is dropped whole, leaving the
+    // 119-byte prefix, and the persisted text is valid UTF-8 by construction (it is a `str`).
+    assert!(
+        found.len() <= FOUND_TEXT_MAX_BYTES,
+        "found text is bounded: {} bytes",
+        found.len()
+    );
+    assert_eq!(
+        found, expected_name,
+        "truncation cut on the char boundary before the straddling char"
+    );
+}
+
 // content-hash gate: a non-matching tree is refused (design.md guard).
 #[test]
 fn content_hash_gate_refuses_non_matching_sources() {
@@ -659,4 +1086,839 @@ fn content_hash_gate_refuses_non_matching_sources() {
     let drifted = vec![(support::DOC.to_string(), format!("{}// drift\n", support::SOURCE))];
     let err = join_guarded(&mut store, &ws(), &index, &drifted, &expected);
     assert!(err.is_err(), "content-hash gate must refuse a non-matching tree");
+}
+
+// ---- Typed alignment rules ----
+
+/// A one-document index over `path`.
+fn one_doc_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
+    ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![SourceDocument {
+            path: path.to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: symbols.to_vec(),
+    }
+}
+
+/// A symbol with one occurrence, for rule fixtures.
+fn one_occ_symbol(
+    package: &str,
+    segments: &[(&str, SegmentKind)],
+    kind: SymbolKind,
+    class: SymbolClass,
+    doc: &str,
+    range: SourceRange,
+    role: OccurrenceRole,
+) -> ExtractedSymbol {
+    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
+    ExtractedSymbol {
+        descriptor: Some(Descriptor::new(package, segs)),
+        kind,
+        class,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: doc.to_string(),
+            range,
+            role,
+        }],
+    }
+}
+
+/// The zero-based `(line, col)` of the byte at `pos` in single-byte-per-char test sources.
+fn line_col(source: &str, pos: usize) -> (u32, u32) {
+    let line = source[..pos].matches('\n').count() as u32;
+    let line_start = source[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    (line, (pos - line_start) as u32)
+}
+
+// _(Guarded positional join — crate-root branch)_ — a use-site reference to an external crate root,
+// spelled with the package name (underscored where the package is hyphenated), aligns under the
+// crate-root rule.
+#[test]
+fn crate_root_reference_aligns_on_package_name() {
+    let source = "use ext_pkg::Thing;\nfn f() {}\n";
+    let tok = source.find("ext_pkg").unwrap();
+    let (line, col) = line_col(source, tok);
+    // The package is `ext-pkg` (hyphen), the source token `ext_pkg` (underscore) — the crates.io
+    // equivalence the rule normalizes.
+    let root = one_occ_symbol(
+        "ext-pkg",
+        &[("crate", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 7),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![root]), &src).unwrap();
+
+    assert_eq!(acc.aligned_crate_root, 1, "package-name token accepted by crate-root");
+    assert_eq!(acc.text_mismatch, 0, "not refused as a mismatch");
+    let id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("ext-pkg", vec![DescriptorSegment::new("crate", SegmentKind::Module)]),
+    );
+    let occs = store.occurrences_of(&id).unwrap();
+    assert_eq!(occs.len(), 1, "the crate-root reference is persisted");
+    assert_eq!(occs[0].rule, "crate_root", "the attribution carries its rule");
+}
+
+// _(Guarded positional join — crate-root branch)_ — a `crate::` path segment aligns under the
+// crate-root rule via the `crate` keyword's own node kind.
+#[test]
+fn crate_keyword_reference_aligns_under_crate_root() {
+    let source = "mod thing { pub struct Thing; }\nuse crate::thing::Thing;\n";
+    let tok = source.find("crate::").unwrap();
+    let (line, col) = line_col(source, tok);
+    let root = one_occ_symbol(
+        "mycrate",
+        &[("crate", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 5),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![root]), &src).unwrap();
+    assert_eq!(
+        acc.aligned_crate_root, 1,
+        "the `crate` keyword is accepted by crate-root"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch)_ — a try-expression occurrence for `branch` aligns
+// under the operator-desugar rule.
+#[test]
+fn try_expression_aligns_for_branch() {
+    let source = "fn f(x: Option<u8>) -> Option<u8> { Some(x?) }\n";
+    let q = source.find('?').unwrap();
+    let (line, col) = line_col(source, q);
+    let branch = one_occ_symbol(
+        "core",
+        &[
+            ("ops", SegmentKind::Module),
+            ("Try", SegmentKind::Type),
+            ("branch", SegmentKind::Method),
+        ],
+        SymbolKind::Method,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 1),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![branch]), &src).unwrap();
+    assert_eq!(acc.aligned_operator_desugar, 1, "`?` accepted for `branch`");
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch)_ — a binary-operator occurrence whose single-byte
+// span sits on the whitespace beside the sigil (the live rust-analyzer shape) still aligns via the
+// syntax-tree construct.
+#[test]
+fn operator_span_adjacent_to_sigil_aligns() {
+    let source = "fn f(a: u8, b: u8) -> u8 { a + b }\n";
+    let space = source.find(" + ").unwrap(); // the whitespace before `+`, not the sigil itself
+    let (line, col) = line_col(source, space);
+    let add = one_occ_symbol(
+        "core",
+        &[
+            ("ops", SegmentKind::Module),
+            ("Add", SegmentKind::Type),
+            ("add", SegmentKind::Method),
+        ],
+        SymbolKind::Method,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 1),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![add]), &src).unwrap();
+    assert_eq!(acc.aligned_operator_desugar, 1, "adjacent span matched by construct");
+    assert_eq!(
+        acc.text_mismatch, 0,
+        "byte-equality against the sigil would have refused this"
+    );
+}
+
+// _(Guarded positional join — refusal branch)_ — a method outside the correspondence, failing
+// name-token equality, stays refused: the rules extend the guard, they do not loosen it.
+#[test]
+fn method_outside_correspondence_stays_refused() {
+    let source = "fn frobnicate() {}\nfn g() { frobnicate(); }\n";
+    let call = source.rfind("frobnicate").unwrap();
+    let (line, col) = line_col(source, call);
+    let compute = one_occ_symbol(
+        "c",
+        &[("compute", SegmentKind::Method)],
+        SymbolKind::Method,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 10),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![compute]), &src).unwrap();
+    assert_eq!(acc.text_mismatch, 1, "no rule accepts a name-shaped drift");
+    assert_eq!(acc.aligned_total(), 0);
+    assert_eq!(
+        acc.aligned_operator_desugar, 0,
+        "`compute` is not in the correspondence"
+    );
+}
+
+// _(Guarded positional join — module-span branch)_ — a module definition spanning its whole
+// document aligns under the module-span rule.
+#[test]
+fn module_definition_spanning_whole_document_aligns() {
+    let source = "fn a() {}\n";
+    let module = one_occ_symbol(
+        "mycrate",
+        &[("mymod", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "mymod.rs",
+        // Line 1, char 0 is one past the final newline: the whole document.
+        SourceRange::new(0, 0, 1, 0),
+        OccurrenceRole::Definition,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("mymod.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("mymod.rs", vec![module]), &src).unwrap();
+    assert_eq!(acc.aligned_module_span, 1, "whole-document module definition accepted");
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — module-span negative branch)_ — a whole-document span on a non-module
+// is not accepted by the module-span rule.
+#[test]
+fn whole_document_span_on_non_module_stays_refused() {
+    let source = "fn a() {}\n";
+    let not_a_module = one_occ_symbol(
+        "mycrate",
+        &[("Thing", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 0, 1, 0),
+        OccurrenceRole::Definition,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![not_a_module]), &src).unwrap();
+    assert_eq!(acc.aligned_module_span, 0, "module-span is gated on the module kind");
+    assert_eq!(acc.aligned_total(), 0);
+    assert_eq!(acc.text_mismatch, 1, "the non-module whole-document span is refused");
+}
+
+// _(Guarded positional join — provenance)_ — attributions accepted under the default rule and under
+// a kind-scoped rule each carry their rule tag.
+#[test]
+fn attributions_carry_their_accepting_rule() {
+    let source = "fn add2(a: u8, b: u8) -> u8 { a + b }\n";
+    let name = source.find("add2").unwrap();
+    let (nl, nc) = line_col(source, name);
+    let plus = source.find('+').unwrap();
+    let (pl, pc) = line_col(source, plus);
+
+    let add2 = one_occ_symbol(
+        "c",
+        &[("add2", SegmentKind::Method)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(nl, nc, nl, nc + 4),
+        OccurrenceRole::Definition,
+    );
+    let add = one_occ_symbol(
+        "core",
+        &[
+            ("ops", SegmentKind::Module),
+            ("Add", SegmentKind::Type),
+            ("add", SegmentKind::Method),
+        ],
+        SymbolKind::Method,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(pl, pc, pl, pc + 1),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![add2, add]), &src).unwrap();
+
+    let exact_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("c", vec![DescriptorSegment::new("add2", SegmentKind::Method)]),
+    );
+    let exact_occs = store.occurrences_of(&exact_id).unwrap();
+    assert_eq!(exact_occs.len(), 1);
+    assert_eq!(exact_occs[0].rule, "exact", "default-rule attribution carries `exact`");
+
+    let op_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new(
+            "core",
+            vec![
+                DescriptorSegment::new("ops", SegmentKind::Module),
+                DescriptorSegment::new("Add", SegmentKind::Type),
+                DescriptorSegment::new("add", SegmentKind::Method),
+            ],
+        ),
+    );
+    let op_occs = store.occurrences_of(&op_id).unwrap();
+    assert_eq!(op_occs.len(), 1);
+    assert_eq!(
+        op_occs[0].rule, "operator_desugar",
+        "kind-scoped attribution carries its rule"
+    );
+}
+
+// _(Guarded positional join — query-surface consequence)_ — `trace` over `references` returns a
+// site aligned under the operator-desugar rule: the silent under-reporting fix.
+#[test]
+fn trace_references_includes_operator_aligned_site() {
+    use silent_cartographer::query::output::Outcome;
+    use silent_cartographer::query::{QueryEngine, Relation, TraceItem};
+
+    let source = "fn f(a: u8, b: u8) -> u8 { a + b }\n";
+    let plus = source.find('+').unwrap();
+    let (pl, pc) = line_col(source, plus);
+    let add = one_occ_symbol(
+        "core",
+        &[
+            ("ops", SegmentKind::Module),
+            ("Add", SegmentKind::Type),
+            ("add", SegmentKind::Method),
+        ],
+        SymbolKind::Method,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(pl, pc, pl, pc + 1),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![add]), &src).unwrap();
+
+    let engine = QueryEngine::new(&store, support::provenance(), content_hash(&src));
+    let answer = engine.trace("ops::Add::add", Relation::References).unwrap();
+    match answer.outcome {
+        Outcome::Found { results } => {
+            assert_eq!(results.len(), 1, "the operator-aligned reference is reported");
+            match &results[0] {
+                TraceItem::Reference { location, .. } => {
+                    assert_eq!(location.document_path, "m.rs");
+                }
+                other => panic!("expected a reference item, got {other:?}"),
+            }
+        }
+        other => panic!("references must include the rule-aligned site, got {other:?}"),
+    }
+}
+
+// _(Join alignment accounting — conservation)_ — per-rule acceptance buckets and refusal buckets
+// are recorded and sum to the total semantic occurrences, with every bucket non-zero.
+#[test]
+fn per_rule_buckets_conserve_the_total() {
+    let source = "\
+use ext_pkg::Thing;
+struct Widget;
+struct Widget;
+fn f(a: u8, b: u8) -> u8 { a + b }
+fn g() { let _w: Widget = Widget; }
+struct Holder;
+impl Holder { fn h() -> Self { Holder } }
+";
+    let doc = "m.rs";
+
+    // exact: the definition of `f`.
+    let f_name = source.find("fn f(").unwrap() + 3;
+    let (fl, fc) = line_col(source, f_name);
+    let f_sym = one_occ_symbol(
+        "mycrate",
+        &[("f", SegmentKind::Method)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        doc,
+        SourceRange::new(fl, fc, fl, fc + 1),
+        OccurrenceRole::Definition,
+    );
+    // crate-root: the `ext_pkg` use-site token.
+    let ext = source.find("ext_pkg").unwrap();
+    let (el, ec) = line_col(source, ext);
+    let root = one_occ_symbol(
+        "ext-pkg",
+        &[("crate", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::External,
+        doc,
+        SourceRange::new(el, ec, el, ec + 7),
+        OccurrenceRole::Reference,
+    );
+    // operator-desugar: `add` at the `+`.
+    let plus = source.find('+').unwrap();
+    let (pl, pc) = line_col(source, plus);
+    let add = one_occ_symbol(
+        "core",
+        &[
+            ("ops", SegmentKind::Module),
+            ("Add", SegmentKind::Type),
+            ("add", SegmentKind::Method),
+        ],
+        SymbolKind::Method,
+        SymbolClass::External,
+        doc,
+        SourceRange::new(pl, pc, pl, pc + 1),
+        OccurrenceRole::Reference,
+    );
+    // module-span: a module definition spanning the whole document (7 lines + final newline).
+    let module = one_occ_symbol(
+        "mycrate",
+        &[("m", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        doc,
+        SourceRange::new(0, 0, 7, 0),
+        OccurrenceRole::Definition,
+    );
+    // self-keyword: a `Holder` reference at the `Self` token inside `impl Holder`.
+    let self_tok = source.find("Self").unwrap();
+    let (hl, hc) = line_col(source, self_tok);
+    let holder_self = one_occ_symbol(
+        "mycrate",
+        &[("Holder", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        doc,
+        SourceRange::new(hl, hc, hl, hc + 4),
+        OccurrenceRole::Reference,
+    );
+    // text-mismatch: `drifted` pointing at the `Thing` token.
+    let thing = source.find("Thing").unwrap();
+    let (tl, tc) = line_col(source, thing);
+    let drifted = one_occ_symbol(
+        "mycrate",
+        &[("drifted", SegmentKind::Term)],
+        SymbolKind::Constant,
+        SymbolClass::InWorkspace,
+        doc,
+        SourceRange::new(tl, tc, tl, tc + 5),
+        OccurrenceRole::Definition,
+    );
+    // semantic-only: a ghost far past the end of the source.
+    let ghost = one_occ_symbol(
+        "mycrate",
+        &[("ghost", SegmentKind::Method)],
+        SymbolKind::Method,
+        SymbolClass::InWorkspace,
+        doc,
+        SourceRange::new(90, 0, 90, 5),
+        OccurrenceRole::Reference,
+    );
+    // duplicate-ambiguous: two `Widget` twins plus one reference.
+    let w1 = source.find("Widget").unwrap();
+    let (w1l, w1c) = line_col(source, w1);
+    let w2 = source[w1 + 1..].find("Widget").unwrap() + w1 + 1;
+    let (w2l, w2c) = line_col(source, w2);
+    let wref = source.rfind("Widget").unwrap();
+    let (wrl, wrc) = line_col(source, wref);
+    let widget_descriptor = &[("Widget", SegmentKind::Type)][..];
+    let mut twin_a = one_occ_symbol(
+        "mycrate",
+        widget_descriptor,
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        doc,
+        SourceRange::new(w1l, w1c, w1l, w1c + 6),
+        OccurrenceRole::Definition,
+    );
+    twin_a.occurrences.push(ExtractedOccurrence {
+        document_path: doc.to_string(),
+        range: SourceRange::new(wrl, wrc, wrl, wrc + 6),
+        role: OccurrenceRole::Reference,
+    });
+    let twin_b = one_occ_symbol(
+        "mycrate",
+        widget_descriptor,
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        doc,
+        SourceRange::new(w2l, w2c, w2l, w2c + 6),
+        OccurrenceRole::Definition,
+    );
+
+    let index = one_doc_index(
+        doc,
+        vec![f_sym, root, add, module, holder_self, drifted, ghost, twin_a, twin_b],
+    );
+    let total: u64 = index.symbols.iter().map(|s| s.occurrences.len() as u64).sum();
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![(doc.to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let acc = store.read_metadata().unwrap().unwrap().accounting;
+    assert!(acc.aligned_exact > 0, "exact bucket non-zero");
+    assert!(acc.aligned_crate_root > 0, "crate-root bucket non-zero");
+    assert!(acc.aligned_operator_desugar > 0, "operator bucket non-zero");
+    assert!(acc.aligned_module_span > 0, "module-span bucket non-zero");
+    assert!(acc.aligned_self_keyword > 0, "self-keyword bucket non-zero");
+    assert!(acc.text_mismatch > 0, "text-mismatch bucket non-zero");
+    assert!(acc.semantic_only > 0, "semantic-only bucket non-zero");
+    assert!(acc.duplicate_ambiguous > 0, "duplicate-ambiguous bucket non-zero");
+    assert_eq!(
+        acc.total_semantic(),
+        total,
+        "rule buckets plus refusal buckets conserve the total"
+    );
+}
+
+// _(Guarded positional join — self-keyword branch)_ — a `Self` return-type reference inside an impl
+// of the expected type aligns under the self-keyword rule and carries its tag.
+#[test]
+fn self_in_own_impl_aligns_with_rule_tag() {
+    let source = "\
+struct GraphStore;
+impl GraphStore {
+    fn open() -> Self { GraphStore }
+}
+";
+    let self_tok = source.find("Self").unwrap();
+    let (sl, sc) = line_col(source, self_tok);
+    let store_ref = one_occ_symbol(
+        "mycrate",
+        &[("GraphStore", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(sl, sc, sl, sc + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![store_ref]), &src).unwrap();
+
+    assert_eq!(acc.aligned_self_keyword, 1, "`Self` in its own impl accepted");
+    assert_eq!(acc.text_mismatch, 0);
+    let id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("mycrate", vec![DescriptorSegment::new("GraphStore", SegmentKind::Type)]),
+    );
+    let occs = store.occurrences_of(&id).unwrap();
+    assert_eq!(occs.len(), 1, "the Self reference is persisted");
+    assert_eq!(occs[0].rule, "self_keyword", "the attribution carries its rule");
+}
+
+// _(Guarded positional join — self-keyword branch)_ — the `Self` segment of a `Self::method(...)`
+// call inside an impl aligns under the self-keyword rule.
+#[test]
+fn self_path_segment_aligns() {
+    let source = "\
+struct Widget2;
+impl Widget2 {
+    fn new() -> Widget2 { Widget2 }
+    fn wrap() -> Widget2 { Self::new() }
+}
+";
+    let self_tok = source.find("Self::").unwrap();
+    let (sl, sc) = line_col(source, self_tok);
+    let widget_ref = one_occ_symbol(
+        "mycrate",
+        &[("Widget2", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(sl, sc, sl, sc + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![widget_ref]), &src).unwrap();
+    assert_eq!(acc.aligned_self_keyword, 1, "`Self::` path segment accepted");
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — self-keyword generic branch)_ — an expected name carrying generic
+// arguments aligns at a `Self` token via base-name comparison on both sides.
+#[test]
+fn generic_self_type_compares_by_base_name() {
+    let source = "\
+struct Answer<T> {
+    v: T,
+}
+impl<T> Answer<T> {
+    fn id(self) -> Self {
+        self
+    }
+}
+";
+    let self_tok = source.find("-> Self").unwrap() + 3;
+    let (sl, sc) = line_col(source, self_tok);
+    // The expected name carries generic arguments, as the live dogfood showed (`Answer<T>`); the
+    // impl header is `impl<T> Answer<T>` — both compare as `Answer`.
+    let answer_ref = one_occ_symbol(
+        "mycrate",
+        &[("Answer<T>", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(sl, sc, sl, sc + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![answer_ref]), &src).unwrap();
+    assert_eq!(acc.aligned_self_keyword, 1, "generic self type accepted by base name");
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — self-keyword negative branch)_ — a `Self` token whose enclosing impl
+// names a different base type stays refused: the impl cross-check, not token presence, is the rule.
+#[test]
+fn self_in_foreign_impl_stays_refused() {
+    let source = "\
+struct A;
+struct B;
+impl A {
+    fn f() -> Self { A }
+}
+";
+    let self_tok = source.find("Self").unwrap();
+    let (sl, sc) = line_col(source, self_tok);
+    // A reference resolving to `B`, drifted onto the `Self` inside `impl A`.
+    let b_ref = one_occ_symbol(
+        "mycrate",
+        &[("B", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(sl, sc, sl, sc + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![b_ref]), &src).unwrap();
+    assert_eq!(acc.aligned_self_keyword, 0, "a foreign impl's Self is never accepted");
+    assert_eq!(acc.aligned_total(), 0);
+    assert_eq!(acc.text_mismatch, 1, "the drifted occurrence is refused and surfaced");
+}
+
+// _(Guarded positional join — self-keyword branch, live shape)_ — rust-analyzer resolves `Self` to
+// the impl symbol (descriptor carrying an `impl` path segment, non-Type kind), not the plain type;
+// the rule accepts it through the same impl-header cross-check. The terminal carries generics to
+// prove base-name comparison holds on this shape too.
+#[test]
+fn self_resolving_to_impl_symbol_aligns() {
+    let source = "\
+struct Answer<T> {
+    v: T,
+}
+impl<T> Answer<T> {
+    fn id(self) -> Self {
+        self
+    }
+}
+";
+    let self_tok = source.find("-> Self").unwrap() + 3;
+    let (sl, sc) = line_col(source, self_tok);
+    // The live shape: terminal named for the type (generics included), sitting behind an `impl`
+    // path segment, with the symbol kind mapped to Other — not Type.
+    let impl_symbol = one_occ_symbol(
+        "mycrate",
+        &[
+            ("output", SegmentKind::Module),
+            ("impl", SegmentKind::Meta),
+            ("Answer<T>", SegmentKind::Type),
+        ],
+        SymbolKind::Other,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(sl, sc, sl, sc + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![impl_symbol]), &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_self_keyword, 1,
+        "the impl-symbol resolution is accepted by the self-keyword rule"
+    );
+    assert_eq!(
+        acc.text_mismatch, 0,
+        "the live Self shape no longer lands in text_mismatch"
+    );
+    let id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new(
+            "mycrate",
+            vec![
+                DescriptorSegment::new("output", SegmentKind::Module),
+                DescriptorSegment::new("impl", SegmentKind::Meta),
+                DescriptorSegment::new("Answer<T>", SegmentKind::Type),
+            ],
+        ),
+    );
+    let occs = store.occurrences_of(&id).unwrap();
+    assert_eq!(occs.len(), 1);
+    assert_eq!(occs[0].rule, "self_keyword", "the attribution carries its rule");
+}
+
+// ---- Operator-desugar family coverage: one acceptance test per correspondence family ----
+
+/// Ingest one reference occurrence of desugar-correspondence `method` at the first occurrence of
+/// `token` in `source`, returning the build's accounting. Each family test pins its own method and
+/// construct so a regression narrowing any single family's match fails independently.
+fn desugar_case(source: &str, token: &str, method: &str) -> silent_cartographer::graph::join::JoinAccounting {
+    let pos = source.find(token).unwrap();
+    let (line, col) = line_col(source, pos);
+    let sym = one_occ_symbol(
+        "core",
+        &[
+            ("ops", SegmentKind::Module),
+            ("Op", SegmentKind::Type),
+            (method, SegmentKind::Method),
+        ],
+        SymbolKind::Method,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(line, col, line, col + token.len() as u32),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![sym]), &src).unwrap()
+}
+
+// _(Guarded positional join — operator branch, equality family)_
+#[test]
+fn equality_operator_aligns_for_eq() {
+    let acc = desugar_case("fn f(a: u8, b: u8) -> bool { a == b }\n", "==", "eq");
+    assert_eq!(acc.aligned_operator_desugar, 1, "`==` accepted for `eq`");
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch, ordered-comparison family)_
+#[test]
+fn ordered_comparison_aligns_for_lt() {
+    let acc = desugar_case("fn f(a: u8, b: u8) -> bool { a < b }\n", "<", "lt");
+    assert_eq!(acc.aligned_operator_desugar, 1, "`<` accepted for `lt`");
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch, compound-assignment family)_
+#[test]
+fn compound_assignment_aligns_for_add_assign() {
+    let acc = desugar_case("fn f(mut a: u8) { a += 1; }\n", "+=", "add_assign");
+    assert_eq!(acc.aligned_operator_desugar, 1, "`+=` accepted for `add_assign`");
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch, bitwise and shift families)_ — both parse as binary
+// expressions; each sub-family is sampled at its own sigil.
+#[test]
+fn bitwise_and_shift_align_for_bitand_and_shl() {
+    let bitand = desugar_case("fn f(a: u8, b: u8) -> u8 { a & b }\n", "&", "bitand");
+    assert_eq!(bitand.aligned_operator_desugar, 1, "`&` accepted for `bitand`");
+    assert_eq!(bitand.text_mismatch, 0);
+
+    let shl = desugar_case("fn f(a: u8) -> u8 { a << 1 }\n", "<<", "shl");
+    assert_eq!(shl.aligned_operator_desugar, 1, "`<<` accepted for `shl`");
+    assert_eq!(shl.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch, unary family)_
+#[test]
+fn unary_not_aligns_for_not() {
+    let acc = desugar_case("fn f(a: bool) -> bool { !a }\n", "!", "not");
+    assert_eq!(acc.aligned_operator_desugar, 1, "`!` accepted for `not`");
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch, index family)_
+#[test]
+fn index_expression_aligns_for_index() {
+    let acc = desugar_case("fn f(v: &[u8]) -> u8 { v[0] }\n", "[0]", "index");
+    assert_eq!(
+        acc.aligned_operator_desugar, 1,
+        "the index expression accepted for `index`"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch, deref family)_ — the explicit unary `*` only.
+#[test]
+fn explicit_deref_aligns_for_deref() {
+    let acc = desugar_case("fn f(p: &u8) -> u8 { *p }\n", "*", "deref");
+    assert_eq!(acc.aligned_operator_desugar, 1, "explicit `*` accepted for `deref`");
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch, call family)_ — a call expression on a callable
+// value.
+#[test]
+fn call_expression_aligns_for_call() {
+    let acc = desugar_case("fn f(g: fn(u8) -> u8) -> u8 { g(1) }\n", "g(1)", "call");
+    assert_eq!(
+        acc.aligned_operator_desugar, 1,
+        "the call expression accepted for `call`"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch, for-loop family)_ — accepted only on the loop
+// construct itself.
+#[test]
+fn for_loop_aligns_for_into_iter() {
+    let acc = desugar_case("fn f(v: Vec<u8>) { for _x in v {} }\n", "for", "into_iter");
+    assert_eq!(
+        acc.aligned_operator_desugar, 1,
+        "the `for` construct accepted for `into_iter`"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — self-keyword branch, qualifier arm)_ — an impl header spelling a
+// path-qualified self type compares by base name: `impl output::Answer` accepts expected `Answer`.
+#[test]
+fn path_qualified_impl_header_compares_by_base_name() {
+    let source = "\
+mod output {
+    pub struct Answer;
+}
+impl output::Answer {
+    fn wrap() -> Self {
+        output::Answer
+    }
+}
+";
+    let self_tok = source.find("Self").unwrap();
+    let (sl, sc) = line_col(source, self_tok);
+    let answer_ref = one_occ_symbol(
+        "mycrate",
+        &[("output", SegmentKind::Module), ("Answer", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(sl, sc, sl, sc + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![answer_ref]), &src).unwrap();
+    assert_eq!(
+        acc.aligned_self_keyword, 1,
+        "the qualified impl header compares by base name"
+    );
+    assert_eq!(acc.text_mismatch, 0);
 }

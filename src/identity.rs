@@ -15,6 +15,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::semantic::model::SourceRange;
+
 /// Identity of the workspace a symbol was indexed under.
 ///
 /// Namespacing every identity with its workspace keeps identical descriptors from two different
@@ -147,36 +149,75 @@ fn base_projection(workspace: &WorkspaceId, descriptor: &Descriptor) -> String {
     format!("{}::{}", workspace.as_str(), descriptor.projection_body())
 }
 
-/// Project a set of resolved descriptors to canonical identities within one workspace, applying
-/// collision-only disambiguation.
+/// A source location a projection ranks a duplicate by: the document it sits in and its range there.
 ///
-/// The input order does not affect any resulting identity: descriptors that share a base projection
-/// are disambiguated in a canonical (sorted) order, so the assignment is a pure function of the
-/// descriptor set. A disambiguator is appended only to members of a colliding group; a descriptor
-/// whose base projection is unique carries no suffix.
+/// Ordered by document path first, then range start (then range end), so a collision group's members
+/// sort into a stable, human-meaningful order independent of the order files or symbols were visited.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DefinitionSite {
+    /// The document the location sits in.
+    pub document_path: String,
+    /// The occurrence range within the document.
+    pub range: SourceRange,
+}
+
+/// One symbol to project: its resolved descriptor and the locations that anchor duplicate ranking.
 ///
-/// Returns the identity for each input descriptor, in the same order as the input.
-pub fn project_all(workspace: &WorkspaceId, descriptors: &[Descriptor]) -> Vec<CanonicalId> {
+/// When a collision group forms, members are ranked by `definition` when present; a member without a
+/// definition occurrence sorts after those with one, by its `fallback` (first-occurrence) location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionInput {
+    /// The resolved descriptor to project.
+    pub descriptor: Descriptor,
+    /// The symbol's definition location, if the backend produced a definition occurrence.
+    pub definition: Option<DefinitionSite>,
+    /// A fallback location — the symbol's first occurrence — used to rank a member that has no
+    /// definition occurrence, so the total order stays deterministic for every input shape.
+    pub fallback: Option<DefinitionSite>,
+}
+
+/// The rank key for one member of a collision group.
+///
+/// Members with a definition sort first, ordered by definition location; members without a
+/// definition sort after, ordered by their fallback location; ties fall back to descriptor content
+/// and then original index so the total order is deterministic for every input shape.
+fn rank_key(input: &ProjectionInput, index: usize) -> (u8, Option<&DefinitionSite>, &Descriptor, usize) {
+    match &input.definition {
+        Some(site) => (0, Some(site), &input.descriptor, index),
+        None => (1, input.fallback.as_ref(), &input.descriptor, index),
+    }
+}
+
+/// Project a set of symbols to canonical identities within one workspace, applying collision-only
+/// disambiguation anchored to each symbol's definition location.
+///
+/// The input order does not affect any resulting identity: symbols that share a base projection are
+/// disambiguated in definition-location order (document path, then range start), so the assignment is
+/// a pure function of the symbols' definition locations rather than of discovery order. A
+/// disambiguator is appended only to members of a colliding group; a descriptor whose base projection
+/// is unique carries no suffix.
+///
+/// Returns the identity for each input, in the same order as the input.
+pub fn project_all(workspace: &WorkspaceId, inputs: &[ProjectionInput]) -> Vec<CanonicalId> {
     // Group input indices by their base projection.
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-    for (idx, descriptor) in descriptors.iter().enumerate() {
+    for (idx, input) in inputs.iter().enumerate() {
         groups
-            .entry(base_projection(workspace, descriptor))
+            .entry(base_projection(workspace, &input.descriptor))
             .or_default()
             .push(idx);
     }
 
-    let mut out: Vec<Option<CanonicalId>> = vec![None; descriptors.len()];
+    let mut out: Vec<Option<CanonicalId>> = vec![None; inputs.len()];
     for (base, mut members) in groups {
         if members.len() == 1 {
             // No observed collision: emit the base projection with no suffix.
             out[members[0]] = Some(CanonicalId(base));
             continue;
         }
-        // Observed collision: disambiguate in a canonical order so the assignment is
-        // order-independent. Members are ranked by full descriptor content first, then by original
-        // index to keep true duplicates stable.
-        members.sort_by(|&a, &b| descriptors[a].cmp(&descriptors[b]).then(a.cmp(&b)));
+        // Observed collision: disambiguate in definition-location order so the assignment is
+        // order-independent and anchored to where each twin is defined.
+        members.sort_by(|&a, &b| rank_key(&inputs[a], a).cmp(&rank_key(&inputs[b], b)));
         for (rank, &idx) in members.iter().enumerate() {
             out[idx] = Some(CanonicalId(format!("{base}#{rank}")));
         }
@@ -197,8 +238,32 @@ mod tests {
 
     use super::*;
 
+    use crate::semantic::model::SourceRange;
+
     fn seg(name: &str, kind: SegmentKind) -> DescriptorSegment {
         DescriptorSegment::new(name, kind)
+    }
+
+    /// Wrap a descriptor as a projection input with no definition or fallback location (the
+    /// no-collision path never consults locations).
+    fn input(descriptor: Descriptor) -> ProjectionInput {
+        ProjectionInput {
+            descriptor,
+            definition: None,
+            fallback: None,
+        }
+    }
+
+    /// Wrap a descriptor as a projection input anchored to a definition location.
+    fn input_at(descriptor: Descriptor, document_path: &str, range: SourceRange) -> ProjectionInput {
+        ProjectionInput {
+            descriptor,
+            definition: Some(DefinitionSite {
+                document_path: document_path.to_string(),
+                range,
+            }),
+            fallback: None,
+        }
     }
 
     /// A small corpus of distinct Rust-shaped descriptors (no overloading, so none collide).
@@ -228,11 +293,16 @@ mod tests {
         ]
     }
 
+    /// The corpus as projection inputs (each descriptor its own symbol, no collision).
+    fn rust_inputs() -> Vec<ProjectionInput> {
+        rust_corpus().into_iter().map(input).collect()
+    }
+
     // _(Deterministic canonical identity)_
     #[test]
     fn reprojection_is_byte_identical() {
         let ws = WorkspaceId::new("ws");
-        let corpus = rust_corpus();
+        let corpus = rust_inputs();
         let first = project_all(&ws, &corpus);
         let second = project_all(&ws, &corpus);
         assert_eq!(first, second);
@@ -242,20 +312,20 @@ mod tests {
     #[test]
     fn projection_is_order_independent() {
         let ws = WorkspaceId::new("ws");
-        let corpus = rust_corpus();
+        let corpus = rust_inputs();
 
         let forward = project_all(&ws, &corpus);
 
         // Visit the same descriptors in reverse order and map each identity back to its descriptor.
-        let mut reversed: Vec<Descriptor> = corpus.clone();
+        let mut reversed: Vec<ProjectionInput> = corpus.clone();
         reversed.reverse();
         let reverse_ids = project_all(&ws, &reversed);
 
-        for (i, descriptor) in corpus.iter().enumerate() {
-            let rev_pos = reversed.iter().position(|d| d == descriptor).unwrap();
+        for (i, input) in corpus.iter().enumerate() {
+            let rev_pos = reversed.iter().position(|d| d == input).unwrap();
             assert_eq!(
                 forward[i], reverse_ids[rev_pos],
-                "identity for {descriptor:?} changed with visitation order"
+                "identity for {input:?} changed with visitation order"
             );
         }
     }
@@ -276,7 +346,7 @@ mod tests {
     #[test]
     fn distinct_symbols_yield_no_duplicate_identities() {
         let ws = WorkspaceId::new("ws");
-        let corpus = rust_corpus();
+        let corpus = rust_inputs();
         let ids = project_all(&ws, &corpus);
         let unique: HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), corpus.len(), "identities are not unique: {ids:?}");
@@ -286,7 +356,7 @@ mod tests {
     #[test]
     fn rust_symbols_carry_no_disambiguator_suffix() {
         let ws = WorkspaceId::new("ws");
-        let corpus = rust_corpus();
+        let corpus = rust_inputs();
         let ids = project_all(&ws, &corpus);
         for id in &ids {
             assert!(
@@ -313,11 +383,60 @@ mod tests {
         );
         assert_ne!(as_term, as_method, "test setup: descriptors must be distinct");
 
-        let ids = project_all(&ws, &[as_term, as_method]);
+        let ids = project_all(
+            &ws,
+            &[
+                input_at(as_term, "a.rs", SourceRange::new(0, 0, 0, 1)),
+                input_at(as_method, "b.rs", SourceRange::new(0, 0, 0, 1)),
+            ],
+        );
         assert_ne!(ids[0], ids[1], "colliding descriptors were not disambiguated");
         assert!(
             ids.iter().all(|id| id.as_str().contains('#')),
             "disambiguator not emitted: {ids:?}"
         );
+    }
+
+    // _(Identity uniqueness within a workspace — duplicate branch)_ — two definitions sharing an
+    // identical resolved descriptor receive distinct identities ordered by their definition
+    // locations.
+    #[test]
+    fn true_duplicates_ranked_by_definition_location() {
+        let ws = WorkspaceId::new("ws");
+        // Identical descriptor for both twins — a genuine duplicate the semantic backend emits.
+        let descriptor = Descriptor::new("crate", vec![seg("m", SegmentKind::Type)]);
+        // The twin in `b.rs` is defined lexically after the twin in `a.rs`; document path orders them.
+        let twin_b = input_at(descriptor.clone(), "b.rs", SourceRange::new(0, 0, 0, 1));
+        let twin_a = input_at(descriptor.clone(), "a.rs", SourceRange::new(0, 0, 0, 1));
+
+        // Present them out of location order to prove the ranking is definition-anchored, not input.
+        let ids = project_all(&ws, &[twin_b, twin_a]);
+        assert_ne!(ids[0], ids[1], "true duplicates must receive distinct identities");
+        // `a.rs` sorts before `b.rs`, so the `a.rs` twin (index 1) gets `#0`.
+        assert!(
+            ids[1].as_str().ends_with("#0"),
+            "earlier definition location ranks first: {ids:?}"
+        );
+        assert!(
+            ids[0].as_str().ends_with("#1"),
+            "later definition location ranks second: {ids:?}"
+        );
+    }
+
+    // _(Identity uniqueness within a workspace — discovery-order branch)_ — indexing the same
+    // duplicated definitions with input order reversed yields the same identity for each.
+    #[test]
+    fn true_duplicate_identities_stable_across_discovery_order() {
+        let ws = WorkspaceId::new("ws");
+        let descriptor = Descriptor::new("crate", vec![seg("m", SegmentKind::Type)]);
+        let twin_a = input_at(descriptor.clone(), "a.rs", SourceRange::new(3, 0, 3, 1));
+        let twin_b = input_at(descriptor.clone(), "b.rs", SourceRange::new(1, 0, 1, 1));
+
+        let forward = project_all(&ws, &[twin_a.clone(), twin_b.clone()]);
+        let reversed = project_all(&ws, &[twin_b, twin_a]);
+
+        // The `a.rs` twin is index 0 forward, index 1 reversed; its identity is the same both times.
+        assert_eq!(forward[0], reversed[1], "a.rs twin identity is stable across order");
+        assert_eq!(forward[1], reversed[0], "b.rs twin identity is stable across order");
     }
 }

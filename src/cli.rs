@@ -19,9 +19,10 @@ pub struct Cli {
     #[arg(long, default_value = ".c10r/index.db", global = true)]
     pub db: PathBuf,
 
-    /// The workspace identity to namespace symbols under.
-    #[arg(long, default_value = "workspace", global = true)]
-    pub workspace: String,
+    /// The workspace identity to namespace symbols under. When omitted, it is derived from the
+    /// workspace root's directory name.
+    #[arg(long, global = true)]
+    pub workspace: Option<String>,
 
     /// Render the answer as structured JSON.
     #[arg(long, global = true)]
@@ -41,7 +42,7 @@ pub enum Command {
     /// Build or refresh the index for the workspace.
     Build(BuildArgs),
     /// Report the index's provenance, freshness, and join-alignment counts.
-    Status,
+    Status(StatusArgs),
 }
 
 /// The detail axis for `get`.
@@ -110,6 +111,19 @@ pub struct TraceArgs {
     /// The relation to trace.
     #[arg(long, value_enum)]
     pub relation: RelationArg,
+}
+
+/// Arguments for `status`.
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Include the join-discrepancy detail: a bounded, grouped summary of the non-aligned
+    /// occurrences behind the counts (group by outcome kind and expected name token).
+    #[arg(long)]
+    pub discrepancies: bool,
+
+    /// With the discrepancy detail, return every persisted row rather than the bounded summary.
+    #[arg(long)]
+    pub all: bool,
 }
 
 /// Arguments for `build`.
