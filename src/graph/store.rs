@@ -11,17 +11,18 @@ use crate::semantic::model::AnalyzerProvenance;
 use super::join::JoinAccounting;
 use super::schema::{SCHEMA_SQL, SCHEMA_VERSION};
 
-/// An edge kind in the graph. Only `Contains` and occurrence-derived references are contracted this
-/// change; the dependency kinds are populated but unverified until proposal 2.
+/// An edge kind in the graph. All four kinds are contracted: `Contains` is enclosure; the three
+/// dependency kinds — `Uses`, `Imports`, `TypeHierarchy` — are read by the dependents traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     /// Enclosure: a declaration directly contains another.
     Contains,
-    /// A call from one symbol to another (unverified until proposal 2).
-    Calls,
-    /// An import relationship (unverified until proposal 2).
+    /// Reference-grade dependency: a declaration references a symbol in its body. Any mention counts
+    /// — a call, a type usage, a constant read — invocation is not required.
+    Uses,
+    /// A module references a symbol at module scope.
     Imports,
-    /// A type-hierarchy relationship (unverified until proposal 2).
+    /// A type implements a trait.
     TypeHierarchy,
 }
 
@@ -30,15 +31,10 @@ impl EdgeKind {
     pub fn tag(&self) -> &'static str {
         match self {
             EdgeKind::Contains => "contains",
-            EdgeKind::Calls => "calls",
+            EdgeKind::Uses => "uses",
             EdgeKind::Imports => "imports",
             EdgeKind::TypeHierarchy => "type_hierarchy",
         }
-    }
-
-    /// Whether this edge kind is contracted for reading this change.
-    pub fn is_verified(&self) -> bool {
-        matches!(self, EdgeKind::Contains)
     }
 }
 
@@ -116,6 +112,25 @@ pub const FOUND_TEXT_MAX_BYTES: usize = 120;
 /// A provisional design constant, superseded by the pagination change. When more groups exist, the
 /// summary marks itself truncated; its totals are computed over the full persisted set regardless.
 pub const DISCREPANCY_GROUP_CAP: usize = 50;
+
+/// The maximum hop distance the dependents traversal walks.
+///
+/// A provisional design constant — like [`DISCREPANCY_GROUP_CAP`], it bounds the walk until the
+/// pagination change lands. It exceeds any plausible real dependency chain while keeping the
+/// recursive query cheap, and it guarantees termination even on cyclic dependency graphs.
+pub const DEPENDENTS_HORIZON: u32 = 20;
+
+/// One dependent of a seed symbol: its identity, its shortest hop distance from the seed, and the
+/// kind of dependency edge that connected it at that distance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependentRow {
+    /// The dependent symbol's canonical identity.
+    pub id: CanonicalId,
+    /// The shortest hop distance from the seed.
+    pub depth: u32,
+    /// The connecting edge kind, chosen from a shortest-depth hop under the fixed tie-break.
+    pub kind: String,
+}
 
 /// A persisted join-discrepancy row: one non-aligned occurrence's inspectable detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,11 +409,14 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Insert a type-tagged edge, marking it verified per its kind.
+    /// Insert a type-tagged edge idempotently: an edge is a relation instance, unique on
+    /// `(kind, src, dst)`, so re-inserting the same relation (a repeated occurrence, or a future
+    /// incremental rebuild) leaves exactly one row. Uniqueness is enforced by the schema index, so
+    /// every write path inherits the dedup.
     pub fn insert_edge(&self, kind: EdgeKind, src: &CanonicalId, dst: &CanonicalId) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO edges (kind, src_id, dst_id, verified) VALUES (?1, ?2, ?3, ?4)",
-            params![kind.tag(), src.as_str(), dst.as_str(), kind.is_verified() as i64],
+            "INSERT OR IGNORE INTO edges (kind, src_id, dst_id) VALUES (?1, ?2, ?3)",
+            params![kind.tag(), src.as_str(), dst.as_str()],
         )?;
         Ok(())
     }
@@ -620,6 +638,21 @@ impl GraphStore {
             .optional()
     }
 
+    /// Every `(src, dst)` pair of a given edge kind, ordered deterministically. Exposes the derived
+    /// dependency edges for inspection and ground-truth comparison.
+    pub fn edges(&self, kind: EdgeKind) -> rusqlite::Result<Vec<(CanonicalId, CanonicalId)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT src_id, dst_id FROM edges WHERE kind = ?1 ORDER BY src_id, dst_id")?;
+        let rows = stmt.query_map(params![kind.tag()], |r| {
+            Ok((
+                CanonicalId::from_raw(r.get::<_, String>(0)?),
+                CanonicalId::from_raw(r.get::<_, String>(1)?),
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// The symbols directly contained by `id` (the `contains` relation, downward).
     pub fn contains(&self, id: &CanonicalId) -> rusqlite::Result<Vec<CanonicalId>> {
         let mut stmt = self
@@ -640,6 +673,69 @@ impl GraphStore {
             Ok(CanonicalId::from_raw(r.get::<_, String>(0)?))
         })?;
         rows.collect()
+    }
+
+    /// Compute the seed's dependents: symbols whose dependency edges (`uses`, `imports`,
+    /// `type_hierarchy`) reach the seed directly or transitively, walking each edge `dst → src`.
+    ///
+    /// Enclosure (`contains`) never propagates dependence — it supplies attribution, not impact — so
+    /// it is excluded from the walk. Each dependent is returned exactly once at its shortest hop
+    /// distance, carrying the connecting edge kind chosen from a shortest-depth hop under a fixed
+    /// tie-break: kind order (`uses` < `imports` < `type_hierarchy`), then canonical identity. The
+    /// seed never appears as its own dependent (a self-loop is inert), and the walk is capped at
+    /// `horizon` hops so cycles terminate. Results are ordered by `(depth, kind order, identity)`.
+    pub fn dependents(&self, seed: &CanonicalId, horizon: u32) -> rusqlite::Result<Vec<DependentRow>> {
+        // `UNION` (not `UNION ALL`) dedupes emitted `(id, depth, kind)` rows globally as SQLite
+        // evaluates the recursion, so a node reachable through many paths is queued and expanded once
+        // rather than once per path — the row count grows with node count, not path count, which
+        // matters because fan-in makes path count exponential while node count stays polynomial. The
+        // dedup key is exactly the three projected columns, so keep them id/depth/kind, unmixed with
+        // anything path-dependent (e.g. no path list), or a distinct-per-path row would slip back in.
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE reach(id, depth, kind) AS (
+                SELECT src_id, 1, kind FROM edges
+                  WHERE kind IN ('uses', 'imports', 'type_hierarchy') AND dst_id = ?1 AND src_id <> ?1
+                UNION
+                SELECT e.src_id, r.depth + 1, e.kind
+                  FROM edges e JOIN reach r ON e.dst_id = r.id
+                  WHERE e.kind IN ('uses', 'imports', 'type_hierarchy') AND e.src_id <> ?1 AND r.depth < ?2
+             )
+             SELECT id, depth, kind FROM reach",
+        )?;
+        let raw: Vec<(String, u32, String)> = stmt
+            .query_map(params![seed.as_str(), horizon as i64], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        // Collapse the raw hops to one entry per symbol: the minimum depth, and among the hops at
+        // that minimum depth the connecting kind lowest under the fixed kind order.
+        let mut best: std::collections::HashMap<String, (u32, String)> = std::collections::HashMap::new();
+        for (id, depth, kind) in raw {
+            let replace = match best.get(&id) {
+                None => true,
+                Some((d, k)) => depth < *d || (depth == *d && kind_order(&kind) < kind_order(k)),
+            };
+            if replace {
+                best.insert(id, (depth, kind));
+            }
+        }
+
+        let mut out: Vec<DependentRow> = best
+            .into_iter()
+            .map(|(id, (depth, kind))| DependentRow {
+                id: CanonicalId::from_raw(id),
+                depth,
+                kind,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.depth
+                .cmp(&b.depth)
+                .then_with(|| kind_order(&a.kind).cmp(&kind_order(&b.kind)))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
     }
 
     /// Every reference-role occurrence of `id`, ordered deterministically.
@@ -702,6 +798,21 @@ fn truncate_on_boundary(s: &str) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+/// The fixed order dependency edge kinds break ties by, so equal-depth hops choose a connecting kind
+/// deterministically and results order reproducibly. Non-dependency tags sort last.
+///
+/// The fallback bucket is unreachable while `EdgeKind` stays closed to the three dependency kinds
+/// above; adding a new edge kind to the dependents walk requires adding it here too, or it will
+/// silently sort last instead of taking its intended tie-break position.
+fn kind_order(tag: &str) -> u8 {
+    match tag {
+        "uses" => 0,
+        "imports" => 1,
+        "type_hierarchy" => 2,
+        _ => 3,
+    }
 }
 
 /// Escape LIKE wildcards in a literal fragment (using `\` as the escape char).

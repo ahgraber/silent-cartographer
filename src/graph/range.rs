@@ -9,7 +9,7 @@
 use crate::semantic::model::{PositionEncoding, SourceRange};
 
 /// A half-open byte span `[start, end)` into a source document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ByteSpan {
     /// Inclusive start byte offset.
     pub start: usize,

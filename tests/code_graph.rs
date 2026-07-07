@@ -3,7 +3,9 @@
 
 mod support;
 
-use silent_cartographer::graph::store::{Freshness, GraphStore, PersistedClass};
+use silent_cartographer::graph::store::{
+    DEPENDENTS_HORIZON, EdgeKind, Freshness, GraphStore, PersistedClass, SymbolRow,
+};
 use silent_cartographer::graph::{content_hash, freshness, ingest, join_guarded};
 use silent_cartographer::identity::{CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId};
 use silent_cartographer::semantic::model::{
@@ -53,6 +55,691 @@ fn open_id() -> CanonicalId {
 
 fn module_id() -> CanonicalId {
     id_of(&[("net", SegmentKind::Module)])
+}
+
+// _(Deduplicated dependency edges)_ — an edge is a relation instance, unique on (kind, src, dst):
+// repeated references from the same declaration to the same symbol collapse to one edge, and
+// rebuilding the identical fixture leaves the edge set unchanged.
+#[test]
+fn edges_are_deduplicated_and_rebuild_is_idempotent() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let index = support::fixture_index();
+    let src = sources();
+
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    let uses_first = store.edges(EdgeKind::Uses).unwrap();
+
+    // `open` references `Client` twice (return type and `let c = Client`), yet exactly one `uses`
+    // edge from `open` to `Client` persists — the per-site detail lives in the occurrences table.
+    let open_to_client = uses_first
+        .iter()
+        .filter(|(s, d)| *s == open_id() && *d == client_id())
+        .count();
+    assert_eq!(
+        open_to_client, 1,
+        "repeated references collapse to one uses edge: {uses_first:?}"
+    );
+
+    // Every persisted uses edge is unique on (src, dst).
+    let distinct: std::collections::HashSet<_> = uses_first.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        uses_first.len(),
+        "no duplicate uses rows: {uses_first:?}"
+    );
+
+    // Rebuilding the identical fixture into the same store yields the identical edge set.
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    let uses_second = store.edges(EdgeKind::Uses).unwrap();
+    assert_eq!(uses_first, uses_second, "rebuild is idempotent over the edge set");
+}
+
+// _(Declaration-level dependency edges (uses) — call branch)_ — a function calling another yields a
+// `uses` edge from caller to callee.
+#[test]
+fn call_yields_a_uses_edge() {
+    let store = ingest_fixture();
+    // `open` calls `connect` inside its closure body.
+    let uses = store.edges(EdgeKind::Uses).unwrap();
+    assert!(uses.contains(&(open_id(), connect_id())), "open uses connect: {uses:?}");
+}
+
+// _(Declaration-level dependency edges (uses) — reference-grade branch)_ — a function that only
+// mentions a type in its body (never calling it) still yields a `uses` edge to that type.
+#[test]
+fn type_mention_yields_a_uses_edge() {
+    let store = ingest_fixture();
+    // `open` mentions `Client` as its return type and constructs it — no method call — yet uses it.
+    let uses = store.edges(EdgeKind::Uses).unwrap();
+    assert!(
+        uses.contains(&(open_id(), client_id())),
+        "open uses Client by type mention: {uses:?}"
+    );
+}
+
+// _(Declaration-level dependency edges (uses) — refusal guard)_ — an occurrence the join refused
+// contributes no dependency edge: edges derive exclusively from aligned occurrences.
+#[test]
+fn refused_occurrence_contributes_no_dependency_edge() {
+    // `caller` is a function; `beta` (external) has a reference occurrence inside caller's body that
+    // points at a token spelling `x`, not `beta` → refused. No uses edge may derive from it.
+    let source = "fn caller() { let x = 1; }\n";
+    let x_pos = source.find("x =").unwrap();
+    let (xl, xc) = line_col(source, x_pos);
+    let caller_pos = source.find("caller").unwrap();
+    let (cl, cc) = line_col(source, caller_pos);
+    let caller = one_occ_symbol(
+        "c",
+        &[("caller", SegmentKind::Method)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(cl, cc, cl, cc + 6),
+        OccurrenceRole::Definition,
+    );
+    let beta = one_occ_symbol(
+        "thirdparty",
+        &[("beta", SegmentKind::Method)],
+        SymbolKind::Function,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(xl, xc, xl, xc + 1),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![caller, beta]), &src).unwrap();
+    assert_eq!(acc.text_mismatch, 1, "the drifted reference is refused");
+    assert!(
+        store.edges(EdgeKind::Uses).unwrap().is_empty(),
+        "a refused occurrence derives no uses edge"
+    );
+}
+
+// _(Module-level dependency edges (imports))_ — a use statement at module scope yields an `imports`
+// edge from the module to the named symbol.
+#[test]
+fn use_statement_yields_an_imports_edge() {
+    // A module `thing` with `use thing::Thing;` at module scope.
+    let source = "\
+mod thing {
+    pub struct Thing;
+}
+use thing::Thing;
+";
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![SourceDocument {
+            path: "m.rs".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![
+            ExtractedSymbol {
+                descriptor: Some(Descriptor::new(
+                    "c",
+                    vec![DescriptorSegment::new("thing", SegmentKind::Module)],
+                )),
+                kind: SymbolKind::Module,
+                class: SymbolClass::InWorkspace,
+                occurrences: vec![ExtractedOccurrence {
+                    document_path: "m.rs".to_string(),
+                    range: SourceRange::new(0, 4, 0, 9),
+                    role: OccurrenceRole::Definition,
+                }],
+            },
+            ExtractedSymbol {
+                descriptor: Some(Descriptor::new(
+                    "c",
+                    vec![
+                        DescriptorSegment::new("thing", SegmentKind::Module),
+                        DescriptorSegment::new("Thing", SegmentKind::Type),
+                    ],
+                )),
+                kind: SymbolKind::Type,
+                class: SymbolClass::InWorkspace,
+                occurrences: vec![
+                    ExtractedOccurrence {
+                        document_path: "m.rs".to_string(),
+                        range: SourceRange::new(1, 15, 1, 20),
+                        role: OccurrenceRole::Definition,
+                    },
+                    ExtractedOccurrence {
+                        document_path: "m.rs".to_string(),
+                        range: SourceRange::new(3, 11, 3, 16),
+                        role: OccurrenceRole::Reference,
+                    },
+                ],
+            },
+        ],
+    };
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let module = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("c", vec![DescriptorSegment::new("thing", SegmentKind::Module)]),
+    );
+    let thing = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new(
+            "c",
+            vec![
+                DescriptorSegment::new("thing", SegmentKind::Module),
+                DescriptorSegment::new("Thing", SegmentKind::Type),
+            ],
+        ),
+    );
+    let imports = store.edges(EdgeKind::Imports).unwrap();
+    assert!(
+        imports.contains(&(module, thing)),
+        "the module imports Thing via the use statement: {imports:?}"
+    );
+}
+
+// _(Module-level dependency edges (imports) — crate-root/multi-document branch)_ — rust-analyzer
+// emits one shared module symbol for every crate root (bin, lib, each `tests/*.rs` file), each with
+// its own definition occurrence spanning its own document. A module-scope reference in EITHER
+// document must resolve to a real importer and yield an `imports` edge, not just the first document
+// `module_by_doc` happens to keep.
+#[test]
+fn shared_module_symbol_maps_to_every_document_it_defines() {
+    // Two crate-root documents, `a.rs` and `b.rs`, both carrying a definition occurrence of the same
+    // module symbol (module-span rule: the occurrence spans the whole document). Each document also
+    // has a module-scope reference to its own external symbol.
+    let source_a = "use ext::Alpha;";
+    let source_b = "use ext::Beta;";
+    let alpha_tok = source_a.find("Alpha").unwrap();
+    let (al, ac) = line_col(source_a, alpha_tok);
+    let beta_tok = source_b.find("Beta").unwrap();
+    let (bl, bc) = line_col(source_b, beta_tok);
+
+    let module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "c",
+            vec![DescriptorSegment::new("root", SegmentKind::Module)],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            ExtractedOccurrence {
+                document_path: "a.rs".to_string(),
+                range: SourceRange::new(0, 0, 0, source_a.len() as u32),
+                role: OccurrenceRole::Definition,
+            },
+            ExtractedOccurrence {
+                document_path: "b.rs".to_string(),
+                range: SourceRange::new(0, 0, 0, source_b.len() as u32),
+                role: OccurrenceRole::Definition,
+            },
+        ],
+    };
+    let alpha = one_occ_symbol(
+        "ext",
+        &[("Alpha", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::External,
+        "a.rs",
+        SourceRange::new(al, ac, al, ac + 5),
+        OccurrenceRole::Reference,
+    );
+    let beta = one_occ_symbol(
+        "ext",
+        &[("Beta", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::External,
+        "b.rs",
+        SourceRange::new(bl, bc, bl, bc + 4),
+        OccurrenceRole::Reference,
+    );
+
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![
+            SourceDocument {
+                path: "a.rs".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+            SourceDocument {
+                path: "b.rs".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+        ],
+        symbols: vec![module, alpha, beta],
+    };
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![
+        ("a.rs".to_string(), source_a.to_string()),
+        ("b.rs".to_string(), source_b.to_string()),
+    ];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let root = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("c", vec![DescriptorSegment::new("root", SegmentKind::Module)]),
+    );
+    let alpha_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("ext", vec![DescriptorSegment::new("Alpha", SegmentKind::Type)]),
+    );
+    let beta_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("ext", vec![DescriptorSegment::new("Beta", SegmentKind::Type)]),
+    );
+
+    let imports = store.edges(EdgeKind::Imports).unwrap();
+    assert!(
+        imports.contains(&(root.clone(), alpha_id)),
+        "the module-scope reference in a.rs yields an imports edge: {imports:?}"
+    );
+    assert!(
+        imports.contains(&(root, beta_id)),
+        "the module-scope reference in b.rs yields an imports edge too, not silently dropped: {imports:?}"
+    );
+}
+
+// _(Module-level dependency edges (imports) — boundary)_ — a reference inside a function yields a
+// `uses` edge from the function and no `imports` edge from the containing module.
+#[test]
+fn reference_inside_a_function_is_not_an_import() {
+    // The fixture's references all sit inside declarations (impl header, function body), never at
+    // module scope, so no imports edge is derived.
+    let store = ingest_fixture();
+    assert!(
+        store.edges(EdgeKind::Imports).unwrap().is_empty(),
+        "function-body references produce uses edges, not imports"
+    );
+    // The connect reference produced a uses edge from open, confirming it was derived as a use.
+    assert!(
+        store
+            .edges(EdgeKind::Uses)
+            .unwrap()
+            .contains(&(open_id(), connect_id()))
+    );
+}
+
+/// Build a symbol whose occurrences are given as `(byte_pos, token_len, role)` against `source`,
+/// used by the trait-implementation edge fixtures where a symbol both defines and is referenced in
+/// an impl header. Byte positions map directly to zero-based `(line, col)` in single-byte sources.
+fn sym_multi(
+    package: &str,
+    segments: &[(&str, SegmentKind)],
+    kind: SymbolKind,
+    class: SymbolClass,
+    doc: &str,
+    occs: &[(usize, usize, OccurrenceRole)],
+    source: &str,
+) -> ExtractedSymbol {
+    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
+    let occurrences = occs
+        .iter()
+        .map(|(pos, len, role)| {
+            let (l, c) = line_col(source, *pos);
+            ExtractedOccurrence {
+                document_path: doc.to_string(),
+                range: SourceRange::new(l, c, l, c + *len as u32),
+                role: *role,
+            }
+        })
+        .collect();
+    ExtractedSymbol {
+        descriptor: Some(Descriptor::new(package, segs)),
+        kind,
+        class,
+        occurrences,
+    }
+}
+
+// _(Trait-implementation edges (type_hierarchy) — plain branch)_ — a workspace type implementing a
+// workspace trait yields an edge from the type to the trait.
+#[test]
+fn plain_trait_impl_yields_type_hierarchy_edge() {
+    let source = "\
+trait Greet {}
+struct Person;
+impl Greet for Person {}
+";
+    let greet = sym_multi(
+        "c",
+        &[("Greet", SegmentKind::Type)],
+        SymbolKind::Trait,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        &[
+            (source.find("Greet").unwrap(), 5, OccurrenceRole::Definition),
+            (source.rfind("Greet").unwrap(), 5, OccurrenceRole::Reference),
+        ],
+        source,
+    );
+    let person = sym_multi(
+        "c",
+        &[("Person", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        &[
+            (source.find("Person").unwrap(), 6, OccurrenceRole::Definition),
+            (source.rfind("Person").unwrap(), 6, OccurrenceRole::Reference),
+        ],
+        source,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![greet, person]), &src).unwrap();
+
+    let greet_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("c", vec![DescriptorSegment::new("Greet", SegmentKind::Type)]),
+    );
+    let person_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("c", vec![DescriptorSegment::new("Person", SegmentKind::Type)]),
+    );
+    let edges = store.edges(EdgeKind::TypeHierarchy).unwrap();
+    assert_eq!(
+        edges,
+        vec![(person_id, greet_id)],
+        "the implementing type points at the trait: {edges:?}"
+    );
+}
+
+// _(Trait-implementation edges (type_hierarchy) — generic branch)_ — a trait name carrying generic
+// parameters resolves through the name-token occurrence, closing the previously-dropped case.
+#[test]
+fn generic_trait_impl_yields_type_hierarchy_edge() {
+    let source = "\
+struct Detail;
+struct Wrapper;
+impl From<Detail> for Wrapper {}
+";
+    // `From` is external; its only occurrence is the name token inside `From<Detail>`.
+    let from = sym_multi(
+        "core",
+        &[("convert", SegmentKind::Module), ("From", SegmentKind::Type)],
+        SymbolKind::Trait,
+        SymbolClass::External,
+        "m.rs",
+        &[(source.find("From").unwrap(), 4, OccurrenceRole::Reference)],
+        source,
+    );
+    let wrapper = sym_multi(
+        "c",
+        &[("Wrapper", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        &[
+            (source.find("Wrapper").unwrap(), 7, OccurrenceRole::Definition),
+            (source.rfind("Wrapper").unwrap(), 7, OccurrenceRole::Reference),
+        ],
+        source,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![from, wrapper]), &src).unwrap();
+
+    let from_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new(
+            "core",
+            vec![
+                DescriptorSegment::new("convert", SegmentKind::Module),
+                DescriptorSegment::new("From", SegmentKind::Type),
+            ],
+        ),
+    );
+    let wrapper_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("c", vec![DescriptorSegment::new("Wrapper", SegmentKind::Type)]),
+    );
+    let edges = store.edges(EdgeKind::TypeHierarchy).unwrap();
+    assert!(
+        edges.contains(&(wrapper_id, from_id)),
+        "the generic trait name resolves through its name token: {edges:?}"
+    );
+}
+
+// _(Trait-implementation edges (type_hierarchy) — external-trait branch)_ — an implementation of a
+// trait defined outside the workspace yields an edge to that external symbol's persisted identity.
+#[test]
+fn external_trait_impl_yields_type_hierarchy_edge() {
+    let source = "\
+struct Widget;
+impl Default for Widget {}
+";
+    let default = sym_multi(
+        "core",
+        &[("default", SegmentKind::Module), ("Default", SegmentKind::Type)],
+        SymbolKind::Trait,
+        SymbolClass::External,
+        "m.rs",
+        &[(source.find("Default").unwrap(), 7, OccurrenceRole::Reference)],
+        source,
+    );
+    let widget = sym_multi(
+        "c",
+        &[("Widget", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        &[
+            (source.find("Widget").unwrap(), 6, OccurrenceRole::Definition),
+            (source.rfind("Widget").unwrap(), 6, OccurrenceRole::Reference),
+        ],
+        source,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![default, widget]), &src).unwrap();
+
+    let default_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new(
+            "core",
+            vec![
+                DescriptorSegment::new("default", SegmentKind::Module),
+                DescriptorSegment::new("Default", SegmentKind::Type),
+            ],
+        ),
+    );
+    let widget_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("c", vec![DescriptorSegment::new("Widget", SegmentKind::Type)]),
+    );
+    let default_row = store.symbol(&default_id).unwrap().expect("external trait persisted");
+    assert_eq!(default_row.class, PersistedClass::External);
+    let edges = store.edges(EdgeKind::TypeHierarchy).unwrap();
+    assert!(
+        edges.contains(&(widget_id, default_id)),
+        "the edge points at the external trait's persisted identity: {edges:?}"
+    );
+}
+
+// _(Trait-implementation edges (type_hierarchy) — skip branch)_ — an impl whose trait name token has
+// no aligned occurrence yields no edge and fabricates no identity: the skip is a refusal to guess.
+#[test]
+fn missing_trait_occurrence_skips_the_edge_without_fabrication() {
+    let source = "\
+struct Thing;
+impl Gone for Thing {}
+";
+    // Only `Thing` is provided; the `Gone` trait name has no aligned occurrence.
+    let thing = sym_multi(
+        "c",
+        &[("Thing", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        &[
+            (source.find("Thing").unwrap(), 5, OccurrenceRole::Definition),
+            (source.rfind("Thing").unwrap(), 5, OccurrenceRole::Reference),
+        ],
+        source,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![thing]), &src).unwrap();
+
+    assert!(
+        store.edges(EdgeKind::TypeHierarchy).unwrap().is_empty(),
+        "no edge is derived when the trait name-token has no aligned occurrence"
+    );
+    assert!(
+        store.symbols_by_shortname("Gone").unwrap().is_empty(),
+        "no identity is fabricated for the unresolved trait name"
+    );
+}
+
+// ---- Dependents traversal ----
+
+/// A synthetic canonical identity for a traversal-graph symbol.
+fn sid(name: &str) -> CanonicalId {
+    CanonicalId::from_raw(format!("test-ws::{name}"))
+}
+
+/// Persist a bare in-workspace symbol so edges referencing it satisfy the foreign-key constraint.
+fn put_symbol(store: &GraphStore, name: &str) {
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: sid(name),
+            display_name: name.to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: None,
+            span: None,
+            span_text: None,
+        })
+        .unwrap();
+}
+
+/// Build a store over `symbols`, then insert `edges` as `(kind, src_name, dst_name)`. An edge
+/// `(Uses, "a", "b")` means "a uses b", so `b`'s dependents include `a`.
+fn graph(symbols: &[&str], edges: &[(EdgeKind, &str, &str)]) -> GraphStore {
+    let store = GraphStore::open_in_memory().unwrap();
+    for s in symbols {
+        put_symbol(&store, s);
+    }
+    for (kind, src, dst) in edges {
+        store.insert_edge(*kind, &sid(src), &sid(dst)).unwrap();
+    }
+    store
+}
+
+// _(Dependents traversal — direct branch)_ — a function using the seed appears at distance 1 with
+// kind `uses`.
+#[test]
+fn dependent_direct_is_distance_one_uses() {
+    let store = graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
+    let deps = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].id, sid("caller"));
+    assert_eq!(deps[0].depth, 1);
+    assert_eq!(deps[0].kind, "uses");
+}
+
+// _(Dependents traversal — transitive branch)_ — a function two hops away appears at distance 2.
+#[test]
+fn dependent_transitive_is_distance_two() {
+    let store = graph(
+        &["seed", "mid", "outer"],
+        &[(EdgeKind::Uses, "mid", "seed"), (EdgeKind::Uses, "outer", "mid")],
+    );
+    let deps = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
+    let outer = deps.iter().find(|d| d.id == sid("outer")).expect("outer reached");
+    assert_eq!(outer.depth, 2, "outer is two hops from the seed: {deps:?}");
+}
+
+// _(Dependents traversal — imports branch)_ — a module importing the seed appears with kind
+// `imports`.
+#[test]
+fn dependent_via_imports_carries_imports_kind() {
+    let store = graph(&["seed", "mod_a"], &[(EdgeKind::Imports, "mod_a", "seed")]);
+    let deps = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].kind, "imports");
+}
+
+// _(Dependents traversal — type_hierarchy branch)_ — a type implementing the seed trait appears with
+// kind `type_hierarchy`.
+#[test]
+fn dependent_via_type_hierarchy_carries_that_kind() {
+    let store = graph(
+        &["seed_trait", "impl_type"],
+        &[(EdgeKind::TypeHierarchy, "impl_type", "seed_trait")],
+    );
+    let deps = store.dependents(&sid("seed_trait"), DEPENDENTS_HORIZON).unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].kind, "type_hierarchy");
+}
+
+// _(Dependents traversal — enclosure excluded)_ — the seed's containing module is not a dependent by
+// containment alone: `contains` supplies attribution, never impact.
+#[test]
+fn enclosure_never_propagates_dependence() {
+    let store = graph(&["seed", "module"], &[(EdgeKind::Contains, "module", "seed")]);
+    let deps = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
+    assert!(
+        deps.is_empty(),
+        "a contains edge does not make the container a dependent: {deps:?}"
+    );
+}
+
+// _(Dependents traversal — shortest distance)_ — a symbol reaching the seed both directly and through
+// an intermediate is reported once, at distance 1.
+#[test]
+fn multiple_paths_report_the_shortest_distance() {
+    // `outer` uses the seed directly AND uses `mid` which uses the seed → two paths, shortest is 1.
+    let store = graph(
+        &["seed", "mid", "outer"],
+        &[
+            (EdgeKind::Uses, "outer", "seed"),
+            (EdgeKind::Uses, "mid", "seed"),
+            (EdgeKind::Uses, "outer", "mid"),
+        ],
+    );
+    let deps = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
+    let outer: Vec<_> = deps.iter().filter(|d| d.id == sid("outer")).collect();
+    assert_eq!(outer.len(), 1, "outer reported exactly once: {deps:?}");
+    assert_eq!(outer[0].depth, 1, "at its shortest distance");
+}
+
+// _(Dependents traversal — cycle)_ — two mutually-using functions terminate, each reported at most
+// once, with the seed excluded from its own results.
+#[test]
+fn cyclic_dependencies_terminate() {
+    // a uses b and b uses a; seed = a. b depends on a (b uses a → edge b→a). From b, the only edge
+    // to b is a→b whose src is the seed, excluded — so the walk terminates.
+    let store = graph(&["a", "b"], &[(EdgeKind::Uses, "a", "b"), (EdgeKind::Uses, "b", "a")]);
+    let deps = store.dependents(&sid("a"), DEPENDENTS_HORIZON).unwrap();
+    assert_eq!(deps.len(), 1, "each symbol reported at most once: {deps:?}");
+    assert_eq!(deps[0].id, sid("b"));
+    assert!(
+        !deps.iter().any(|d| d.id == sid("a")),
+        "the seed is never its own dependent"
+    );
+}
+
+// _(Dependents traversal — determinism)_ — repeated identical queries return byte-identical ordering.
+#[test]
+fn dependents_ordering_is_deterministic() {
+    let store = graph(
+        &["seed", "x", "y", "z"],
+        &[
+            (EdgeKind::Uses, "x", "seed"),
+            (EdgeKind::Imports, "y", "seed"),
+            (EdgeKind::TypeHierarchy, "z", "seed"),
+        ],
+    );
+    let first = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
+    let second = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
+    assert_eq!(first, second, "identical queries return identical ordering");
+    // All at depth 1, so ordering falls to the fixed kind order: uses, imports, type_hierarchy.
+    let kinds: Vec<&str> = first.iter().map(|d| d.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["uses", "imports", "type_hierarchy"],
+        "fixed kind order: {first:?}"
+    );
 }
 
 // _(Guarded positional join — canonical write-site)_ — an occurrence whose location spells the

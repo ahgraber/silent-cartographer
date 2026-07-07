@@ -4,7 +4,7 @@
 pub mod output;
 pub mod resolve;
 
-use crate::graph::store::{Freshness, GraphStore, OccurrenceRow, PersistedClass, SymbolRow};
+use crate::graph::store::{DEPENDENTS_HORIZON, Freshness, GraphStore, OccurrenceRow, PersistedClass, SymbolRow};
 use crate::identity::CanonicalId;
 use crate::semantic::model::AnalyzerProvenance;
 
@@ -31,6 +31,8 @@ pub enum Relation {
     Contains,
     /// The sites that reference the subject (type-occurrences for a type subject).
     References,
+    /// The symbols that depend on the subject, directly or transitively (the impact assessment).
+    Dependents,
 }
 
 /// A query error distinct from a typed-absence answer (which is a successful "none").
@@ -39,6 +41,17 @@ pub enum QueryError {
     /// The store could not be read.
     #[error("store error: {0}")]
     Store(#[from] rusqlite::Error),
+    /// A dependency edge named a symbol that has no row in the store — an invariant violation, since
+    /// edges carry NOT NULL foreign keys to symbols.
+    #[error("store corruption: dependency edge references missing symbol {0}")]
+    MissingSymbol(CanonicalId),
+    /// `trace` was called with `Relation::Dependents`, which carries a depth bound and horizon
+    /// aggregate that do not fit the plain relation payload.
+    #[error(
+        "the `dependents` relation carries a depth bound and horizon aggregate that `trace` cannot \
+         express; call `QueryEngine::dependents` instead"
+    )]
+    DependentsNotTraceable,
 }
 
 /// The query engine over a store, carrying the analyzer provenance in effect and a content hash for
@@ -122,6 +135,14 @@ impl<'a> QueryEngine<'a> {
 
     /// `trace`: return the symbols standing in `relation` to the subject `reference`.
     pub fn trace(&self, reference: &str, relation: Relation) -> Result<Answer<TraceItem>, QueryError> {
+        // The dependents relation carries a depth bound and a horizon aggregate that do not fit the
+        // plain relation payload; it is answered by `dependents()`, not `trace`. A confident empty
+        // answer here would misrepresent a subject that may have many dependents, so this is an error
+        // rather than a typed absence.
+        if relation == Relation::Dependents {
+            return Err(QueryError::DependentsNotTraceable);
+        }
+
         let (provenance, freshness) = self.provenance_and_freshness()?;
         let subject = match self.resolve(reference)? {
             Resolution::Unique(row) => row,
@@ -153,6 +174,7 @@ impl<'a> QueryEngine<'a> {
                 .into_iter()
                 .map(|occ| TraceItem::reference(&subject, occ))
                 .collect(),
+            Relation::Dependents => unreachable!("returned above"),
         };
 
         if items.is_empty() {
@@ -160,6 +182,86 @@ impl<'a> QueryEngine<'a> {
         } else {
             Ok(Answer::found(items, provenance, freshness))
         }
+    }
+
+    /// `dependents`: the impact assessment for the subject `reference` — the symbols that depend on
+    /// it, directly or transitively, to `depth`.
+    ///
+    /// Detailed results run to the requested depth; each carries the dependent symbol, the connecting
+    /// edge kind, its hop distance, and its location. Dependents deeper than the bound are reported in
+    /// aggregate — counts by edge kind and distance — up to the internal horizon, and the answer
+    /// always discloses whether reach ends within the bound, extends beyond it, or is itself cut off
+    /// at the horizon. A subject with no dependents is typed absence (`Empty`), not a failure.
+    pub fn dependents(&self, reference: &str, depth: u32) -> Result<Answer<DependentsReport>, QueryError> {
+        let (provenance, freshness) = self.provenance_and_freshness()?;
+        let subject = match self.resolve(reference)? {
+            Resolution::Unique(row) => row,
+            Resolution::Ambiguous(rows) => {
+                let views = rows.iter().map(symbol_view).collect();
+                return Ok(Answer::ambiguous(views, provenance, freshness));
+            }
+            Resolution::None => return Ok(Answer::absent(provenance, freshness)),
+        };
+
+        let rows = self.store.dependents(&subject.canonical_id, DEPENDENTS_HORIZON)?;
+        if rows.is_empty() {
+            return Ok(Answer::empty(provenance, freshness));
+        }
+
+        // Split at the depth bound: detail rows up to the bound (already ordered by the store),
+        // aggregate counts by (distance, kind) beyond it. `cut_at_horizon` is computed independently
+        // of that split: a dependent at the horizon depth means deeper reach may exist unexplored,
+        // regardless of whether that row is detailed or aggregated, so it must not depend on
+        // `depth < DEPENDENTS_HORIZON` to be observed.
+        let mut detail = Vec::new();
+        let mut aggregate: std::collections::BTreeMap<(u32, String), u64> = std::collections::BTreeMap::new();
+        let mut beyond_exists = false;
+        let mut cut_at_horizon = false;
+        for r in &rows {
+            if r.depth >= DEPENDENTS_HORIZON {
+                cut_at_horizon = true;
+            }
+            if r.depth <= depth {
+                let Some(row) = self.store.symbol(&r.id)? else {
+                    // NOT NULL foreign keys tie every edge to a symbol row, so a miss here means the
+                    // store's invariant was violated, not a legitimate absence.
+                    return Err(QueryError::MissingSymbol(r.id.clone()));
+                };
+                detail.push(DependentItem {
+                    symbol: symbol_view(&row),
+                    kind: r.kind.clone(),
+                    distance: r.depth,
+                    location: location_of(&row),
+                });
+            } else {
+                beyond_exists = true;
+                *aggregate.entry((r.depth, r.kind.clone())).or_insert(0) += 1;
+            }
+        }
+
+        // Precedence: a horizon cut is disclosed first — it means the walk itself stopped early, so
+        // "ends within bound" or "beyond bound" would both overstate confidence in the reach shown.
+        let disclosure = if cut_at_horizon {
+            HorizonDisclosure::CutAtHorizon
+        } else if beyond_exists {
+            HorizonDisclosure::BeyondBound
+        } else {
+            HorizonDisclosure::EndsWithinBound
+        };
+
+        let beyond_bound = aggregate
+            .into_iter()
+            .map(|((distance, kind), count)| AggregateCount { kind, distance, count })
+            .collect();
+
+        let report = DependentsReport {
+            depth_bound: depth,
+            horizon: DEPENDENTS_HORIZON,
+            disclosure,
+            detail,
+            beyond_bound,
+        };
+        Ok(Answer::found(vec![report], provenance, freshness))
     }
 
     /// Render a symbol at a detail level.
@@ -243,6 +345,63 @@ impl TraceItem {
             enclosing: occ.enclosing_id,
         }
     }
+}
+
+/// One detailed dependent in an impact answer: the depending symbol, the kind of dependency edge
+/// that connected it, its hop distance from the subject, and its definition location.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DependentItem {
+    /// The dependent symbol's identity and name.
+    pub symbol: SymbolView,
+    /// The connecting dependency edge kind (`uses`, `imports`, or `type_hierarchy`).
+    pub kind: String,
+    /// The hop distance from the subject (the shortest, when several paths exist).
+    pub distance: u32,
+    /// The dependent's definition location, or `None` for an external symbol with no source here.
+    pub location: Option<Location>,
+}
+
+/// An aggregate count of dependents beyond the requested depth: how many were reached at a given
+/// distance through a given edge kind.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AggregateCount {
+    /// The connecting dependency edge kind.
+    pub kind: String,
+    /// The hop distance the count is for.
+    pub distance: u32,
+    /// How many dependents were reached at that distance through that kind.
+    pub count: u64,
+}
+
+/// How far the dependency network extends relative to the requested depth — the honest horizon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HorizonDisclosure {
+    /// No reach extends beyond the detailed results: the impact is fully shown.
+    EndsWithinBound,
+    /// Reach extends past the requested depth; the deeper dependents are fully aggregated within the
+    /// internal horizon.
+    BeyondBound,
+    /// The aggregate itself is bounded: the walk reached the internal horizon, so dependents deeper
+    /// than the horizon exist unseen — the reported reach is a floor, not the total.
+    CutAtHorizon,
+}
+
+/// A depth-bounded impact answer: detailed dependents up to the requested depth, aggregate counts of
+/// the deeper reach, and the horizon disclosure that keeps "the query stopped here" distinct from
+/// "the impact ends here."
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DependentsReport {
+    /// The requested depth bound the detailed results run to.
+    pub depth_bound: u32,
+    /// The internal horizon the aggregate itself is bounded by.
+    pub horizon: u32,
+    /// How the reach relates to the bound and the horizon.
+    pub disclosure: HorizonDisclosure,
+    /// The detailed dependents at distance ≤ the bound, ordered by (distance, kind, identity).
+    pub detail: Vec<DependentItem>,
+    /// Aggregate counts of dependents beyond the bound, by (distance, kind).
+    pub beyond_bound: Vec<AggregateCount>,
 }
 
 /// Build the identity+name view of a symbol.

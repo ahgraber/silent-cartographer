@@ -8,7 +8,7 @@
 /// The current schema version. Bumped on any schema-affecting change under the reproducibility
 /// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
 /// before any table access; the `index_metadata.schema_version` column carries it as provenance.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -67,17 +67,18 @@ CREATE TABLE IF NOT EXISTS occurrences (
 CREATE INDEX IF NOT EXISTS occurrences_by_symbol ON occurrences(symbol_id);
 CREATE INDEX IF NOT EXISTS occurrences_by_enclosing ON occurrences(enclosing_id);
 
--- Type-tagged edges between symbols. `kind` is one of 'contains', 'calls', 'imports',
--- 'type_hierarchy'. `verified` is 0 for edges populated but not yet contracted for reading
--- (calls / imports / type_hierarchy remain unverified until proposal 2).
+-- Type-tagged edges between symbols. `kind` is one of 'contains' (enclosure), 'uses' (a declaration
+-- references a symbol in its body — reference-grade: any mention counts, not only a call),
+-- 'imports' (a module references a symbol at module scope), or 'type_hierarchy' (a type implements a
+-- trait). An edge is a relation instance, unique on (kind, src_id, dst_id): repeated occurrences of
+-- the same relation persist as one row, with the per-site detail carried by the occurrences table.
 CREATE TABLE IF NOT EXISTS edges (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     kind      TEXT NOT NULL,
     src_id    TEXT NOT NULL REFERENCES symbols(canonical_id),
-    dst_id    TEXT NOT NULL REFERENCES symbols(canonical_id),
-    verified  INTEGER NOT NULL DEFAULT 1
+    dst_id    TEXT NOT NULL REFERENCES symbols(canonical_id)
 );
-CREATE INDEX IF NOT EXISTS edges_by_kind ON edges(kind);
+CREATE UNIQUE INDEX IF NOT EXISTS edges_unique ON edges(kind, src_id, dst_id);
 CREATE INDEX IF NOT EXISTS edges_by_src ON edges(kind, src_id);
 CREATE INDEX IF NOT EXISTS edges_by_dst ON edges(kind, dst_id);
 

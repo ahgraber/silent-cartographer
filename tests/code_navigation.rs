@@ -4,7 +4,7 @@
 mod support;
 
 use silent_cartographer::graph::ingest;
-use silent_cartographer::graph::store::GraphStore;
+use silent_cartographer::graph::store::{DEPENDENTS_HORIZON, EdgeKind, GraphStore, PersistedClass, SymbolRow};
 use silent_cartographer::identity::{
     CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one,
 };
@@ -419,6 +419,322 @@ fn get_unknown_reference_returns_typed_absence_in_json() {
     // Both still carry the full output contract (provenance + freshness), unlike a failure.
     assert!(absent_json.contains("rust-analyzer"));
     assert!(absent_json.contains("freshness"));
+}
+
+// ---- Dependents: the depth-bounded impact answer ----
+
+/// A synthetic identity for a dependents-graph symbol.
+fn dep_id(name: &str) -> CanonicalId {
+    CanonicalId::from_raw(format!("test-ws::{name}"))
+}
+
+/// Persist a bare in-workspace symbol so dependency edges satisfy the foreign-key constraint and the
+/// symbol is resolvable by its canonical identity.
+fn put_dep_symbol(store: &GraphStore, name: &str) {
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: dep_id(name),
+            display_name: name.to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: None,
+            span: None,
+            span_text: None,
+        })
+        .unwrap();
+}
+
+/// A store over `symbols`, with `edges` as `(kind, src_name, dst_name)`. An edge `(Uses, "a", "b")`
+/// means "a uses b", so `b`'s dependents include `a`.
+fn dep_graph(symbols: &[&str], edges: &[(EdgeKind, &str, &str)]) -> GraphStore {
+    let store = GraphStore::open_in_memory().unwrap();
+    for s in symbols {
+        put_dep_symbol(&store, s);
+    }
+    for (kind, src, dst) in edges {
+        store.insert_edge(*kind, &dep_id(src), &dep_id(dst)).unwrap();
+    }
+    store
+}
+
+/// A query engine over a directly-built store (no metadata written; answers read stale, which is
+/// irrelevant to the dependents outcome under test).
+fn dep_engine(store: &GraphStore) -> QueryEngine<'_> {
+    QueryEngine::new(store, support::provenance(), "hash".to_string())
+}
+
+// _(Trace dependents; Detailed results carry kind and distance)_ — `dependents` returns direct
+// dependents each labeled with the connecting edge kind and its distance.
+#[test]
+fn dependents_reports_kind_and_distance() {
+    use silent_cartographer::query::DependentsReport;
+    let store = dep_graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
+    let engine = dep_engine(&store);
+    let answer = engine.dependents("test-ws::seed", 1).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    let report: &DependentsReport = &results[0];
+    assert_eq!(report.detail.len(), 1);
+    assert_eq!(report.detail[0].symbol.canonical_id, dep_id("caller"));
+    assert_eq!(report.detail[0].kind, "uses", "detail carries the connecting kind");
+    assert_eq!(report.detail[0].distance, 1, "detail carries the hop distance");
+}
+
+// _(Reach ends within the bound)_ — a subject whose every dependent lies within the requested depth
+// reports no reach beyond the detail.
+#[test]
+fn dependents_reach_ends_within_bound() {
+    use silent_cartographer::query::{DependentsReport, HorizonDisclosure};
+    // Two direct dependents, nothing deeper.
+    let store = dep_graph(
+        &["seed", "a", "b"],
+        &[(EdgeKind::Uses, "a", "seed"), (EdgeKind::Uses, "b", "seed")],
+    );
+    let engine = dep_engine(&store);
+    let answer = engine.dependents("test-ws::seed", 1).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found");
+    };
+    let report: &DependentsReport = &results[0];
+    assert_eq!(report.disclosure, HorizonDisclosure::EndsWithinBound);
+    assert!(report.beyond_bound.is_empty(), "no reach beyond the bound: {report:?}");
+    assert_eq!(report.detail.len(), 2);
+}
+
+// _(Reach extends beyond the bound)_ — a subject with deeper dependents stops detail at the bound and
+// reports aggregate counts of the deeper dependents by edge kind and distance.
+#[test]
+fn dependents_beyond_bound_aggregates_by_kind_and_distance() {
+    use silent_cartographer::query::{DependentsReport, HorizonDisclosure};
+    // seed <- mid (uses, depth 1) <- outer (uses, depth 2).
+    let store = dep_graph(
+        &["seed", "mid", "outer"],
+        &[(EdgeKind::Uses, "mid", "seed"), (EdgeKind::Uses, "outer", "mid")],
+    );
+    let engine = dep_engine(&store);
+    let answer = engine.dependents("test-ws::seed", 1).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found");
+    };
+    let report: &DependentsReport = &results[0];
+    assert_eq!(report.disclosure, HorizonDisclosure::BeyondBound);
+    assert_eq!(report.detail.len(), 1, "only the direct dependent is detailed");
+    assert_eq!(report.detail[0].symbol.canonical_id, dep_id("mid"));
+    assert_eq!(report.beyond_bound.len(), 1, "the deeper dependent is aggregated");
+    let agg = &report.beyond_bound[0];
+    assert_eq!(agg.kind, "uses");
+    assert_eq!(agg.distance, 2);
+    assert_eq!(agg.count, 1);
+}
+
+// _(Aggregate discloses its own horizon)_ — a dependency network extending past the internal horizon
+// makes the answer state the aggregate itself is bounded, not the total reach. Uses a chain longer
+// than the horizon.
+#[test]
+fn dependents_aggregate_discloses_the_horizon() {
+    use silent_cartographer::query::{DependentsReport, HorizonDisclosure};
+    // A chain f0 <- f1 <- ... <- fN, longer than the horizon, so a dependent sits at the horizon
+    // depth and deeper links exist unseen.
+    let n = (DEPENDENTS_HORIZON + 2) as usize;
+    let names: Vec<String> = (0..=n).map(|i| format!("f{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    // f{i+1} uses f{i}: edge (Uses, "f{i+1}", "f{i}").
+    let edges: Vec<(EdgeKind, &str, &str)> = (0..n)
+        .map(|i| (EdgeKind::Uses, name_refs[i + 1], name_refs[i]))
+        .collect();
+    let store = dep_graph(&name_refs, &edges);
+    let engine = dep_engine(&store);
+    let answer = engine.dependents("test-ws::f0", 1).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found");
+    };
+    let report: &DependentsReport = &results[0];
+    assert_eq!(
+        report.disclosure,
+        HorizonDisclosure::CutAtHorizon,
+        "the aggregate itself is bounded at the horizon: {report:?}"
+    );
+    // The deepest aggregated distance is the horizon; nothing beyond it is claimed.
+    let max_distance = report.beyond_bound.iter().map(|a| a.distance).max().unwrap();
+    assert_eq!(
+        max_distance, DEPENDENTS_HORIZON,
+        "reach is reported only to the horizon"
+    );
+}
+
+// _(Horizon disclosure at depth == horizon)_ — requesting exactly the horizon depth still discloses
+// the cut: a dependent sitting at the horizon means deeper reach may exist unexplored, regardless of
+// whether the bound happens to coincide with the horizon.
+#[test]
+fn dependents_discloses_cut_when_depth_equals_horizon() {
+    use silent_cartographer::query::{DependentsReport, HorizonDisclosure};
+    let n = (DEPENDENTS_HORIZON + 2) as usize;
+    let names: Vec<String> = (0..=n).map(|i| format!("f{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let edges: Vec<(EdgeKind, &str, &str)> = (0..n)
+        .map(|i| (EdgeKind::Uses, name_refs[i + 1], name_refs[i]))
+        .collect();
+    let store = dep_graph(&name_refs, &edges);
+    let engine = dep_engine(&store);
+    let answer = engine.dependents("test-ws::f0", DEPENDENTS_HORIZON).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found");
+    };
+    let report: &DependentsReport = &results[0];
+    assert_eq!(
+        report.disclosure,
+        HorizonDisclosure::CutAtHorizon,
+        "depth == horizon still discloses the cut: {report:?}"
+    );
+}
+
+// _(Horizon disclosure at depth beyond the horizon)_ — requesting more depth than the horizon allows
+// still discloses the cut, since the walk itself never reaches past the horizon.
+#[test]
+fn dependents_discloses_cut_when_depth_exceeds_horizon() {
+    use silent_cartographer::query::{DependentsReport, HorizonDisclosure};
+    let n = (DEPENDENTS_HORIZON + 2) as usize;
+    let names: Vec<String> = (0..=n).map(|i| format!("f{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let edges: Vec<(EdgeKind, &str, &str)> = (0..n)
+        .map(|i| (EdgeKind::Uses, name_refs[i + 1], name_refs[i]))
+        .collect();
+    let store = dep_graph(&name_refs, &edges);
+    let engine = dep_engine(&store);
+    let answer = engine.dependents("test-ws::f0", DEPENDENTS_HORIZON + 5).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found");
+    };
+    let report: &DependentsReport = &results[0];
+    assert_eq!(
+        report.disclosure,
+        HorizonDisclosure::CutAtHorizon,
+        "depth beyond the horizon still discloses the cut: {report:?}"
+    );
+}
+
+// _(Horizon disclosure does not over-fire)_ — a subject whose whole network ends well shallower than
+// the horizon, queried with a depth larger than the network's actual depth, discloses EndsWithinBound
+// rather than falsely claiming a horizon cut.
+#[test]
+fn dependents_shallow_network_ends_within_bound_even_at_large_depth() {
+    use silent_cartographer::query::{DependentsReport, HorizonDisclosure};
+    // seed <- mid (depth 1) <- outer (depth 2); network ends at depth 2, far short of the horizon.
+    let store = dep_graph(
+        &["seed", "mid", "outer"],
+        &[(EdgeKind::Uses, "mid", "seed"), (EdgeKind::Uses, "outer", "mid")],
+    );
+    let engine = dep_engine(&store);
+    let answer = engine.dependents("test-ws::seed", DEPENDENTS_HORIZON).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found");
+    };
+    let report: &DependentsReport = &results[0];
+    assert_eq!(
+        report.disclosure,
+        HorizonDisclosure::EndsWithinBound,
+        "a shallow network must not falsely disclose a horizon cut: {report:?}"
+    );
+}
+
+// _(`--depth 0` semantics)_ — depth 0 details nothing; every dependent, however shallow, falls into
+// the aggregate, and disclosure follows the same rules as any other depth.
+#[test]
+fn dependents_depth_zero_is_aggregate_only() {
+    use silent_cartographer::query::{DependentsReport, HorizonDisclosure};
+    let store = dep_graph(
+        &["seed", "a", "b"],
+        &[(EdgeKind::Uses, "a", "seed"), (EdgeKind::Uses, "b", "seed")],
+    );
+    let engine = dep_engine(&store);
+    let answer = engine.dependents("test-ws::seed", 0).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found");
+    };
+    let report: &DependentsReport = &results[0];
+    assert!(report.detail.is_empty(), "depth 0 details nothing: {report:?}");
+    let total: u64 = report.beyond_bound.iter().map(|a| a.count).sum();
+    assert_eq!(total, 2, "both dependents fall into the aggregate: {report:?}");
+    assert_eq!(report.disclosure, HorizonDisclosure::BeyondBound);
+}
+
+// _(Empty relation is typed absence)_ — a symbol with no dependents returns a definite empty answer,
+// distinct from a failure.
+#[test]
+fn dependents_of_leaf_is_typed_absence() {
+    let store = dep_graph(&["lonely"], &[]);
+    let engine = dep_engine(&store);
+    let answer = engine
+        .dependents("test-ws::lonely", 1)
+        .expect("no dependents is a successful typed answer, not a failure");
+    assert!(
+        matches!(answer.outcome, Outcome::Empty),
+        "a symbol with no dependents is typed Empty: {:?}",
+        answer.outcome
+    );
+    assert!(answer.to_json().contains("\"empty\""), "renders the empty outcome tag");
+}
+
+// _(`trace` refuses the dependents relation)_ — `trace` cannot express the depth-bounded, horizon
+// aggregated dependents payload, so it errors rather than returning a confident but misleading empty
+// answer for a subject that may have many dependents.
+#[test]
+fn trace_with_dependents_relation_errors_instead_of_empty() {
+    let store = dep_graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
+    let engine = dep_engine(&store);
+    let err = engine
+        .trace("test-ws::seed", Relation::Dependents)
+        .expect_err("trace must refuse the dependents relation, not answer empty");
+    assert!(
+        matches!(err, silent_cartographer::query::QueryError::DependentsNotTraceable),
+        "expected DependentsNotTraceable, got {err:?}"
+    );
+}
+
+// _(Depth-bounded impact answer — teaching error)_ — supplying `--depth` with a relation other than
+// `dependents` fails with a teaching error naming the flag, the relation, and the accepting relation.
+#[test]
+fn depth_with_non_dependents_relation_is_a_teaching_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    silent_cartographer::commands::build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+
+    let err = silent_cartographer::commands::run_trace(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "net::Client",
+        Relation::Contains,
+        Some(2),
+        false,
+    )
+    .expect_err("--depth with contains must fail");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("--depth"), "names the flag: {msg}");
+    assert!(msg.contains("contains"), "names the offending relation: {msg}");
+    assert!(msg.contains("dependents"), "names the relation that accepts it: {msg}");
+}
+
+// _(Relationship trace — self-description)_ — the command's self-description presents `dependents` as
+// impact assessment.
+#[test]
+fn trace_self_description_frames_dependents_as_impact() {
+    use clap::CommandFactory;
+    let mut cmd = silent_cartographer::cli::Cli::command();
+    let mut trace = cmd
+        .find_subcommand_mut("trace")
+        .expect("trace subcommand present")
+        .clone();
+    let help = trace.render_long_help().to_string();
+    assert!(
+        help.contains("impact assessment"),
+        "the self-description frames dependents as impact assessment: {help}"
+    );
+    assert!(
+        help.contains("what could break"),
+        "the self-description carries the impact question: {help}"
+    );
 }
 
 // _(Calibrated output contract)_ — repeated identical queries return locations in the same order.

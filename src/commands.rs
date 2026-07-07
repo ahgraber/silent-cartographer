@@ -256,19 +256,46 @@ pub fn run_get(
 }
 
 /// `trace`: return the symbols in a relation to the subject.
+///
+/// `depth` is meaningful only for the `dependents` relation, where it bounds the detailed impact
+/// reach (default 1). Supplying it with any other relation is a typed teaching error that names the
+/// flag, the offending relation, and the relations that accept it — rather than silently ignoring a
+/// meaningless flag.
 pub fn run_trace(
     db: &Path,
     root: &Path,
     rust_analyzer: &str,
     reference: &str,
     relation: Relation,
+    depth: Option<u32>,
     json: bool,
 ) -> Result<String> {
+    if !matches!(relation, Relation::Dependents) && depth.is_some() {
+        return Err(anyhow!(
+            "the `--depth` flag applies only to the `dependents` relation, but it was given with `{}`; \
+             relations that accept `--depth`: dependents",
+            relation_label(relation)
+        ));
+    }
     let store = GraphStore::open(db).context("opening index database")?;
     let (provenance, hash) = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash);
+    if matches!(relation, Relation::Dependents) {
+        let answer = engine.dependents(reference, depth.unwrap_or(1))?;
+        return Ok(render(&answer, json));
+    }
     let answer = engine.trace(reference, relation)?;
     Ok(render(&answer, json))
+}
+
+/// The CLI label for a relation, for the `--depth` teaching error.
+fn relation_label(relation: Relation) -> &'static str {
+    match relation {
+        Relation::Containers => "containers",
+        Relation::Contains => "contains",
+        Relation::References => "references",
+        Relation::Dependents => "dependents",
+    }
 }
 
 /// Parse a `path:byte_offset` position argument.

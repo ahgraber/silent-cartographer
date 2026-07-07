@@ -142,8 +142,10 @@ pub fn ingest(
     // A name -> identity index over persisted type symbols, so an `impl` block attributes its
     // members to the type it implements.
     let mut type_by_name: HashMap<String, CanonicalId> = HashMap::new();
-    // The module symbol defined in each document, so a module-scope reference has a real importer.
-    let mut module_by_doc: HashMap<String, CanonicalId> = HashMap::new();
+    // The identities of every persisted module-kind symbol, so the pass below can recognize a module
+    // definition occurrence without re-deriving `sym.kind` from `def_name_span` (which holds only one
+    // document per symbol and so cannot answer "is this a module").
+    let mut module_ids: std::collections::HashSet<CanonicalId> = std::collections::HashSet::new();
     for (idx, sym) in index.symbols.iter().enumerate() {
         let Some(Some(id)) = identities.get(idx) else {
             continue;
@@ -153,10 +155,23 @@ pub fn ingest(
         {
             type_by_name.entry(name.to_string()).or_insert_with(|| id.clone());
         }
-        if sym.kind == SymbolKind::Module
-            && let Some((doc, _)) = def_name_span.get(id)
-        {
-            module_by_doc.entry(doc.clone()).or_insert_with(|| id.clone());
+        if sym.kind == SymbolKind::Module {
+            module_ids.insert(id.clone());
+        }
+    }
+
+    // The module symbol defined in each document, so a module-scope reference has a real importer.
+    // rust-analyzer emits one shared module symbol for every crate root (the bin, the lib, each
+    // `tests/*.rs` file), each with its own definition occurrence in its own document — so this maps
+    // every document containing an aligned module definition to that module's identity, not just the
+    // first one `def_name_span` happened to keep. First-wins per document (a document defining more
+    // than one module is not a real shape) is fine.
+    let mut module_by_doc: HashMap<String, CanonicalId> = HashMap::new();
+    for aligned in &join_result.aligned {
+        if aligned.role == OccurrenceRole::Definition && module_ids.contains(&aligned.symbol) {
+            module_by_doc
+                .entry(aligned.document_path.clone())
+                .or_insert_with(|| aligned.symbol.clone());
         }
     }
 
@@ -223,8 +238,10 @@ pub fn ingest(
         }
     }
 
-    // Populate the uncontracted dependency edges (unverified until proposal 2): a reference from an
-    // enclosing declaration to the referenced symbol is a `calls` candidate.
+    // Derive the reference-grade dependency edges from aligned references. A reference attributed to
+    // an enclosing declaration is a `uses` edge from that declaration to the referenced symbol; a
+    // reference attributed to the module (no narrower declaration) is an `imports` edge from the
+    // module. Insertion is idempotent, so repeated references collapse to one edge per relation.
     for aligned in &join_result.aligned {
         if aligned.role != OccurrenceRole::Reference {
             continue;
@@ -240,10 +257,10 @@ pub fn ingest(
             &def_name_span,
             &type_by_name,
         ) {
-            // A reference from inside a declaration is a call candidate.
-            Some(caller) => store.insert_edge(EdgeKind::Calls, &caller, &aligned.symbol)?,
-            // A module-scope reference (no narrower enclosing declaration) is an import candidate,
-            // from the enclosing module to the referenced symbol, when the module is persisted.
+            // A reference from inside a declaration: the declaration uses the referenced symbol.
+            Some(user) => store.insert_edge(EdgeKind::Uses, &user, &aligned.symbol)?,
+            // A module-scope reference (no narrower enclosing declaration): the enclosing module
+            // imports the referenced symbol, when the module is persisted.
             None => {
                 if let Some(module) = module_by_doc.get(&aligned.document_path) {
                     store.insert_edge(EdgeKind::Imports, module, &aligned.symbol)?;
@@ -252,12 +269,29 @@ pub fn ingest(
         }
     }
 
-    // Populate `type_hierarchy` edges (unverified until proposal 2) from `impl Trait for Type`
-    // blocks: an edge from the implementing type to the implemented trait.
-    for source in source_map.values() {
+    // Derive `type_hierarchy` edges from `impl Trait for Type` blocks: an edge from the implementing
+    // type to the implemented trait. Each header's trait and type name-token spans resolve through
+    // the aligned occurrence sitting at exactly that location — the canonical identity SCIP assigned
+    // there — so generic and qualified trait names resolve without string surgery, and same-named
+    // symbols are never confused. When no aligned occurrence exists at a span, the edge is skipped;
+    // an identity is never fabricated from a display name.
+    //
+    // Relies on the invariant that one (document, name-span) location holds one token and therefore
+    // at most one aligned occurrence attributed to it; `or_insert_with` below is a no-op in practice.
+    // If the join ever allowed overlapping attributions at the same location, this map would silently
+    // first-win rather than surface the conflict.
+    let mut occ_by_location: HashMap<(&str, ByteSpan), CanonicalId> = HashMap::new();
+    for aligned in &join_result.aligned {
+        occ_by_location
+            .entry((aligned.document_path.as_str(), aligned.name_span))
+            .or_insert_with(|| aligned.symbol.clone());
+    }
+    for (path, source) in &source_map {
         if let Some(tree) = syntax::SyntaxTree::parse(source) {
-            for (type_name, trait_name) in tree.trait_impls() {
-                if let (Some(ty), Some(tr)) = (type_by_name.get(&type_name), type_by_name.get(&trait_name)) {
+            for imp in tree.trait_impls() {
+                let ty = occ_by_location.get(&(*path, imp.type_name_span));
+                let tr = occ_by_location.get(&(*path, imp.trait_name_span));
+                if let (Some(ty), Some(tr)) = (ty, tr) {
                     store.insert_edge(EdgeKind::TypeHierarchy, ty, tr)?;
                 }
             }

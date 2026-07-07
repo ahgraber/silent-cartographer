@@ -67,7 +67,7 @@ impl From<DetailArg> for Detail {
 }
 
 /// The relation axis for `trace`.
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RelationArg {
     /// The declaration that directly encloses the subject.
     Containers,
@@ -75,6 +75,10 @@ pub enum RelationArg {
     Contains,
     /// The sites that reference the subject.
     References,
+    /// Everything that depends on the subject, directly and transitively to `--depth`: the impact
+    /// assessment — "what could break if this symbol changes." Reference-grade, so any mention counts
+    /// (a type usage or constant read, not only a call); the set is inclusive by design.
+    Dependents,
 }
 
 impl From<RelationArg> for Relation {
@@ -83,6 +87,7 @@ impl From<RelationArg> for Relation {
             RelationArg::Containers => Relation::Containers,
             RelationArg::Contains => Relation::Contains,
             RelationArg::References => Relation::References,
+            RelationArg::Dependents => Relation::Dependents,
         }
     }
 }
@@ -111,6 +116,12 @@ pub struct TraceArgs {
     /// The relation to trace.
     #[arg(long, value_enum)]
     pub relation: RelationArg,
+
+    /// For the `dependents` relation, how many hops of transitive impact to detail (default 1).
+    /// Depth 0 means aggregate-only: no detailed rows, every dependent counted in the aggregate.
+    /// Supplying it with any other relation is an error.
+    #[arg(long)]
+    pub depth: Option<u32>,
 }
 
 /// Arguments for `status`.

@@ -30,6 +30,20 @@ pub struct SyntaxDeclaration {
     pub full_span: ByteSpan,
 }
 
+/// The name-token spans of the trait and the implementing type in one `impl Trait for Type` block.
+///
+/// Each span points at the terminal identifier token — the identifier inside a generic type
+/// (`From<DetailArg>` → `From`), the terminal segment of a qualified path (`fmt::Display` →
+/// `Display`), the bare identifier otherwise — so edge derivation can resolve it through the aligned
+/// occurrence sitting at exactly that location, never by matching display names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraitImpl {
+    /// The name-token span of the implementing type.
+    pub type_name_span: ByteSpan,
+    /// The name-token span of the implemented trait.
+    pub trait_name_span: ByteSpan,
+}
+
 /// The syntactic construct located at a byte span: its node kind, full span, and — for
 /// operator-shaped expressions — the operator token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,11 +163,13 @@ impl SyntaxTree {
         chain
     }
 
-    /// The `(type_name, trait_name)` pairs for every `impl Trait for Type` block in the file.
+    /// The trait/type name-token spans for every `impl Trait for Type` block in the file.
     ///
-    /// Feeds the uncontracted `type_hierarchy` edges. A plain inherent `impl Type` (no trait) is not
-    /// a hierarchy relationship and is skipped.
-    pub fn trait_impls(&self) -> Vec<(String, String)> {
+    /// Each entry carries the terminal identifier span of the type and the trait (see [`TraitImpl`]),
+    /// so `type_hierarchy` edge derivation resolves each span through the aligned occurrence at that
+    /// location. A plain inherent `impl Type` (no trait) is not a hierarchy relationship and is
+    /// skipped, as is any header whose trait or type has no resolvable name token.
+    pub fn trait_impls(&self) -> Vec<TraitImpl> {
         let root = self.tree.root_node();
         let mut out = Vec::new();
         let mut cursor = root.walk();
@@ -162,10 +178,12 @@ impl SyntaxTree {
             if node.kind() == "impl_item"
                 && let Some(trait_node) = node.child_by_field_name("trait")
                 && let Some(type_node) = node.child_by_field_name("type")
-                && let (Some(trait_name), Some(type_name)) =
-                    (self.text_at(span_of(trait_node)), self.text_at(span_of(type_node)))
+                && let (Some(trait_tok), Some(type_tok)) = (name_token(trait_node), name_token(type_node))
             {
-                out.push((type_name.to_string(), trait_name.to_string()));
+                out.push(TraitImpl {
+                    type_name_span: span_of(type_tok),
+                    trait_name_span: span_of(trait_tok),
+                });
             }
             for child in node.children(&mut cursor) {
                 stack.push(child);
@@ -246,6 +264,18 @@ impl SyntaxTree {
             }
         }
         out
+    }
+}
+
+/// The terminal identifier token of a type or trait node: the identifier inside a generic type
+/// (`From<Arg>` → `From`), the terminal segment of a qualified path (`fmt::Display` → `Display`), or
+/// the bare identifier itself. Returns `None` for a shape carrying no resolvable name token.
+fn name_token(node: Node) -> Option<Node> {
+    match node.kind() {
+        "type_identifier" | "identifier" => Some(node),
+        "generic_type" => node.child_by_field_name("type").and_then(name_token),
+        "scoped_type_identifier" | "scoped_identifier" => node.child_by_field_name("name").and_then(name_token),
+        _ => None,
     }
 }
 

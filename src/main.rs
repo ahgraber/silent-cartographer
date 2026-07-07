@@ -33,6 +33,7 @@ fn main() -> Result<()> {
                 &default_analyzer(),
                 &args.reference,
                 args.relation.into(),
+                args.depth,
                 cli.json,
             )?;
             println!("{out}");
