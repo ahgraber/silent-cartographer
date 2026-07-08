@@ -30,7 +30,7 @@ The system SHALL qualify every canonical identity with the identity of the works
 #### Scenario: Same descriptor in two workspaces stays distinct
 
 - **GIVEN** two workspaces that each define a symbol with the same module path and qualified name
-- **WHEN** both are indexed into the store
+- **WHEN** each workspace is indexed into its own store
 - **THEN** the two symbols have distinct canonical identities and neither query nor reference resolution conflates them
 
 ### Requirement: Identity uniqueness within a workspace
