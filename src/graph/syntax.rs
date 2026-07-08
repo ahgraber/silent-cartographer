@@ -243,6 +243,37 @@ impl SyntaxTree {
         None
     }
 
+    /// Whether `span` sits on the name token of a module declaration — the identifier that is the
+    /// `name` field of a `mod_item` (`mod name;` or `mod name { .. }`).
+    ///
+    /// A module symbol is referenced from every `use`/path segment naming it across the workspace;
+    /// only the declaration site carries parent-module evidence, so callers deriving module
+    /// containment must gate reference occurrences through this check rather than trusting any
+    /// reference.
+    pub fn is_module_declaration_name(&self, span: ByteSpan) -> bool {
+        let root = self.tree.root_node();
+        let end = span.end.max(span.start + 1).min(root.end_byte());
+        let Some(mut node) = root.descendant_for_byte_range(span.start, end) else {
+            return false;
+        };
+        while !node.is_named() {
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            node = parent;
+        }
+        if node.kind() != "identifier" {
+            return false;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        parent.kind() == "mod_item"
+            && parent
+                .child_by_field_name("name")
+                .is_some_and(|name| span_of(name) == span_of(node))
+    }
+
     /// Every persisted declaration in the file, each with its name and full span.
     pub fn all_declarations(&self) -> Vec<SyntaxDeclaration> {
         let root = self.tree.root_node();
@@ -433,6 +464,44 @@ mod net {
     fn construct_at_crate_keyword() {
         let c = construct_at_token("use crate::thing::Thing;\n", "crate");
         assert_eq!(c.kind, "crate");
+    }
+
+    // A module-declaration name token is recognized; a use-style path segment spelling the same
+    // module name, and non-module identifiers, are not.
+    #[test]
+    fn module_declaration_name_is_distinguished_from_use_style_references() {
+        let src = "\
+mod sub;
+mod inline_mod {
+    pub fn f() {}
+}
+use sub::thing;
+fn not_a_mod() {}
+";
+        let tree = SyntaxTree::parse(src).unwrap();
+        let span = |token: &str, occurrence: usize| {
+            let abs = src.match_indices(token).nth(occurrence - 1).expect("token present").0;
+            ByteSpan {
+                start: abs,
+                end: abs + token.len(),
+            }
+        };
+
+        // Declaration sites: `mod sub;` and `mod inline_mod { .. }`.
+        assert!(tree.is_module_declaration_name(span("sub", 1)), "`mod sub;` name");
+        assert!(
+            tree.is_module_declaration_name(span("inline_mod", 1)),
+            "inline module name"
+        );
+
+        // A use-style path segment naming the module is not a declaration site.
+        assert!(
+            !tree.is_module_declaration_name(span("sub", 2)),
+            "`use sub::thing` path segment is not a declaration"
+        );
+
+        // A non-module identifier is not a declaration site.
+        assert!(!tree.is_module_declaration_name(span("not_a_mod", 1)), "fn name");
     }
 
     // `Self` is a name node in both type position and path-segment position, and the nearest

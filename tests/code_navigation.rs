@@ -440,6 +440,7 @@ fn put_dep_symbol(store: &GraphStore, name: &str) {
             document_path: None,
             span: None,
             span_text: None,
+            duplicated: false,
         })
         .unwrap();
 }

@@ -8,7 +8,7 @@
 /// The current schema version. Bumped on any schema-affecting change under the reproducibility
 /// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
 /// before any table access; the `index_metadata.schema_version` column carries it as provenance.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS index_metadata (
 
 -- One row per persisted symbol. `class` is 'in_workspace' or 'external'; externals carry identity
 -- and reference occurrences but no definition span (nullable span columns).
+-- `duplicated` marks a true same-descriptor twin: an in-workspace definition whose identical
+-- resolved descriptor is shared by at least one other definition. Distinct descriptors whose
+-- canonical projections merely collide (and so carry a `#<rank>` disambiguator) are NOT duplicated.
 -- The reserved `embedding` column holds the deferred semantic-pillar vector; its shape is not yet
 -- committed, so it is a nullable BLOB placeholder that a future additive migration reshapes.
 CREATE TABLE IF NOT EXISTS symbols (
@@ -47,13 +50,17 @@ CREATE TABLE IF NOT EXISTS symbols (
     span_start     INTEGER,
     span_end       INTEGER,
     span_text      TEXT,
+    duplicated     INTEGER NOT NULL DEFAULT 0,
     embedding      BLOB
 );
 
 -- One row per occurrence of a symbol. `role` is 'definition' or 'reference'. `rule` is the
 -- alignment rule that accepted the attribution ('exact', 'crate_root', 'operator_desugar',
--- 'module_span') — its provenance. Aligned reference occurrences carry `enclosing_id`, the nearest
--- enclosing persisted declaration (NULL means the module/file itself is the attribution).
+-- 'module_span', 'self_keyword') — its provenance. Aligned reference occurrences carry
+-- `enclosing_id`, the nearest enclosing persisted declaration (NULL means the module/file itself is
+-- the attribution). `locality` is the locality rule ('defining_document' or 'module_chain') that
+-- selected this attribution's twin, for an occurrence resolved from a duplicated descriptor's group;
+-- NULL for an ordinary (non-duplicated) attribution.
 CREATE TABLE IF NOT EXISTS occurrences (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol_id      TEXT    NOT NULL REFERENCES symbols(canonical_id),
@@ -62,7 +69,8 @@ CREATE TABLE IF NOT EXISTS occurrences (
     span_end       INTEGER NOT NULL,
     role           TEXT    NOT NULL,
     rule           TEXT    NOT NULL,
-    enclosing_id   TEXT    REFERENCES symbols(canonical_id)
+    enclosing_id   TEXT    REFERENCES symbols(canonical_id),
+    locality       TEXT
 );
 CREATE INDEX IF NOT EXISTS occurrences_by_symbol ON occurrences(symbol_id);
 CREATE INDEX IF NOT EXISTS occurrences_by_enclosing ON occurrences(enclosing_id);

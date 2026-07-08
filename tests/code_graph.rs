@@ -9,8 +9,8 @@ use silent_cartographer::graph::store::{
 use silent_cartographer::graph::{content_hash, freshness, ingest, join_guarded};
 use silent_cartographer::identity::{CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId};
 use silent_cartographer::semantic::model::{
-    AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
-    SourceDocument, SourceRange, SymbolClass, SymbolKind,
+    AnalyzerProvenance, DuplicateGroup, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole,
+    PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind, normalize,
 };
 
 fn ws() -> WorkspaceId {
@@ -92,6 +92,68 @@ fn edges_are_deduplicated_and_rebuild_is_idempotent() {
     ingest(&mut store, &ws(), &index, &src).unwrap();
     let uses_second = store.edges(EdgeKind::Uses).unwrap();
     assert_eq!(uses_first, uses_second, "rebuild is idempotent over the edge set");
+}
+
+// _(Whole-build supersession)_ — a build over an existing same-version store wholly supersedes every
+// derived table: rebuilding the identical index leaves byte-identical symbol, occurrence, and edge
+// row sets (no accumulation), and a symbol absent from the next index leaves no stale row behind.
+#[test]
+fn rebuilding_over_the_same_store_supersedes_all_derived_rows() {
+    let snapshot = |store: &GraphStore| {
+        let names = ["net", "Client", "connect", "disconnect", "open"];
+        let mut symbols = Vec::new();
+        let mut occurrences = Vec::new();
+        for name in names {
+            for row in store.symbols_by_shortname(name).unwrap() {
+                occurrences.extend(store.occurrences_of(&row.canonical_id).unwrap());
+                symbols.push(row);
+            }
+        }
+        let mut edges = Vec::new();
+        for kind in [
+            EdgeKind::Contains,
+            EdgeKind::Uses,
+            EdgeKind::Imports,
+            EdgeKind::TypeHierarchy,
+        ] {
+            for (src, dst) in store.edges(kind).unwrap() {
+                edges.push((kind.tag().to_string(), src, dst));
+            }
+        }
+        (symbols, occurrences, edges)
+    };
+
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let index = support::fixture_index();
+    let src = sources();
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    let first = snapshot(&store);
+    assert!(
+        !first.0.is_empty() && !first.1.is_empty() && !first.2.is_empty(),
+        "sanity: the first build produced symbol, occurrence, and edge rows"
+    );
+
+    // Second build of the identical index over the same store: every derived row set is superseded,
+    // not accumulated — equal counts AND equal content.
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    let second = snapshot(&store);
+    assert_eq!(first.0, second.0, "symbol rows are identical after a rebuild");
+    assert_eq!(first.1, second.1, "occurrence rows are identical after a rebuild");
+    assert_eq!(first.2, second.2, "edge rows are identical after a rebuild");
+
+    // Staleness clearing, not just dedup: a symbol present only in the earlier index is absent after
+    // a build of an index without it.
+    let mut smaller = support::fixture_index();
+    smaller.symbols.retain(|s| s.terminal_name() != Some("disconnect"));
+    ingest(&mut store, &ws(), &smaller, &src).unwrap();
+    assert!(
+        store.symbols_by_shortname("disconnect").unwrap().is_empty(),
+        "the vanished symbol's row is superseded away, not left stale"
+    );
+    assert!(
+        !store.symbols_by_shortname("connect").unwrap().is_empty(),
+        "symbols still in the index persist"
+    );
 }
 
 // _(Declaration-level dependency edges (uses) — call branch)_ — a function calling another yields a
@@ -211,6 +273,8 @@ use thing::Thing;
                 ],
             },
         ],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -306,6 +370,8 @@ fn shared_module_symbol_maps_to_every_document_it_defines() {
             },
         ],
         symbols: vec![module, alpha, beta],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![
@@ -608,6 +674,7 @@ fn put_symbol(store: &GraphStore, name: &str) {
             document_path: None,
             span: None,
             span_text: None,
+            duplicated: false,
         })
         .unwrap();
 }
@@ -785,6 +852,8 @@ fn text_mismatch_is_refused_and_surfaced() {
                 role: OccurrenceRole::Definition,
             }],
         }],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -814,6 +883,8 @@ fn text_mismatch_is_refused_and_surfaced() {
                 role: OccurrenceRole::Definition,
             }],
         }],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store2 = GraphStore::open_in_memory().unwrap();
     let src2 = vec![("n.rs".to_string(), nonascii.to_string())];
@@ -850,6 +921,8 @@ fn semantic_only_occurrence_is_unaligned() {
                 role: OccurrenceRole::Definition,
             }],
         }],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1001,6 +1074,8 @@ impl Client {
                 }],
             },
         ],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1099,6 +1174,8 @@ use thing::Thing;
                 ],
             },
         ],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1190,6 +1267,8 @@ fn external_symbol_persists_without_definition_span() {
                 }],
             },
         ],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1282,20 +1361,21 @@ fn accounting_conserves_occurrence_total() {
 }
 
 // _(Workspace-namespaced identity — persisted path)_ — the same descriptor ingested under two
-// workspaces persists two distinct symbols, and queries do not conflate them.
+// workspaces persists two distinct symbols, and queries do not conflate them. A store holds exactly
+// one build (whole-build supersession), so each workspace builds into its own store; the identities
+// stay distinct across them, which is what keeps the future multi-workspace surface designable.
 #[test]
 fn two_workspace_ingest_persists_distinct_symbols() {
     use silent_cartographer::query::resolve::{Resolution, resolve};
 
-    // One store, two builds of the identical index under distinct workspace identities. Symbols are
-    // keyed by canonical identity, which is workspace-namespaced, so both sets coexist.
-    let mut store = GraphStore::open_in_memory().unwrap();
     let index = support::fixture_index();
     let src = sources();
     let ws_a = WorkspaceId::new("workspace-a");
     let ws_b = WorkspaceId::new("workspace-b");
-    ingest(&mut store, &ws_a, &index, &src).unwrap();
-    ingest(&mut store, &ws_b, &index, &src).unwrap();
+    let mut store_a = GraphStore::open_in_memory().unwrap();
+    let mut store_b = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store_a, &ws_a, &index, &src).unwrap();
+    ingest(&mut store_b, &ws_b, &index, &src).unwrap();
 
     let descriptor = Descriptor::new(
         "mycrate",
@@ -1309,30 +1389,34 @@ fn two_workspace_ingest_persists_distinct_symbols() {
     let id_b = silent_cartographer::identity::project_one(&ws_b, &descriptor);
     assert_ne!(id_a, id_b, "the two workspace projections are distinct identities");
 
-    // Both are persisted as their own rows.
-    let row_a = store.symbol(&id_a).unwrap().expect("workspace-a symbol persisted");
-    let row_b = store.symbol(&id_b).unwrap().expect("workspace-b symbol persisted");
+    // Each is persisted as its own row, under its own workspace-namespaced identity.
+    let row_a = store_a.symbol(&id_a).unwrap().expect("workspace-a symbol persisted");
+    let row_b = store_b.symbol(&id_b).unwrap().expect("workspace-b symbol persisted");
     assert_ne!(row_a.canonical_id, row_b.canonical_id);
 
     // Identity-tier resolution round-trips each to exactly its own symbol — never the other's.
-    match resolve(&store, id_a.as_str()).unwrap() {
+    match resolve(&store_a, id_a.as_str()).unwrap() {
         Resolution::Unique(row) => assert_eq!(row.canonical_id, id_a),
         other => panic!("expected unique for identity a, got {other:?}"),
     }
-    match resolve(&store, id_b.as_str()).unwrap() {
+    match resolve(&store_b, id_b.as_str()).unwrap() {
         Resolution::Unique(row) => assert_eq!(row.canonical_id, id_b),
         other => panic!("expected unique for identity b, got {other:?}"),
     }
+    // No conflation: neither store answers for the other workspace's identity.
+    match resolve(&store_a, id_b.as_str()).unwrap() {
+        Resolution::None => {}
+        other => panic!("workspace-a's store must not answer for workspace-b's identity: {other:?}"),
+    }
 
-    // A qualified name shared across the workspaces resolves to a typed candidate set carrying both
-    // identities — surfaced ambiguity, not a silent conflation into one.
-    match resolve(&store, "net::Client::connect").unwrap() {
-        Resolution::Ambiguous(rows) => {
-            let ids: Vec<&str> = rows.iter().map(|r| r.canonical_id.as_str()).collect();
-            assert!(ids.contains(&id_a.as_str()), "candidates include workspace-a: {ids:?}");
-            assert!(ids.contains(&id_b.as_str()), "candidates include workspace-b: {ids:?}");
-        }
-        other => panic!("expected ambiguous across workspaces, got {other:?}"),
+    // The shared qualified name resolves within each store to exactly that workspace's symbol.
+    match resolve(&store_a, "net::Client::connect").unwrap() {
+        Resolution::Unique(row) => assert_eq!(row.canonical_id, id_a),
+        other => panic!("expected workspace-a's own symbol, got {other:?}"),
+    }
+    match resolve(&store_b, "net::Client::connect").unwrap() {
+        Resolution::Unique(row) => assert_eq!(row.canonical_id, id_b),
+        other => panic!("expected workspace-b's own symbol, got {other:?}"),
     }
 }
 
@@ -1389,6 +1473,8 @@ fn duplicate_index() -> ExtractedIndex {
             encoding: PositionEncoding::Utf8,
         }],
         symbols: vec![twin_a, twin_b],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     }
 }
 
@@ -1572,6 +1658,8 @@ fn text_mismatch_detail_is_persisted() {
                 role: OccurrenceRole::Definition,
             }],
         }],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1618,6 +1706,8 @@ fn discrepancies_are_superseded_per_build() {
                 role: OccurrenceRole::Definition,
             }],
         }],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     ingest(&mut store, &ws(), &index1, &[("m.rs".to_string(), source1.to_string())]).unwrap();
     assert!(
@@ -1729,6 +1819,8 @@ fn oversized_found_text_is_classified_on_full_bytes_and_truncated_on_a_boundary(
                 role: OccurrenceRole::Definition,
             }],
         }],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source)];
@@ -1786,6 +1878,8 @@ fn one_doc_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
             encoding: PositionEncoding::Utf8,
         }],
         symbols: symbols.to_vec(),
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     }
 }
 
@@ -1851,6 +1945,12 @@ fn crate_root_reference_aligns_on_package_name() {
     let occs = store.occurrences_of(&id).unwrap();
     assert_eq!(occs.len(), 1, "the crate-root reference is persisted");
     assert_eq!(occs[0].rule, "crate_root", "the attribution carries its rule");
+    // The package-name carve-out is scoped to duplicated groups: a unique crate root's package-name
+    // reference flows through the ordinary join with no locality tag.
+    assert_eq!(
+        occs[0].locality, None,
+        "an unduplicated crate-root attribution carries no locality provenance"
+    );
 }
 
 // _(Guarded positional join — crate-root branch)_ — a `crate::` path segment aligns under the
@@ -2608,4 +2708,1135 @@ impl output::Answer {
         "the qualified impl header compares by base name"
     );
     assert_eq!(acc.text_mismatch, 0);
+}
+
+// ---- Locality attribution ----
+
+/// A twin symbol carrying only its own definition occurrence, for a group-addressed duplicate index.
+fn twin(descriptor: Descriptor, kind: SymbolKind, doc: &str, def_range: SourceRange) -> ExtractedSymbol {
+    ExtractedSymbol {
+        descriptor: Some(descriptor),
+        kind,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: doc.to_string(),
+            range: def_range,
+            role: OccurrenceRole::Definition,
+        }],
+    }
+}
+
+/// A group reference occurrence at `doc`/`range`, for a [`DuplicateGroup`].
+fn group_ref(doc: &str, range: SourceRange) -> ExtractedOccurrence {
+    ExtractedOccurrence {
+        document_path: doc.to_string(),
+        range,
+        role: OccurrenceRole::Reference,
+    }
+}
+
+/// A multi-document index carrying `symbols` and one duplicate group over `descriptor` with
+/// `group_occurrences`.
+fn duplicate_group_index(
+    documents: &[&str],
+    symbols: Vec<ExtractedSymbol>,
+    descriptor: Descriptor,
+    group_occurrences: Vec<ExtractedOccurrence>,
+) -> ExtractedIndex {
+    ExtractedIndex {
+        provenance: support::provenance(),
+        documents: documents
+            .iter()
+            .map(|p| SourceDocument {
+                path: p.to_string(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols,
+        duplicate_groups: vec![DuplicateGroup {
+            descriptor,
+            occurrences: group_occurrences,
+        }],
+        library_roots: Default::default(),
+    }
+}
+
+fn widget_descriptor() -> Descriptor {
+    Descriptor::new("dupcrate", vec![DescriptorSegment::new("Widget", SegmentKind::Type)])
+}
+
+// _(Reference in one duplicate's territory is attributed to it — defining-document branch)_ — a
+// group reference sitting in a twin's own defining document attributes to that twin, carrying
+// `defining_document` locality provenance.
+#[test]
+fn reference_in_twins_defining_document_attributes_via_defining_document_locality() {
+    // twin_a defines and is referenced again in a.rs; twin_b defines in b.rs.
+    let a_source = "struct Widget;\nfn use_a() { let _w: Widget = Widget; }\n";
+    let b_source = "struct Widget;\n";
+
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "a.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "b.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    // The reference: the second "Widget" token on line 1 of a.rs.
+    let ref_pos = a_source.match_indices("Widget").nth(1).unwrap().0;
+    let (rl, rc) = line_col(a_source, ref_pos);
+    let group_occ = group_ref("a.rs", SourceRange::new(rl, rc, rl, rc + "Widget".len() as u32));
+
+    let index = duplicate_group_index(
+        &["a.rs", "b.rs"],
+        vec![twin_a, twin_b],
+        widget_descriptor(),
+        vec![group_occ],
+    );
+    let src = vec![
+        ("a.rs".to_string(), a_source.to_string()),
+        ("b.rs".to_string(), b_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(acc.duplicate_ambiguous, 0, "the reference is settled, not ambiguous");
+    assert_eq!(
+        acc.aligned_exact, 3,
+        "two definitions plus the settled reference align exactly"
+    );
+
+    // The reference attributed to the a.rs twin specifically, carrying defining_document provenance.
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    let a_twin = twins
+        .iter()
+        .find(|t| t.document_path.as_deref() == Some("a.rs"))
+        .expect("the a.rs twin is persisted");
+    let b_twin = twins
+        .iter()
+        .find(|t| t.document_path.as_deref() == Some("b.rs"))
+        .expect("the b.rs twin is persisted");
+    let a_refs = store.references_of(&a_twin.canonical_id).unwrap();
+    let b_refs = store.references_of(&b_twin.canonical_id).unwrap();
+    assert_eq!(
+        a_refs.len(),
+        1,
+        "the reference attributes to the twin in whose document it sits"
+    );
+    assert_eq!(
+        a_refs[0].locality.as_deref(),
+        Some("defining_document"),
+        "the attribution carries defining_document locality provenance: {a_refs:?}"
+    );
+    assert!(b_refs.is_empty(), "the other twin owns no reference");
+}
+
+// _(Reference in one duplicate's territory is attributed to it — provenance round-trip)_ — the
+// locality rule that selected a group reference's twin is persisted alongside the attribution and
+// retrieved unchanged; an ordinary (non-duplicated) attribution's locality is absent.
+#[test]
+fn locality_provenance_round_trips_through_the_store() {
+    let a_source = "struct Widget;\nfn use_a() { let _w: Widget = Widget; }\n";
+    let b_source = "struct Widget;\n";
+
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "a.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "b.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let ref_pos = a_source.match_indices("Widget").nth(1).unwrap().0;
+    let (rl, rc) = line_col(a_source, ref_pos);
+    let group_occ = group_ref("a.rs", SourceRange::new(rl, rc, rl, rc + "Widget".len() as u32));
+
+    let index = duplicate_group_index(
+        &["a.rs", "b.rs"],
+        vec![twin_a, twin_b],
+        widget_descriptor(),
+        vec![group_occ],
+    );
+    let src = vec![
+        ("a.rs".to_string(), a_source.to_string()),
+        ("b.rs".to_string(), b_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    let a_twin = twins
+        .iter()
+        .find(|t| t.document_path.as_deref() == Some("a.rs"))
+        .unwrap();
+    let refs = store.references_of(&a_twin.canonical_id).unwrap();
+    assert_eq!(
+        refs[0].locality.as_deref(),
+        Some("defining_document"),
+        "the locality provenance is retrieved unchanged after persistence: {refs:?}"
+    );
+
+    // An ordinary attribution (no duplicated descriptor involved) carries no locality tag.
+    let ordinary_store = ingest_fixture();
+    let connect_refs = ordinary_store.references_of(&connect_id()).unwrap();
+    assert_eq!(connect_refs.len(), 1);
+    assert_eq!(
+        connect_refs[0].locality, None,
+        "an ordinary attribution's locality is absent, not a stray tag"
+    );
+}
+
+// _(Reference in one duplicate's territory is attributed to it — module-chain branch)_ — a group
+// reference sitting in a document reachable only through one twin's module-declaration chain
+// attributes to that twin, carrying `module_chain` locality provenance.
+#[test]
+fn reference_reachable_only_through_one_twins_module_chain_attributes_via_module_chain_locality() {
+    // Two Widget twins define from their own crate-root documents; crate_a.rs additionally declares
+    // a submodule `sub` living in sub_a.rs. The group reference sits in sub_a.rs, reachable only
+    // through crate_a.rs's module chain — crate_b.rs has no such submodule.
+    let crate_a_source = "struct Widget;\nmod sub;\n";
+    let crate_b_source = "struct Widget;\n";
+    let sub_a_source = "fn use_widget() { let _w: Widget = Widget; }\n";
+
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "crate_a.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "crate_b.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+
+    // The module-declaration evidence `parent_document_map` walks: module `sub`'s definition
+    // document is sub_a.rs, and its one reference occurrence (the `mod sub;` declaration) sits in
+    // crate_a.rs, so `parent_of["sub_a.rs"] == "crate_a.rs"`. The definition occurrence spans the
+    // whole sub_a.rs document (the module-span alignment rule's shape); the reference occurrence
+    // sits at `sub` in line 1 of crate_a.rs (`mod sub;`, after the `struct Widget;` line).
+    let sub_descriptor = Descriptor::new("dupcrate", vec![DescriptorSegment::new("sub", SegmentKind::Module)]);
+    let sub_a_lines = sub_a_source.matches('\n').count() as u32;
+    let sub_def = ExtractedSymbol {
+        descriptor: Some(sub_descriptor),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            ExtractedOccurrence {
+                document_path: "sub_a.rs".to_string(),
+                range: SourceRange::new(0, 0, sub_a_lines, 0),
+                role: OccurrenceRole::Definition,
+            },
+            ExtractedOccurrence {
+                document_path: "crate_a.rs".to_string(),
+                range: SourceRange::new(1, 4, 1, 7),
+                role: OccurrenceRole::Reference,
+            },
+        ],
+    };
+
+    let ref_pos = sub_a_source.match_indices("Widget").nth(1).unwrap().0;
+    let (rl, rc) = line_col(sub_a_source, ref_pos);
+    let group_occ = group_ref("sub_a.rs", SourceRange::new(rl, rc, rl, rc + "Widget".len() as u32));
+
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec!["crate_a.rs", "crate_b.rs", "sub_a.rs"]
+            .into_iter()
+            .map(|p| SourceDocument {
+                path: p.to_string(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols: vec![twin_a, twin_b, sub_def],
+        duplicate_groups: vec![DuplicateGroup {
+            descriptor: widget_descriptor(),
+            occurrences: vec![group_occ],
+        }],
+        library_roots: Default::default(),
+    };
+
+    let src = vec![
+        ("crate_a.rs".to_string(), crate_a_source.to_string()),
+        ("crate_b.rs".to_string(), crate_b_source.to_string()),
+        ("sub_a.rs".to_string(), sub_a_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.duplicate_ambiguous, 0,
+        "the reference resolves through the module chain, not ambiguous"
+    );
+
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    let a_twin = twins
+        .iter()
+        .find(|t| t.document_path.as_deref() == Some("crate_a.rs"))
+        .expect("the crate_a.rs Widget twin is persisted");
+    let b_twin = twins
+        .iter()
+        .find(|t| t.document_path.as_deref() == Some("crate_b.rs"))
+        .expect("the crate_b.rs Widget twin is persisted");
+    let a_refs = store.references_of(&a_twin.canonical_id).unwrap();
+    let b_refs = store.references_of(&b_twin.canonical_id).unwrap();
+    assert_eq!(
+        a_refs.len(),
+        1,
+        "the reference attributes to the twin reachable through the module chain"
+    );
+    assert_eq!(
+        a_refs[0].locality.as_deref(),
+        Some("module_chain"),
+        "the attribution carries module_chain locality provenance: {a_refs:?}"
+    );
+    assert!(
+        b_refs.is_empty(),
+        "the other twin, unreachable from sub_a.rs, owns no reference"
+    );
+}
+
+// _(Module-chain evidence is declaration-site only)_ — a module referenced only through use-style
+// path segments (no `mod name;` declaration site anywhere) derives no parent document, so a group
+// reference in that module's document stays duplicate-ambiguous instead of walking an arbitrary
+// reference to the wrong twin.
+#[test]
+fn use_style_module_references_derive_no_parent_and_group_reference_stays_ambiguous() {
+    // twin_a's own defining document (crate_a.rs) carries a use-style reference to module `sub` —
+    // the misattribution bait: a first-reference-wins derivation would walk sub.rs → crate_a.rs and
+    // hand the reference to twin_a. Neither reference is a `mod sub;` declaration.
+    let crate_a_source = "struct Widget;\nuse sub::thing;\n";
+    let crate_b_source = "struct Widget;\n";
+    let other_source = "use sub::other;\n";
+    let sub_source = "fn use_widget() { let _w: Widget = Widget; }\n";
+
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "crate_a.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "crate_b.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+
+    // Module `sub` defined in sub.rs, referenced from crate_a.rs and other.rs — both use-style path
+    // segments, neither a declaration site.
+    let a_ref_pos = crate_a_source.find("sub").unwrap();
+    let (al, ac) = line_col(crate_a_source, a_ref_pos);
+    let o_ref_pos = other_source.find("sub").unwrap();
+    let (ol, oc) = line_col(other_source, o_ref_pos);
+    let sub_lines = sub_source.matches('\n').count() as u32;
+    let sub_def = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "dupcrate",
+            vec![DescriptorSegment::new("sub", SegmentKind::Module)],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            ExtractedOccurrence {
+                document_path: "sub.rs".to_string(),
+                range: SourceRange::new(0, 0, sub_lines, 0),
+                role: OccurrenceRole::Definition,
+            },
+            ExtractedOccurrence {
+                document_path: "crate_a.rs".to_string(),
+                range: SourceRange::new(al, ac, al, ac + 3),
+                role: OccurrenceRole::Reference,
+            },
+            ExtractedOccurrence {
+                document_path: "other.rs".to_string(),
+                range: SourceRange::new(ol, oc, ol, oc + 3),
+                role: OccurrenceRole::Reference,
+            },
+        ],
+    };
+
+    let ref_pos = sub_source.match_indices("Widget").nth(1).unwrap().0;
+    let (rl, rc) = line_col(sub_source, ref_pos);
+    let group_occ = group_ref("sub.rs", SourceRange::new(rl, rc, rl, rc + "Widget".len() as u32));
+
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec!["crate_a.rs", "crate_b.rs", "other.rs", "sub.rs"]
+            .into_iter()
+            .map(|p| SourceDocument {
+                path: p.to_string(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols: vec![twin_a, twin_b, sub_def],
+        duplicate_groups: vec![DuplicateGroup {
+            descriptor: widget_descriptor(),
+            occurrences: vec![group_occ],
+        }],
+        library_roots: Default::default(),
+    };
+
+    let src = vec![
+        ("crate_a.rs".to_string(), crate_a_source.to_string()),
+        ("crate_b.rs".to_string(), crate_b_source.to_string()),
+        ("other.rs".to_string(), other_source.to_string()),
+        ("sub.rs".to_string(), sub_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.duplicate_ambiguous, 1,
+        "no declaration-site evidence connects sub.rs to any twin, so the reference is refused"
+    );
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    for t in &twins {
+        assert!(
+            store.references_of(&t.canonical_id).unwrap().is_empty(),
+            "no twin is attributed through use-style reference evidence"
+        );
+    }
+}
+
+// _(Package-name reference without target metadata is typed ambiguous)_ — a package-name token
+// denotes the package's library target no matter which document it sits in, so containing-document
+// locality must never hand it to the containing file's own crate root; with no authoritative target
+// description available (the index's library-root map is empty), it is refused to
+// duplicate-ambiguous. The `crate`-keyword form in the same document is target-relative by
+// construction and keeps its locality attribution.
+#[test]
+fn package_name_reference_among_duplicated_crate_roots_is_ambiguous_while_crate_keyword_attributes() {
+    // Two crate-root twins sharing descriptor `dupcrate` + terminal segment `crate` (package name
+    // differs from the terminal name). root_a.rs carries BOTH reference forms. `library_roots` is
+    // empty (the `duplicate_group_index` helper's default): no target metadata is available.
+    let root_a_source = "use dupcrate::thing;\nuse crate::other;\n";
+    let root_b_source = "fn placeholder() {}\n";
+
+    let crate_descriptor = || Descriptor::new("dupcrate", vec![DescriptorSegment::new("crate", SegmentKind::Module)]);
+    let a_lines = root_a_source.matches('\n').count() as u32;
+    let b_lines = root_b_source.matches('\n').count() as u32;
+    // Crate-root twin definitions span their whole documents (the module-span rule's shape).
+    let twin_a = twin(
+        crate_descriptor(),
+        SymbolKind::Module,
+        "root_a.rs",
+        SourceRange::new(0, 0, a_lines, 0),
+    );
+    let twin_b = twin(
+        crate_descriptor(),
+        SymbolKind::Module,
+        "root_b.rs",
+        SourceRange::new(0, 0, b_lines, 0),
+    );
+
+    // Group references, both in twin_a's own defining document: the package-name token and the
+    // `crate` keyword token.
+    let pkg_pos = root_a_source.find("dupcrate").unwrap();
+    let (pl, pc) = line_col(root_a_source, pkg_pos);
+    let pkg_occ = group_ref("root_a.rs", SourceRange::new(pl, pc, pl, pc + "dupcrate".len() as u32));
+    let kw_pos = root_a_source.find("crate::other").unwrap();
+    let (kl, kc) = line_col(root_a_source, kw_pos);
+    let kw_occ = group_ref("root_a.rs", SourceRange::new(kl, kc, kl, kc + "crate".len() as u32));
+
+    let index = duplicate_group_index(
+        &["root_a.rs", "root_b.rs"],
+        vec![twin_a, twin_b],
+        crate_descriptor(),
+        vec![pkg_occ, kw_occ],
+    );
+    let src = vec![
+        ("root_a.rs".to_string(), root_a_source.to_string()),
+        ("root_b.rs".to_string(), root_b_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.duplicate_ambiguous, 1,
+        "the package-name token is refused to duplicate-ambiguous, never attributed by locality"
+    );
+    assert_eq!(
+        acc.aligned_crate_root, 1,
+        "the crate-keyword token still attributes under the crate-root rule"
+    );
+
+    let roots = store.symbols_by_shortname("crate").unwrap();
+    let a_root = roots
+        .iter()
+        .find(|r| r.document_path.as_deref() == Some("root_a.rs"))
+        .expect("the root_a.rs twin is persisted");
+    let b_root = roots
+        .iter()
+        .find(|r| r.document_path.as_deref() == Some("root_b.rs"))
+        .expect("the root_b.rs twin is persisted");
+    let a_refs = store.references_of(&a_root.canonical_id).unwrap();
+    assert_eq!(
+        a_refs.len(),
+        1,
+        "only the crate-keyword reference attributes to the containing twin: {a_refs:?}"
+    );
+    assert_eq!(a_refs[0].rule, "crate_root");
+    assert_eq!(
+        a_refs[0].locality.as_deref(),
+        Some("defining_document"),
+        "the keyword attribution keeps its locality provenance: {a_refs:?}"
+    );
+    assert!(
+        store.references_of(&b_root.canonical_id).unwrap().is_empty(),
+        "the other twin owns nothing"
+    );
+
+    // The refused package-name occurrence is inspectable as a duplicate-ambiguous discrepancy.
+    let rows = store.all_discrepancies().unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.outcome == "duplicate_ambiguous" && r.expected_name == "crate"),
+        "the package-name refusal is surfaced: {rows:?}"
+    );
+}
+
+// _(Package-name reference resolves to the library target)_ — with the build system's target
+// description available, a package-name token attributes to the twin defined at the package's
+// library root — never to the containing document's own crate root — under `target_metadata`
+// locality provenance; the `crate`-keyword token in the same document keeps ordinary locality.
+#[test]
+fn package_name_reference_resolves_to_the_library_twin_via_target_metadata() {
+    // Two crate-root twins; the build metadata names root_b.rs as the library target's root. The
+    // package-name token sits in root_a.rs — the OTHER twin's document, the misattribution bait.
+    let root_a_source = "use dupcrate::thing;\nuse crate::other;\n";
+    let root_b_source = "fn placeholder() {}\n";
+
+    let crate_descriptor = || Descriptor::new("dupcrate", vec![DescriptorSegment::new("crate", SegmentKind::Module)]);
+    let a_lines = root_a_source.matches('\n').count() as u32;
+    let b_lines = root_b_source.matches('\n').count() as u32;
+    let twin_a = twin(
+        crate_descriptor(),
+        SymbolKind::Module,
+        "root_a.rs",
+        SourceRange::new(0, 0, a_lines, 0),
+    );
+    let twin_b = twin(
+        crate_descriptor(),
+        SymbolKind::Module,
+        "root_b.rs",
+        SourceRange::new(0, 0, b_lines, 0),
+    );
+
+    let pkg_pos = root_a_source.find("dupcrate").unwrap();
+    let (pl, pc) = line_col(root_a_source, pkg_pos);
+    let pkg_occ = group_ref("root_a.rs", SourceRange::new(pl, pc, pl, pc + "dupcrate".len() as u32));
+    let kw_pos = root_a_source.find("crate::other").unwrap();
+    let (kl, kc) = line_col(root_a_source, kw_pos);
+    let kw_occ = group_ref("root_a.rs", SourceRange::new(kl, kc, kl, kc + "crate".len() as u32));
+
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec!["root_a.rs", "root_b.rs"]
+            .into_iter()
+            .map(|p| SourceDocument {
+                path: p.to_string(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols: vec![twin_a, twin_b],
+        duplicate_groups: vec![DuplicateGroup {
+            descriptor: crate_descriptor(),
+            occurrences: vec![pkg_occ, kw_occ],
+        }],
+        library_roots: [("dupcrate".to_string(), "root_b.rs".to_string())].into(),
+    };
+    let src = vec![
+        ("root_a.rs".to_string(), root_a_source.to_string()),
+        ("root_b.rs".to_string(), root_b_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.duplicate_ambiguous, 0,
+        "both reference forms resolve — nothing is left ambiguous"
+    );
+    assert_eq!(
+        acc.aligned_crate_root, 2,
+        "package-name and crate-keyword tokens both align under the crate-root rule"
+    );
+
+    let roots = store.symbols_by_shortname("crate").unwrap();
+    let a_root = roots
+        .iter()
+        .find(|r| r.document_path.as_deref() == Some("root_a.rs"))
+        .expect("the root_a.rs twin is persisted");
+    let b_root = roots
+        .iter()
+        .find(|r| r.document_path.as_deref() == Some("root_b.rs"))
+        .expect("the root_b.rs twin is persisted");
+
+    // The package-name token attributes to the LIBRARY twin (root_b.rs), never to the containing
+    // document's own crate root, and carries the target-description evidence as provenance.
+    let b_refs = store.references_of(&b_root.canonical_id).unwrap();
+    assert_eq!(
+        b_refs.len(),
+        1,
+        "the package-name reference attributes to the library twin: {b_refs:?}"
+    );
+    assert_eq!(b_refs[0].rule, "crate_root");
+    assert_eq!(
+        b_refs[0].locality.as_deref(),
+        Some("target_metadata"),
+        "the attribution carries the target-metadata evidence: {b_refs:?}"
+    );
+
+    // The crate-keyword token keeps ordinary locality: it attributes to its containing twin.
+    let a_refs = store.references_of(&a_root.canonical_id).unwrap();
+    assert_eq!(
+        a_refs.len(),
+        1,
+        "the crate-keyword reference attributes to the containing twin: {a_refs:?}"
+    );
+    assert_eq!(
+        a_refs[0].locality.as_deref(),
+        Some("defining_document"),
+        "the keyword attribution keeps ordinary locality provenance: {a_refs:?}"
+    );
+}
+
+// _(Locality does not bypass the guarded join)_ — a group reference in exactly one twin's
+// defining document, whose source text does not spell the expected name, is refused as
+// text-mismatch rather than attributed.
+#[test]
+fn locality_selected_occurrence_with_mismatched_text_is_refused_not_attributed() {
+    let a_source = "struct Widget;\nfn use_a() { let _w = OTHER; }\n";
+    let b_source = "struct Widget;\n";
+
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "a.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "b.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    // The group occurrence's range points at "OTHER", not "Widget" — a text mismatch even though
+    // a.rs is uniquely twin_a's defining document.
+    let other_pos = a_source.find("OTHER").unwrap();
+    let (rl, rc) = line_col(a_source, other_pos);
+    let group_occ = group_ref("a.rs", SourceRange::new(rl, rc, rl, rc + "OTHER".len() as u32));
+
+    let index = duplicate_group_index(
+        &["a.rs", "b.rs"],
+        vec![twin_a, twin_b],
+        widget_descriptor(),
+        vec![group_occ],
+    );
+    let src = vec![
+        ("a.rs".to_string(), a_source.to_string()),
+        ("b.rs".to_string(), b_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.text_mismatch, 1,
+        "locality selects the twin but the text still refuses"
+    );
+    assert_eq!(
+        acc.duplicate_ambiguous, 0,
+        "locality found a unique twin, so it is not ambiguous"
+    );
+
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    for t in &twins {
+        assert!(
+            store.references_of(&t.canonical_id).unwrap().is_empty(),
+            "no twin is attributed the mismatched reference"
+        );
+    }
+    let rows = store.all_discrepancies().unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.outcome == "text_mismatch" && r.expected_name == "Widget"),
+        "the refusal is surfaced as a text-mismatch discrepancy: {rows:?}"
+    );
+}
+
+// _(Reference outside every duplicate's territory is typed ambiguous)_ — a group reference whose
+// document is associated with no twin (no defining-document match, no module-chain path) is typed
+// duplicate-ambiguous.
+#[test]
+fn reference_outside_every_twins_territory_is_ambiguous() {
+    let a_source = "struct Widget;\n";
+    let b_source = "struct Widget;\n";
+    let c_source = "fn use_c() { let _w: Widget = Widget; }\n";
+
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "a.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "b.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    // c.rs is neither twin's defining document, and no module-chain evidence connects it to either.
+    let ref_pos = c_source.match_indices("Widget").nth(1).unwrap().0;
+    let (rl, rc) = line_col(c_source, ref_pos);
+    let group_occ = group_ref("c.rs", SourceRange::new(rl, rc, rl, rc + "Widget".len() as u32));
+
+    let index = duplicate_group_index(
+        &["a.rs", "b.rs", "c.rs"],
+        vec![twin_a, twin_b],
+        widget_descriptor(),
+        vec![group_occ],
+    );
+    let src = vec![
+        ("a.rs".to_string(), a_source.to_string()),
+        ("b.rs".to_string(), b_source.to_string()),
+        ("c.rs".to_string(), c_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.duplicate_ambiguous, 1,
+        "the reference lies outside every twin's territory"
+    );
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    for t in &twins {
+        assert!(store.references_of(&t.canonical_id).unwrap().is_empty());
+    }
+}
+
+// _(Reference outside every duplicate's territory is typed ambiguous — inspectability)_ — the
+// surfaced group-ambiguous discrepancy carries the group's shared identity base (the twins' common
+// identity with the `#<rank>` disambiguator stripped), never an empty symbol, so an inspecting
+// consumer sees which descriptor group the ambiguity belongs to.
+#[test]
+fn group_ambiguous_discrepancy_names_the_group_identity() {
+    use silent_cartographer::graph::join::{JoinOutcome, SourceCorpus, join};
+
+    let a_source = "struct Widget;\n";
+    let b_source = "struct Widget;\n";
+    let c_source = "fn use_c() { let _w: Widget = Widget; }\n";
+
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "a.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "b.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let ref_pos = c_source.match_indices("Widget").nth(1).unwrap().0;
+    let (rl, rc) = line_col(c_source, ref_pos);
+    let group_occ = group_ref("c.rs", SourceRange::new(rl, rc, rl, rc + "Widget".len() as u32));
+
+    let index = duplicate_group_index(
+        &["a.rs", "b.rs", "c.rs"],
+        vec![twin_a, twin_b],
+        widget_descriptor(),
+        vec![group_occ],
+    );
+    let corpus = SourceCorpus::new([("a.rs", a_source), ("b.rs", b_source), ("c.rs", c_source)]);
+    // The twins' identities as identity projection would assign them: shared base, `#<rank>` each.
+    let identities = vec![
+        Some(CanonicalId::from_raw("test-ws::dupcrate::Widget#0")),
+        Some(CanonicalId::from_raw("test-ws::dupcrate::Widget#1")),
+    ];
+
+    let result = join(&index, &corpus, &identities);
+    let ambiguous = result
+        .unaligned
+        .iter()
+        .find(|u| u.outcome == JoinOutcome::DuplicateAmbiguous)
+        .expect("the outside-territory reference is surfaced as duplicate-ambiguous");
+    assert!(
+        !ambiguous.symbol.as_str().is_empty(),
+        "the discrepancy carries a non-empty symbol: {ambiguous:?}"
+    );
+    assert_eq!(
+        ambiguous.symbol.as_str(),
+        "test-ws::dupcrate::Widget",
+        "the discrepancy names the group's shared identity base: {ambiguous:?}"
+    );
+
+    // Degenerate branch: no twin was persisted at all (identities withheld). The discrepancy still
+    // names the group non-emptily, falling back to the descriptor's terminal name.
+    let no_identities = vec![None, None];
+    let result = join(&index, &corpus, &no_identities);
+    let ambiguous = result
+        .unaligned
+        .iter()
+        .find(|u| u.outcome == JoinOutcome::DuplicateAmbiguous)
+        .expect("the group reference is still surfaced without persisted twins");
+    assert!(
+        !ambiguous.symbol.as_str().is_empty(),
+        "even with no persisted twins the discrepancy names the group: {ambiguous:?}"
+    );
+}
+
+// _(Reference in shared territory is typed ambiguous)_ — a group reference whose document is the
+// defining document of more than one twin (a genuinely shared document) is typed duplicate-ambiguous.
+#[test]
+fn reference_in_shared_territory_is_ambiguous() {
+    // Both twins define from the same document (a file compiled into two targets, the design's
+    // known hard case) — the defining-document rule finds two matches, not one.
+    let source = "struct Widget;\nfn use_shared() { let _w: Widget = Widget; }\n";
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "shared.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "shared.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+
+    let ref_pos = source.match_indices("Widget").nth(1).unwrap().0;
+    let (rl, rc) = line_col(source, ref_pos);
+    let group_occ = group_ref("shared.rs", SourceRange::new(rl, rc, rl, rc + "Widget".len() as u32));
+
+    let index = duplicate_group_index(
+        &["shared.rs"],
+        vec![twin_a, twin_b],
+        widget_descriptor(),
+        vec![group_occ],
+    );
+    let src = vec![("shared.rs".to_string(), source.to_string())];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.duplicate_ambiguous, 1,
+        "a document that is both twins' defining document settles to ambiguous, not a guess"
+    );
+}
+
+// _(Join alignment accounting — conservation, locality-attributed input shape)_ — with a mix of
+// locality-attributed group references and duplicate-ambiguous refusals, the per-rule acceptance
+// counts and refusal counts still conserve the total occurrence count.
+#[test]
+fn conservation_holds_with_locality_attributed_and_ambiguous_group_references() {
+    let a_source = "struct Widget;\nfn use_a() { let _w: Widget = Widget; }\n";
+    let b_source = "struct Widget;\n";
+    let c_source = "fn use_c() { let _w: Widget = Widget; }\n";
+
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "a.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "b.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+
+    let a_ref_pos = a_source.match_indices("Widget").nth(1).unwrap().0;
+    let (arl, arc) = line_col(a_source, a_ref_pos);
+    let settled_occ = group_ref("a.rs", SourceRange::new(arl, arc, arl, arc + "Widget".len() as u32));
+
+    let c_ref_pos = c_source.match_indices("Widget").nth(1).unwrap().0;
+    let (crl, crc) = line_col(c_source, c_ref_pos);
+    let ambiguous_occ = group_ref("c.rs", SourceRange::new(crl, crc, crl, crc + "Widget".len() as u32));
+
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec!["a.rs", "b.rs", "c.rs"]
+            .into_iter()
+            .map(|p| SourceDocument {
+                path: p.to_string(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols: vec![twin_a, twin_b],
+        duplicate_groups: vec![DuplicateGroup {
+            descriptor: widget_descriptor(),
+            occurrences: vec![settled_occ, ambiguous_occ],
+        }],
+        library_roots: Default::default(),
+    };
+    let total_occurrences = 2 /* definitions */ + 2 /* group references */;
+
+    let src = vec![
+        ("a.rs".to_string(), a_source.to_string()),
+        ("b.rs".to_string(), b_source.to_string()),
+        ("c.rs".to_string(), c_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(acc.duplicate_ambiguous, 1, "the unsettled reference is ambiguous");
+    assert_eq!(
+        acc.aligned_exact, 3,
+        "two definitions plus the locality-settled reference align"
+    );
+    assert_eq!(
+        acc.total_semantic(),
+        total_occurrences,
+        "per-rule acceptances plus refusals conserve the total occurrence count"
+    );
+}
+
+// _(Store & Schema — per-target imports edges)_ — after normalization splits twin crate roots into
+// distinct symbols, each target's own module-scope reference produces an `imports` edge from that
+// target's own crate-root identity, not a shared/collapsed one (the blast-radius dedup-collapse
+// caveat the crate-root workaround existed for).
+#[test]
+fn twin_crate_roots_produce_per_target_imports_edges_after_normalization() {
+    // Two crate roots sharing an identical descriptor (the rust-analyzer true-duplicate defect),
+    // each with its own module-scope `use` reference to a distinct external symbol.
+    let source_a = "use ext::Alpha;";
+    let source_b = "use ext::Beta;";
+    let alpha_tok = source_a.find("Alpha").unwrap();
+    let (al, ac) = line_col(source_a, alpha_tok);
+    let beta_tok = source_b.find("Beta").unwrap();
+    let (bl, bc) = line_col(source_b, beta_tok);
+
+    let crate_descriptor = || Descriptor::new("dupcrate", vec![DescriptorSegment::new("crate", SegmentKind::Module)]);
+    // Both definition occurrences land on the same merged symbol, as a backend that has not yet
+    // learned to split twins would emit — `normalize` is what performs the split under test.
+    let merged_root = ExtractedSymbol {
+        descriptor: Some(crate_descriptor()),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            ExtractedOccurrence {
+                document_path: "a.rs".to_string(),
+                range: SourceRange::new(0, 0, 0, source_a.len() as u32),
+                role: OccurrenceRole::Definition,
+            },
+            ExtractedOccurrence {
+                document_path: "b.rs".to_string(),
+                range: SourceRange::new(0, 0, 0, source_b.len() as u32),
+                role: OccurrenceRole::Definition,
+            },
+        ],
+    };
+    let alpha = one_occ_symbol(
+        "ext",
+        &[("Alpha", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::External,
+        "a.rs",
+        SourceRange::new(al, ac, al, ac + 5),
+        OccurrenceRole::Reference,
+    );
+    let beta = one_occ_symbol(
+        "ext",
+        &[("Beta", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::External,
+        "b.rs",
+        SourceRange::new(bl, bc, bl, bc + 4),
+        OccurrenceRole::Reference,
+    );
+
+    let raw_index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![
+            SourceDocument {
+                path: "a.rs".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+            SourceDocument {
+                path: "b.rs".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+        ],
+        symbols: vec![merged_root, alpha, beta],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+    };
+    // The normalization pass every backend flows through: splits the merged crate root into two
+    // distinct twin symbols, one per definition document.
+    let index = normalize(raw_index);
+    assert_eq!(
+        index.symbols.iter().filter(|s| s.kind == SymbolKind::Module).count(),
+        2,
+        "the merged crate root split into two distinct module symbols"
+    );
+
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![
+        ("a.rs".to_string(), source_a.to_string()),
+        ("b.rs".to_string(), source_b.to_string()),
+    ];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let roots = store.symbols_by_shortname("crate").unwrap();
+    assert_eq!(roots.len(), 2, "two distinct crate-root symbols persisted: {roots:?}");
+    let a_root = roots
+        .iter()
+        .find(|r| r.document_path.as_deref() == Some("a.rs"))
+        .expect("the a.rs crate root is persisted");
+    let b_root = roots
+        .iter()
+        .find(|r| r.document_path.as_deref() == Some("b.rs"))
+        .expect("the b.rs crate root is persisted");
+
+    let alpha_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("ext", vec![DescriptorSegment::new("Alpha", SegmentKind::Type)]),
+    );
+    let beta_id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("ext", vec![DescriptorSegment::new("Beta", SegmentKind::Type)]),
+    );
+
+    let imports = store.edges(EdgeKind::Imports).unwrap();
+    assert!(
+        imports.contains(&(a_root.canonical_id.clone(), alpha_id.clone())),
+        "a.rs's own crate root imports Alpha: {imports:?}"
+    );
+    assert!(
+        imports.contains(&(b_root.canonical_id.clone(), beta_id.clone())),
+        "b.rs's own crate root imports Beta: {imports:?}"
+    );
+    assert!(
+        !imports.contains(&(a_root.canonical_id.clone(), beta_id)),
+        "a.rs's crate root does not import b.rs's target: {imports:?}"
+    );
+    assert!(
+        !imports.contains(&(b_root.canonical_id.clone(), alpha_id)),
+        "b.rs's crate root does not import a.rs's target: {imports:?}"
+    );
+}
+
+// ---- Duplicated-descriptor disclosure ----
+
+// _(Duplicated descriptors are disclosed — retrievable branch, store surface)_ — a store with a
+// duplicated descriptor's twins returns one group naming the shared descriptor's base and both
+// definitions.
+#[test]
+fn store_duplicated_groups_returns_the_shared_descriptor_and_its_definitions() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let index = duplicate_index();
+    let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let groups = store.duplicated_groups().unwrap();
+    assert_eq!(groups.len(), 1, "one duplicated-descriptor group: {groups:?}");
+    let group = &groups[0];
+    assert_eq!(group.definitions.len(), 2, "both twins listed: {group:?}");
+    for d in &group.definitions {
+        assert_eq!(
+            d.display_name, "Widget",
+            "each group member is a Widget definition: {group:?}"
+        );
+    }
+}
+
+// _(Duplicated descriptors are disclosed — no-duplicates branch, store surface)_ — a store with no
+// duplicated descriptor returns a definite empty set, not a failure.
+#[test]
+fn store_duplicated_groups_is_a_definite_empty_set_without_duplicates() {
+    let store = ingest_fixture();
+    let groups = store.duplicated_groups().unwrap();
+    assert!(
+        groups.is_empty(),
+        "no duplicated descriptors on the standard fixture: {groups:?}"
+    );
+}
+
+// _(Duplicated descriptors are disclosed — collision-vs-duplicate boundary)_ — two DISTINCT
+// descriptors whose canonical base projections collide (same names, different segment kinds) receive
+// `#<rank>` disambiguators from identity projection but are NOT duplicated descriptors: their
+// references attribute normally, and `duplicated_groups` must not report them as twins.
+#[test]
+fn canonical_collision_groups_are_not_reported_as_duplicated_descriptors() {
+    // `m::f` as a Term and `m::f` as a Method: distinct descriptors, identical base projection.
+    let source = "const f: u8 = 1;\nfn f() {}\n";
+    let const_pos = source.find('f').unwrap();
+    let (cl, cc) = line_col(source, const_pos);
+    let fn_pos = source
+        .match_indices('f')
+        .find(|(i, _)| source[..*i].ends_with("fn "))
+        .unwrap()
+        .0;
+    let (fl, fc) = line_col(source, fn_pos);
+
+    let as_term = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "c",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("f", SegmentKind::Term),
+            ],
+        )),
+        kind: SymbolKind::Constant,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: "m.rs".to_string(),
+            range: SourceRange::new(cl, cc, cl, cc + 1),
+            role: OccurrenceRole::Definition,
+        }],
+    };
+    let as_method = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "c",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("f", SegmentKind::Method),
+            ],
+        )),
+        kind: SymbolKind::Method,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: "m.rs".to_string(),
+            range: SourceRange::new(fl, fc, fl, fc + 1),
+            role: OccurrenceRole::Definition,
+        }],
+    };
+
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(
+        &mut store,
+        &ws(),
+        &one_doc_index("m.rs", vec![as_term, as_method]),
+        &src,
+    )
+    .unwrap();
+
+    // Sanity: the pair really collided in projection (both carry a disambiguator) — otherwise this
+    // test would be vacuous.
+    let members = store.symbols_by_shortname("f").unwrap();
+    assert_eq!(members.len(), 2, "both colliding symbols persisted: {members:?}");
+    assert!(
+        members.iter().all(|m| m.canonical_id.as_str().contains('#')),
+        "the canonical collision was disambiguated: {members:?}"
+    );
+
+    // The contract: canonical-collision groups are not duplicated descriptors.
+    let groups = store.duplicated_groups().unwrap();
+    assert!(
+        groups.is_empty(),
+        "a canonical-collision pair must not be reported as a duplicated-descriptor group: {groups:?}"
+    );
 }

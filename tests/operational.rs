@@ -69,7 +69,16 @@ fn status_reports_provenance_freshness_and_alignment() {
     // `status` in JSON, with no live analyzer, echoes the recorded provenance and reports counts.
     // The workspace root has no `.rs` files, so the current hash differs from the built hash and the
     // index reads stale — status still reports the recorded provenance and the alignment counts.
-    let report = run_status(&db, dir.path(), "definitely-not-a-real-analyzer", true, false, false).unwrap();
+    let report = run_status(
+        &db,
+        dir.path(),
+        "definitely-not-a-real-analyzer",
+        true,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
 
     assert!(
         report.contains("rust-analyzer"),
@@ -176,6 +185,8 @@ fn build_n_discrepancy_groups(n: usize) -> (tempfile::TempDir, std::path::PathBu
             encoding: PositionEncoding::Utf8,
         }],
         symbols,
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
@@ -189,7 +200,7 @@ fn build_n_discrepancy_groups(n: usize) -> (tempfile::TempDir, std::path::PathBu
 fn discrepancy_summary_is_truncated_but_totals_cover_the_full_set() {
     let groups = DISCREPANCY_GROUP_CAP + 5;
     let (_dir, db) = build_n_discrepancy_groups(groups);
-    let report = run_status(&db, Path::new("."), "not-a-real-analyzer", true, true, false).unwrap();
+    let report = run_status(&db, Path::new("."), "not-a-real-analyzer", true, true, false, false).unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
 
     let disc = &v["discrepancies"];
@@ -222,7 +233,7 @@ fn discrepancy_summary_is_truncated_but_totals_cover_the_full_set() {
 fn full_listing_returns_every_row() {
     let groups = DISCREPANCY_GROUP_CAP + 5;
     let (_dir, db) = build_n_discrepancy_groups(groups);
-    let report = run_status(&db, Path::new("."), "not-a-real-analyzer", true, false, true).unwrap();
+    let report = run_status(&db, Path::new("."), "not-a-real-analyzer", true, false, true, false).unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
 
     let disc = &v["discrepancies"];
@@ -239,7 +250,7 @@ fn full_listing_returns_every_row() {
 #[test]
 fn summary_group_shape_carries_kind_token_count_and_exemplar() {
     let (_dir, db) = build_n_discrepancy_groups(3);
-    let report = run_status(&db, Path::new("."), "not-a-real-analyzer", true, true, false).unwrap();
+    let report = run_status(&db, Path::new("."), "not-a-real-analyzer", true, true, false, false).unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
 
     let groups = v["discrepancies"]["groups"].as_array().unwrap();
@@ -318,7 +329,7 @@ fn query_refuses_an_incompatible_store_with_guidance() {
     let db = dir.path().join("index.db");
     write_pre_guard_store(&db);
 
-    let err = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false)
+    let err = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false)
         .expect_err("status against an incompatible store must refuse");
 
     // The refusal is the typed guard error, not a storage-level failure leaking through.
@@ -356,7 +367,7 @@ fn matching_version_store_operates_normally() {
     build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
 
     // Read paths operate normally.
-    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false).unwrap();
+    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false).unwrap();
     assert!(report.contains("join_alignment"), "status answers normally: {report}");
     let store = GraphStore::open(&db).unwrap();
     let engine = QueryEngine::new(&store, support::provenance(), content_hash(&sources()));
@@ -390,7 +401,7 @@ fn status_reports_per_rule_acceptance_buckets() {
     let db = dir.path().join("index.db");
     build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
 
-    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false).unwrap();
+    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false).unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
     let alignment = &v["join_alignment"];
 
@@ -422,4 +433,140 @@ fn status_reports_per_rule_acceptance_buckets() {
     for refusal in ["text_mismatch", "semantic_only", "duplicate_ambiguous", "syntax_only"] {
         assert!(alignment[refusal].is_u64(), "{refusal} reported alongside: {report}");
     }
+}
+
+/// An index over two documents, each defining `dupcrate::Widget` under an identical descriptor — a
+/// duplicated-descriptor group with no group-addressed references (the disclosure surface cares only
+/// about the group's shared descriptor and its definitions).
+fn duplicated_group_index() -> ExtractedIndex {
+    let widget = |doc: &str| ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "dupcrate",
+            vec![DescriptorSegment::new("Widget", SegmentKind::Type)],
+        )),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: doc.to_string(),
+            range: SourceRange::new(0, 7, 0, 13),
+            role: OccurrenceRole::Definition,
+        }],
+    };
+    ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![
+            SourceDocument {
+                path: "a.rs".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+            SourceDocument {
+                path: "b.rs".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+        ],
+        symbols: vec![widget("a.rs"), widget("b.rs")],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+    }
+}
+
+// _(Duplicated descriptors are disclosed — retrievable branch)_ — a build with a duplicated
+// descriptor discloses the group count in the summary and, with `--duplicates`, the group's shared
+// descriptor and member definitions.
+#[test]
+fn duplicated_groups_are_retrievable_with_descriptor_and_definitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let a_source = "struct Widget;\n";
+    let b_source = "struct Widget;\n";
+    build_from_index(
+        &db,
+        "op-ws",
+        &duplicated_group_index(),
+        &[
+            ("a.rs".to_string(), a_source.to_string()),
+            ("b.rs".to_string(), b_source.to_string()),
+        ],
+    )
+    .unwrap();
+
+    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, true).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+    assert_eq!(
+        v["duplicated_descriptors"]["group_count"].as_u64(),
+        Some(1),
+        "the summary discloses one duplicated group: {report}"
+    );
+    let groups = v["duplicated_descriptors"]["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "one group detail returned: {report}");
+    let group = &groups[0];
+    let defs = group["definitions"].as_array().unwrap();
+    assert_eq!(
+        defs.len(),
+        2,
+        "both definitions sharing the descriptor are listed: {group}"
+    );
+    let docs: std::collections::HashSet<&str> = defs.iter().map(|d| d["document_path"].as_str().unwrap()).collect();
+    assert_eq!(
+        docs,
+        std::collections::HashSet::from(["a.rs", "b.rs"]),
+        "each definition's own document is disclosed: {group}"
+    );
+}
+
+// _(Duplicated descriptors are disclosed — no-duplicates branch)_ — a build with no duplicated
+// descriptor discloses a definite zero group count, distinct from an unavailable answer.
+#[test]
+fn no_duplicates_is_a_definite_zero_group_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+
+    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, true).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+    assert_eq!(
+        v["duplicated_descriptors"]["group_count"].as_u64(),
+        Some(0),
+        "a definite zero, not a missing field: {report}"
+    );
+    assert_eq!(
+        v["duplicated_descriptors"]["groups"].as_array().unwrap().len(),
+        0,
+        "an explicit empty set of groups: {report}"
+    );
+}
+
+// _(Duplicated descriptors are disclosed — summary surface)_ — the duplicated-group count is present
+// in `status` JSON even without the `--duplicates` detail flag.
+#[test]
+fn status_json_always_carries_the_duplicated_group_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let a_source = "struct Widget;\n";
+    let b_source = "struct Widget;\n";
+    build_from_index(
+        &db,
+        "op-ws",
+        &duplicated_group_index(),
+        &[
+            ("a.rs".to_string(), a_source.to_string()),
+            ("b.rs".to_string(), b_source.to_string()),
+        ],
+    )
+    .unwrap();
+
+    // No --duplicates flag: the count is still present, but not the per-group detail.
+    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(
+        v["duplicated_descriptors"]["group_count"].as_u64(),
+        Some(1),
+        "the group count is always disclosed alongside the join-outcome counts: {report}"
+    );
+    assert!(
+        v["duplicated_descriptors"].get("groups").is_none(),
+        "per-group detail is withheld without --duplicates: {report}"
+    );
 }

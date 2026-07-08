@@ -80,6 +80,10 @@ pub struct SymbolRow {
     pub span: Option<(usize, usize)>,
     /// The exact source text of the definition span, if any.
     pub span_text: Option<String>,
+    /// Whether this symbol is a true same-descriptor twin: an in-workspace definition whose
+    /// identical resolved descriptor is shared by at least one other definition. Distinct
+    /// descriptors whose canonical projections merely collide are not duplicated.
+    pub duplicated: bool,
 }
 
 /// A persisted occurrence row.
@@ -94,10 +98,14 @@ pub struct OccurrenceRow {
     /// The role tag (`definition` or `reference`).
     pub role: String,
     /// The alignment rule that accepted the attribution (`exact`, `crate_root`, `operator_desugar`,
-    /// or `module_span`) — its provenance.
+    /// `module_span`, or `self_keyword`) — its provenance.
     pub rule: String,
     /// The nearest enclosing persisted declaration, if attributed.
     pub enclosing_id: Option<CanonicalId>,
+    /// The locality rule (`defining_document` or `module_chain`) that selected this attribution's
+    /// twin, for an occurrence resolved from a duplicated descriptor's group; `None` for an ordinary
+    /// (non-duplicated) attribution.
+    pub locality: Option<String>,
 }
 
 /// The maximum number of `found_text` bytes persisted per discrepancy row.
@@ -180,6 +188,22 @@ impl DiscrepancySummary {
     pub fn truncated(&self) -> bool {
         self.total_groups > self.groups.len() as u64
     }
+}
+
+/// A duplicated-descriptor group: the shared descriptor's canonical base and the persisted
+/// definitions that share it.
+///
+/// Derived at query time from the persisted symbols table (design.md: "derived, not separately
+/// persisted"): members are the symbols marked `duplicated` at ingest — true same-descriptor twins,
+/// never canonical-projection collisions of distinct descriptors — grouped by their identity with
+/// the `#<rank>` disambiguator stripped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicatedGroup {
+    /// The shared descriptor's canonical base (the identity with its `#<rank>` suffix stripped).
+    pub descriptor_base: String,
+    /// The definitions that share the descriptor, ordered by canonical identity (their disambiguator
+    /// rank).
+    pub definitions: Vec<SymbolRow>,
 }
 
 /// The recorded index metadata.
@@ -301,9 +325,28 @@ impl GraphStore {
         Ok(Self { conn })
     }
 
-    /// A mutable transaction handle over the connection.
-    pub fn transaction(&mut self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        self.conn.transaction()
+    /// Begin the single transaction a build's writes run inside.
+    ///
+    /// The returned guard rolls the transaction back on drop unless committed, so a failed build
+    /// never leaves the store half-cleared or half-written — the prior build stays authoritative
+    /// wholesale. Uses an unchecked transaction so the store's `&self` write methods remain callable
+    /// while the guard is alive (every statement on the connection joins the open transaction).
+    pub fn begin_build(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.conn.unchecked_transaction()
+    }
+
+    /// Delete every derived row — occurrences, edges, discrepancies, then symbols — so the running
+    /// build wholly supersedes the prior one.
+    ///
+    /// Children first: `occurrences` and `edges` carry foreign keys into `symbols`. Meant to run
+    /// inside [`Self::begin_build`]'s transaction; `index_metadata` is not touched (its single row is
+    /// replaced by [`Self::write_metadata`]).
+    pub fn clear_derived(&self) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM occurrences", [])?;
+        self.conn.execute("DELETE FROM edges", [])?;
+        self.conn.execute("DELETE FROM join_discrepancies", [])?;
+        self.conn.execute("DELETE FROM symbols", [])?;
+        Ok(())
     }
 
     /// Replace the index metadata row with the given build's metadata.
@@ -374,8 +417,8 @@ impl GraphStore {
     pub fn insert_symbol(&self, row: &SymbolRow) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO symbols
-                (canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 row.canonical_id.as_str(),
                 row.display_name,
@@ -385,6 +428,7 @@ impl GraphStore {
                 row.span.map(|s| s.0 as i64),
                 row.span.map(|s| s.1 as i64),
                 row.span_text,
+                row.duplicated as i64,
             ],
         )?;
         Ok(())
@@ -394,8 +438,8 @@ impl GraphStore {
     pub fn insert_occurrence(&self, row: &OccurrenceRow) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO occurrences
-                (symbol_id, document_path, span_start, span_end, role, rule, enclosing_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (symbol_id, document_path, span_start, span_end, role, rule, enclosing_id, locality)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 row.symbol_id.as_str(),
                 row.document_path,
@@ -404,6 +448,7 @@ impl GraphStore {
                 row.role,
                 row.rule,
                 row.enclosing_id.as_ref().map(|e| e.as_str().to_string()),
+                row.locality,
             ],
         )?;
         Ok(())
@@ -421,34 +466,30 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Wholly replace the join-discrepancy detail with `rows`, atomically.
+    /// Insert the build's join-discrepancy detail rows.
     ///
-    /// The prior build's rows are deleted and the new set inserted inside one transaction, so a
-    /// concurrent reader sees either the old set or the new one, never a mix, and no stale rows
-    /// survive a rebuild. Each `found_text` is truncated to [`FOUND_TEXT_MAX_BYTES`] on a UTF-8
-    /// boundary before persistence.
-    pub fn rewrite_discrepancies(&mut self, rows: &[DiscrepancyRow]) -> rusqlite::Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM join_discrepancies", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO join_discrepancies
-                    (document_path, span_start, span_end, outcome, expected_name, found_text)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )?;
-            for row in rows {
-                let found = row.found_text.as_deref().map(truncate_on_boundary);
-                stmt.execute(params![
-                    row.document_path,
-                    row.span.map(|s| s.0 as i64),
-                    row.span.map(|s| s.1 as i64),
-                    row.outcome,
-                    row.expected_name,
-                    found,
-                ])?;
-            }
+    /// The prior build's rows are removed by [`Self::clear_derived`], and atomicity — a reader sees
+    /// either the old build's set or the new one, never a mix — comes from the surrounding
+    /// [`Self::begin_build`] transaction. Each `found_text` is truncated to
+    /// [`FOUND_TEXT_MAX_BYTES`] on a UTF-8 boundary before persistence.
+    pub fn insert_discrepancies(&self, rows: &[DiscrepancyRow]) -> rusqlite::Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO join_discrepancies
+                (document_path, span_start, span_end, outcome, expected_name, found_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for row in rows {
+            let found = row.found_text.as_deref().map(truncate_on_boundary);
+            stmt.execute(params![
+                row.document_path,
+                row.span.map(|s| s.0 as i64),
+                row.span.map(|s| s.1 as i64),
+                row.outcome,
+                row.expected_name,
+                found,
+            ])?;
         }
-        tx.commit()
+        Ok(())
     }
 
     /// The bounded discrepancy summary: groups by `(outcome, expected_name)` ordered by descending
@@ -542,7 +583,7 @@ impl GraphStore {
     pub fn symbol(&self, id: &CanonicalId) -> rusqlite::Result<Option<SymbolRow>> {
         self.conn
             .query_row(
-                "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text
+                "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
                  FROM symbols WHERE canonical_id = ?1",
                 params![id.as_str()],
                 Self::map_symbol,
@@ -565,13 +606,14 @@ impl GraphStore {
             document_path: r.get(4)?,
             span,
             span_text: r.get(7)?,
+            duplicated: r.get::<_, i64>(8)? != 0,
         })
     }
 
     /// All symbols whose display name equals `shortname`.
     pub fn symbols_by_shortname(&self, shortname: &str) -> rusqlite::Result<Vec<SymbolRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text
+            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
              FROM symbols WHERE display_name = ?1 ORDER BY canonical_id",
         )?;
         let rows = stmt.query_map(params![shortname], Self::map_symbol)?;
@@ -583,7 +625,7 @@ impl GraphStore {
     pub fn symbols_by_qualified_suffix(&self, qualified: &str) -> rusqlite::Result<Vec<SymbolRow>> {
         let suffix = format!("::{qualified}");
         let mut stmt = self.conn.prepare(
-            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text
+            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
              FROM symbols
              WHERE canonical_id = ?1 OR canonical_id LIKE ?2 ESCAPE '\\'
              ORDER BY canonical_id",
@@ -593,10 +635,45 @@ impl GraphStore {
         rows.collect()
     }
 
+    /// The duplicated-descriptor groups the build encountered: symbols marked `duplicated` at ingest
+    /// (true same-descriptor twins, under the two-definition quorum), grouped by their canonical
+    /// identity with the `#<rank>` disambiguator stripped (the shared descriptor's base).
+    ///
+    /// The `duplicated` mark is what distinguishes real twins from canonical-projection collisions:
+    /// two DISTINCT descriptors whose base projections happen to collide also carry `#<rank>`
+    /// suffixes, but they are not duplicated descriptors — their references attribute normally — and
+    /// they are never reported here.
+    ///
+    /// A definite empty set (`Vec::new()`) when no duplicated descriptor was observed, distinct from
+    /// a query failure.
+    pub fn duplicated_groups(&self) -> rusqlite::Result<Vec<DuplicatedGroup>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
+             FROM symbols WHERE class = 'in_workspace' AND duplicated = 1 ORDER BY canonical_id",
+        )?;
+        let rows: Vec<SymbolRow> = stmt.query_map([], Self::map_symbol)?.collect::<rusqlite::Result<_>>()?;
+
+        let mut by_base: std::collections::BTreeMap<String, Vec<SymbolRow>> = std::collections::BTreeMap::new();
+        for row in rows {
+            if let Some(base) = disambiguator_base(row.canonical_id.as_str()) {
+                by_base.entry(base).or_default().push(row);
+            }
+        }
+
+        Ok(by_base
+            .into_iter()
+            .filter(|(_, members)| members.len() > 1)
+            .map(|(descriptor_base, definitions)| DuplicatedGroup {
+                descriptor_base,
+                definitions,
+            })
+            .collect())
+    }
+
     /// The occurrences of a symbol, ordered deterministically.
     pub fn occurrences_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<OccurrenceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id
+            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id, locality
              FROM occurrences WHERE symbol_id = ?1
              ORDER BY document_path, span_start, span_end",
         )?;
@@ -612,6 +689,7 @@ impl GraphStore {
             role: r.get(4)?,
             rule: r.get(5)?,
             enclosing_id: r.get::<_, Option<String>>(6)?.map(CanonicalId::from_raw),
+            locality: r.get(7)?,
         })
     }
 
@@ -626,7 +704,7 @@ impl GraphStore {
     ) -> rusqlite::Result<Option<SymbolRow>> {
         self.conn
             .query_row(
-                "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text
+                "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
                  FROM symbols
                  WHERE document_path = ?1 AND span_start IS NOT NULL
                    AND span_start <= ?2 AND ?2 < span_end
@@ -741,7 +819,7 @@ impl GraphStore {
     /// Every reference-role occurrence of `id`, ordered deterministically.
     pub fn references_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<OccurrenceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id
+            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id, locality
              FROM occurrences WHERE symbol_id = ?1 AND role = 'reference'
              ORDER BY document_path, span_start, span_end",
         )?;
@@ -785,6 +863,21 @@ fn remove_store_files(path: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The descriptor base of a canonical identity: the identity with a trailing `#<digits>`
+/// disambiguator stripped, or `None` when the identity carries no disambiguator.
+///
+/// [`project_all`](crate::identity::project_all) appends `#<rank>` only to members of an observed
+/// collision group, so this recovers exactly the shared base a duplicated-descriptor group formed
+/// under.
+fn disambiguator_base(canonical_id: &str) -> Option<String> {
+    let (base, rank) = canonical_id.rsplit_once('#')?;
+    if !rank.is_empty() && rank.bytes().all(|b| b.is_ascii_digit()) {
+        Some(base.to_string())
+    } else {
+        None
+    }
 }
 
 /// Truncate `s` to at most [`FOUND_TEXT_MAX_BYTES`] bytes, cutting on a UTF-8 character boundary so

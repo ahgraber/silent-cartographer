@@ -161,11 +161,10 @@ pub fn ingest(
     }
 
     // The module symbol defined in each document, so a module-scope reference has a real importer.
-    // rust-analyzer emits one shared module symbol for every crate root (the bin, the lib, each
-    // `tests/*.rs` file), each with its own definition occurrence in its own document — so this maps
-    // every document containing an aligned module definition to that module's identity, not just the
-    // first one `def_name_span` happened to keep. First-wins per document (a document defining more
-    // than one module is not a real shape) is fine.
+    // With duplicate crate roots split into distinct symbols upstream, each module symbol (including
+    // each crate root) has exactly one defining document, so this is the plain single-document
+    // mapping: every document containing an aligned module definition maps to that module's own
+    // identity.
     let mut module_by_doc: HashMap<String, CanonicalId> = HashMap::new();
     for aligned in &join_result.aligned {
         if aligned.role == OccurrenceRole::Definition && module_ids.contains(&aligned.symbol) {
@@ -174,6 +173,28 @@ pub fn ingest(
                 .or_insert_with(|| aligned.symbol.clone());
         }
     }
+
+    // True same-descriptor twins: descriptors shared by two or more persisted, definition-bearing
+    // symbols (the two-definition quorum). This marks real duplicates only — two DISTINCT descriptors
+    // whose canonical projections collide are disambiguated by identity projection but are not
+    // duplicated descriptors, and must not be disclosed as such.
+    let mut definition_count_by_descriptor: HashMap<&crate::identity::Descriptor, usize> = HashMap::new();
+    for (idx, sym) in index.symbols.iter().enumerate() {
+        let Some(Some(_)) = identities.get(idx) else {
+            continue;
+        };
+        if sym.definition().is_some()
+            && let Some(descriptor) = &sym.descriptor
+        {
+            *definition_count_by_descriptor.entry(descriptor).or_default() += 1;
+        }
+    }
+
+    // Every write below runs inside one transaction: the prior build's derived rows are wholly
+    // superseded (a same-version rebuild never accumulates or leaves stale rows), and the guard
+    // rolls everything back on a failed build, so the store always holds exactly one whole build.
+    let tx = store.begin_build()?;
+    store.clear_derived()?;
 
     for (idx, sym) in index.symbols.iter().enumerate() {
         let Some(Some(id)) = identities.get(idx) else {
@@ -184,6 +205,11 @@ pub fn ingest(
             SymbolClass::External => PersistedClass::External,
             _ => PersistedClass::InWorkspace,
         };
+        let duplicated = sym.definition().is_some()
+            && sym
+                .descriptor
+                .as_ref()
+                .is_some_and(|d| definition_count_by_descriptor.get(d).copied().unwrap_or(0) > 1);
         let (document_path, span, span_text) = definition_span(sym, id, &def_name_span, &source_map);
         store.insert_symbol(&SymbolRow {
             canonical_id: id.clone(),
@@ -193,6 +219,7 @@ pub fn ingest(
             document_path,
             span,
             span_text,
+            duplicated,
         })?;
     }
 
@@ -224,6 +251,7 @@ pub fn ingest(
             role: role.to_string(),
             rule: aligned.rule.tag().to_string(),
             enclosing_id,
+            locality: aligned.locality.map(|l| l.tag().to_string()),
         })?;
     }
 
@@ -299,11 +327,9 @@ pub fn ingest(
     }
 
     // Persist the inspectable detail behind every non-aligned outcome (text-mismatch, semantic-only,
-    // and duplicate-ambiguous), wholly superseding the prior build's rows in one transaction. A span
-    // whose coordinates could not normalize is persisted as typed absence, never a fabricated
-    // location. This rewrite happens before the metadata publish below, so the metadata commit is
-    // the final write of a build: a crash mid-build leaves the prior metadata authoritative, and
-    // fresh metadata can never coexist with stale discrepancy rows.
+    // and duplicate-ambiguous). A span whose coordinates could not normalize is persisted as typed
+    // absence, never a fabricated location. The prior build's rows were removed by `clear_derived`
+    // at the start of the build transaction.
     let discrepancies: Vec<DiscrepancyRow> = join_result
         .unaligned
         .iter()
@@ -315,7 +341,7 @@ pub fn ingest(
             found_text: occ.found_text.clone(),
         })
         .collect();
-    store.rewrite_discrepancies(&discrepancies)?;
+    store.insert_discrepancies(&discrepancies)?;
 
     store.write_metadata(&IndexMetadata {
         workspace_id: workspace.clone(),
@@ -323,6 +349,10 @@ pub fn ingest(
         content_hash: content,
         accounting: join_result.accounting,
     })?;
+
+    // The single commit publishes the whole build atomically: a crash anywhere above rolls back to
+    // the prior build wholesale, so fresh metadata can never coexist with another build's rows.
+    tx.commit()?;
 
     Ok(join_result.accounting)
 }

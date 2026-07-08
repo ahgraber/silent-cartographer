@@ -133,6 +133,7 @@ pub fn build_from_index(
 
 /// `status`: report provenance, freshness, and the join-alignment counts. With `discrepancies`, add
 /// the bounded grouped discrepancy summary; with `all`, add every persisted discrepancy row instead.
+/// With `duplicates`, add the duplicated-descriptor group detail; the group count is always reported.
 pub fn run_status(
     db: &Path,
     root: &Path,
@@ -140,6 +141,7 @@ pub fn run_status(
     json: bool,
     discrepancies: bool,
     all: bool,
+    duplicates: bool,
 ) -> Result<String> {
     let store = GraphStore::open(db).context("opening index database")?;
     let Some(meta) = store.read_metadata()? else {
@@ -147,6 +149,7 @@ pub fn run_status(
     };
     let (provenance, hash) = current_state(&store, root, rust_analyzer)?;
     let freshness = store.freshness(&hash, &provenance)?.expect("metadata present");
+    let duplicated_groups = store.duplicated_groups()?;
 
     let mut report = serde_json::json!({
         "workspace": meta.workspace_id.as_str(),
@@ -175,7 +178,34 @@ pub fn run_status(
             "duplicate_ambiguous": meta.accounting.duplicate_ambiguous,
             "syntax_only": meta.accounting.syntax_only,
         },
+        "duplicated_descriptors": {
+            "group_count": duplicated_groups.len(),
+        },
     });
+
+    if duplicates {
+        report["duplicated_descriptors"]["groups"] = serde_json::json!(
+            duplicated_groups
+                .iter()
+                .map(|g| {
+                    serde_json::json!({
+                        "descriptor_base": g.descriptor_base,
+                        "definitions": g
+                            .definitions
+                            .iter()
+                            .map(|d| {
+                                serde_json::json!({
+                                    "canonical_id": d.canonical_id.as_str(),
+                                    "display_name": d.display_name,
+                                    "document_path": d.document_path,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
 
     if all {
         let rows = store.all_discrepancies()?;

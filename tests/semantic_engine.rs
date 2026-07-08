@@ -5,6 +5,7 @@ mod support;
 
 use std::path::Path;
 
+use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind};
 use silent_cartographer::semantic::conformance;
 use silent_cartographer::semantic::fixture::FixtureEngine;
 use silent_cartographer::semantic::model::{
@@ -75,6 +76,8 @@ fn non_conformant_backend_is_rejected() {
                 role: Definition,
             }],
         }],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     };
     let engine = FixtureEngine::new(broken);
     let report = conformance::run(&engine, Path::new("."));
@@ -141,6 +144,87 @@ fn live_updates_capability_is_queryable() {
         !batch.capabilities().live_updates(),
         "undeclared live-updates is explicit absence"
     );
+}
+
+// _(Same-descriptor definitions extracted as distinct symbols)_ — a backend that merges two
+// definitions under one descriptor has them split when its output is taken through the backend
+// contract (`analyze`), not only when `normalize` is called directly: the port-boundary wiring
+// carries the contract for every backend. The fixture backend stands in for any SCIP adapter here.
+#[test]
+fn merged_twins_are_split_through_the_backend_contract() {
+    let descriptor = Descriptor::new("c", vec![DescriptorSegment::new("Widget", SegmentKind::Type)]);
+    let occ = |path: &str, line: u32, role: OccurrenceRole| ExtractedOccurrence {
+        document_path: path.to_string(),
+        range: SourceRange::new(line, 0, line, 1),
+        role,
+    };
+    // One symbol carrying two definitions (the merged shape a raw adapter produces) plus a reference.
+    let merged = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![
+            SourceDocument {
+                path: "a.rs".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+            SourceDocument {
+                path: "b.rs".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+        ],
+        symbols: vec![ExtractedSymbol {
+            descriptor: Some(descriptor.clone()),
+            kind: SymbolKind::Type,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![
+                occ("a.rs", 0, Definition),
+                occ("b.rs", 0, Definition),
+                occ("a.rs", 1, Reference),
+            ],
+        }],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+    };
+
+    // Take the index through the backend contract surface, exactly as ingestion does.
+    let engine = FixtureEngine::new(merged);
+    let extracted = engine.analyze(Path::new(".")).expect("fixture backend analyzes");
+
+    // The twins arrive split — one symbol per definition, each anchored at its own location, neither
+    // carrying the reference.
+    assert_eq!(
+        extracted.symbols.len(),
+        2,
+        "one symbol per definition through the contract"
+    );
+    let mut docs: Vec<&str> = extracted
+        .symbols
+        .iter()
+        .map(|s| {
+            s.definition()
+                .expect("each twin keeps its definition")
+                .document_path
+                .as_str()
+        })
+        .collect();
+    docs.sort();
+    assert_eq!(docs, vec!["a.rs", "b.rs"], "twins anchored at their own definitions");
+    for twin in &extracted.symbols {
+        assert!(
+            twin.occurrences.iter().all(|o| o.role == Definition),
+            "no twin carries a reference through the contract"
+        );
+    }
+
+    // The reference survives in the group-addressed collection, assigned to no single twin.
+    assert_eq!(
+        extracted.duplicate_groups.len(),
+        1,
+        "one group for the duplicated descriptor"
+    );
+    let group = &extracted.duplicate_groups[0];
+    assert_eq!(group.descriptor, descriptor);
+    assert_eq!(group.occurrences.len(), 1, "the reference moved to the group");
+    assert!(group.occurrences.iter().all(|o| o.role == Reference));
 }
 
 /// Build the exemplar SCIP index (mirroring `support::SOURCE`) as `scip::types::Index`.

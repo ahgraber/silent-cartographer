@@ -135,5 +135,7 @@ pub fn fixture_index() -> ExtractedIndex {
             encoding: PositionEncoding::Utf8,
         }],
         symbols: vec![module, client, connect, disconnect, open],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
     }
 }

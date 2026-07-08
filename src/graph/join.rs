@@ -19,13 +19,16 @@
 //! Duplicate-ambiguous is the calibration guard against the semantic backend's true-duplicate defect:
 //! when more than one distinct definition shares an identical resolved descriptor, the backend cannot
 //! say which twin a reference means. Each definition occurrence still attaches to the definition at
-//! its own location (co-location), but every non-definition occurrence of such a descriptor is typed
+//! its own location (co-location); a non-definition occurrence of such a descriptor is attributed to a
+//! twin only when a locality rule selects it uniquely — the occurrence sits in that twin's own
+//! defining document, or in a document reachable only through that twin's module tree — and it still
+//! passes the ordinary alignment rules; an occurrence no locality rule settles is typed
 //! duplicate-ambiguous and attributed to no twin, rather than silently misassigned.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::identity::CanonicalId;
-use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SymbolKind};
+use crate::identity::{CanonicalId, Descriptor};
+use crate::semantic::model::{ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, SymbolKind};
 
 use super::range::{ByteSpan, LineIndex, range_to_span};
 use super::syntax::{ConstructAt, SyntaxDeclaration, SyntaxTree};
@@ -58,6 +61,32 @@ impl AlignmentRule {
             AlignmentRule::OperatorDesugar => "operator_desugar",
             AlignmentRule::ModuleSpan => "module_span",
             AlignmentRule::SelfKeyword => "self_keyword",
+        }
+    }
+}
+
+/// The locality rule that selected a duplicated descriptor's twin for a group reference occurrence.
+/// Stored as additional provenance alongside the [`AlignmentRule`] on an attribution derived from a
+/// duplicate group; `None` for an attribution not derived from a duplicate group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalityRule {
+    /// The occurrence's document is the definition document of exactly one twin.
+    DefiningDocument,
+    /// The occurrence's document belongs to exactly one twin's module tree.
+    ModuleChain,
+    /// The occurrence's source token spells the package's own name, which denotes the package's
+    /// library target regardless of the containing document; the twin defined at the library
+    /// target's root — per the build system's authoritative target description — is selected.
+    TargetMetadata,
+}
+
+impl LocalityRule {
+    /// The stored tag for this rule.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            LocalityRule::DefiningDocument => "defining_document",
+            LocalityRule::ModuleChain => "module_chain",
+            LocalityRule::TargetMetadata => "target_metadata",
         }
     }
 }
@@ -103,6 +132,9 @@ pub struct AlignedOccurrence {
     pub role: OccurrenceRole,
     /// The alignment rule that accepted this attribution (its provenance).
     pub rule: AlignmentRule,
+    /// The locality rule that selected this attribution's twin, for an occurrence resolved from a
+    /// duplicated descriptor's group; `None` for an ordinary (non-duplicated) attribution.
+    pub locality: Option<LocalityRule>,
     /// For a reference occurrence, the enclosing declaration chain (innermost first); empty means
     /// the enclosing construct is the module/file itself (the outermost attribution).
     pub enclosing: Vec<SyntaxDeclaration>,
@@ -336,6 +368,7 @@ pub fn join(index: &ExtractedIndex, corpus: &SourceCorpus, identities: &[Option<
                         name_span: matched_span,
                         role: occ.role,
                         rule,
+                        locality: None,
                         enclosing,
                     });
                 }
@@ -384,6 +417,143 @@ pub fn join(index: &ExtractedIndex, corpus: &SourceCorpus, identities: &[Option<
         }
     }
 
+    // Group-addressed occurrences of duplicated descriptors: locality selects a unique twin, then the
+    // occurrence still runs the ordinary alignment rules against that twin's expected name.
+    let twins_by_descriptor = twin_symbols_by_descriptor(index, identities);
+    let parent_of = parent_document_map(index, &prepared);
+    for group in &index.duplicate_groups {
+        // The identity the group's own discrepancies are surfaced under: the twins' shared base
+        // (their identity with the `#<rank>` disambiguator stripped), so inspection sees which
+        // descriptor group an ambiguity belongs to.
+        let group_identity = group_base_identity(
+            &group.descriptor,
+            twins_by_descriptor.get(&group.descriptor).map(Vec::as_slice),
+            index,
+            identities,
+        );
+        let Some(twins) = twins_by_descriptor.get(&group.descriptor) else {
+            // No persisted twins for this descriptor (e.g. the caller chose not to persist them):
+            // nothing to attribute to, so every occurrence is duplicate-ambiguous.
+            for occ in &group.occurrences {
+                record_group_ambiguous(
+                    occ,
+                    group,
+                    &group_identity,
+                    &prepared,
+                    index,
+                    &mut accounting,
+                    &mut unaligned,
+                );
+            }
+            continue;
+        };
+        let expected_name = group.descriptor.terminal_name().unwrap_or_default();
+
+        for occ in &group.occurrences {
+            // Normalize the occurrence's location up front: the package-name check must read the
+            // source token, and the alignment rules need the byte span.
+            let doc = prepared.get(&occ.document_path);
+            let span = doc.and_then(|d| {
+                let encoding = index
+                    .encoding_for(&occ.document_path)
+                    .expect("document has an encoding");
+                range_to_span(d.tree.source(), &d.line_index, occ.range, encoding)
+            });
+
+            // Package-name resolution via build-target metadata (design.md, 2026-07-07 second
+            // amendment): a token spelling the package's own name denotes the package's library
+            // target no matter which document it sits in, so containing-document locality is never
+            // consulted for it. The library twin comes from the build system's authoritative target
+            // description (`library_roots`); when that is unavailable, or names no persisted twin,
+            // the occurrence degrades to the typed duplicate-ambiguous refusal — honesty, never a
+            // guess. The token comparison reuses the crate-root rule's normalization; the
+            // terminal-name guard keeps this path off groups whose own name spells the package
+            // name. Scoped to duplicated groups only — a unique crate root's package-name reference
+            // still aligns through the ordinary join.
+            if let Some(d) = doc
+                && let Some(span) = span
+                && let Some(name_span) = d.tree.name_node_containing(span)
+                && let Some(token) = d.tree.text_at(name_span)
+                && token != expected_name
+                && package_matches(token, &group.descriptor.package)
+            {
+                let library_twin = index
+                    .library_roots
+                    .get(&group.descriptor.package)
+                    .and_then(|root| twins.iter().find(|(_, _, def_doc)| *def_doc == root.as_str()));
+                match library_twin {
+                    Some((twin_symbol, identity, _)) => join_group_occurrence(
+                        occ,
+                        twin_symbol,
+                        identity,
+                        LocalityRule::TargetMetadata,
+                        span,
+                        d,
+                        expected_name,
+                        &mut accounting,
+                        &mut aligned,
+                        &mut unaligned,
+                        &mut aligned_name_spans,
+                    ),
+                    None => record_group_ambiguous(
+                        occ,
+                        group,
+                        &group_identity,
+                        &prepared,
+                        index,
+                        &mut accounting,
+                        &mut unaligned,
+                    ),
+                }
+                continue;
+            }
+
+            let selection = select_twin(&occ.document_path, twins, &parent_of);
+            let Some((twin_symbol, identity, locality)) = selection else {
+                record_group_ambiguous(
+                    occ,
+                    group,
+                    &group_identity,
+                    &prepared,
+                    index,
+                    &mut accounting,
+                    &mut unaligned,
+                );
+                continue;
+            };
+
+            let (Some(d), Some(span)) = (doc, span) else {
+                // No source for the document, or coordinates that could not normalize onto it:
+                // semantic-only, keyed to the locality-selected twin.
+                accounting.semantic_only += 1;
+                unaligned.push(UnalignedOccurrence {
+                    symbol: identity.clone(),
+                    document_path: occ.document_path.clone(),
+                    role: occ.role,
+                    outcome: JoinOutcome::SemanticOnly,
+                    span: None,
+                    expected_name: expected_name.to_string(),
+                    found_text: None,
+                });
+                continue;
+            };
+
+            join_group_occurrence(
+                occ,
+                twin_symbol,
+                identity,
+                locality,
+                span,
+                d,
+                expected_name,
+                &mut accounting,
+                &mut aligned,
+                &mut unaligned,
+                &mut aligned_name_spans,
+            );
+        }
+    }
+
     // Syntax-only: declarations in a parsed document whose name node no aligned occurrence matched.
     for (path, doc) in &prepared {
         let matched = aligned_name_spans.get(path).cloned().unwrap_or_default();
@@ -398,6 +568,285 @@ pub fn join(index: &ExtractedIndex, corpus: &SourceCorpus, identities: &[Option<
         aligned,
         unaligned,
         accounting,
+    }
+}
+
+/// Record one group occurrence as duplicate-ambiguous: no locality rule selected a unique twin. The
+/// occurrence's location is still recorded (normalized when the source is available) so the ambiguity
+/// is inspectable, exactly as the prior unconditional-refusal path did.
+/// Run one group-addressed occurrence, its twin already selected by a locality rule, through the
+/// ordinary alignment rules: locality selects the target, it never overrides a text refusal — the
+/// occurrence is accepted or refused exactly as it would be for a non-duplicated symbol, with the
+/// selecting locality rule recorded as provenance on an acceptance.
+#[allow(clippy::too_many_arguments)] // the join's shared sinks (accounting, aligned, unaligned, span map) travel together
+fn join_group_occurrence(
+    occ: &ExtractedOccurrence,
+    twin_symbol: &ExtractedSymbol,
+    identity: &CanonicalId,
+    locality: LocalityRule,
+    span: ByteSpan,
+    doc: &PreparedDocument,
+    expected_name: &str,
+    accounting: &mut JoinAccounting,
+    aligned: &mut Vec<AlignedOccurrence>,
+    unaligned: &mut Vec<UnalignedOccurrence>,
+    aligned_name_spans: &mut HashMap<String, Vec<ByteSpan>>,
+) {
+    match evaluate_rules(twin_symbol, occ.role, span, expected_name, &doc.tree) {
+        Some((rule, matched_span)) => {
+            accounting.accept(rule);
+            let enclosing = doc.tree.enclosing_declarations(span.start);
+            aligned_name_spans
+                .entry(occ.document_path.clone())
+                .or_default()
+                .push(matched_span);
+            aligned.push(AlignedOccurrence {
+                symbol: identity.clone(),
+                document_path: occ.document_path.clone(),
+                name_span: matched_span,
+                role: occ.role,
+                rule,
+                locality: Some(locality),
+                enclosing,
+            });
+        }
+        None => match doc.tree.name_node_containing(span) {
+            Some(name_span) => {
+                accounting.text_mismatch += 1;
+                unaligned.push(UnalignedOccurrence {
+                    symbol: identity.clone(),
+                    document_path: occ.document_path.clone(),
+                    role: occ.role,
+                    outcome: JoinOutcome::TextMismatch,
+                    span: Some(name_span),
+                    expected_name: expected_name.to_string(),
+                    found_text: doc.tree.text_at(name_span).map(str::to_string),
+                });
+            }
+            None if doc.tree.has_construct_at(span) => {
+                accounting.text_mismatch += 1;
+                unaligned.push(UnalignedOccurrence {
+                    symbol: identity.clone(),
+                    document_path: occ.document_path.clone(),
+                    role: occ.role,
+                    outcome: JoinOutcome::TextMismatch,
+                    span: Some(span),
+                    expected_name: expected_name.to_string(),
+                    found_text: doc.tree.text_at(span).map(str::to_string),
+                });
+            }
+            None => {
+                accounting.semantic_only += 1;
+                unaligned.push(UnalignedOccurrence {
+                    symbol: identity.clone(),
+                    document_path: occ.document_path.clone(),
+                    role: occ.role,
+                    outcome: JoinOutcome::SemanticOnly,
+                    span: Some(span),
+                    expected_name: expected_name.to_string(),
+                    found_text: None,
+                });
+            }
+        },
+    }
+}
+
+fn record_group_ambiguous(
+    occ: &ExtractedOccurrence,
+    group: &crate::semantic::model::DuplicateGroup,
+    group_identity: &CanonicalId,
+    prepared: &HashMap<String, PreparedDocument>,
+    index: &ExtractedIndex,
+    accounting: &mut JoinAccounting,
+    unaligned: &mut Vec<UnalignedOccurrence>,
+) {
+    accounting.duplicate_ambiguous += 1;
+    let span = prepared.get(&occ.document_path).and_then(|doc| {
+        let encoding = index
+            .encoding_for(&occ.document_path)
+            .expect("document has an encoding");
+        range_to_span(doc.tree.source(), &doc.line_index, occ.range, encoding)
+    });
+    // No single twin owns the occurrence, so the discrepancy is surfaced under the group's shared
+    // identity base — which descriptor group the ambiguity belongs to stays inspectable.
+    unaligned.push(UnalignedOccurrence {
+        symbol: group_identity.clone(),
+        document_path: occ.document_path.clone(),
+        role: occ.role,
+        outcome: JoinOutcome::DuplicateAmbiguous,
+        span,
+        expected_name: group.descriptor.terminal_name().unwrap_or_default().to_string(),
+        found_text: None,
+    });
+}
+
+/// The identity a duplicate group's own discrepancies are surfaced under: the shared base of the
+/// twins' identities (the `#<rank>` disambiguator stripped from any twin — the base is common to the
+/// whole collision group by construction).
+///
+/// When the group has no persisted twins, any persisted symbol carrying the same descriptor names
+/// the group; failing that, the descriptor's terminal name keeps the discrepancy non-empty and
+/// inspectable.
+fn group_base_identity(
+    descriptor: &Descriptor,
+    twins: Option<&[(&ExtractedSymbol, &CanonicalId, &str)]>,
+    index: &ExtractedIndex,
+    identities: &[Option<CanonicalId>],
+) -> CanonicalId {
+    if let Some(twins) = twins
+        && let Some((_, identity, _)) = twins.first()
+    {
+        return strip_disambiguator(identity);
+    }
+    for (idx, symbol) in index.symbols.iter().enumerate() {
+        if symbol.descriptor.as_ref() == Some(descriptor)
+            && let Some(Some(identity)) = identities.get(idx)
+        {
+            return strip_disambiguator(identity);
+        }
+    }
+    CanonicalId::from_raw(descriptor.terminal_name().unwrap_or_default().to_string())
+}
+
+/// An identity with a trailing `#<digits>` collision disambiguator stripped; an identity carrying no
+/// disambiguator is returned unchanged.
+fn strip_disambiguator(identity: &CanonicalId) -> CanonicalId {
+    match identity.as_str().rsplit_once('#') {
+        Some((base, rank)) if !rank.is_empty() && rank.bytes().all(|b| b.is_ascii_digit()) => {
+            CanonicalId::from_raw(base.to_string())
+        }
+        _ => identity.clone(),
+    }
+}
+
+/// The persisted twin symbols sharing each duplicated descriptor: `(symbol, identity, definition
+/// document)`, keyed by the shared descriptor.
+///
+/// Only symbols with an assigned identity (the caller chose to persist them) and a definition
+/// occurrence participate; a descriptor with fewer than two such symbols has no group to resolve
+/// against (its occurrences, if any duplicate group still names it, are typed ambiguous).
+fn twin_symbols_by_descriptor<'a>(
+    index: &'a ExtractedIndex,
+    identities: &'a [Option<CanonicalId>],
+) -> HashMap<&'a Descriptor, Vec<(&'a ExtractedSymbol, &'a CanonicalId, &'a str)>> {
+    let mut by_descriptor: HashMap<&Descriptor, Vec<(&ExtractedSymbol, &CanonicalId, &str)>> = HashMap::new();
+    for (idx, symbol) in index.symbols.iter().enumerate() {
+        let Some(Some(identity)) = identities.get(idx) else {
+            continue;
+        };
+        let Some(descriptor) = &symbol.descriptor else {
+            continue;
+        };
+        let Some(def) = symbol.definition() else {
+            continue;
+        };
+        by_descriptor
+            .entry(descriptor)
+            .or_default()
+            .push((symbol, identity, def.document_path.as_str()));
+    }
+    by_descriptor.retain(|_, twins| twins.len() > 1);
+    by_descriptor
+}
+
+/// The document a module symbol's definition is declared from: for every in-workspace module symbol,
+/// its definition document maps to the document containing that module's declaration site (`mod
+/// name;` / `mod name { .. }`).
+///
+/// Built from evidence in the index cross-checked against the syntax oracle: a module symbol is
+/// referenced from every `use`/path segment naming it across the workspace, so a reference
+/// occurrence counts as declaration evidence only when its span is the name token of a `mod` item in
+/// the parsed document. Per definition document, exactly one distinct declaring document yields a
+/// parent edge; zero (a crate root, declared by no one) or more than one (conflicting evidence)
+/// yields no entry — the chain stops there and the occurrence falls to duplicate-ambiguous, refusal
+/// over guessing.
+fn parent_document_map(
+    index: &ExtractedIndex,
+    prepared: &HashMap<String, PreparedDocument>,
+) -> HashMap<String, String> {
+    // Every declaration-site document observed per definition document.
+    let mut declared_from: HashMap<String, HashSet<String>> = HashMap::new();
+    for symbol in &index.symbols {
+        if symbol.kind != SymbolKind::Module {
+            continue;
+        }
+        let Some(def) = symbol.definition() else {
+            continue;
+        };
+        for occ in &symbol.occurrences {
+            if occ.role != OccurrenceRole::Reference {
+                continue;
+            }
+            let Some(doc) = prepared.get(&occ.document_path) else {
+                continue;
+            };
+            let Some(encoding) = index.encoding_for(&occ.document_path) else {
+                continue;
+            };
+            let Some(span) = range_to_span(doc.tree.source(), &doc.line_index, occ.range, encoding) else {
+                continue;
+            };
+            if doc.tree.is_module_declaration_name(span) {
+                declared_from
+                    .entry(def.document_path.clone())
+                    .or_default()
+                    .insert(occ.document_path.clone());
+            }
+        }
+    }
+
+    declared_from
+        .into_iter()
+        .filter_map(|(def_doc, declaring)| {
+            if declaring.len() == 1 {
+                Some((def_doc, declaring.into_iter().next().expect("one element")))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Select the unique twin a group occurrence's document is associated with, in evidence order:
+/// defining-document, then module-chain. Returns `None` when no twin or more than one twin is
+/// associated — the occurrence is then typed duplicate-ambiguous.
+fn select_twin<'a>(
+    document_path: &str,
+    twins: &[(&'a ExtractedSymbol, &'a CanonicalId, &'a str)],
+    parent_of: &HashMap<String, String>,
+) -> Option<(&'a ExtractedSymbol, &'a CanonicalId, LocalityRule)> {
+    // Defining-document: the occurrence's document is the definition document of exactly one twin.
+    let direct: Vec<_> = twins.iter().filter(|(_, _, doc)| *doc == document_path).collect();
+    if direct.len() == 1 {
+        let (symbol, identity, _) = direct[0];
+        return Some((symbol, identity, LocalityRule::DefiningDocument));
+    }
+    if direct.len() > 1 {
+        return None;
+    }
+
+    // Module-chain: walk the occurrence's document up through the parent-of-document map (each hop
+    // moving from a module's definition document to the document declaring it) until a document that
+    // is a twin's own definition document is reached, or the chain runs out. A cycle terminates the
+    // walk (via the visited set) rather than looping forever on malformed input.
+    let mut current = document_path.to_string();
+    let mut visited: HashSet<String> = HashSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            return None;
+        }
+        let reached: Vec<_> = twins.iter().filter(|(_, _, doc)| *doc == current).collect();
+        if reached.len() == 1 {
+            let (symbol, identity, _) = reached[0];
+            return Some((symbol, identity, LocalityRule::ModuleChain));
+        }
+        if reached.len() > 1 {
+            return None;
+        }
+        match parent_of.get(&current) {
+            Some(parent) => current = parent.clone(),
+            None => return None,
+        }
     }
 }
 

@@ -63,6 +63,7 @@ fn main() -> Result<()> {
                 cli.json,
                 args.discrepancies,
                 args.all,
+                args.duplicates,
             )?;
             println!("{out}");
         }

@@ -135,6 +135,12 @@ pub struct StatusArgs {
     /// With the discrepancy detail, return every persisted row rather than the bounded summary.
     #[arg(long)]
     pub all: bool,
+
+    /// Include the duplicated-descriptor group detail: each group's shared descriptor and the
+    /// definitions that share it. The group count is always reported in the summary; this flag adds
+    /// the per-group detail.
+    #[arg(long)]
+    pub duplicates: bool,
 }
 
 /// Arguments for `build`.

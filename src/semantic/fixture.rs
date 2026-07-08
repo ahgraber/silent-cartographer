@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use super::model::{AnalyzerProvenance, ExtractedIndex};
+use super::model::{AnalyzerProvenance, ExtractedIndex, normalize};
 use super::{Capabilities, SemanticEngine, SemanticError};
 
 /// A backend that replays a pre-built index. Used to exercise everything downstream of extraction.
@@ -22,7 +22,7 @@ impl FixtureEngine {
     /// eligibility (matching the Rust adapter's declarations).
     pub fn new(index: ExtractedIndex) -> Self {
         Self {
-            index,
+            index: normalize(index),
             capabilities: Capabilities::none().with_enclosure().with_base_index(),
             failure: None,
         }
@@ -41,6 +41,8 @@ impl FixtureEngine {
                 provenance,
                 documents: Vec::new(),
                 symbols: Vec::new(),
+                duplicate_groups: Vec::new(),
+                library_roots: Default::default(),
             },
             capabilities: Capabilities::none(),
             failure: Some(reason.into()),
