@@ -10,7 +10,9 @@ Defines the persistent store that unifies the syntax and semantic oracles into o
 
 The system SHALL attribute each semantic occurrence to the syntactic construct at the corresponding source location, and SHALL persist an attribution as aligned only when the occurrence satisfies a named alignment rule's exact expectation.
 The default rule is name-token equality: the source text at the location matches the occurrence's expected symbol name — its name token, the terminal segment of the descriptor, not the qualified path.
-Four kind-scoped rules extend it: a crate-root module occurrence is accepted when the source token is the descriptor's own package name or the keyword `crate`; a reference occurrence of a desugared-operator method is accepted when its location holds the operator construct that method desugars from, per a closed correspondence; a module definition occurrence is accepted when its range spans the module's whole document; and a reference occurrence resolving to a type — or to an implementation of one — is accepted at a self-type keyword when the enclosing implementation's self type is that type, generic arguments aside.
+Kind-scoped rules extend the default rule, each scoped to the language whose constructs it reconciles.
+For Rust, four: a crate-root module occurrence is accepted when the source token is the descriptor's own package name or the keyword `crate`; a reference occurrence of a desugared-operator method is accepted when its location holds the operator construct that method desugars from, per a closed correspondence; a module definition occurrence is accepted when its range spans the module's whole document; and a reference occurrence resolving to a type — or to an implementation of one — is accepted at a self-type keyword when the enclosing implementation's self type is that type, generic arguments aside.
+A language for which no kind-scoped rule has been established accepts occurrences under the default rule only, refusing the rest; rule families are added per language as calibration evidence justifies each one.
 Every aligned attribution SHALL carry the rule that accepted it as provenance.
 An occurrence satisfying no rule SHALL NOT be persisted as an aligned attribution; when a semantic occurrence and the syntax at its location cannot be reconciled under any rule, the system SHALL surface the discrepancy and SHALL NOT persist it as a confident attribution.
 
@@ -92,6 +94,18 @@ An occurrence satisfying no rule SHALL NOT be persisted as an aligned attributio
 - **WHEN** the aligned attributions are retrieved
 - **THEN** each carries the rule that accepted it as provenance
 
+#### Scenario: Python name token accepted under the default rule
+
+- **GIVEN** a Python semantic occurrence whose source location spells the symbol's own name
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the default rule
+
+#### Scenario: Python occurrence outside the default rule stays refused
+
+- **GIVEN** a Python semantic occurrence whose source location does not spell the symbol's name token, in the absence of any Python kind-scoped rule covering it
+- **WHEN** the join runs
+- **THEN** the occurrence is refused and surfaced as a discrepancy, never persisted as a confident attribution
+
 ### Requirement: Lossless symbol persistence
 
 The system SHALL persist each symbol's canonical identity, its occurrences, and its source span such that a later query returns the same identity, occurrence set, and the exact source text of the symbol's span.
@@ -120,8 +134,8 @@ The system SHALL persist the enclosure relation between symbols such that, for a
 
 ### Requirement: Staleness reflects underlying change
 
-The system SHALL mark a persisted result as stale whenever the sources it was derived from no longer match the indexed content, or the analyzer identity and version recorded as its provenance differ from the analyzer in effect.
-While neither has changed, the result SHALL be reported as fresh.
+The system SHALL mark a persisted result as stale whenever the sources it was derived from no longer match the indexed content, or any element of its recorded provenance — the analyzer identity and version, or an environment fact the backend declared material — differs from the one in effect.
+While none has changed, the result SHALL be reported as fresh.
 
 #### Scenario: Unchanged sources stay fresh
 
@@ -139,6 +153,12 @@ While neither has changed, the result SHALL be reported as fresh.
 
 - **GIVEN** an index recorded under one analyzer version
 - **WHEN** the analyzer in effect is a different version
+- **THEN** results from that index are reported as stale and flagged for reindex
+
+#### Scenario: Changed environment marks stale
+
+- **GIVEN** an index recorded with a declared interpreter environment as provenance
+- **WHEN** the environment in effect no longer matches the recorded one
 - **THEN** results from that index are reported as stale and flagged for reindex
 
 ### Requirement: Reference occurrences carry enclosing-declaration attribution
@@ -346,15 +366,21 @@ The system SHALL persist an `imports` dependency edge from a module to a symbol 
 - **WHEN** the index is built
 - **THEN** an `imports` edge from the module to that symbol is persisted
 
+#### Scenario: Python import produces an imports edge
+
+- **GIVEN** a Python module containing an import statement naming a symbol defined in another module
+- **WHEN** the index is built
+- **THEN** an `imports` edge from the importing module to that symbol is persisted
+
 #### Scenario: Reference inside a declaration is not an import
 
 - **GIVEN** a reference occurrence attributed to a function inside a module
 - **WHEN** the index is built
 - **THEN** the reference produces a `uses` edge from the function and no `imports` edge from the module
 
-### Requirement: Trait-implementation edges (type_hierarchy)
+### Requirement: Declared subtype edges (type_hierarchy)
 
-The system SHALL persist a `type_hierarchy` edge from an implementing type to the implemented trait for every explicitly declared trait implementation in the indexed sources whose type and trait are both persisted symbols, including implementations whose trait name carries generic parameters.
+The system SHALL persist a `type_hierarchy` edge from a subtype to the supertype it explicitly declares — a Rust type's declared trait implementation, or a Python class's declared base class — for every such declaration in the indexed sources whose subtype and supertype are both persisted symbols, including declarations whose supertype name carries generic or parameterized forms, and one edge per declared supertype when a declaration names several.
 
 #### Scenario: Plain trait implementation produces an edge
 
@@ -373,6 +399,40 @@ The system SHALL persist a `type_hierarchy` edge from an implementing type to th
 - **GIVEN** a workspace type with a declared implementation of a trait defined outside the workspace
 - **WHEN** the index is built
 - **THEN** a `type_hierarchy` edge from the type to the external trait's persisted symbol is persisted
+
+#### Scenario: Python base class produces an edge
+
+- **GIVEN** a Python class declaring a base class defined in the workspace
+- **WHEN** the index is built
+- **THEN** a `type_hierarchy` edge from the subclass to the base class is persisted
+
+#### Scenario: Multiple bases each produce an edge
+
+- **GIVEN** a Python class declaring more than one base class
+- **WHEN** the index is built
+- **THEN** a `type_hierarchy` edge is persisted from the subclass to each declared base
+
+### Requirement: Build selects exactly one language backend
+
+A build SHALL select the backend whose language the workspace's project manifest declares; when the workspace declares manifests for more than one supported language and no explicit selection is supplied, the build SHALL refuse with a typed error naming the selection mechanism; an explicit selection SHALL override detection; and the selected backend SHALL be recorded in the index's provenance.
+
+#### Scenario: Single-language workspace selects its backend
+
+- **GIVEN** a workspace declaring only a Python project manifest
+- **WHEN** a build runs with no explicit language selection
+- **THEN** the Python backend is selected and recorded in the index's provenance
+
+#### Scenario: Two manifests without a selection refuse
+
+- **GIVEN** a workspace declaring both a Rust and a Python project manifest
+- **WHEN** a build runs with no explicit language selection
+- **THEN** the build refuses with a typed error naming the explicit selection mechanism, and no index is persisted from the attempt
+
+#### Scenario: Explicit selection overrides detection
+
+- **GIVEN** a workspace declaring both a Rust and a Python project manifest
+- **WHEN** a build runs with an explicit language selection
+- **THEN** the build proceeds with the selected backend and records it in the index's provenance
 
 ### Requirement: Dependents traversal
 
