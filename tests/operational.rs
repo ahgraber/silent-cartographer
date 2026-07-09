@@ -5,9 +5,10 @@ mod support;
 
 use std::path::Path;
 
-use silent_cartographer::commands::{build_from_index, resolve_workspace, run_status};
+use silent_cartographer::commands::{build_from_index, detect_language, resolve_workspace, run_build, run_status};
 use silent_cartographer::graph::content_hash;
 use silent_cartographer::graph::store::{DISCREPANCY_GROUP_CAP, GraphStore};
+use silent_cartographer::graph::syntax::Language;
 use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one};
 use silent_cartographer::query::output::Outcome;
 use silent_cartographer::query::{Detail, QueryEngine};
@@ -15,6 +16,7 @@ use silent_cartographer::semantic::model::{
     ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding, SourceDocument,
     SourceRange, SymbolClass, SymbolKind,
 };
+use silent_cartographer::semantic::python_adapter::PythonAdapter;
 
 fn sources() -> Vec<(String, String)> {
     vec![(support::DOC.to_string(), support::SOURCE.to_string())]
@@ -34,7 +36,7 @@ fn build_produces_a_queryable_index() {
 
     // The index is queryable: resolve and retrieve a symbol from the freshly built store.
     let store = GraphStore::open(&db).unwrap();
-    let engine = QueryEngine::new(&store, support::provenance(), content_hash(&sources()));
+    let engine = QueryEngine::new(&store, support::provenance(), content_hash(&sources()), None);
     let answer = engine.get("net::Client::connect", Detail::Body).unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Found { .. }),
@@ -187,6 +189,7 @@ fn build_n_discrepancy_groups(n: usize) -> (tempfile::TempDir, std::path::PathBu
         symbols,
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
@@ -370,7 +373,7 @@ fn matching_version_store_operates_normally() {
     let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false).unwrap();
     assert!(report.contains("join_alignment"), "status answers normally: {report}");
     let store = GraphStore::open(&db).unwrap();
-    let engine = QueryEngine::new(&store, support::provenance(), content_hash(&sources()));
+    let engine = QueryEngine::new(&store, support::provenance(), content_hash(&sources()), None);
     let answer = engine.get("net::Client::connect", Detail::Location).unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Found { .. }),
@@ -467,6 +470,7 @@ fn duplicated_group_index() -> ExtractedIndex {
         symbols: vec![widget("a.rs"), widget("b.rs")],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     }
 }
 
@@ -569,4 +573,191 @@ fn status_json_always_carries_the_duplicated_group_count() {
         v["duplicated_descriptors"].get("groups").is_none(),
         "per-group detail is withheld without --duplicates: {report}"
     );
+}
+
+/// Write a minimal manifest of the given name into `dir`.
+fn write_manifest(dir: &Path, name: &str) {
+    std::fs::write(dir.join(name), "# fixture manifest\n").unwrap();
+}
+
+// _(Scenario: Single-language workspace selects its backend)_ — a workspace declaring only a
+// pyproject.toml selects the Python backend with no explicit selection, and the selected backend's
+// analyzer identity (what build records as provenance) is scip-python.
+#[test]
+fn python_manifest_selects_python_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "pyproject.toml");
+
+    let language = detect_language(None, dir.path()).unwrap();
+    assert_eq!(language, Language::Python, "pyproject.toml marks Python");
+    assert_eq!(
+        PythonAdapter::analyzer_name(),
+        "scip-python",
+        "the selected backend's provenance identity"
+    );
+
+    // Driving `build` down the selected path reaches the Python backend: with the indexer
+    // deterministically absent, the refusal names scip-python — evidence of the selection.
+    std::fs::create_dir(dir.path().join(".venv")).unwrap();
+    let db = dir.path().join("index.db");
+    let missing_tool = dir.path().join("no-tools").join("scip-python");
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        "rust-analyzer",
+        missing_tool.to_str().unwrap(),
+        None,
+        None,
+    )
+    .expect_err("the indexer is absent");
+    assert!(
+        err.to_string().contains("scip-python"),
+        "the build went down the Python path: {err}"
+    );
+}
+
+// _(Scenario: Two manifests without a selection refuse)_ — both manifests and no explicit selection
+// is a typed refusal naming the selection mechanism, and no store is written from the attempt.
+#[test]
+fn two_manifests_without_selection_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "Cargo.toml");
+    write_manifest(dir.path(), "pyproject.toml");
+
+    let db = dir.path().join("index.db");
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        "rust-analyzer",
+        "scip-python",
+        None,
+        None,
+    )
+    .expect_err("two manifests are ambiguous");
+    assert!(
+        err.to_string().contains("--language"),
+        "the refusal names the selection mechanism: {err}"
+    );
+    assert!(!db.exists(), "no store is written from the refused attempt");
+}
+
+// _(Scenario: Explicit selection overrides detection)_ — with both manifests present, an explicit
+// selection chooses the backend; an explicit selection also needs no manifest at all (legacy
+// layouts are served by the flag rather than detection heuristics).
+#[test]
+fn explicit_selection_overrides_detection() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "Cargo.toml");
+    write_manifest(dir.path(), "pyproject.toml");
+
+    assert_eq!(
+        detect_language(Some(Language::Rust), dir.path()).unwrap(),
+        Language::Rust
+    );
+    assert_eq!(
+        detect_language(Some(Language::Python), dir.path()).unwrap(),
+        Language::Python
+    );
+
+    let bare = tempfile::tempdir().unwrap();
+    assert_eq!(
+        detect_language(Some(Language::Python), bare.path()).unwrap(),
+        Language::Python,
+        "an explicit selection needs no manifest"
+    );
+
+    // And with no manifest and no selection, the refusal says no supported project was detected.
+    let err = detect_language(None, bare.path()).expect_err("nothing to detect");
+    assert!(
+        err.to_string().contains("no supported project"),
+        "the refusal is a teaching error: {err}"
+    );
+}
+
+// _(Scenario: Missing indexer tool refuses with guidance — the store-untouched clause)_ — a build
+// attempt that fails on an unavailable tool leaves an existing store's rows and metadata
+// byte-identical, on both backends' refusal paths.
+#[test]
+fn failed_build_leaves_existing_store_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    let before = std::fs::read(&db).unwrap();
+
+    // The Rust path, refused on an unavailable rust-analyzer.
+    write_manifest(dir.path(), "Cargo.toml");
+    let missing_analyzer = dir.path().join("no-tools").join("rust-analyzer");
+    run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        missing_analyzer.to_str().unwrap(),
+        "scip-python",
+        None,
+        None,
+    )
+    .expect_err("the analyzer is absent");
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        before,
+        "the store is byte-identical after the refused Rust build"
+    );
+
+    // The Python path, refused on an unavailable scip-python (explicitly selected so the ambient
+    // machine's manifests play no part).
+    std::fs::create_dir(dir.path().join(".venv")).unwrap();
+    let missing_scip = dir.path().join("no-tools").join("scip-python");
+    run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        "rust-analyzer",
+        missing_scip.to_str().unwrap(),
+        None,
+        Some(Language::Python),
+    )
+    .expect_err("the indexer is absent");
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        before,
+        "the store is byte-identical after the refused Python build"
+    );
+}
+
+// _(Scenario: Unresolvable environment refuses with guidance — explicit-flag half)_ — an explicit
+// `--environment` pointing at a nonexistent path refuses with the typed environment error before
+// the tool is even looked up (environment resolution precedes adapter construction) and before any
+// store is touched.
+#[test]
+fn explicit_environment_refusal_precedes_tool_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "pyproject.toml");
+
+    let db = dir.path().join("index.db");
+    let missing_env = dir.path().join("no-such-venv");
+    // The scip-python argument is also deliberately absent: seeing the *environment* error proves
+    // resolution ran first and the tool was never looked up.
+    let missing_tool = dir.path().join("no-tools").join("scip-python");
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        "rust-analyzer",
+        missing_tool.to_str().unwrap(),
+        Some(missing_env.as_path()),
+        None,
+    )
+    .expect_err("the explicit environment does not exist");
+    let message = err.to_string();
+    assert!(
+        message.contains("environment") && message.contains("no-such-venv"),
+        "the typed refusal names the explicit environment problem: {message}"
+    );
+    assert!(
+        !message.contains("scip-python"),
+        "the refusal precedes any tool lookup: {message}"
+    );
+    assert!(!db.exists(), "no store is touched by the refused attempt");
 }

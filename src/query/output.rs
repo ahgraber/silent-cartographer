@@ -22,12 +22,14 @@ pub struct Provenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FreshnessLabel {
-    /// Sources and analyzer unchanged since indexing.
+    /// Sources, analyzer, and declared environment unchanged since indexing.
     Fresh,
     /// The source content changed since indexing.
     StaleContent,
     /// The analyzer version differs from the recorded provenance.
     StaleVersion,
+    /// The recorded interpreter environment differs from the one in effect.
+    StaleEnvironment,
 }
 
 impl From<Freshness> for FreshnessLabel {
@@ -36,6 +38,7 @@ impl From<Freshness> for FreshnessLabel {
             Freshness::Fresh => FreshnessLabel::Fresh,
             Freshness::StaleContent => FreshnessLabel::StaleContent,
             Freshness::StaleVersion => FreshnessLabel::StaleVersion,
+            Freshness::StaleEnvironment => FreshnessLabel::StaleEnvironment,
         }
     }
 }

@@ -39,7 +39,15 @@ fn main() -> Result<()> {
             println!("{out}");
         }
         Command::Build(args) => {
-            let accounting = commands::run_build(&cli.db, cli.workspace.as_deref(), &args.root, &args.rust_analyzer)?;
+            let accounting = commands::run_build(
+                &cli.db,
+                cli.workspace.as_deref(),
+                &args.root,
+                &args.rust_analyzer,
+                "scip-python",
+                args.environment.as_deref(),
+                args.language.map(Into::into),
+            )?;
             println!(
                 "built: aligned={} (exact={} crate_root={} operator_desugar={} module_span={} \
                  self_keyword={}) text_mismatch={} semantic_only={} duplicate_ambiguous={} syntax_only={}",

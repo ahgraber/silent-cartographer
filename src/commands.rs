@@ -3,16 +3,18 @@
 //! These are thin orchestration over the query engine and the ingest path, kept out of `main` so
 //! they are testable without spawning a process.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::graph::store::GraphStore;
+use crate::graph::syntax::Language;
 use crate::graph::{content_hash, ingest};
 use crate::identity::WorkspaceId;
 use crate::query::output::Answer;
 use crate::query::{Detail, QueryEngine, Relation};
-use crate::semantic::model::{AnalyzerProvenance, ExtractedIndex};
+use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
+use crate::semantic::python_adapter::{PythonAdapter, environment_facts, resolve_environment};
 use crate::semantic::{SemanticEngine, rust_adapter::RustAdapter};
 
 /// Collect `(workspace_relative_path, source_text)` for every `.rs` file under `root`.
@@ -20,24 +22,43 @@ use crate::semantic::{SemanticEngine, rust_adapter::RustAdapter};
 /// Paths are relative to `root` and use `/` separators to match SCIP document paths. `target/` and
 /// hidden directories are skipped.
 pub fn collect_rust_sources(root: &Path) -> Result<Vec<(String, String)>> {
+    collect_sources(root, "rs", &["target"])
+}
+
+/// Collect `(workspace_relative_path, source_text)` for every `.py` file under `root`.
+///
+/// Paths are relative to `root` and use `/` separators to match SCIP document paths. `venv/` and
+/// hidden directories (`.venv/` included) are skipped — the environment's own sources are not the
+/// workspace's.
+pub fn collect_python_sources(root: &Path) -> Result<Vec<(String, String)>> {
+    collect_sources(root, "py", &["venv"])
+}
+
+fn collect_sources(root: &Path, extension: &str, skip_dirs: &[&str]) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
-    collect_dir(root, root, &mut out)?;
+    collect_dir(root, root, extension, skip_dirs, &mut out)?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
-fn collect_dir(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> Result<()> {
+fn collect_dir(
+    root: &Path,
+    dir: &Path,
+    extension: &str,
+    skip_dirs: &[&str],
+    out: &mut Vec<(String, String)>,
+) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if entry.file_type()?.is_dir() {
-            if name.starts_with('.') || name == "target" {
+            if name.starts_with('.') || skip_dirs.contains(&name.as_ref()) {
                 continue;
             }
-            collect_dir(root, &path, out)?;
-        } else if path.extension().is_some_and(|e| e == "rs") {
+            collect_dir(root, &path, extension, skip_dirs, out)?;
+        } else if path.extension().is_some_and(|e| e == extension) {
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -55,24 +76,54 @@ pub fn render<T: serde::Serialize + std::fmt::Debug>(answer: &Answer<T>, json: b
     if json { answer.to_json() } else { format!("{answer:#?}") }
 }
 
-/// The provenance and source hash currently in effect for a workspace root, used to mark answers
-/// fresh or stale. When no analyzer is available, the recorded provenance is echoed so queries still
-/// work against a previously-built index.
-fn current_state(store: &GraphStore, root: &Path, rust_analyzer: &str) -> Result<(AnalyzerProvenance, String)> {
+/// The provenance, source hash, and declared environment currently in effect for a workspace root,
+/// used to mark answers fresh or stale. The recorded metadata's analyzer identity says which
+/// backend's state applies. When no analyzer is available, the recorded provenance is echoed so
+/// queries still work against a previously-built index.
+fn current_state(
+    store: &GraphStore,
+    root: &Path,
+    rust_analyzer: &str,
+) -> Result<(AnalyzerProvenance, String, Option<EnvironmentFacts>)> {
+    let recorded = store.read_metadata()?;
+    let is_python = recorded
+        .as_ref()
+        .is_some_and(|m| m.provenance.analyzer_name == PythonAdapter::analyzer_name());
+
+    if is_python {
+        let sources = collect_python_sources(root)?;
+        let hash = content_hash(&sources);
+        // The environment in effect, resolved exactly as a build resolves it. An environment that
+        // does not resolve (or whose facts cannot be read) is absent — which the freshness
+        // comparison reports as drift against a recorded environment, never as fresh.
+        let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
+        let environment = resolve_environment(None, virtual_env.as_deref(), root)
+            .ok()
+            .and_then(|env| environment_facts(&env).ok());
+        // Prefer the live tool's version; fall back to the recorded provenance.
+        let provenance = match PythonAdapter::discover_version(PythonAdapter::analyzer_name()) {
+            Ok(version) => AnalyzerProvenance {
+                analyzer_name: PythonAdapter::analyzer_name().to_string(),
+                analyzer_version: version,
+            },
+            Err(_) => recorded
+                .map(|m| m.provenance)
+                .expect("python identity implies metadata"),
+        };
+        return Ok((provenance, hash, environment));
+    }
+
     let sources = collect_rust_sources(root)?;
     let hash = content_hash(&sources);
     // Prefer a live analyzer's version; fall back to the recorded provenance.
     let provenance = match RustAdapter::new(rust_analyzer) {
         Ok(adapter) => adapter.provenance(),
-        Err(_) => store
-            .read_metadata()?
-            .map(|m| m.provenance)
-            .unwrap_or(AnalyzerProvenance {
-                analyzer_name: RustAdapter::analyzer_name().to_string(),
-                analyzer_version: "unknown".to_string(),
-            }),
+        Err(_) => recorded.map(|m| m.provenance).unwrap_or(AnalyzerProvenance {
+            analyzer_name: RustAdapter::analyzer_name().to_string(),
+            analyzer_version: "unknown".to_string(),
+        }),
     };
-    Ok((provenance, hash))
+    Ok((provenance, hash, None))
 }
 
 /// Resolve the workspace identity for a build: a supplied identity is used verbatim; otherwise it is
@@ -97,17 +148,65 @@ pub fn resolve_workspace(supplied: Option<&str>, root: &Path) -> Result<Workspac
     Ok(WorkspaceId::new(name))
 }
 
-/// `build`: (re)build the index for the workspace via the ingest path.
+/// Select the language backend for a build: an explicit selection overrides detection outright
+/// (legacy layouts without a modern manifest are served by the flag); detection reads the
+/// workspace's project manifests — `Cargo.toml` marks Rust, `pyproject.toml` marks Python.
+///
+/// Both manifests without a selection, or neither manifest, refuse with a typed teaching error
+/// rather than guessing a backend.
+pub fn detect_language(explicit: Option<Language>, root: &Path) -> Result<Language> {
+    if let Some(language) = explicit {
+        return Ok(language);
+    }
+    let rust = root.join("Cargo.toml").exists();
+    let python = root.join("pyproject.toml").exists();
+    match (rust, python) {
+        (true, false) => Ok(Language::Rust),
+        (false, true) => Ok(Language::Python),
+        (true, true) => Err(anyhow!(
+            "both Cargo.toml and pyproject.toml are present in {}; pass --language rust|python to select the backend",
+            root.display()
+        )),
+        (false, false) => Err(anyhow!(
+            "no supported project was detected in {} (no Cargo.toml or pyproject.toml); \
+             pass --language rust|python to select a backend explicitly",
+            root.display()
+        )),
+    }
+}
+
+/// `build`: (re)build the index for the workspace via the ingest path, through the backend the
+/// workspace's manifest selects (or `language` explicitly names).
+///
+/// Every refusal — ambiguous or missing manifests, an unresolvable Python environment, an
+/// unavailable tool — happens before the store is opened, so a failed attempt leaves an existing
+/// store untouched.
 pub fn run_build(
     db: &Path,
     workspace: Option<&str>,
     root: &Path,
     rust_analyzer: &str,
+    scip_python: &str,
+    environment: Option<&Path>,
+    language: Option<Language>,
 ) -> Result<crate::graph::join::JoinAccounting> {
     let workspace_id = resolve_workspace(workspace, root)?;
-    let adapter = RustAdapter::new(rust_analyzer).map_err(|e| anyhow!("rust-analyzer unavailable: {e}"))?;
-    let index: ExtractedIndex = adapter.analyze(root).map_err(|e| anyhow!("indexing failed: {e}"))?;
-    let sources = collect_rust_sources(root)?;
+    let language = detect_language(language, root)?;
+    let (index, sources): (ExtractedIndex, Vec<(String, String)>) = match language {
+        Language::Rust => {
+            let adapter = RustAdapter::new(rust_analyzer).map_err(|e| anyhow!("rust-analyzer unavailable: {e}"))?;
+            let index = adapter.analyze(root).map_err(|e| anyhow!("indexing failed: {e}"))?;
+            (index, collect_rust_sources(root)?)
+        }
+        Language::Python => {
+            // $VIRTUAL_ENV is read here, at the outer edge; resolution itself is pure.
+            let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
+            let environment = resolve_environment(environment, virtual_env.as_deref(), root)?;
+            let adapter = PythonAdapter::new(scip_python, environment, workspace_id.as_str())?;
+            let index = adapter.analyze(root).map_err(|e| anyhow!("indexing failed: {e}"))?;
+            (index, collect_python_sources(root)?)
+        }
+    };
     ensure_parent_dir(db)?;
     // The write path replaces an incompatible store outright: the index is derived, replayable
     // data, so rebuild is the migration.
@@ -147,8 +246,10 @@ pub fn run_status(
     let Some(meta) = store.read_metadata()? else {
         return Ok("no index built".to_string());
     };
-    let (provenance, hash) = current_state(&store, root, rust_analyzer)?;
-    let freshness = store.freshness(&hash, &provenance)?.expect("metadata present");
+    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let freshness = store
+        .freshness(&hash, &provenance, environment.as_ref())?
+        .expect("metadata present");
     let duplicated_groups = store.duplicated_groups()?;
 
     let mut report = serde_json::json!({
@@ -161,6 +262,7 @@ pub fn run_status(
             crate::graph::store::Freshness::Fresh => "fresh",
             crate::graph::store::Freshness::StaleContent => "stale_content",
             crate::graph::store::Freshness::StaleVersion => "stale_version",
+            crate::graph::store::Freshness::StaleEnvironment => "stale_environment",
         },
         "stale": freshness.is_stale(),
         "join_alignment": {
@@ -272,8 +374,8 @@ pub fn run_get(
     json: bool,
 ) -> Result<String> {
     let store = GraphStore::open(db).context("opening index database")?;
-    let (provenance, hash) = current_state(&store, root, rust_analyzer)?;
-    let engine = QueryEngine::new(&store, provenance, hash);
+    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let engine = QueryEngine::new(&store, provenance, hash, environment);
 
     if let Some(at) = at {
         let (doc, offset) = parse_position(at)?;
@@ -308,8 +410,8 @@ pub fn run_trace(
         ));
     }
     let store = GraphStore::open(db).context("opening index database")?;
-    let (provenance, hash) = current_state(&store, root, rust_analyzer)?;
-    let engine = QueryEngine::new(&store, provenance, hash);
+    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let engine = QueryEngine::new(&store, provenance, hash, environment);
     if matches!(relation, Relation::Dependents) {
         let answer = engine.dependents(reference, depth.unwrap_or(1))?;
         return Ok(render(&answer, json));

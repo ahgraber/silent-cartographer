@@ -141,6 +141,22 @@ pub struct AnalyzerProvenance {
     pub analyzer_version: String,
 }
 
+/// The interpreter-environment facts a backend declares material to an index's meaning: what the
+/// index's symbols resolved against. Declared by the Python adapter; absent for backends (like
+/// Rust's) whose resolution does not depend on an activated environment. Staleness compares the
+/// whole struct, so any drift — interpreter, environment path, or installed package set — marks
+/// derived results stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentFacts {
+    /// The interpreter's reported version (the `python --version` output).
+    pub interpreter_version: String,
+    /// The resolved environment's path.
+    pub environment_path: String,
+    /// The installed-package fingerprint: a hash over the sorted `*.dist-info` directory names
+    /// under the environment's site-packages, so installs, upgrades, and removals all change it.
+    pub package_fingerprint: String,
+}
+
 /// A source document referenced by the index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceDocument {
@@ -188,6 +204,10 @@ pub struct ExtractedIndex {
     /// consumers degrade to their typed refusals, never guess.
     #[serde(default)]
     pub library_roots: std::collections::BTreeMap<String, String>,
+    /// The interpreter-environment facts the backend declares material to this index's meaning.
+    /// Declared by the Python adapter; `None` for backends without an environment dependency (Rust).
+    #[serde(default)]
+    pub environment: Option<EnvironmentFacts>,
 }
 
 impl ExtractedIndex {
@@ -265,6 +285,7 @@ pub fn normalize(index: ExtractedIndex) -> ExtractedIndex {
         symbols,
         duplicate_groups,
         library_roots: index.library_roots,
+        environment: index.environment,
     }
 }
 
@@ -324,6 +345,7 @@ mod tests {
             symbols,
             duplicate_groups: Vec::new(),
             library_roots: Default::default(),
+            environment: None,
         }
     }
 

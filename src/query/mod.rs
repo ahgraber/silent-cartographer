@@ -6,7 +6,7 @@ pub mod resolve;
 
 use crate::graph::store::{DEPENDENTS_HORIZON, Freshness, GraphStore, OccurrenceRow, PersistedClass, SymbolRow};
 use crate::identity::CanonicalId;
-use crate::semantic::model::AnalyzerProvenance;
+use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
 
 use output::{Answer, Location, Provenance, SymbolView};
 use resolve::{Resolution, resolve};
@@ -54,22 +54,29 @@ pub enum QueryError {
     DependentsNotTraceable,
 }
 
-/// The query engine over a store, carrying the analyzer provenance in effect and a content hash for
-/// freshness evaluation.
+/// The query engine over a store, carrying the analyzer provenance, content hash, and declared
+/// environment in effect for freshness evaluation.
 pub struct QueryEngine<'a> {
     store: &'a GraphStore,
     current_provenance: AnalyzerProvenance,
     current_hash: String,
+    current_environment: Option<EnvironmentFacts>,
 }
 
 impl<'a> QueryEngine<'a> {
-    /// Construct a query engine over `store`, told the analyzer and source hash currently in effect
-    /// so every answer can be marked fresh or stale.
-    pub fn new(store: &'a GraphStore, current_provenance: AnalyzerProvenance, current_hash: String) -> Self {
+    /// Construct a query engine over `store`, told the analyzer, source hash, and declared
+    /// environment currently in effect so every answer can be marked fresh or stale.
+    pub fn new(
+        store: &'a GraphStore,
+        current_provenance: AnalyzerProvenance,
+        current_hash: String,
+        current_environment: Option<EnvironmentFacts>,
+    ) -> Self {
         Self {
             store,
             current_provenance,
             current_hash,
+            current_environment,
         }
     }
 
@@ -78,7 +85,11 @@ impl<'a> QueryEngine<'a> {
         let meta = self.store.read_metadata()?;
         let freshness = self
             .store
-            .freshness(&self.current_hash, &self.current_provenance)?
+            .freshness(
+                &self.current_hash,
+                &self.current_provenance,
+                self.current_environment.as_ref(),
+            )?
             .unwrap_or(Freshness::StaleContent);
         let provenance = match meta {
             Some(m) => Provenance {

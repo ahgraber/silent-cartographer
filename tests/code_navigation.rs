@@ -29,7 +29,7 @@ fn built_store() -> GraphStore {
 
 fn engine_over<'a>(store: &'a GraphStore, provenance: AnalyzerProvenance) -> QueryEngine<'a> {
     let hash = silent_cartographer::graph::content_hash(&sources());
-    QueryEngine::new(store, provenance, hash)
+    QueryEngine::new(store, provenance, hash, None)
 }
 
 /// The identity of a fixture symbol, from its descriptor segments.
@@ -312,7 +312,7 @@ fn result_identifies_symbols_by_identity_and_name() {
 fn stale_result_flagged_through_get_and_trace() {
     let store = built_store();
     // A query engine told the current hash differs (sources changed since indexing).
-    let engine = QueryEngine::new(&store, support::provenance(), "different-hash".to_string());
+    let engine = QueryEngine::new(&store, support::provenance(), "different-hash".to_string(), None);
 
     let get_answer = engine.get("net::Client::connect", Detail::Location).unwrap();
     assert!(get_answer.stale, "get result over changed sources is stale");
@@ -461,7 +461,7 @@ fn dep_graph(symbols: &[&str], edges: &[(EdgeKind, &str, &str)]) -> GraphStore {
 /// A query engine over a directly-built store (no metadata written; answers read stale, which is
 /// irrelevant to the dependents outcome under test).
 fn dep_engine(store: &GraphStore) -> QueryEngine<'_> {
-    QueryEngine::new(store, support::provenance(), "hash".to_string())
+    QueryEngine::new(store, support::provenance(), "hash".to_string(), None)
 }
 
 // _(Trace dependents; Detailed results carry kind and distance)_ — `dependents` returns direct
@@ -761,4 +761,153 @@ fn deterministic_ordering_across_repeated_queries() {
         }
     };
     assert_eq!(locs(&first), locs(&second), "identical queries return the same order");
+}
+
+// ---------------------------------------------------------------------------
+// Python (fixture-level): navigation over the committed python-conformance
+// fixture — no live tool.
+// ---------------------------------------------------------------------------
+
+fn py_ws() -> WorkspaceId {
+    WorkspaceId::new("py-ws")
+}
+
+fn py_id(segments: &[(&str, SegmentKind)]) -> CanonicalId {
+    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
+    project_one(&py_ws(), &Descriptor::new("python-conformance", segs))
+}
+
+fn py_widget_id() -> CanonicalId {
+    py_id(&[("pkg.shapes", SegmentKind::Module), ("Widget", SegmentKind::Type)])
+}
+
+fn py_render_id() -> CanonicalId {
+    py_id(&[
+        ("pkg.shapes", SegmentKind::Module),
+        ("Widget", SegmentKind::Type),
+        ("render", SegmentKind::Method),
+    ])
+}
+
+fn py_build_id() -> CanonicalId {
+    py_id(&[("pkg.consumer", SegmentKind::Module), ("build", SegmentKind::Method)])
+}
+
+fn py_consumer_module_id() -> CanonicalId {
+    py_id(&[("pkg.consumer", SegmentKind::Module), ("__init__", SegmentKind::Meta)])
+}
+
+fn py_store() -> GraphStore {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(
+        &mut store,
+        &py_ws(),
+        &support::python_fixture_index(),
+        &support::python_fixture_sources(),
+    )
+    .unwrap();
+    store
+}
+
+fn py_engine(store: &GraphStore) -> QueryEngine<'_> {
+    let provenance = support::python_fixture_index().provenance;
+    let hash = silent_cartographer::graph::content_hash(&support::python_fixture_sources());
+    QueryEngine::new(store, provenance, hash, None)
+}
+
+/// The fixture text of a Python source, for byte-exact expectations.
+fn py_source(rel: &str) -> String {
+    support::python_fixture_sources()
+        .into_iter()
+        .find(|(p, _)| p == rel)
+        .expect("fixture source present")
+        .1
+}
+
+// _(Scenario: Retrieve full body of a Python symbol)_ — the body spans several indentation levels
+// and is returned byte-exact.
+#[test]
+fn python_body_retrieval_is_byte_exact() {
+    use silent_cartographer::query::DetailPayload;
+    let store = py_store();
+    let engine = py_engine(&store);
+    let answer = engine.get(py_render_id().as_str(), Detail::Body).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+
+    // The exact bytes of the whole `render` definition, sliced from the fixture source itself.
+    let source = py_source("pkg/shapes.py");
+    let start = source.find("def render").unwrap();
+    let end = source.find("\"unreachable\"").unwrap() + "\"unreachable\"".len();
+    let expected = &source[start..end];
+
+    match &results[0].payload {
+        DetailPayload::Body { body: Some(body) } => assert_eq!(body, expected, "byte-exact body"),
+        other => panic!("expected a body, got {other:?}"),
+    }
+}
+
+// _(Scenario: Retrieve Python symbol by position)_ — a position inside a method body resolves to
+// the enclosing method.
+#[test]
+fn python_get_by_position_resolves_enclosing_method() {
+    let store = py_store();
+    let engine = py_engine(&store);
+    let source = py_source("pkg/shapes.py");
+    let inside_render = source.find("return \"widget\"").unwrap();
+    let answer = engine
+        .get_by_position("pkg/shapes.py", inside_render, Detail::Location)
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    assert_eq!(
+        results[0].symbol.canonical_id,
+        py_render_id(),
+        "position resolves to the enclosing method, not the class or module"
+    );
+}
+
+// _(Scenario: Trace dependents of a Python symbol)_ — Widget's dependents carry the connecting edge
+// kind and hop distance: `build` uses it (the call inside the function body) and the consuming
+// module imports it (the module-scope import line).
+#[test]
+fn python_dependents_trace_carries_kind_and_distance() {
+    use silent_cartographer::query::DependentsReport;
+    let store = py_store();
+    let engine = py_engine(&store);
+    let answer = engine.dependents(py_widget_id().as_str(), 1).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    let report: &DependentsReport = &results[0];
+
+    let uses = report
+        .detail
+        .iter()
+        .find(|d| d.symbol.canonical_id == py_build_id())
+        .unwrap_or_else(|| panic!("build is a dependent: {:?}", report.detail));
+    assert_eq!(uses.kind, "uses", "the function that calls Widget is a uses dependent");
+    assert_eq!(uses.distance, 1);
+
+    let imports = report
+        .detail
+        .iter()
+        .find(|d| d.symbol.canonical_id == py_consumer_module_id())
+        .unwrap_or_else(|| panic!("the importing module is a dependent: {:?}", report.detail));
+    assert_eq!(imports.kind, "imports", "the importing module is an imports dependent");
+    assert_eq!(imports.distance, 1);
+}
+
+// _(Scenario: Python dotted qualified name resolves)_ — a `pkg.module.Class` style reference
+// resolves to exactly one symbol.
+#[test]
+fn python_dotted_qualified_name_resolves() {
+    let store = py_store();
+    let engine = py_engine(&store);
+    match engine.resolve("pkg.shapes.Widget").unwrap() {
+        Resolution::Unique(row) => assert_eq!(row.canonical_id, py_widget_id()),
+        other => panic!("expected a unique resolution, got {other:?}"),
+    }
 }

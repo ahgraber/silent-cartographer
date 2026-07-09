@@ -8,7 +8,7 @@
 /// The current schema version. Bumped on any schema-affecting change under the reproducibility
 /// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
 /// before any table access; the `index_metadata.schema_version` column carries it as provenance.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -16,12 +16,16 @@ PRAGMA foreign_keys = ON;
 
 -- One row per indexed workspace build. Holds provenance, the content-hash gate, and the
 -- join-alignment accounting: one acceptance count per alignment rule, plus the refusal counts.
+-- `environment` is the backend's declared interpreter-environment facts as JSON (nullable — absent
+-- for backends, like Rust's, that declare none); staleness compares it against the environment in
+-- effect.
 CREATE TABLE IF NOT EXISTS index_metadata (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version      INTEGER NOT NULL,
     workspace_id        TEXT    NOT NULL,
     analyzer_name       TEXT    NOT NULL,
     analyzer_version    TEXT    NOT NULL,
+    environment         TEXT,
     content_hash                   TEXT    NOT NULL,
     aligned_exact_count            INTEGER NOT NULL DEFAULT 0,
     aligned_crate_root_count       INTEGER NOT NULL DEFAULT 0,

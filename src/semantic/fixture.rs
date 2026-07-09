@@ -43,6 +43,7 @@ impl FixtureEngine {
                 symbols: Vec::new(),
                 duplicate_groups: Vec::new(),
                 library_roots: Default::default(),
+                environment: None,
             },
             capabilities: Capabilities::none(),
             failure: Some(reason.into()),

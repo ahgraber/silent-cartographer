@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::graph::syntax::Language;
 use crate::query::{Detail, Relation};
 
 /// The `c10r` CLI: precise, type-aware navigation over a persisted code graph.
@@ -143,6 +144,24 @@ pub struct StatusArgs {
     pub duplicates: bool,
 }
 
+/// The language backend selector for `build`: overrides manifest detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LanguageArg {
+    /// The Rust backend (`rust-analyzer scip`).
+    Rust,
+    /// The Python backend (`scip-python index`).
+    Python,
+}
+
+impl From<LanguageArg> for Language {
+    fn from(l: LanguageArg) -> Self {
+        match l {
+            LanguageArg::Rust => Language::Rust,
+            LanguageArg::Python => Language::Python,
+        }
+    }
+}
+
 /// Arguments for `build`.
 #[derive(Debug, Args)]
 pub struct BuildArgs {
@@ -153,4 +172,15 @@ pub struct BuildArgs {
     /// Path to the `rust-analyzer` executable.
     #[arg(long, default_value = "rust-analyzer")]
     pub rust_analyzer: String,
+
+    /// The language backend to build with. When omitted, the workspace's project manifest decides
+    /// (`Cargo.toml` → rust, `pyproject.toml` → python); with both manifests present this flag is
+    /// required.
+    #[arg(long, value_enum)]
+    pub language: Option<LanguageArg>,
+
+    /// An explicit interpreter-environment path (meaningful for the Python backend). Overrides
+    /// `$VIRTUAL_ENV` and the workspace's `.venv`/`venv` directories.
+    #[arg(long)]
+    pub environment: Option<PathBuf>,
 }

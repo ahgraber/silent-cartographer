@@ -6,7 +6,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::identity::{CanonicalId, WorkspaceId};
-use crate::semantic::model::AnalyzerProvenance;
+use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
 
 use super::join::JoinAccounting;
 use super::schema::{SCHEMA_SQL, SCHEMA_VERSION};
@@ -217,17 +217,23 @@ pub struct IndexMetadata {
     pub content_hash: String,
     /// The join-alignment accounting for the build.
     pub accounting: JoinAccounting,
+    /// The backend's declared interpreter-environment facts, if it declared any (`None` for the
+    /// Rust adapter). Compared whole against the environment in effect by [`GraphStore::freshness`].
+    pub environment: Option<EnvironmentFacts>,
 }
 
-/// The freshness of the index relative to the sources and analyzer currently in effect.
+/// The freshness of the index relative to the sources, analyzer, and declared environment currently
+/// in effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
-    /// Sources and analyzer are unchanged since indexing.
+    /// Sources, analyzer, and declared environment are unchanged since indexing.
     Fresh,
     /// The source content changed since indexing.
     StaleContent,
     /// The analyzer version differs from the recorded provenance.
     StaleVersion,
+    /// The recorded interpreter environment differs from the one in effect.
+    StaleEnvironment,
 }
 
 impl Freshness {
@@ -351,18 +357,24 @@ impl GraphStore {
 
     /// Replace the index metadata row with the given build's metadata.
     pub fn write_metadata(&self, meta: &IndexMetadata) -> rusqlite::Result<()> {
+        // Declared environment facts persist as JSON text; a backend that declares none writes NULL.
+        let environment = meta
+            .environment
+            .as_ref()
+            .map(|facts| serde_json::to_string(facts).expect("environment facts serialize"));
         self.conn.execute(
             "INSERT OR REPLACE INTO index_metadata
-                (id, schema_version, workspace_id, analyzer_name, analyzer_version, content_hash,
+                (id, schema_version, workspace_id, analyzer_name, analyzer_version, environment, content_hash,
                  aligned_exact_count, aligned_crate_root_count, aligned_operator_desugar_count,
                  aligned_module_span_count, aligned_self_keyword_count, text_mismatch_count,
                  semantic_only_count, duplicate_ambiguous_count, syntax_only_count)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 SCHEMA_VERSION,
                 meta.workspace_id.as_str(),
                 meta.provenance.analyzer_name,
                 meta.provenance.analyzer_version,
+                environment,
                 meta.content_hash,
                 meta.accounting.aligned_exact as i64,
                 meta.accounting.aligned_crate_root as i64,
@@ -382,30 +394,42 @@ impl GraphStore {
     pub fn read_metadata(&self) -> rusqlite::Result<Option<IndexMetadata>> {
         self.conn
             .query_row(
-                "SELECT workspace_id, analyzer_name, analyzer_version, content_hash,
+                "SELECT workspace_id, analyzer_name, analyzer_version, environment, content_hash,
                         aligned_exact_count, aligned_crate_root_count, aligned_operator_desugar_count,
                         aligned_module_span_count, aligned_self_keyword_count, text_mismatch_count,
                         semantic_only_count, duplicate_ambiguous_count, syntax_only_count
                  FROM index_metadata WHERE id = 1",
                 [],
                 |r| {
+                    // A NULL column is a backend that declared no environment; unparsable JSON is a
+                    // corrupt row surfaced as a typed conversion error, never silently dropped
+                    // (dropping it would report a drifted environment as fresh).
+                    let environment = r
+                        .get::<_, Option<String>>(3)?
+                        .map(|json| {
+                            serde_json::from_str::<EnvironmentFacts>(&json).map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+                            })
+                        })
+                        .transpose()?;
                     Ok(IndexMetadata {
                         workspace_id: WorkspaceId::new(r.get::<_, String>(0)?),
                         provenance: AnalyzerProvenance {
                             analyzer_name: r.get(1)?,
                             analyzer_version: r.get(2)?,
                         },
-                        content_hash: r.get(3)?,
+                        environment,
+                        content_hash: r.get(4)?,
                         accounting: JoinAccounting {
-                            aligned_exact: r.get::<_, i64>(4)? as u64,
-                            aligned_crate_root: r.get::<_, i64>(5)? as u64,
-                            aligned_operator_desugar: r.get::<_, i64>(6)? as u64,
-                            aligned_module_span: r.get::<_, i64>(7)? as u64,
-                            aligned_self_keyword: r.get::<_, i64>(8)? as u64,
-                            text_mismatch: r.get::<_, i64>(9)? as u64,
-                            semantic_only: r.get::<_, i64>(10)? as u64,
-                            duplicate_ambiguous: r.get::<_, i64>(11)? as u64,
-                            syntax_only: r.get::<_, i64>(12)? as u64,
+                            aligned_exact: r.get::<_, i64>(5)? as u64,
+                            aligned_crate_root: r.get::<_, i64>(6)? as u64,
+                            aligned_operator_desugar: r.get::<_, i64>(7)? as u64,
+                            aligned_module_span: r.get::<_, i64>(8)? as u64,
+                            aligned_self_keyword: r.get::<_, i64>(9)? as u64,
+                            text_mismatch: r.get::<_, i64>(10)? as u64,
+                            semantic_only: r.get::<_, i64>(11)? as u64,
+                            duplicate_ambiguous: r.get::<_, i64>(12)? as u64,
+                            syntax_only: r.get::<_, i64>(13)? as u64,
                         },
                     })
                 },
@@ -827,8 +851,14 @@ impl GraphStore {
         rows.collect()
     }
 
-    /// Evaluate freshness against the sources' current content hash and the analyzer in effect.
-    pub fn freshness(&self, current_hash: &str, current: &AnalyzerProvenance) -> rusqlite::Result<Option<Freshness>> {
+    /// Evaluate freshness against the sources' current content hash, the analyzer in effect, and
+    /// the declared environment in effect (`None` when no environment applies or none resolves).
+    pub fn freshness(
+        &self,
+        current_hash: &str,
+        current: &AnalyzerProvenance,
+        current_environment: Option<&EnvironmentFacts>,
+    ) -> rusqlite::Result<Option<Freshness>> {
         let Some(meta) = self.read_metadata()? else {
             return Ok(None);
         };
@@ -840,6 +870,11 @@ impl GraphStore {
             || meta.provenance.analyzer_name != current.analyzer_name
         {
             return Ok(Some(Freshness::StaleVersion));
+        }
+        // The whole declared environment must match, absence included: a recorded environment that
+        // can no longer be resolved is drift, never reported fresh.
+        if meta.environment.as_ref() != current_environment {
+            return Ok(Some(Freshness::StaleEnvironment));
         }
         Ok(Some(Freshness::Fresh))
     }

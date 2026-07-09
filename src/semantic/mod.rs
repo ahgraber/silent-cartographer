@@ -10,12 +10,14 @@ pub mod capabilities;
 pub mod conformance;
 pub mod fixture;
 pub mod model;
+pub mod python_adapter;
 pub mod rust_adapter;
+pub mod scip;
 
 pub use capabilities::Capabilities;
 pub use model::{
-    AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
-    SourceDocument, SourceRange, SymbolClass, SymbolKind,
+    AnalyzerProvenance, EnvironmentFacts, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole,
+    PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind,
 };
 
 use thiserror::Error;
@@ -29,6 +31,11 @@ pub enum SemanticError {
     /// The backend's tool was not available in the environment.
     #[error("semantic backend unavailable: {0}")]
     Unavailable(String),
+    /// The project's interpreter environment could not be resolved well enough to produce a
+    /// faithful index — a typed refusal naming the remedy, never a silent fallback to a system
+    /// interpreter.
+    #[error("python environment unresolved: {0}")]
+    Environment(String),
 }
 
 /// The backend contract floor: the intersection every semantic backend must satisfy.

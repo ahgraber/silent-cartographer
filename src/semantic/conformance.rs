@@ -117,6 +117,18 @@ pub fn check_index(index: &ExtractedIndex) -> ConformanceReport {
     ConformanceReport { violations }
 }
 
+/// Run the same contract clauses against several backends, one project root per backend, reporting
+/// each under its label.
+///
+/// Backends gate independently: a violation in one backend's report never affects another's — the
+/// suite is parameterized by backend, not aggregated across them.
+pub fn run_all<'a>(backends: &[(&'a str, &'a dyn SemanticEngine, &'a Path)]) -> Vec<(&'a str, ConformanceReport)> {
+    backends
+        .iter()
+        .map(|(label, engine, root)| (*label, run(*engine, root)))
+        .collect()
+}
+
 /// Run a backend over a project and check its output against the contract.
 ///
 /// A backend whose `analyze` fails is reported non-conformant (it cannot be relied upon), rather
@@ -124,11 +136,13 @@ pub fn check_index(index: &ExtractedIndex) -> ConformanceReport {
 pub fn run(engine: &dyn SemanticEngine, project_root: &Path) -> ConformanceReport {
     match engine.analyze(project_root) {
         Ok(index) => check_index(&index),
-        Err(SemanticError::Analysis(msg)) | Err(SemanticError::Unavailable(msg)) => ConformanceReport {
-            violations: vec![Violation {
-                clause: "analyze-succeeds",
-                detail: msg,
-            }],
-        },
+        Err(SemanticError::Analysis(msg) | SemanticError::Unavailable(msg) | SemanticError::Environment(msg)) => {
+            ConformanceReport {
+                violations: vec![Violation {
+                    clause: "analyze-succeeds",
+                    detail: msg,
+                }],
+            }
+        }
     }
 }

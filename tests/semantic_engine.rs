@@ -78,6 +78,7 @@ fn non_conformant_backend_is_rejected() {
         }],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let engine = FixtureEngine::new(broken);
     let report = conformance::run(&engine, Path::new("."));
@@ -183,6 +184,7 @@ fn merged_twins_are_split_through_the_backend_contract() {
         }],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
 
     // Take the index through the backend contract surface, exactly as ingestion does.
@@ -320,6 +322,201 @@ fn exemplar_scip_fixture_translates_and_passes_conformance() {
     assert!(
         report.is_conformant(),
         "exemplar translation must pass the conformance suite: {:?}",
+        report.violations()
+    );
+}
+
+/// The committed Python conformance fixture directory.
+fn python_fixture_root() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python-conformance")
+}
+
+/// One-off generator for the checked-in Python fixture index. Run explicitly to (re)create it:
+/// `cargo test --test semantic_engine -- --ignored generate_python_conformance_scip_fixture`
+///
+/// Generates THROUGH the adapter (its real invocation, project-name/version flags included), never
+/// through an ad-hoc tool call, so the committed bytes reflect exactly what a build would parse.
+/// Needs `python3` (to create the fixture venv on first run) and `scip-python` on PATH; it refuses
+/// with a clear message when either is missing.
+#[test]
+#[ignore = "fixture generator; needs python3 + scip-python; run explicitly to regenerate tests/fixtures/python-conformance/index.scip"]
+fn generate_python_conformance_scip_fixture() {
+    use silent_cartographer::semantic::python_adapter::PythonAdapter;
+
+    let root = python_fixture_root();
+    let venv = root.join(".venv");
+    if !venv.is_dir() {
+        let status = std::process::Command::new("python3")
+            .args(["-m", "venv"])
+            .arg(&venv)
+            .status()
+            .expect("python3 is required to create the fixture venv");
+        assert!(status.success(), "python3 -m venv failed");
+    }
+
+    let adapter = PythonAdapter::new("scip-python", venv, "python-conformance")
+        .expect("scip-python is required: npm install -g @sourcegraph/scip-python");
+    let output = root.join("index.scip");
+    adapter
+        .write_scip_index(&root, &output)
+        .expect("scip-python index runs");
+    assert!(output.exists());
+
+    // Record the tool version the committed index was generated with, inside the fixture dir.
+    let version = adapter.provenance().analyzer_version;
+    std::fs::write(root.join("SCIP-PYTHON-VERSION"), format!("{version}\n")).expect("record tool version");
+}
+
+// _(Scenario: Python definition occurrence extracted)_ — from the committed fixture index, a class
+// defined in the fixture arrives with its resolved descriptor and a definition-role occurrence
+// whose range maps through a declared encoding.
+#[test]
+fn python_definition_occurrence_extracted() {
+    let index = support::python_fixture_index();
+    let widget = index
+        .symbols
+        .iter()
+        .find(|s| s.terminal_name() == Some("Widget"))
+        .expect("Widget symbol present in the committed index");
+    assert!(widget.descriptor.is_some(), "resolved descriptor present");
+    let def = widget.definition().expect("Widget has a definition occurrence");
+    assert_eq!(def.role, OccurrenceRole::Definition);
+    assert_eq!(def.document_path, "pkg/shapes.py", "the definition maps to its module");
+    assert!(index.encoding_for(&def.document_path).is_some(), "range is mappable");
+}
+
+// _(Scenario: Python reference occurrence extracted)_ — a symbol used in a different module than
+// the one defining it arrives with a reference-role occurrence at the use site.
+#[test]
+fn python_reference_occurrence_extracted() {
+    let index = support::python_fixture_index();
+    let widget = index
+        .symbols
+        .iter()
+        .find(|s| s.terminal_name() == Some("Widget"))
+        .unwrap();
+    let cross_module_reference = widget
+        .occurrences
+        .iter()
+        .any(|o| o.role == OccurrenceRole::Reference && o.document_path == "pkg/consumer.py");
+    assert!(
+        cross_module_reference,
+        "Widget is referenced from the consuming module: {:?}",
+        widget.occurrences
+    );
+    // The committed Python translation satisfies the whole contract, same clauses as Rust.
+    let report = conformance::check_index(&index);
+    assert!(
+        report.is_conformant(),
+        "python fixture translation passes the suite: {:?}",
+        report.violations()
+    );
+}
+
+// _(Scenario: Backends gate independently)_ — the suite runs the same clauses per backend; a
+// deliberately broken backend beside a conforming one is reported non-conformant without affecting
+// the conforming backend's verdict.
+#[test]
+fn nonconformant_backend_does_not_affect_the_other() {
+    // A conforming backend (the committed Python fixture through the shared translation).
+    let conforming = FixtureEngine::new(support::python_fixture_index());
+    // A deliberately broken backend: a non-local symbol with no resolved descriptor.
+    let broken_index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![SourceDocument {
+            path: "src/a.rs".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![ExtractedSymbol {
+            descriptor: None,
+            kind: SymbolKind::Type,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![ExtractedOccurrence {
+                document_path: "src/a.rs".to_string(),
+                range: SourceRange::new(0, 0, 0, 1),
+                role: Definition,
+            }],
+        }],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    };
+    let broken = FixtureEngine::new(broken_index);
+
+    let reports = conformance::run_all(&[
+        ("python", &conforming as &dyn SemanticEngine, Path::new(".")),
+        ("broken", &broken as &dyn SemanticEngine, Path::new(".")),
+    ]);
+    let by_label: std::collections::HashMap<&str, bool> =
+        reports.iter().map(|(l, r)| (*l, r.is_conformant())).collect();
+    assert!(by_label["python"], "the conforming backend stays usable");
+    assert!(!by_label["broken"], "the broken backend is gated out");
+}
+
+// _(Live leg)_ — the real scip-python over the fixture project must match the committed index's
+// shape. When the tool (or python3 for the venv) is absent this leg SKIPs explicitly, never
+// silently passing.
+#[test]
+fn python_live_tool_matches_committed_fixture_shape() {
+    use silent_cartographer::semantic::python_adapter::PythonAdapter;
+
+    if PythonAdapter::discover_version("scip-python").is_err() {
+        eprintln!("SKIP: scip-python not installed");
+        return;
+    }
+    if std::process::Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("SKIP: python3 not available to create the fixture venv");
+        return;
+    }
+
+    // Copy the fixture project into a temp dir and give it a fresh venv, so the live run needs
+    // nothing pre-existing in the repo tree.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let fixture = support::python_fixture_root();
+    std::fs::copy(fixture.join("pyproject.toml"), root.join("pyproject.toml")).unwrap();
+    std::fs::create_dir(root.join("pkg")).unwrap();
+    for rel in ["pkg/__init__.py", "pkg/consumer.py", "pkg/shapes.py"] {
+        std::fs::copy(fixture.join(rel), root.join(rel)).unwrap();
+    }
+    let venv = root.join(".venv");
+    let status = std::process::Command::new("python3")
+        .args(["-m", "venv"])
+        .arg(&venv)
+        .status()
+        .unwrap();
+    assert!(status.success(), "python3 -m venv failed");
+
+    let adapter = PythonAdapter::new("scip-python", venv, "python-conformance").expect("tool present (checked)");
+    let live = adapter.analyze(root).expect("live scip-python indexes the fixture");
+
+    // Shape comparison: the live run resolves exactly the committed index's in-workspace symbols.
+    let committed = support::python_fixture_index();
+    let shape = |index: &ExtractedIndex| -> Vec<String> {
+        let mut names: Vec<String> = index
+            .symbols
+            .iter()
+            .filter(|s| s.class == SymbolClass::InWorkspace)
+            .filter_map(|s| s.descriptor.as_ref())
+            .map(|d| {
+                let segments: Vec<&str> = d.segments.iter().map(|seg| seg.name.as_str()).collect();
+                format!("{} {}", d.package, segments.join("::"))
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        shape(&live),
+        shape(&committed),
+        "live scip-python output drifted from the committed fixture shape (tool version: {})",
+        adapter.provenance().analyzer_version
+    );
+    // The live output passes the same conformance clauses.
+    let report = conformance::check_index(&live);
+    assert!(
+        report.is_conformant(),
+        "live output conforms: {:?}",
         report.violations()
     );
 }

@@ -31,7 +31,7 @@ use crate::identity::{CanonicalId, Descriptor};
 use crate::semantic::model::{ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, SymbolKind};
 
 use super::range::{ByteSpan, LineIndex, range_to_span};
-use super::syntax::{ConstructAt, SyntaxDeclaration, SyntaxTree};
+use super::syntax::{ConstructAt, Language, SyntaxDeclaration, SyntaxTree};
 
 /// The named alignment rule that accepted an attribution. Stored as provenance on every aligned
 /// occurrence; each rule also carries its own acceptance bucket in the accounting.
@@ -255,12 +255,17 @@ struct PreparedDocument {
 ///
 /// `identities[i]` is the canonical identity of `index.symbols[i]`. Symbols without an identity
 /// (e.g. those the caller chose not to persist) are skipped.
-pub fn join(index: &ExtractedIndex, corpus: &SourceCorpus, identities: &[Option<CanonicalId>]) -> JoinResult {
-    // Parse each referenced document once.
+pub fn join(
+    index: &ExtractedIndex,
+    corpus: &SourceCorpus,
+    identities: &[Option<CanonicalId>],
+    language: Language,
+) -> JoinResult {
+    // Parse each referenced document once, as the index's language.
     let mut prepared: HashMap<String, PreparedDocument> = HashMap::new();
     for doc in &index.documents {
         if let Some(source) = corpus.get(&doc.path)
-            && let Some(tree) = SyntaxTree::parse(source)
+            && let Some(tree) = SyntaxTree::parse(source, language)
         {
             prepared.insert(
                 doc.path.clone(),

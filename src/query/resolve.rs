@@ -37,6 +37,24 @@ pub fn resolve(store: &GraphStore, reference: &str) -> rusqlite::Result<Resoluti
         return Ok(classify(candidates));
     }
 
+    // Dotted qualified tier: a Python-style `pkg.module.Class` name. A dot maps ambiguously onto
+    // identity separators (a Python namespace segment's own name contains dots), so candidates are
+    // matched by dotted-form suffix: an identity matches when replacing its `::` separators with
+    // `.` yields the reference at a `.` boundary.
+    if reference.contains('.') {
+        let short = reference.rsplit('.').next().unwrap_or(reference);
+        let mut candidates: Vec<SymbolRow> = store
+            .symbols_by_shortname(short)?
+            .into_iter()
+            .filter(|row| {
+                let dotted = row.canonical_id.as_str().replace("::", ".");
+                dotted == reference || dotted.ends_with(&format!(".{reference}"))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.canonical_id.cmp(&b.canonical_id));
+        return Ok(classify(candidates));
+    }
+
     // Shortname tier: a bare name.
     let mut candidates = store.symbols_by_shortname(reference)?;
     candidates.sort_by(|a, b| a.canonical_id.cmp(&b.canonical_id));

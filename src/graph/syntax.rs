@@ -1,4 +1,5 @@
-//! The syntax oracle: tree-sitter-rust structure and enclosure over a source file.
+//! The syntax oracle: tree-sitter structure and enclosure over a source file, for every language
+//! the join consumes.
 //!
 //! This oracle is always fresh, error-tolerant, and needs no build. It owns structure and
 //! enclosure; the semantic index owns cross-file identity. The join reconciles the two.
@@ -7,15 +8,28 @@
 //! given byte span, and the chain of persisted declarations that enclose a byte offset (a closure is
 //! not a persisted declaration, so it is transparent to the chain — a reference inside a closure
 //! attributes to the enclosing function).
+//!
+//! Structure differs by language, so declaration kinds, name-node kinds, and the module-declaration
+//! query are each a per-[`Language`] table; the query surface itself ([`SyntaxTree`]'s methods) is
+//! the same for every language a caller selects.
 
 use tree_sitter::{Node, Parser, Tree};
 
 use super::range::ByteSpan;
 
+/// The source language a [`SyntaxTree`] is parsed as, selecting its declaration-kind and name-node
+/// tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Rust,
+    Python,
+}
+
 /// A parsed syntax tree over one source file, retaining the source for byte slicing.
 pub struct SyntaxTree {
     tree: Tree,
     source: String,
+    language: Language,
 }
 
 /// A declaration node the graph persists, identified by the byte span of its name and its full
@@ -44,6 +58,21 @@ pub struct TraitImpl {
     pub trait_name_span: ByteSpan,
 }
 
+/// The subclass/base name-token spans of one Python `class Sub(Base1, Base2):` definition.
+///
+/// Each base span points at the terminal identifier token (a dotted base `module.Base` → `Base`;
+/// the bare identifier otherwise), so `type_hierarchy` edge derivation resolves it through the
+/// aligned occurrence sitting at exactly that location — the Python analog of [`TraitImpl`]. A base
+/// shape carrying no resolvable name token (a call, a subscript) contributes no span: skip, never
+/// guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassBases {
+    /// The name-token span of the class being defined.
+    pub class_name_span: ByteSpan,
+    /// The name-token spans of the declared bases, in declaration order.
+    pub base_name_spans: Vec<ByteSpan>,
+}
+
 /// The syntactic construct located at a byte span: its node kind, full span, and — for
 /// operator-shaped expressions — the operator token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +86,7 @@ pub struct ConstructAt {
 }
 
 /// tree-sitter node kinds that correspond to persisted Rust declarations.
-const DECLARATION_KINDS: &[&str] = &[
+const RUST_DECLARATION_KINDS: &[&str] = &[
     "mod_item",
     "struct_item",
     "enum_item",
@@ -71,6 +100,32 @@ const DECLARATION_KINDS: &[&str] = &[
     "function_signature_item",
 ];
 
+/// tree-sitter node kinds that correspond to persisted Python declarations: the module (the whole
+/// document), classes, and functions (async functions are `function_definition` nodes too, so they
+/// need no separate entry).
+const PYTHON_DECLARATION_KINDS: &[&str] = &["module", "class_definition", "function_definition"];
+
+/// The persisted-declaration node kinds for `language`.
+fn declaration_kinds(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Rust => RUST_DECLARATION_KINDS,
+        Language::Python => PYTHON_DECLARATION_KINDS,
+    }
+}
+
+/// The identifier-like (name) node kinds for `language`.
+fn name_node_kinds(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Rust => &[
+            "identifier",
+            "type_identifier",
+            "field_identifier",
+            "shorthand_field_identifier",
+        ],
+        Language::Python => &["identifier"],
+    }
+}
+
 fn span_of(node: Node) -> ByteSpan {
     ByteSpan {
         start: node.start_byte(),
@@ -79,14 +134,19 @@ fn span_of(node: Node) -> ByteSpan {
 }
 
 impl SyntaxTree {
-    /// Parse Rust `source`. Returns `None` only if the parser cannot be initialized.
-    pub fn parse(source: &str) -> Option<Self> {
+    /// Parse `source` as `language`. Returns `None` only if the parser cannot be initialized.
+    pub fn parse(source: &str, language: Language) -> Option<Self> {
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).ok()?;
+        let grammar = match language {
+            Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Language::Python => tree_sitter_python::LANGUAGE.into(),
+        };
+        parser.set_language(&grammar).ok()?;
         let tree = parser.parse(source, None)?;
         Some(Self {
             tree,
             source: source.to_string(),
+            language,
         })
     }
 
@@ -115,7 +175,7 @@ impl SyntaxTree {
             if !node_span.contains(&span) {
                 continue;
             }
-            if is_name_node(node) {
+            if is_name_node(node, self.language) {
                 // Prefer the tightest containing identifier.
                 best = Some(match best {
                     Some(b) if (b.end - b.start) <= (node_span.end - node_span.start) => b,
@@ -146,16 +206,17 @@ impl SyntaxTree {
     /// module/file itself (the outermost attribution).
     pub fn enclosing_declarations(&self, offset: usize) -> Vec<SyntaxDeclaration> {
         let root = self.tree.root_node();
+        let kinds = declaration_kinds(self.language);
         let mut chain = Vec::new();
         let mut node = root.descendant_for_byte_range(offset, offset);
         while let Some(n) = node {
-            if DECLARATION_KINDS.contains(&n.kind())
-                && let Some(name_span) = declaration_name_span(n, &self.source)
+            if kinds.contains(&n.kind())
+                && let Some(name_span) = declaration_name_span(n)
             {
                 chain.push(SyntaxDeclaration {
                     node_kind: n.kind().to_string(),
                     name_span,
-                    full_span: span_of(n),
+                    full_span: declaration_full_span(n),
                 });
             }
             node = n.parent();
@@ -183,6 +244,44 @@ impl SyntaxTree {
                 out.push(TraitImpl {
                     type_name_span: span_of(type_tok),
                     trait_name_span: span_of(trait_tok),
+                });
+            }
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// The subclass/base name-token spans for every `class Sub(Base1, Base2):` definition in a
+    /// Python file — the Python analog of [`Self::trait_impls`].
+    ///
+    /// Each entry carries the class's own name-token span and one span per declared base's terminal
+    /// identifier, so `type_hierarchy` edge derivation resolves each through the aligned occurrence
+    /// at that location. A class without a superclass list contributes an entry with no base spans;
+    /// keyword arguments in the header (`metaclass=...`) and base shapes without a name token are
+    /// skipped, never guessed at.
+    pub fn class_bases(&self) -> Vec<ClassBases> {
+        let root = self.tree.root_node();
+        let mut out = Vec::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "class_definition"
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                let mut base_name_spans = Vec::new();
+                if let Some(superclasses) = node.child_by_field_name("superclasses") {
+                    let mut args_cursor = superclasses.walk();
+                    for arg in superclasses.named_children(&mut args_cursor) {
+                        if let Some(token) = python_base_name_token(arg) {
+                            base_name_spans.push(span_of(token));
+                        }
+                    }
+                }
+                out.push(ClassBases {
+                    class_name_span: span_of(name),
+                    base_name_spans,
                 });
             }
             for child in node.children(&mut cursor) {
@@ -251,6 +350,11 @@ impl SyntaxTree {
     /// containment must gate reference occurrences through this check rather than trusting any
     /// reference.
     pub fn is_module_declaration_name(&self, span: ByteSpan) -> bool {
+        // Python has no `mod`-style declaration, so the module-chain locality rule this check backs
+        // is inert for Python: every Python span reports no module-declaration site.
+        if self.language != Language::Rust {
+            return false;
+        }
         let root = self.tree.root_node();
         let end = span.end.max(span.start + 1).min(root.end_byte());
         let Some(mut node) = root.descendant_for_byte_range(span.start, end) else {
@@ -277,17 +381,18 @@ impl SyntaxTree {
     /// Every persisted declaration in the file, each with its name and full span.
     pub fn all_declarations(&self) -> Vec<SyntaxDeclaration> {
         let root = self.tree.root_node();
+        let kinds = declaration_kinds(self.language);
         let mut out = Vec::new();
         let mut cursor = root.walk();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if DECLARATION_KINDS.contains(&node.kind())
-                && let Some(name_span) = declaration_name_span(node, &self.source)
+            if kinds.contains(&node.kind())
+                && let Some(name_span) = declaration_name_span(node)
             {
                 out.push(SyntaxDeclaration {
                     node_kind: node.kind().to_string(),
                     name_span,
-                    full_span: span_of(node),
+                    full_span: declaration_full_span(node),
                 });
             }
             for child in node.children(&mut cursor) {
@@ -310,17 +415,31 @@ fn name_token(node: Node) -> Option<Node> {
     }
 }
 
-/// Whether a node is an identifier-like name node.
-fn is_name_node(node: Node) -> bool {
-    matches!(
-        node.kind(),
-        "identifier" | "type_identifier" | "field_identifier" | "shorthand_field_identifier"
-    )
+/// Whether a node is an identifier-like name node for `language`.
+fn is_name_node(node: Node, language: Language) -> bool {
+    name_node_kinds(language).contains(&node.kind())
+}
+
+/// The terminal identifier token of a Python base-class expression: the bare identifier, or the
+/// terminal segment of a dotted name (`module.Base` → `Base`). Returns `None` for a shape carrying
+/// no resolvable name token (a call, a subscript, a keyword argument).
+fn python_base_name_token(node: Node) -> Option<Node> {
+    match node.kind() {
+        "identifier" => Some(node),
+        "attribute" => node.child_by_field_name("attribute").and_then(python_base_name_token),
+        _ => None,
+    }
 }
 
 /// The byte span of a declaration node's `name` field, if it has one.
-fn declaration_name_span(node: Node, _source: &str) -> Option<ByteSpan> {
-    // Most Rust item nodes expose their name under the `name` field.
+///
+/// Most Rust item nodes and both Python declaration nodes (`class_definition`,
+/// `function_definition`) expose their name under the `name` field directly. `impl_item` has no
+/// `name` field; its `type` field's identifier is the attribution anchor instead. Python's `module`
+/// node has no name field at all — it is the document itself, so it is excluded from both the
+/// enclosing-declaration chain and the enumeration this gates, exactly as Rust's top level (no
+/// wrapping declaration) is.
+fn declaration_name_span(node: Node) -> Option<ByteSpan> {
     if let Some(name) = node.child_by_field_name("name") {
         return Some(span_of(name));
     }
@@ -331,6 +450,18 @@ fn declaration_name_span(node: Node, _source: &str) -> Option<ByteSpan> {
         return Some(span_of(ty));
     }
     None
+}
+
+/// The full byte span persisted for a declaration node.
+///
+/// A Python declaration wrapped in `decorated_definition` (`@deco\ndef f(): ...`) persists the
+/// wrapper's span so decorators are included in the declaration's body; every other declaration
+/// persists its own span.
+fn declaration_full_span(node: Node) -> ByteSpan {
+    match node.parent() {
+        Some(parent) if parent.kind() == "decorated_definition" => span_of(parent),
+        _ => span_of(node),
+    }
 }
 
 #[cfg(test)]
@@ -360,7 +491,7 @@ mod net {
 
     #[test]
     fn name_node_containing_finds_identifier() {
-        let tree = SyntaxTree::parse(SRC).unwrap();
+        let tree = SyntaxTree::parse(SRC, Language::Rust).unwrap();
         let connect_def = span_of_token("connect", 1);
         let name = tree.name_node_containing(connect_def).unwrap();
         assert_eq!(tree.text_at(name), Some("connect"));
@@ -368,7 +499,7 @@ mod net {
 
     #[test]
     fn enclosing_declarations_skips_closures() {
-        let tree = SyntaxTree::parse(SRC).unwrap();
+        let tree = SyntaxTree::parse(SRC, Language::Rust).unwrap();
         // The `connect()` call inside the closure in `open`.
         let call = span_of_token("connect", 2);
         let chain = tree.enclosing_declarations(call.start);
@@ -378,7 +509,7 @@ mod net {
 
     #[test]
     fn module_level_offset_has_module_as_outermost() {
-        let tree = SyntaxTree::parse(SRC).unwrap();
+        let tree = SyntaxTree::parse(SRC, Language::Rust).unwrap();
         let client_ref = span_of_token("Client", 2); // in `impl Client`
         let chain = tree.enclosing_declarations(client_ref.start);
         // The outermost declaration is the module `net`.
@@ -387,7 +518,7 @@ mod net {
 
     /// The construct at the first occurrence of `token` in `src`.
     fn construct_at_token(src: &str, token: &str) -> ConstructAt {
-        let tree = SyntaxTree::parse(src).unwrap();
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
         let start = src.find(token).expect("token present");
         tree.construct_at(ByteSpan {
             start,
@@ -435,7 +566,7 @@ mod net {
     #[test]
     fn construct_at_whitespace_beside_sigil_is_the_expression() {
         let src = "fn f(a: u8, b: u8) -> u8 { a + b }\n";
-        let tree = SyntaxTree::parse(src).unwrap();
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
         let space_before_plus = src.find(" + ").unwrap(); // the space between `a` and `+`
         let c = tree
             .construct_at(ByteSpan {
@@ -478,7 +609,7 @@ mod inline_mod {
 use sub::thing;
 fn not_a_mod() {}
 ";
-        let tree = SyntaxTree::parse(src).unwrap();
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
         let span = |token: &str, occurrence: usize| {
             let abs = src.match_indices(token).nth(occurrence - 1).expect("token present").0;
             ByteSpan {
@@ -517,7 +648,7 @@ trait Tr {
     fn t() -> Self;
 }
 ";
-        let tree = SyntaxTree::parse(src).unwrap();
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
 
         // Both `Self` positions resolve through the name-node path with text `Self`.
         for pos in [src.find("Self").unwrap(), src.find("Self::").unwrap()] {
@@ -537,5 +668,104 @@ trait Tr {
         // Inside the trait body: no impl to cross-check against.
         let in_trait = src.rfind("Self").unwrap();
         assert_eq!(tree.enclosing_impl_self_type(in_trait), None);
+    }
+
+    const PY_SRC: &str = "\
+class Widget:
+    def method(self):
+        pass
+
+@decorator
+def decorated():
+    pass
+
+async def async_fn():
+    pass
+
+TOP_LEVEL = 1
+";
+
+    /// The byte span of the `occurrence`-th (1-based) appearance of `token` in `src`.
+    fn py_span_of(src: &str, token: &str, occurrence: usize) -> ByteSpan {
+        let abs = src.match_indices(token).nth(occurrence - 1).expect("token present").0;
+        ByteSpan {
+            start: abs,
+            end: abs + token.len(),
+        }
+    }
+
+    // Every persisted Python declaration enumerates with its kind, name text, and span; a
+    // decorated declaration's span is the wrapper's span (decorators included), while its name node
+    // is the inner definition's `name` field.
+    #[test]
+    fn python_declarations_enumerate_with_names_and_spans() {
+        let tree = SyntaxTree::parse(PY_SRC, Language::Python).unwrap();
+        let decls = tree.all_declarations();
+
+        let class = decls.iter().find(|d| d.node_kind == "class_definition").unwrap();
+        assert_eq!(tree.text_at(class.name_span), Some("Widget"));
+        assert_eq!(
+            tree.text_at(class.full_span),
+            Some("class Widget:\n    def method(self):\n        pass")
+        );
+
+        let method = decls
+            .iter()
+            .find(|d| d.node_kind == "function_definition" && tree.text_at(d.name_span) == Some("method"))
+            .unwrap();
+        assert_eq!(tree.text_at(method.full_span), Some("def method(self):\n        pass"));
+
+        let decorated = decls
+            .iter()
+            .find(|d| tree.text_at(d.name_span) == Some("decorated"))
+            .unwrap();
+        assert_eq!(decorated.node_kind, "function_definition");
+        // The decorated span includes the decorator line, not just the `def` header.
+        let decorated_start = py_span_of(PY_SRC, "@decorator", 1).start;
+        assert_eq!(decorated.full_span.start, decorated_start);
+        assert_eq!(
+            tree.text_at(decorated.full_span),
+            Some("@decorator\ndef decorated():\n    pass")
+        );
+
+        let async_fn = decls
+            .iter()
+            .find(|d| tree.text_at(d.name_span) == Some("async_fn"))
+            .unwrap();
+        assert_eq!(async_fn.node_kind, "function_definition");
+        assert_eq!(
+            tree.text_at(async_fn.full_span),
+            Some("async def async_fn():\n    pass")
+        );
+    }
+
+    // A position inside a method body encloses [method, class]; a position at module top level
+    // encloses nothing (Python's `module` has no name field, so it never appears in the chain — the
+    // same "no wrapping declaration" shape as Rust's top level).
+    #[test]
+    fn python_enclosing_declarations_innermost_first() {
+        let tree = SyntaxTree::parse(PY_SRC, Language::Python).unwrap();
+
+        let in_method_body = PY_SRC.find("pass").unwrap();
+        let chain = tree.enclosing_declarations(in_method_body);
+        let names: Vec<Option<&str>> = chain.iter().map(|d| tree.text_at(d.name_span)).collect();
+        assert_eq!(names, vec![Some("method"), Some("Widget")]);
+
+        let at_module_top = PY_SRC.find("TOP_LEVEL").unwrap();
+        assert_eq!(tree.enclosing_declarations(at_module_top), Vec::new());
+    }
+
+    // A span inside an identifier resolves to that identifier's own span; a span on a keyword (not
+    // an identifier-kind node in the Python grammar) resolves to nothing.
+    #[test]
+    fn python_name_node_containment() {
+        let tree = SyntaxTree::parse(PY_SRC, Language::Python).unwrap();
+
+        let widget_span = py_span_of(PY_SRC, "Widget", 1);
+        let name = tree.name_node_containing(widget_span).unwrap();
+        assert_eq!(tree.text_at(name), Some("Widget"));
+
+        let class_keyword = py_span_of(PY_SRC, "class", 1);
+        assert_eq!(tree.name_node_containing(class_keyword), None);
     }
 }

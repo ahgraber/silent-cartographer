@@ -12,13 +12,15 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
 use crate::identity::{CanonicalId, DefinitionSite, ProjectionInput, WorkspaceId, project_all};
-use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SymbolClass, SymbolKind};
+use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SourceRange, SymbolClass, SymbolKind};
+use crate::semantic::python_adapter::PythonAdapter;
 
 use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join};
 use range::ByteSpan;
 use store::{
     DiscrepancyRow, EdgeKind, Freshness, GraphStore, IndexMetadata, OccurrenceRow, PersistedClass, SymbolRow,
 };
+use syntax::Language;
 
 /// An error during ingest.
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +109,18 @@ fn occurrence_site(occ: &crate::semantic::model::ExtractedOccurrence) -> Definit
     }
 }
 
+/// The syntax language an index's documents parse as.
+///
+/// The recorded analyzer identity is the language marker (the design records no separate language
+/// column or flag): a scip-python index is Python source, anything else is Rust.
+fn index_language(index: &ExtractedIndex) -> Language {
+    if index.provenance.analyzer_name == PythonAdapter::analyzer_name() {
+        Language::Python
+    } else {
+        Language::Rust
+    }
+}
+
 /// Ingest an extracted index and its sources into the store as one build.
 ///
 /// This is the composition the whole change turns on: project identities, run the guarded join,
@@ -122,8 +136,9 @@ pub fn ingest(
     sources: &[(String, String)],
 ) -> Result<JoinAccounting, IngestError> {
     let identities = project_identities(workspace, index);
+    let language = index_language(index);
     let corpus = SourceCorpus::new(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
-    let join_result = join(index, &corpus, &identities);
+    let join_result = join(index, &corpus, &identities, language);
 
     let source_map: HashMap<&str, &str> = sources.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
     let content = content_hash(sources);
@@ -173,6 +188,27 @@ pub fn ingest(
                 .or_insert_with(|| aligned.symbol.clone());
         }
     }
+    // Python: a module's definition occurrence is scip-python's zero-width marker at the document
+    // origin — a structural fact of the index, but not name-token-alignable, so under the Python
+    // launch posture (default rule only) the join refuses it and it stays counted as a refusal.
+    // The document→module mapping is therefore taken from the extracted index itself: which symbol
+    // is a document's module is identity bookkeeping, not an occurrence attribution, and using it
+    // to source `imports` edges fabricates no aligned evidence. The marker shape is pinned by the
+    // committed python-conformance fixture.
+    if language == Language::Python {
+        for (idx, sym) in index.symbols.iter().enumerate() {
+            let Some(Some(id)) = identities.get(idx) else {
+                continue;
+            };
+            if let Some(def) = sym.definition()
+                && def.range == SourceRange::new(0, 0, 0, 0)
+            {
+                module_by_doc
+                    .entry(def.document_path.clone())
+                    .or_insert_with(|| id.clone());
+            }
+        }
+    }
 
     // True same-descriptor twins: descriptors shared by two or more persisted, definition-bearing
     // symbols (the two-definition quorum). This marks real duplicates only — two DISTINCT descriptors
@@ -210,7 +246,7 @@ pub fn ingest(
                 .descriptor
                 .as_ref()
                 .is_some_and(|d| definition_count_by_descriptor.get(d).copied().unwrap_or(0) > 1);
-        let (document_path, span, span_text) = definition_span(sym, id, &def_name_span, &source_map);
+        let (document_path, span, span_text) = definition_span(sym, id, &def_name_span, &source_map, language);
         store.insert_symbol(&SymbolRow {
             canonical_id: id.clone(),
             display_name,
@@ -261,7 +297,7 @@ pub fn ingest(
         if aligned.role != OccurrenceRole::Definition {
             continue;
         }
-        if let Some(parent) = parent_of_definition(aligned, &source_map, &def_name_span, &type_by_name) {
+        if let Some(parent) = parent_of_definition(aligned, &source_map, &def_name_span, &type_by_name, language) {
             store.insert_edge(EdgeKind::Contains, &parent, &aligned.symbol)?;
         }
     }
@@ -315,12 +351,32 @@ pub fn ingest(
             .or_insert_with(|| aligned.symbol.clone());
     }
     for (path, source) in &source_map {
-        if let Some(tree) = syntax::SyntaxTree::parse(source) {
-            for imp in tree.trait_impls() {
-                let ty = occ_by_location.get(&(*path, imp.type_name_span));
-                let tr = occ_by_location.get(&(*path, imp.trait_name_span));
-                if let (Some(ty), Some(tr)) = (ty, tr) {
-                    store.insert_edge(EdgeKind::TypeHierarchy, ty, tr)?;
+        let Some(tree) = syntax::SyntaxTree::parse(source, language) else {
+            continue;
+        };
+        match language {
+            Language::Rust => {
+                for imp in tree.trait_impls() {
+                    let ty = occ_by_location.get(&(*path, imp.type_name_span));
+                    let tr = occ_by_location.get(&(*path, imp.trait_name_span));
+                    if let (Some(ty), Some(tr)) = (ty, tr) {
+                        store.insert_edge(EdgeKind::TypeHierarchy, ty, tr)?;
+                    }
+                }
+            }
+            // Python: `class Sub(Base1, Base2):` headers, one edge per declared base, each endpoint
+            // resolved through the aligned occurrence at its own name-token span — a base token with
+            // no aligned occurrence contributes no edge (skip, never guess).
+            Language::Python => {
+                for class in tree.class_bases() {
+                    let Some(sub) = occ_by_location.get(&(*path, class.class_name_span)) else {
+                        continue;
+                    };
+                    for base_span in class.base_name_spans {
+                        if let Some(base) = occ_by_location.get(&(*path, base_span)) {
+                            store.insert_edge(EdgeKind::TypeHierarchy, sub, base)?;
+                        }
+                    }
                 }
             }
         }
@@ -348,6 +404,7 @@ pub fn ingest(
         provenance: index.provenance.clone(),
         content_hash: content,
         accounting: join_result.accounting,
+        environment: index.environment.clone(),
     })?;
 
     // The single commit publishes the whole build atomically: a crash anywhere above rolls back to
@@ -379,6 +436,7 @@ fn definition_span(
     id: &CanonicalId,
     def_name_span: &HashMap<CanonicalId, (String, ByteSpan)>,
     sources: &HashMap<&str, &str>,
+    language: Language,
 ) -> (Option<String>, Option<(usize, usize)>, Option<String>) {
     if sym.class == SymbolClass::External {
         return (None, None, None);
@@ -389,7 +447,7 @@ fn definition_span(
     let Some(source) = sources.get(doc.as_str()) else {
         return (Some(doc.clone()), None, None);
     };
-    if let Some(tree) = syntax::SyntaxTree::parse(source) {
+    if let Some(tree) = syntax::SyntaxTree::parse(source, language) {
         for decl in tree.all_declarations() {
             if decl.name_span == *name_span {
                 let text = source.get(decl.full_span.start..decl.full_span.end).map(str::to_string);
@@ -445,9 +503,10 @@ fn parent_of_definition(
     sources: &HashMap<&str, &str>,
     def_name_span: &HashMap<CanonicalId, (String, ByteSpan)>,
     type_by_name: &HashMap<String, CanonicalId>,
+    language: Language,
 ) -> Option<CanonicalId> {
     let source = sources.get(aligned.document_path.as_str())?;
-    let tree = syntax::SyntaxTree::parse(source)?;
+    let tree = syntax::SyntaxTree::parse(source, language)?;
     let chain = tree.enclosing_declarations(aligned.name_span.start);
     let parent_chain: Vec<syntax::SyntaxDeclaration> =
         chain.into_iter().filter(|d| d.name_span != aligned.name_span).collect();
@@ -460,12 +519,14 @@ fn parent_of_definition(
     )
 }
 
-/// Evaluate freshness of the store against the current sources and analyzer.
+/// Evaluate freshness of the store against the current sources, analyzer, and declared environment
+/// in effect (`None` when no environment applies or none resolves).
 pub fn freshness(
     store: &GraphStore,
     sources: &[(String, String)],
     current: &crate::semantic::model::AnalyzerProvenance,
+    current_environment: Option<&crate::semantic::model::EnvironmentFacts>,
 ) -> rusqlite::Result<Option<Freshness>> {
     let hash = content_hash(sources);
-    store.freshness(&hash, current)
+    store.freshness(&hash, current, current_environment)
 }

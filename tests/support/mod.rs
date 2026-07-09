@@ -137,5 +137,39 @@ pub fn fixture_index() -> ExtractedIndex {
         symbols: vec![module, client, connect, disconnect, open],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     }
+}
+
+/// The committed Python conformance fixture directory (`tests/fixtures/python-conformance`).
+pub fn python_fixture_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python-conformance")
+}
+
+/// The committed Python fixture SCIP index, taken through the shared translation and normalization
+/// exactly as `PythonAdapter::analyze` takes the tool's live output.
+pub fn python_fixture_index() -> ExtractedIndex {
+    use silent_cartographer::semantic::model::normalize;
+    use silent_cartographer::semantic::scip::translate_index;
+
+    let path = python_fixture_root().join("index.scip");
+    let bytes = std::fs::read(&path).expect("checked-in python-conformance index.scip present");
+    let index: scip::types::Index = protobuf::Message::parse_from_bytes(&bytes).expect("valid SCIP protobuf");
+    let provenance = AnalyzerProvenance {
+        analyzer_name: index.metadata.tool_info.name.clone(),
+        analyzer_version: index.metadata.tool_info.version.clone(),
+    };
+    normalize(translate_index(&index, &provenance))
+}
+
+/// The Python fixture's sources, `(scip_document_path, text)`, read from the committed project.
+pub fn python_fixture_sources() -> Vec<(String, String)> {
+    let root = python_fixture_root();
+    ["pkg/__init__.py", "pkg/consumer.py", "pkg/shapes.py"]
+        .iter()
+        .map(|rel| {
+            let text = std::fs::read_to_string(root.join(rel)).expect("fixture source present");
+            (rel.to_string(), text)
+        })
+        .collect()
 }

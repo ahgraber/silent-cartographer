@@ -9,8 +9,8 @@ use silent_cartographer::graph::store::{
 use silent_cartographer::graph::{content_hash, freshness, ingest, join_guarded};
 use silent_cartographer::identity::{CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId};
 use silent_cartographer::semantic::model::{
-    AnalyzerProvenance, DuplicateGroup, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole,
-    PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind, normalize,
+    AnalyzerProvenance, DuplicateGroup, EnvironmentFacts, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol,
+    OccurrenceRole, PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind, normalize,
 };
 
 fn ws() -> WorkspaceId {
@@ -275,6 +275,7 @@ use thing::Thing;
         ],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -372,6 +373,7 @@ fn shared_module_symbol_maps_to_every_document_it_defines() {
         symbols: vec![module, alpha, beta],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![
@@ -854,6 +856,7 @@ fn text_mismatch_is_refused_and_surfaced() {
         }],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -885,6 +888,7 @@ fn text_mismatch_is_refused_and_surfaced() {
         }],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store2 = GraphStore::open_in_memory().unwrap();
     let src2 = vec![("n.rs".to_string(), nonascii.to_string())];
@@ -923,6 +927,7 @@ fn semantic_only_occurrence_is_unaligned() {
         }],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -988,12 +993,30 @@ fn enclosure_is_persisted() {
     );
 }
 
-// _(Staleness reflects underlying change — fresh branch)_
+/// Environment facts differing only by their package fingerprint, for the staleness write-sites.
+fn env_facts(fingerprint: &str) -> EnvironmentFacts {
+    EnvironmentFacts {
+        interpreter_version: "Python 3.12.4".to_string(),
+        environment_path: "/ws/.venv".to_string(),
+        package_fingerprint: fingerprint.to_string(),
+    }
+}
+
+// _(Staleness reflects underlying change — fresh branch)_ — unchanged sources and analyzer stay
+// fresh, and so does an unchanged recorded environment.
 #[test]
 fn unchanged_sources_and_analyzer_are_fresh() {
     let store = ingest_fixture();
-    let f = freshness(&store, &sources(), &support::provenance()).unwrap();
+    let f = freshness(&store, &sources(), &support::provenance(), None).unwrap();
     assert_eq!(f, Some(Freshness::Fresh));
+
+    // A store recorded with environment facts stays fresh while the environment in effect matches.
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let mut index = support::fixture_index();
+    index.environment = Some(env_facts("fp-a"));
+    ingest(&mut store, &ws(), &index, &sources()).unwrap();
+    let f = freshness(&store, &sources(), &support::provenance(), Some(&env_facts("fp-a"))).unwrap();
+    assert_eq!(f, Some(Freshness::Fresh), "an unchanged environment stays fresh");
 }
 
 // _(Staleness reflects underlying change — content write-site)_
@@ -1001,7 +1024,7 @@ fn unchanged_sources_and_analyzer_are_fresh() {
 fn changed_content_marks_stale() {
     let store = ingest_fixture();
     let changed = vec![(support::DOC.to_string(), format!("{}\n// edit\n", support::SOURCE))];
-    let f = freshness(&store, &changed, &support::provenance()).unwrap();
+    let f = freshness(&store, &changed, &support::provenance(), None).unwrap();
     assert_eq!(f, Some(Freshness::StaleContent));
 }
 
@@ -1013,9 +1036,67 @@ fn changed_analyzer_version_marks_stale_and_flags_reindex() {
         analyzer_name: "rust-analyzer".to_string(),
         analyzer_version: "9.9.9".to_string(),
     };
-    let f = freshness(&store, &sources(), &newer).unwrap();
+    let f = freshness(&store, &sources(), &newer, None).unwrap();
     assert_eq!(f, Some(Freshness::StaleVersion));
     assert!(f.unwrap().is_stale(), "version drift flags reindex");
+}
+
+// _(Staleness reflects underlying change — environment write-site; scenario: Changed environment
+// marks stale)_ — a recorded interpreter environment differing from the one in effect (here by its
+// installed-package fingerprint) marks results stale and flags reindex.
+#[test]
+fn changed_environment_marks_stale() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let mut index = support::fixture_index();
+    index.environment = Some(env_facts("fp-a"));
+    ingest(&mut store, &ws(), &index, &sources()).unwrap();
+
+    let drifted = env_facts("fp-b");
+    let f = freshness(&store, &sources(), &support::provenance(), Some(&drifted)).unwrap();
+    assert_eq!(f, Some(Freshness::StaleEnvironment));
+    assert!(f.unwrap().is_stale(), "environment drift flags reindex");
+
+    // An environment that can no longer be resolved is drift too, never reported fresh.
+    let f = freshness(&store, &sources(), &support::provenance(), None).unwrap();
+    assert_eq!(
+        f,
+        Some(Freshness::StaleEnvironment),
+        "an unresolvable environment is drift"
+    );
+}
+
+// _(Scenario: Declared environment facts ride the provenance)_ — environment facts persist on the
+// index metadata and round-trip whole beside the analyzer identity; a backend that declares none
+// round-trips as typed absence.
+#[test]
+fn environment_provenance_round_trips_through_metadata() {
+    use silent_cartographer::graph::store::IndexMetadata;
+
+    let store = GraphStore::open_in_memory().unwrap();
+    let meta = IndexMetadata {
+        workspace_id: ws(),
+        provenance: support::provenance(),
+        content_hash: "hash".to_string(),
+        accounting: Default::default(),
+        environment: Some(env_facts("fp-a")),
+    };
+    store.write_metadata(&meta).unwrap();
+    let read = store.read_metadata().unwrap().expect("metadata present");
+    assert_eq!(read.environment, Some(env_facts("fp-a")), "the facts round-trip whole");
+    assert_eq!(
+        read.provenance,
+        support::provenance(),
+        "the analyzer identity rides alongside"
+    );
+
+    // A backend that declares no environment (the Rust adapter) round-trips as absent.
+    let meta = IndexMetadata {
+        environment: None,
+        ..meta
+    };
+    store.write_metadata(&meta).unwrap();
+    let read = store.read_metadata().unwrap().expect("metadata present");
+    assert_eq!(read.environment, None, "absence is typed, not defaulted");
 }
 
 // _(Reference occurrences carry enclosing-declaration attribution)_ — inside a method.
@@ -1076,6 +1157,7 @@ impl Client {
         ],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1176,6 +1258,7 @@ use thing::Thing;
         ],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1269,6 +1352,7 @@ fn external_symbol_persists_without_definition_span() {
         ],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1475,6 +1559,7 @@ fn duplicate_index() -> ExtractedIndex {
         symbols: vec![twin_a, twin_b],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     }
 }
 
@@ -1660,6 +1745,7 @@ fn text_mismatch_detail_is_persisted() {
         }],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1708,6 +1794,7 @@ fn discrepancies_are_superseded_per_build() {
         }],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     ingest(&mut store, &ws(), &index1, &[("m.rs".to_string(), source1.to_string())]).unwrap();
     assert!(
@@ -1821,6 +1908,7 @@ fn oversized_found_text_is_classified_on_full_bytes_and_truncated_on_a_boundary(
         }],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source)];
@@ -1880,6 +1968,7 @@ fn one_doc_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
         symbols: symbols.to_vec(),
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     }
 }
 
@@ -2198,7 +2287,7 @@ fn trace_references_includes_operator_aligned_site() {
     let src = vec![("m.rs".to_string(), source.to_string())];
     ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![add]), &src).unwrap();
 
-    let engine = QueryEngine::new(&store, support::provenance(), content_hash(&src));
+    let engine = QueryEngine::new(&store, support::provenance(), content_hash(&src), None);
     let answer = engine.trace("ops::Add::add", Relation::References).unwrap();
     match answer.outcome {
         Outcome::Found { results } => {
@@ -2758,6 +2847,7 @@ fn duplicate_group_index(
             occurrences: group_occurrences,
         }],
         library_roots: Default::default(),
+        environment: None,
     }
 }
 
@@ -2963,6 +3053,7 @@ fn reference_reachable_only_through_one_twins_module_chain_attributes_via_module
             occurrences: vec![group_occ],
         }],
         library_roots: Default::default(),
+        environment: None,
     };
 
     let src = vec![
@@ -3084,6 +3175,7 @@ fn use_style_module_references_derive_no_parent_and_group_reference_stays_ambigu
             occurrences: vec![group_occ],
         }],
         library_roots: Default::default(),
+        environment: None,
     };
 
     let src = vec![
@@ -3254,6 +3346,7 @@ fn package_name_reference_resolves_to_the_library_twin_via_target_metadata() {
             occurrences: vec![pkg_occ, kw_occ],
         }],
         library_roots: [("dupcrate".to_string(), "root_b.rs".to_string())].into(),
+        environment: None,
     };
     let src = vec![
         ("root_a.rs".to_string(), root_a_source.to_string()),
@@ -3464,7 +3557,12 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
         Some(CanonicalId::from_raw("test-ws::dupcrate::Widget#1")),
     ];
 
-    let result = join(&index, &corpus, &identities);
+    let result = join(
+        &index,
+        &corpus,
+        &identities,
+        silent_cartographer::graph::syntax::Language::Rust,
+    );
     let ambiguous = result
         .unaligned
         .iter()
@@ -3483,7 +3581,12 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
     // Degenerate branch: no twin was persisted at all (identities withheld). The discrepancy still
     // names the group non-emptily, falling back to the descriptor's terminal name.
     let no_identities = vec![None, None];
-    let result = join(&index, &corpus, &no_identities);
+    let result = join(
+        &index,
+        &corpus,
+        &no_identities,
+        silent_cartographer::graph::syntax::Language::Rust,
+    );
     let ambiguous = result
         .unaligned
         .iter()
@@ -3580,6 +3683,7 @@ fn conservation_holds_with_locality_attributed_and_ambiguous_group_references() 
             occurrences: vec![settled_occ, ambiguous_occ],
         }],
         library_roots: Default::default(),
+        environment: None,
     };
     let total_occurrences = 2 /* definitions */ + 2 /* group references */;
 
@@ -3672,6 +3776,7 @@ fn twin_crate_roots_produce_per_target_imports_edges_after_normalization() {
         symbols: vec![merged_root, alpha, beta],
         duplicate_groups: Vec::new(),
         library_roots: Default::default(),
+        environment: None,
     };
     // The normalization pass every backend flows through: splits the merged crate root into two
     // distinct twin symbols, one per definition document.
@@ -3839,4 +3944,139 @@ fn canonical_collision_groups_are_not_reported_as_duplicated_descriptors() {
         groups.is_empty(),
         "a canonical-collision pair must not be reported as a duplicated-descriptor group: {groups:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Python (fixture-level): the guarded join and derived edges over the committed
+// python-conformance fixture — no live tool.
+// ---------------------------------------------------------------------------
+
+fn py_ws() -> WorkspaceId {
+    WorkspaceId::new("py-ws")
+}
+
+fn py_id(segments: &[(&str, SegmentKind)]) -> CanonicalId {
+    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
+    silent_cartographer::identity::project_one(&py_ws(), &Descriptor::new("python-conformance", segs))
+}
+
+fn py_widget_id() -> CanonicalId {
+    py_id(&[("pkg.shapes", SegmentKind::Module), ("Widget", SegmentKind::Type)])
+}
+
+fn py_base_id() -> CanonicalId {
+    py_id(&[("pkg.shapes", SegmentKind::Module), ("Base", SegmentKind::Type)])
+}
+
+fn py_mixin_id() -> CanonicalId {
+    py_id(&[("pkg.shapes", SegmentKind::Module), ("Mixin", SegmentKind::Type)])
+}
+
+fn py_gadget_id() -> CanonicalId {
+    py_id(&[("pkg.shapes", SegmentKind::Module), ("Gadget", SegmentKind::Type)])
+}
+
+fn py_consumer_module_id() -> CanonicalId {
+    py_id(&[("pkg.consumer", SegmentKind::Module), ("__init__", SegmentKind::Meta)])
+}
+
+fn py_shapes_module_id() -> CanonicalId {
+    py_id(&[("pkg.shapes", SegmentKind::Module), ("__init__", SegmentKind::Meta)])
+}
+
+fn ingest_python_fixture() -> GraphStore {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let index = support::python_fixture_index();
+    let sources = support::python_fixture_sources();
+    ingest(&mut store, &py_ws(), &index, &sources).unwrap();
+    store
+}
+
+// _(Scenario: Python name token accepted under the default rule)_ — a Python occurrence whose
+// location spells the symbol's own name aligns, and its rule provenance is the default rule.
+#[test]
+fn python_name_token_aligns_under_default_rule() {
+    let store = ingest_python_fixture();
+    let occs = store.occurrences_of(&py_widget_id()).unwrap();
+    assert!(!occs.is_empty(), "Widget occurrences aligned");
+    assert!(
+        occs.iter().any(|o| o.role == "definition"),
+        "the definition site aligns: {occs:?}"
+    );
+    assert!(
+        occs.iter().any(|o| o.role == "reference"),
+        "reference sites align: {occs:?}"
+    );
+    for occ in &occs {
+        assert_eq!(occ.rule, "exact", "every acceptance carries the default rule: {occ:?}");
+    }
+}
+
+// _(Scenario: Python occurrence outside the default rule stays refused)_ — the import line's module
+// occurrence spans `pkg.shapes`, which does not spell the module symbol's name token (`__init__`);
+// with no Python kind-scoped rule it lands in a typed discrepancy, never an aligned attribution.
+#[test]
+fn python_non_name_occurrence_is_refused() {
+    let store = ingest_python_fixture();
+
+    // Not aligned: the shapes module symbol has no aligned occurrence anywhere.
+    let module_occs = store.occurrences_of(&py_shapes_module_id()).unwrap();
+    assert!(
+        module_occs.is_empty(),
+        "module occurrences stay refused under the default rule: {module_occs:?}"
+    );
+
+    // Surfaced: the refusal is a typed discrepancy at the import site.
+    let rows = store.all_discrepancies().unwrap();
+    let refused = rows
+        .iter()
+        .find(|r| r.document_path == "pkg/consumer.py" && r.expected_name == "__init__" && r.span == Some((5, 15)))
+        .unwrap_or_else(|| panic!("import-site module occurrence surfaces as a discrepancy: {rows:?}"));
+    assert!(
+        refused.outcome == "text_mismatch" || refused.outcome == "semantic_only",
+        "typed refusal outcome: {refused:?}"
+    );
+}
+
+// _(Scenario: Python import produces an imports edge)_ — a module-scope reference occurrence (the
+// `from pkg.shapes import Widget` line) is attributed to the importing module itself and yields an
+// `imports` edge from that module to the symbol.
+#[test]
+fn python_import_produces_imports_edge() {
+    let store = ingest_python_fixture();
+    let imports = store.edges(EdgeKind::Imports).unwrap();
+    assert!(
+        imports.contains(&(py_consumer_module_id(), py_widget_id())),
+        "imports edge from the importing module to Widget: {imports:?}"
+    );
+}
+
+// _(Scenario: Python base class produces an edge)_ — the base-name token in the class definition
+// header resolves through the aligned occurrence at exactly that location (as Rust impl headers
+// do), yielding a `type_hierarchy` edge from the subclass to its base.
+#[test]
+fn python_base_class_produces_type_hierarchy_edge() {
+    let store = ingest_python_fixture();
+    let edges = store.edges(EdgeKind::TypeHierarchy).unwrap();
+    assert!(
+        edges.contains(&(py_widget_id(), py_base_id())),
+        "Widget(Base) yields Widget → Base: {edges:?}"
+    );
+}
+
+// _(Scenario: Multiple bases each produce an edge)_ — `class Gadget(Base, Mixin)` yields one edge
+// per declared base; and the whole fixture yields exactly one edge per declared base across the
+// file (skip-never-guess: nothing fabricated beyond the declared bases).
+#[test]
+fn python_multiple_bases_produce_one_edge_each() {
+    let store = ingest_python_fixture();
+    let mut edges = store.edges(EdgeKind::TypeHierarchy).unwrap();
+    edges.sort();
+    let mut expected = vec![
+        (py_widget_id(), py_base_id()),
+        (py_gadget_id(), py_base_id()),
+        (py_gadget_id(), py_mixin_id()),
+    ];
+    expected.sort();
+    assert_eq!(edges, expected, "exactly one edge per declared base");
 }
