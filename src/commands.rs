@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::graph::join::JoinAccounting;
 use crate::graph::store::GraphStore;
 use crate::graph::syntax::Language;
 use crate::graph::{content_hash, ingest};
@@ -215,6 +216,35 @@ pub fn run_build(
     Ok(accounting)
 }
 
+/// The one-line `build` accounting summary: every per-rule acceptance bucket inside the
+/// parentheses (their sum is the `aligned=` total), followed by the refusal and syntax-only counts.
+///
+/// Every [`crate::graph::join::AlignmentRule`] bucket MUST render here:
+/// `accounting_line_renders_every_bucket` sums the parenthesized buckets against
+/// [`JoinAccounting::aligned_total`], so a bucket added to the accounting without a render site
+/// fails that test instead of silently vanishing from the build output.
+pub fn build_accounting_line(accounting: &JoinAccounting) -> String {
+    format!(
+        "built: aligned={} (exact={} crate_root={} operator_desugar={} module_span={} self_keyword={} \
+         module_name={} self_name={} module_marker={} import_alias={}) text_mismatch={} semantic_only={} \
+         duplicate_ambiguous={} syntax_only={}",
+        accounting.aligned_total(),
+        accounting.aligned_exact,
+        accounting.aligned_crate_root,
+        accounting.aligned_operator_desugar,
+        accounting.aligned_module_span,
+        accounting.aligned_self_keyword,
+        accounting.aligned_module_name,
+        accounting.aligned_self_name,
+        accounting.aligned_module_marker,
+        accounting.aligned_import_alias,
+        accounting.text_mismatch,
+        accounting.semantic_only,
+        accounting.duplicate_ambiguous,
+        accounting.syntax_only
+    )
+}
+
 /// Build directly from a pre-produced index (used where a live analyzer is unavailable, e.g. tests
 /// and the exemplar fixtures).
 pub fn build_from_index(
@@ -274,6 +304,9 @@ pub fn run_status(
                 "module_span": meta.accounting.aligned_module_span,
                 "self_keyword": meta.accounting.aligned_self_keyword,
                 "module_name": meta.accounting.aligned_module_name,
+                "self_name": meta.accounting.aligned_self_name,
+                "module_marker": meta.accounting.aligned_module_marker,
+                "import_alias": meta.accounting.aligned_import_alias,
                 "total": meta.accounting.aligned_total(),
             },
             "text_mismatch": meta.accounting.text_mismatch,

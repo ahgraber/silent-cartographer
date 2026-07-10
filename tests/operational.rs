@@ -5,8 +5,11 @@ mod support;
 
 use std::path::Path;
 
-use silent_cartographer::commands::{build_from_index, detect_language, resolve_workspace, run_build, run_status};
+use silent_cartographer::commands::{
+    build_accounting_line, build_from_index, detect_language, resolve_workspace, run_build, run_status,
+};
 use silent_cartographer::graph::content_hash;
+use silent_cartographer::graph::join::JoinAccounting;
 use silent_cartographer::graph::store::{DISCREPANCY_GROUP_CAP, GraphStore};
 use silent_cartographer::graph::syntax::Language;
 use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one};
@@ -427,6 +430,17 @@ fn status_reports_per_rule_acceptance_buckets() {
         "self-keyword bucket reported"
     );
     assert_eq!(aligned["module_name"].as_u64(), Some(0), "module-name bucket reported");
+    assert_eq!(aligned["self_name"].as_u64(), Some(0), "self-name bucket reported");
+    assert_eq!(
+        aligned["module_marker"].as_u64(),
+        Some(0),
+        "module-marker bucket reported"
+    );
+    assert_eq!(
+        aligned["import_alias"].as_u64(),
+        Some(0),
+        "import-alias bucket reported"
+    );
     assert_eq!(
         aligned["total"].as_u64().unwrap(),
         aligned["exact"].as_u64().unwrap(),
@@ -436,6 +450,67 @@ fn status_reports_per_rule_acceptance_buckets() {
     // The refusal counts sit alongside the acceptance buckets.
     for refusal in ["text_mismatch", "semantic_only", "duplicate_ambiguous", "syntax_only"] {
         assert!(alignment[refusal].is_u64(), "{refusal} reported alongside: {report}");
+    }
+}
+
+// _(The build line renders every acceptance bucket)_ — with every accounting field non-zero, the
+// per-rule buckets inside the rendered line's parentheses sum to its `aligned=` total. A bucket
+// added to the accounting without a render site breaks this sum, so a new rule can never silently
+// vanish from the build output.
+#[test]
+fn accounting_line_renders_every_bucket() {
+    let accounting = JoinAccounting {
+        aligned_exact: 1,
+        aligned_crate_root: 2,
+        aligned_operator_desugar: 3,
+        aligned_module_span: 4,
+        aligned_self_keyword: 5,
+        aligned_module_name: 6,
+        aligned_self_name: 7,
+        aligned_module_marker: 8,
+        aligned_import_alias: 9,
+        text_mismatch: 10,
+        semantic_only: 11,
+        duplicate_ambiguous: 12,
+        syntax_only: 13,
+    };
+    let line = build_accounting_line(&accounting);
+
+    let aligned_total: u64 = line
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("aligned="))
+        .expect("the line carries an aligned= total")
+        .parse()
+        .expect("the aligned= total is a count");
+    assert_eq!(aligned_total, accounting.aligned_total(), "the total is the real total");
+
+    let open = line.find('(').expect("the per-rule buckets are parenthesized");
+    let close = line.find(')').expect("the per-rule buckets are parenthesized");
+    let bucket_sum: u64 = line[open + 1..close]
+        .split_whitespace()
+        .map(|pair| {
+            pair.split('=')
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("every parenthesized entry is a bucket=count pair: {pair:?}"))
+        })
+        .sum();
+    assert_eq!(
+        bucket_sum, aligned_total,
+        "the rendered buckets sum to the aligned= total — a bucket missing from the line breaks this: {line}"
+    );
+
+    // The refusal and syntax-only counts render alongside.
+    for (label, value) in [
+        ("text_mismatch", accounting.text_mismatch),
+        ("semantic_only", accounting.semantic_only),
+        ("duplicate_ambiguous", accounting.duplicate_ambiguous),
+        ("syntax_only", accounting.syntax_only),
+    ] {
+        assert!(
+            line.contains(&format!("{label}={value}")),
+            "{label} renders on the line: {line}"
+        );
     }
 }
 

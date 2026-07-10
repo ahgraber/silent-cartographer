@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
 use crate::identity::{CanonicalId, DefinitionSite, ProjectionInput, WorkspaceId, project_all};
-use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SourceRange, SymbolClass, SymbolKind};
+use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SymbolClass, SymbolKind};
 use crate::semantic::python_adapter::PythonAdapter;
 
-use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join};
+use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join, module_by_document};
 use range::ByteSpan;
 use store::{
     DiscrepancyRow, EdgeKind, Freshness, GraphStore, IndexMetadata, OccurrenceRow, PersistedClass, SymbolRow,
@@ -137,8 +137,12 @@ pub fn ingest(
 ) -> Result<JoinAccounting, IngestError> {
     let identities = project_identities(workspace, index);
     let language = index_language(index);
+    // The document→module derivation runs before the join: the join's self-name rule compares each
+    // occurrence against its containing document's own module, and the module bookkeeping below
+    // reads the same map — one derivation, two consumers.
+    let doc_module = module_by_document(index, &identities);
     let corpus = SourceCorpus::new(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
-    let join_result = join(index, &corpus, &identities, language);
+    let join_result = join(index, &corpus, &identities, language, &doc_module);
 
     let source_map: HashMap<&str, &str> = sources.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
     let content = content_hash(sources);
@@ -189,24 +193,13 @@ pub fn ingest(
         }
     }
     // Python: a module's definition occurrence is scip-python's zero-width marker at the document
-    // origin — a structural fact of the index, but not name-token-alignable, so under the Python
-    // launch posture (default rule only) the join refuses it and it stays counted as a refusal.
-    // The document→module mapping is therefore taken from the extracted index itself: which symbol
-    // is a document's module is identity bookkeeping, not an occurrence attribution, and using it
-    // to source `imports` edges fabricates no aligned evidence. The marker shape is pinned by the
-    // committed python-conformance fixture.
+    // origin. Which symbol is a document's module is identity bookkeeping derived once, before the
+    // join (`module_by_document` — the same map the join's self-name rule reads); merging it here
+    // keeps `imports`-edge sourcing working even for a marker the join refused.
     if language == Language::Python {
-        for (idx, sym) in index.symbols.iter().enumerate() {
-            let Some(Some(id)) = identities.get(idx) else {
-                continue;
-            };
-            if sym.kind == SymbolKind::Module
-                && let Some(def) = sym.definition()
-                && def.range == SourceRange::new(0, 0, 0, 0)
-            {
-                module_by_doc
-                    .entry(def.document_path.clone())
-                    .or_insert_with(|| id.clone());
+        for (doc_path, &idx) in &doc_module {
+            if let Some(Some(id)) = identities.get(idx) {
+                module_by_doc.entry(doc_path.clone()).or_insert_with(|| id.clone());
             }
         }
     }
@@ -296,6 +289,13 @@ pub fn ingest(
     // declaration contains it.
     for aligned in &join_result.aligned {
         if aligned.role != OccurrenceRole::Definition {
+            continue;
+        }
+        // An empty aligned span (the Python module origin marker) has a position but no extent;
+        // reading enclosure from it would fabricate containment — a document whose first byte sits
+        // inside a declaration would make that declaration "contain" the module — so it derives no
+        // parent.
+        if aligned.name_span.start == aligned.name_span.end {
             continue;
         }
         if let Some(parent) = parent_of_definition(aligned, &source_map, &def_name_span, &type_by_name, language) {

@@ -8,7 +8,7 @@
 /// The current schema version. Bumped on any schema-affecting change under the reproducibility
 /// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
 /// before any table access; the `index_metadata.schema_version` column carries it as provenance.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS index_metadata (
     aligned_module_span_count      INTEGER NOT NULL DEFAULT 0,
     aligned_self_keyword_count     INTEGER NOT NULL DEFAULT 0,
     aligned_module_name_count      INTEGER NOT NULL DEFAULT 0,
+    aligned_self_name_count        INTEGER NOT NULL DEFAULT 0,
+    aligned_module_marker_count    INTEGER NOT NULL DEFAULT 0,
+    aligned_import_alias_count     INTEGER NOT NULL DEFAULT 0,
     text_mismatch_count            INTEGER NOT NULL DEFAULT 0,
     semantic_only_count            INTEGER NOT NULL DEFAULT 0,
     duplicate_ambiguous_count      INTEGER NOT NULL DEFAULT 0,
@@ -61,7 +64,8 @@ CREATE TABLE IF NOT EXISTS symbols (
 
 -- One row per occurrence of a symbol. `role` is 'definition' or 'reference'. `rule` is the
 -- alignment rule that accepted the attribution ('exact', 'crate_root', 'operator_desugar',
--- 'module_span', 'self_keyword', 'module_name') — its provenance. Aligned reference occurrences carry
+-- 'module_span', 'self_keyword', 'module_name', 'self_name', 'module_marker', 'import_alias') —
+-- its provenance. Aligned reference occurrences carry
 -- `enclosing_id`, the nearest enclosing persisted declaration (NULL means the module/file itself is
 -- the attribution). `locality` is the locality rule ('defining_document', 'module_chain',
 -- 'target_metadata', or 'declaration_scope') that selected this attribution's twin, for an occurrence

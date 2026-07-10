@@ -73,6 +73,26 @@ pub struct ClassBases {
     pub base_name_spans: Vec<ByteSpan>,
 }
 
+/// One declared alias binding: a document-local name bound to a target token, from an
+/// `import ... as ...`-shaped construct.
+///
+/// The join verifies a binding by checking whether an aligned occurrence already sits at
+/// `target_token_span` (or at the whole `binding_span`, the shape scip-python emits at from-import
+/// binding sites) — the binding is only usable evidence once that occurrence's symbol identity is
+/// known, never by comparing names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AliasBinding {
+    /// The byte span of the alias identifier — the local name a reference token must spell to use
+    /// this binding.
+    pub alias_name_span: ByteSpan,
+    /// The byte span of the target token the alias binds to: the aliased name's own span (Python) or
+    /// the terminal path segment being renamed (Rust).
+    pub target_token_span: ByteSpan,
+    /// The byte span of the whole binding construct — the `aliased_import` (Python) or
+    /// `use_as_clause` (Rust) node, covering `target as alias`.
+    pub binding_span: ByteSpan,
+}
+
 /// The syntactic construct located at a byte span: its node kind, full span, and — for
 /// operator-shaped expressions — the operator token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +311,77 @@ impl SyntaxTree {
         out
     }
 
+    /// Every declared alias binding in the file: Python `import a.b as c` / `from m import n as c`
+    /// (`aliased_import` nodes), and Rust `use path as name;` / `pub use path as name;`
+    /// (`use_as_clause` nodes).
+    ///
+    /// A plain `import x` or `use a::b;` (no `as` clause) declares no binding and contributes
+    /// nothing — the join's import-alias rule has no evidence without an explicit local rename.
+    pub fn alias_bindings(&self) -> Vec<AliasBinding> {
+        match self.language {
+            Language::Python => self.python_alias_bindings(),
+            Language::Rust => self.rust_alias_bindings(),
+        }
+    }
+
+    /// Python alias bindings, read from `aliased_import` nodes under `import`/`from ... import`
+    /// statements.
+    ///
+    /// The target token span is the aliased name's own span as tree-sitter reports it: the full
+    /// dotted name for `import a.b as c`, the plain name for `from m import n as c`. The alias span
+    /// is the `alias` field's identifier.
+    fn python_alias_bindings(&self) -> Vec<AliasBinding> {
+        let root = self.tree.root_node();
+        let mut out = Vec::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "aliased_import"
+                && let (Some(target), Some(alias)) =
+                    (node.child_by_field_name("name"), node.child_by_field_name("alias"))
+            {
+                out.push(AliasBinding {
+                    alias_name_span: span_of(alias),
+                    target_token_span: span_of(target),
+                    binding_span: span_of(node),
+                });
+            }
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// Rust alias bindings, read from `use_as_clause` nodes under `use`/`pub use` declarations.
+    ///
+    /// The target token span is the terminal segment of the `path` field: the whole node for a bare
+    /// `identifier` path, or the `name` field's identifier for a `scoped_identifier` path
+    /// (`a::b as c` → `b`). A path shape with no resolvable terminal segment contributes nothing.
+    fn rust_alias_bindings(&self) -> Vec<AliasBinding> {
+        let root = self.tree.root_node();
+        let mut out = Vec::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "use_as_clause"
+                && let Some(path) = node.child_by_field_name("path")
+                && let Some(alias) = node.child_by_field_name("alias")
+                && let Some(target) = rust_use_path_terminal(path)
+            {
+                out.push(AliasBinding {
+                    alias_name_span: span_of(alias),
+                    target_token_span: span_of(target),
+                    binding_span: span_of(node),
+                });
+            }
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
     /// The syntactic construct at `span`: the smallest **named** node containing it, with the
     /// operator token for operator-shaped expressions.
     ///
@@ -378,6 +469,27 @@ impl SyntaxTree {
                 .is_some_and(|name| span_of(name) == span_of(node))
     }
 
+    /// The chain of `attribute`/`dotted_name` node spans enclosing `span`, innermost first (Python).
+    ///
+    /// A dotted construct is the parser's own grouping of a qualified reference (`h2.connection` is
+    /// the enclosing construct of the `h2` token inside `h2.connection.H2Connection(...)`), so a
+    /// prefix-token occurrence can retry evidence against the wider text the parser sees, without
+    /// re-deriving dotted-name grouping by hand. A span outside any dotted construct yields an empty
+    /// chain.
+    pub fn enclosing_dotted_constructs(&self, span: ByteSpan) -> Vec<ByteSpan> {
+        let root = self.tree.root_node();
+        let end = span.end.max(span.start + 1).min(root.end_byte());
+        let mut chain = Vec::new();
+        let mut node = root.descendant_for_byte_range(span.start, end);
+        while let Some(n) = node {
+            if matches!(n.kind(), "attribute" | "dotted_name") {
+                chain.push(span_of(n));
+            }
+            node = n.parent();
+        }
+        chain
+    }
+
     /// Every persisted declaration in the file, each with its name and full span.
     pub fn all_declarations(&self) -> Vec<SyntaxDeclaration> {
         let root = self.tree.root_node();
@@ -418,6 +530,18 @@ fn name_token(node: Node) -> Option<Node> {
 /// Whether a node is an identifier-like name node for `language`.
 fn is_name_node(node: Node, language: Language) -> bool {
     name_node_kinds(language).contains(&node.kind())
+}
+
+/// The terminal segment of a Rust `use_as_clause`'s `path` field: the node itself for a bare
+/// `identifier` or the path keyword `crate`/`self`/`super`, or the `name` field's identifier for a
+/// `scoped_identifier` (`a::b` → `b`). Returns `None` for a path shape with no resolvable terminal
+/// segment.
+fn rust_use_path_terminal(node: Node) -> Option<Node> {
+    match node.kind() {
+        "identifier" | "crate" | "self" | "super" => Some(node),
+        "scoped_identifier" => node.child_by_field_name("name"),
+        _ => None,
+    }
 }
 
 /// The terminal identifier token of a Python base-class expression: the bare identifier, or the
@@ -767,5 +891,112 @@ TOP_LEVEL = 1
 
         let class_keyword = py_span_of(PY_SRC, "class", 1);
         assert_eq!(tree.name_node_containing(class_keyword), None);
+    }
+
+    // Both Python alias forms yield their declared bindings with correct target/alias spans; a plain
+    // `import x` (no `as` clause) yields none.
+    #[test]
+    fn python_alias_bindings_enumerate() {
+        let src = "import a.b as c\nfrom m import n as c2\nimport x\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+        let bindings = tree.alias_bindings();
+        assert_eq!(
+            bindings.len(),
+            2,
+            "only the two `as`-aliased imports bind: {bindings:?}"
+        );
+
+        let dotted_target = py_span_of(src, "a.b", 1);
+        let dotted_alias = py_span_of(src, "c", 1);
+        let dotted_binding = py_span_of(src, "a.b as c", 1);
+        assert!(
+            bindings.iter().any(|b| b.target_token_span == dotted_target
+                && b.alias_name_span == dotted_alias
+                && b.binding_span == dotted_binding),
+            "`import a.b as c` binds alias `c` to target `a.b` across binding span `a.b as c`: {bindings:?}"
+        );
+
+        let from_target = py_span_of(src, "n", 1);
+        let from_alias = py_span_of(src, "c2", 1);
+        let from_binding = py_span_of(src, "n as c2", 1);
+        assert!(
+            bindings.iter().any(|b| b.target_token_span == from_target
+                && b.alias_name_span == from_alias
+                && b.binding_span == from_binding),
+            "`from m import n as c2` binds alias `c2` to target `n` across binding span `n as c2`: {bindings:?}"
+        );
+    }
+
+    // Both Rust `use ... as` forms (bare and `pub`) yield their declared bindings; a plain `use a::b;`
+    // (no `as` clause) yields none.
+    #[test]
+    fn rust_use_as_bindings_enumerate() {
+        let src = "use alpha::beta as gamma;\npub use delta as epsilon;\nuse alpha::beta;\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let bindings = tree.alias_bindings();
+        assert_eq!(bindings.len(), 2, "only the two `as`-aliased uses bind: {bindings:?}");
+
+        let span = |token: &str, occurrence: usize| {
+            let abs = src.match_indices(token).nth(occurrence - 1).expect("token present").0;
+            ByteSpan {
+                start: abs,
+                end: abs + token.len(),
+            }
+        };
+
+        let scoped_target = span("beta", 1); // the `beta` in `alpha::beta as gamma`
+        let scoped_alias = span("gamma", 1);
+        let scoped_binding = span("alpha::beta as gamma", 1);
+        assert!(
+            bindings.iter().any(|b| b.target_token_span == scoped_target
+                && b.alias_name_span == scoped_alias
+                && b.binding_span == scoped_binding),
+            "`use alpha::beta as gamma;` binds alias `gamma` to the terminal segment `beta` across the whole \
+             clause: {bindings:?}"
+        );
+
+        let bare_target = span("delta", 1);
+        let bare_alias = span("epsilon", 1);
+        let bare_binding = span("delta as epsilon", 1);
+        assert!(
+            bindings.iter().any(|b| b.target_token_span == bare_target
+                && b.alias_name_span == bare_alias
+                && b.binding_span == bare_binding),
+            "`pub use delta as epsilon;` binds alias `epsilon` to target `delta` across the whole clause: \
+             {bindings:?}"
+        );
+    }
+
+    // The chain at a prefix token inside a multi-segment dotted construct contains every enclosing
+    // dotted span, innermost first; a bare identifier outside any dotted construct yields an empty
+    // chain.
+    #[test]
+    fn python_dotted_construct_chain_at_token() {
+        let src = "h2.connection.H2Connection(1)\nx\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+
+        let h2_token = py_span_of(src, "h2", 1);
+        let chain = tree.enclosing_dotted_constructs(h2_token);
+        let texts: Vec<Option<&str>> = chain.iter().map(|s| tree.text_at(*s)).collect();
+        assert!(
+            texts.contains(&Some("h2.connection")),
+            "chain contains the inner dotted span: {texts:?}"
+        );
+        assert!(
+            texts.contains(&Some("h2.connection.H2Connection")),
+            "chain contains the wider dotted span: {texts:?}"
+        );
+        assert_eq!(
+            texts.first().copied(),
+            Some(Some("h2.connection")),
+            "innermost enclosing construct comes first: {texts:?}"
+        );
+
+        let bare = py_span_of(src, "x", 1);
+        assert_eq!(
+            tree.enclosing_dotted_constructs(bare),
+            Vec::new(),
+            "a bare identifier outside any dotted construct has no enclosing chain"
+        );
     }
 }

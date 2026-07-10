@@ -132,6 +132,16 @@ impl PythonAdapter {
 /// enrichment recognizes that shape once, at the adapter boundary, so every downstream consumer (the
 /// join's module-name rule, module-to-document bookkeeping, `get`/`status` display) keys off the one
 /// `module` kind vocabulary instead of re-deriving the shape from the descriptor.
+///
+/// A second, unrelated module shape needs no enrichment here: a reference occurrence at a bare
+/// `__name__`/`__file__` token resolves to a symbol string ending in a single `Namespace`-suffixed
+/// descriptor segment with no `__init__` — e.g. `` `tests.test_basic`/ `` (one segment, name
+/// `tests.test_basic`, `Suffix::Namespace`), verified against a live scip-python (0.6.6) index. That
+/// shape already classifies as `SymbolKind::Module` through [`super::scip::symbol_kind_from`]'s
+/// existing `Namespace → SegmentKind::Module` mapping, which runs before this function during
+/// translation — so it never reaches this enrichment as anything but a module. The self-name
+/// alignment rule compares such an occurrence's resolved symbol against the containing document's own
+/// module by descriptor identity; no adapter change was needed for it.
 pub fn classify_module_kinds(index: &mut ExtractedIndex) {
     for symbol in &mut index.symbols {
         let Some(descriptor) = &symbol.descriptor else {
@@ -320,6 +330,8 @@ pub fn package_fingerprint(site_packages: &Path) -> Result<String, SemanticError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{Descriptor, DescriptorSegment};
+    use crate::semantic::model::{ExtractedSymbol, SymbolClass};
 
     /// A canonicalized tempdir path (macOS tempdirs live behind a `/private` symlink; comparing
     /// resolved paths keeps the assertions byte-exact).
@@ -327,6 +339,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().canonicalize().unwrap();
         (dir, path)
+    }
+
+    // A reference occurrence at a bare `__name__`/`__file__` token resolves to a single-segment
+    // `Namespace`-suffixed descriptor (e.g. `` `tests.test_basic`/ ``, no `__init__` terminal) —
+    // distinct from the `__init__`-terminal shape this module's enrichment recognizes. That shape
+    // already classifies as `SymbolKind::Module` through the translation's own descriptor→kind
+    // mapping before `classify_module_kinds` runs, so the enrichment is a no-op on it — pinning that
+    // here guards against a future translation change silently reclassifying it.
+    #[test]
+    fn namespace_only_descriptor_is_already_module_kind_without_enrichment() {
+        let mut index = ExtractedIndex {
+            provenance: AnalyzerProvenance {
+                analyzer_name: "scip-python".to_string(),
+                analyzer_version: "0.6.6".to_string(),
+            },
+            documents: Vec::new(),
+            symbols: vec![ExtractedSymbol {
+                descriptor: Some(Descriptor::new(
+                    "flask",
+                    vec![DescriptorSegment::new("tests.test_basic", SegmentKind::Module)],
+                )),
+                kind: SymbolKind::Module,
+                class: SymbolClass::InWorkspace,
+                occurrences: Vec::new(),
+            }],
+            duplicate_groups: Vec::new(),
+            library_roots: Default::default(),
+            environment: None,
+        };
+        classify_module_kinds(&mut index);
+        assert_eq!(index.symbols[0].kind, SymbolKind::Module);
     }
 
     #[test]

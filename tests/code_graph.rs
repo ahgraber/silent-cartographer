@@ -1118,6 +1118,9 @@ fn module_name_count_rides_metadata() {
         semantic_only: 8,
         duplicate_ambiguous: 9,
         syntax_only: 10,
+        // Zero-valued here; the non-zero round-trip of the self-name/module-marker/import-alias
+        // buckets is `new_rule_counts_ride_metadata`.
+        ..JoinAccounting::default()
     };
     let meta = IndexMetadata {
         workspace_id: ws(),
@@ -1131,6 +1134,45 @@ fn module_name_count_rides_metadata() {
     assert_eq!(
         read.accounting, accounting,
         "every per-rule count, the module-name bucket included, round-trips whole"
+    );
+}
+
+// _(Join alignment accounting — the self-name, module-marker, and import-alias buckets ride
+// metadata)_ — a metadata round-trip with every field non-zero preserves the three new per-rule
+// counts alongside the rest.
+#[test]
+fn new_rule_counts_ride_metadata() {
+    use silent_cartographer::graph::join::JoinAccounting;
+    use silent_cartographer::graph::store::IndexMetadata;
+
+    let store = GraphStore::open_in_memory().unwrap();
+    let accounting = JoinAccounting {
+        aligned_exact: 1,
+        aligned_crate_root: 2,
+        aligned_operator_desugar: 3,
+        aligned_module_span: 4,
+        aligned_self_keyword: 5,
+        aligned_module_name: 6,
+        aligned_self_name: 7,
+        aligned_module_marker: 8,
+        aligned_import_alias: 9,
+        text_mismatch: 10,
+        semantic_only: 11,
+        duplicate_ambiguous: 12,
+        syntax_only: 13,
+    };
+    let meta = IndexMetadata {
+        workspace_id: ws(),
+        provenance: support::provenance(),
+        content_hash: "hash".to_string(),
+        accounting,
+        environment: None,
+    };
+    store.write_metadata(&meta).unwrap();
+    let read = store.read_metadata().unwrap().expect("metadata present");
+    assert_eq!(
+        read.accounting, accounting,
+        "all three new per-rule counts round-trip whole alongside the rest"
     );
 }
 
@@ -1478,9 +1520,10 @@ fn accounting_conserves_occurrence_total() {
         "three semantic counts conserve the total"
     );
 
-    // The module-name bucket is a write-site of the same conserved sum: a Python index mixing a
-    // module-name acceptance with a text mismatch still conserves its occurrence total.
-    let py_source = "shapes\npkg\n";
+    // Every Python-rule bucket is a write-site of the same conserved sum: an index mixing
+    // module-name, self-name, module-marker, and import-alias acceptances with an exact acceptance
+    // and a text mismatch still conserves its occurrence total.
+    let py_source = "shapes\npkg\nfrom m import n as c\nc\nMODULE_NAME = __name__\n";
     let py_module = ExtractedSymbol {
         descriptor: Some(Descriptor::new(
             "synthetic",
@@ -1497,20 +1540,67 @@ fn accounting_conserves_occurrence_total() {
             py_occ("m.py", 1, 0, 3, OccurrenceRole::Reference),
         ],
     };
-    let py_index = py_synthetic_index(vec![py_module]);
+    // The document's own module: its zero-width origin marker aligns under the module-marker rule
+    // and anchors the document→module map for the self-name term below.
+    let py_own_module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("pkg.m", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![py_occ("m.py", 0, 0, 0, OccurrenceRole::Definition)],
+    };
+    // The bare-namespace module shape a `__name__` occurrence resolves to (line 4, cols 14..22).
+    let py_self_name = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![DescriptorSegment::new("pkg.m", SegmentKind::Module)],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::External,
+        occurrences: vec![py_occ("m.py", 4, 14, 22, OccurrenceRole::Reference)],
+    };
+    // An aliased symbol: exact at the binding target `n` (line 2), import-alias at the `c` use
+    // (line 3).
+    let py_aliased = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("n", SegmentKind::Term),
+            ],
+        )),
+        kind: SymbolKind::Constant,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            py_occ("m.py", 2, 14, 15, OccurrenceRole::Reference),
+            py_occ("m.py", 3, 0, 1, OccurrenceRole::Reference),
+        ],
+    };
+    let py_index = py_synthetic_index(vec![py_module, py_own_module, py_self_name, py_aliased]);
     let py_total: u64 = py_index.symbols.iter().map(|s| s.occurrences.len() as u64).sum();
     let mut py_store = GraphStore::open_in_memory().unwrap();
     let py_src = vec![("m.py".to_string(), py_source.to_string())];
     ingest(&mut py_store, &ws(), &py_index, &py_src).unwrap();
     let py_acc = py_store.read_metadata().unwrap().unwrap().accounting;
-    assert!(
-        py_acc.aligned_module_name > 0,
-        "the module-name bucket contributes a non-zero term"
-    );
+    for (bucket, count) in [
+        ("aligned_module_name", py_acc.aligned_module_name),
+        ("aligned_self_name", py_acc.aligned_self_name),
+        ("aligned_module_marker", py_acc.aligned_module_marker),
+        ("aligned_import_alias", py_acc.aligned_import_alias),
+        ("aligned_exact", py_acc.aligned_exact),
+        ("text_mismatch", py_acc.text_mismatch),
+    ] {
+        assert!(count > 0, "{bucket} contributes a non-zero term: {py_acc:?}");
+    }
     assert_eq!(
         py_acc.total_semantic(),
         py_total,
-        "the sum including aligned_module_name conserves the occurrence total"
+        "the sum including every Python-rule bucket conserves the occurrence total"
     );
 }
 
@@ -3845,6 +3935,7 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
         &corpus,
         &identities,
         silent_cartographer::graph::syntax::Language::Rust,
+        &std::collections::HashMap::new(),
     );
     let ambiguous = result
         .unaligned
@@ -3869,6 +3960,7 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
         &corpus,
         &no_identities,
         silent_cartographer::graph::syntax::Language::Rust,
+        &std::collections::HashMap::new(),
     );
     let ambiguous = result
         .unaligned
@@ -4276,10 +4368,13 @@ fn ingest_python_fixture() -> GraphStore {
 }
 
 // _(Scenario: Python name token accepted under the default rule)_ — a Python occurrence whose
-// location spells the symbol's own name aligns, and its rule provenance is the default rule.
+// location spells the symbol's own name aligns under the default rule; a Widget occurrence at any
+// other token (the fixture's `W` alias use) carries the rule that actually accepted it, never a
+// mislabeled default acceptance.
 #[test]
 fn python_name_token_aligns_under_default_rule() {
     let store = ingest_python_fixture();
+    let sources: std::collections::HashMap<String, String> = support::python_fixture_sources().into_iter().collect();
     let occs = store.occurrences_of(&py_widget_id()).unwrap();
     assert!(!occs.is_empty(), "Widget occurrences aligned");
     assert!(
@@ -4291,35 +4386,61 @@ fn python_name_token_aligns_under_default_rule() {
         "reference sites align: {occs:?}"
     );
     for occ in &occs {
-        assert_eq!(occ.rule, "exact", "every acceptance carries the default rule: {occ:?}");
+        let text = &sources[&occ.document_path][occ.span.0..occ.span.1];
+        if text == "Widget" {
+            assert_eq!(
+                occ.rule, "exact",
+                "every acceptance at the symbol's own name token carries the default rule: {occ:?}"
+            );
+        } else {
+            assert_eq!(
+                (text, occ.rule.as_str()),
+                ("W", "import_alias"),
+                "the only non-name-token acceptance is the alias use, with its own provenance: {occ:?}"
+            );
+        }
     }
 }
 
-// _(Scenario: Python occurrence outside every rule stays refused)_ — the consumer module's own
-// zero-width definition marker (scip-python's document-origin marker, no identifier at that span)
-// satisfies neither the default rule (no name token to compare) nor the module-name rule (the
-// structural name-node gate finds nothing there); it lands in a typed discrepancy, never an aligned
-// attribution.
+// _(Scenario: Python occurrence outside every rule stays refused)_ — an occurrence of symbol A at
+// a token spelling unrelated symbol B's name (the star-re-export misattribution shape scip-python
+// emits for all-star `__init__` packages) satisfies no rule: it lands in a typed discrepancy with
+// zero aligned rows, never an aligned attribution.
 #[test]
 fn python_occurrence_outside_every_rule_stays_refused() {
-    let store = ingest_python_fixture();
+    let source = "Beta\n";
+    let alpha = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("Alpha", SegmentKind::Type),
+            ],
+        )),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        // Symbol A's occurrence points at the `Beta` token — a site spelling an unrelated symbol.
+        occurrences: vec![py_occ("m.py", 0, 0, 4, OccurrenceRole::Reference)],
+    };
+    let index = py_synthetic_index(vec![alpha]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
 
-    // Not aligned: the consumer module symbol has no aligned occurrence anywhere.
-    let module_occs = store.occurrences_of(&py_consumer_module_id()).unwrap();
-    assert!(
-        module_occs.is_empty(),
-        "module occurrences stay refused: {module_occs:?}"
-    );
+    // Zero aligned rows: no rule accepts the misattributed token.
+    assert_eq!(acc.aligned_total(), 0, "no rule accepts the misattributed token");
 
-    // Surfaced: the refusal is a typed discrepancy at the zero-width definition marker.
+    // Surfaced: the refusal is a typed discrepancy disclosing both sides of the mismatch.
     let rows = store.all_discrepancies().unwrap();
     let refused = rows
         .iter()
-        .find(|r| r.document_path == "pkg/consumer.py" && r.expected_name == "__init__" && r.span == Some((0, 0)))
-        .unwrap_or_else(|| panic!("zero-width module definition marker surfaces as a discrepancy: {rows:?}"));
-    assert!(
-        refused.outcome == "text_mismatch" || refused.outcome == "semantic_only",
-        "typed refusal outcome: {refused:?}"
+        .find(|r| r.document_path == "m.py" && r.expected_name == "Alpha")
+        .unwrap_or_else(|| panic!("the misattributed occurrence surfaces as a discrepancy: {rows:?}"));
+    assert_eq!(refused.outcome, "text_mismatch", "typed refusal outcome: {refused:?}");
+    assert_eq!(
+        refused.found_text.as_deref(),
+        Some("Beta"),
+        "the found token is disclosed: {refused:?}"
     );
 }
 
@@ -4380,28 +4501,28 @@ fn python_module_reference_aligns_under_module_name_rule() {
 }
 
 // _(Module kind classification)_ — every `__init__`-terminal symbol in the committed fixture index
-// carries `SymbolKind::Module`, and no class/function/parameter symbol does: classification keys off
-// kind everywhere downstream, not scip-python's naming convention.
+// carries `SymbolKind::Module`, as does the bare-namespace shape a `__name__`/`__file__` self-name
+// token resolves to (a single `Module`-kind segment spelling the document's own dotted name, with no
+// `__init__` terminal); no class/function/parameter symbol carries `SymbolKind::Module` under either
+// shape. Classification keys off kind everywhere downstream, not scip-python's naming convention.
 #[test]
 fn python_module_symbols_classify_as_module_kind() {
     let index = support::python_fixture_index();
     for symbol in &index.symbols {
-        let is_init_terminal = symbol
-            .descriptor
-            .as_ref()
-            .and_then(|d| d.segments.last())
-            .is_some_and(|seg| seg.name == "__init__");
-        if is_init_terminal {
+        let last_segment = symbol.descriptor.as_ref().and_then(|d| d.segments.last());
+        let is_init_terminal = last_segment.is_some_and(|seg| seg.name == "__init__");
+        let is_bare_namespace = last_segment.is_some_and(|seg| seg.kind == SegmentKind::Module);
+        if is_init_terminal || is_bare_namespace {
             assert_eq!(
                 symbol.kind,
                 SymbolKind::Module,
-                "__init__-terminal symbol classifies as module kind: {symbol:?}"
+                "__init__-terminal and bare-namespace symbols classify as module kind: {symbol:?}"
             );
         } else {
             assert_ne!(
                 symbol.kind,
                 SymbolKind::Module,
-                "non-__init__-terminal symbol does not classify as module kind: {symbol:?}"
+                "a symbol carrying neither module shape does not classify as module kind: {symbol:?}"
             );
         }
     }
@@ -4551,7 +4672,9 @@ fn non_module_occurrence_is_outside_module_name_rule() {
 
 // _(Kind-scoped rules are language-gated)_ — the four Rust rules never evaluate for a Python
 // document. The pinned leak: a zero-width Python module marker on an EMPTY document vacuously spans
-// the whole (empty) document, which the un-gated module-span rule accepted; gated, it refuses.
+// the whole (empty) document, which the un-gated module-span rule accepted. Gated, the marker
+// aligns under Python's own module-marker rule — never the Rust module-span rule — so the
+// provenance pins which language's rule family produced the acceptance.
 #[test]
 fn rust_kind_scoped_rules_do_not_fire_for_python() {
     let source = "";
@@ -4578,12 +4701,11 @@ fn rust_kind_scoped_rules_do_not_fire_for_python() {
         acc.aligned_module_span, 0,
         "the Rust module-span rule never accepts a Python occurrence"
     );
-    assert_eq!(acc.aligned_total(), 0, "the zero-width marker aligns under no rule");
     assert_eq!(
-        acc.text_mismatch + acc.semantic_only,
-        1,
-        "the marker is refused with a typed outcome"
+        acc.aligned_module_marker, 1,
+        "the marker aligns under Python's own module-marker rule"
     );
+    assert_eq!(acc.aligned_total(), 1, "exactly the module-marker acceptance");
 }
 
 // _(Scenario: Relative-import module reference accepted)_ — a module occurrence whose span covers a
@@ -4666,4 +4788,508 @@ fn python_module_prefix_token_stays_refused() {
     );
     assert_eq!(acc.aligned_total(), 0, "no rule accepts the prefix token");
     assert_eq!(acc.text_mismatch, 1, "the occurrence is refused");
+}
+
+// _(Scenario: Module reference accepted through its enclosing dotted construct)_ — an occurrence of
+// module `pkg.sub` whose span covers only the leading `pkg` token inside the dotted expression
+// `pkg.sub` aligns under the module-name rule (the enclosing construct's text is the evidence the
+// span quirk hid); the same prefix token standing alone, with no enclosing dotted construct
+// spelling the module, stays refused.
+#[test]
+fn module_reference_accepted_through_enclosing_dotted_construct() {
+    let source = "pkg.sub\npkg\n";
+    let module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("pkg.sub", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            // The `pkg` token inside `pkg.sub` — line 0, cols 0..3.
+            py_occ("m.py", 0, 0, 3, OccurrenceRole::Reference),
+            // A bare `pkg` token with no enclosing dotted construct — line 1, cols 0..3.
+            py_occ("m.py", 1, 0, 3, OccurrenceRole::Reference),
+        ],
+    };
+    let index = py_synthetic_index(vec![module]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_module_name, 1,
+        "the prefix token inside the dotted construct aligns under the module-name rule"
+    );
+    assert_eq!(
+        acc.text_mismatch, 1,
+        "the bare prefix token with no enclosing dotted construct stays refused"
+    );
+}
+
+/// The canonical identity of the bare-namespace module symbol a `__name__` token's occurrence
+/// resolves to in the committed fixture (a single Module-kind segment, no `__init__` terminal).
+fn py_consumer_namespace_id() -> CanonicalId {
+    py_id(&[("pkg.consumer", SegmentKind::Module)])
+}
+
+// _(Scenario: Module self-name token accepted for its own module)_ — the fixture's
+// `MODULE_NAME = __name__` line carries an occurrence resolving to `pkg.consumer` (the containing
+// document's own module) at the `__name__` token; it aligns under the self-name rule with that rule
+// as provenance.
+#[test]
+fn self_name_token_accepted_for_own_module() {
+    let store = ingest_python_fixture();
+    let occs = store.occurrences_of(&py_consumer_namespace_id()).unwrap();
+    let self_name = occs
+        .iter()
+        .find(|o| o.document_path == "pkg/consumer.py" && o.role == "reference")
+        .unwrap_or_else(|| panic!("the __name__ occurrence aligns: {occs:?}"));
+    assert_eq!(
+        self_name.rule, "self_name",
+        "the acceptance carries the self-name rule as provenance: {self_name:?}"
+    );
+}
+
+// _(Scenario: Self-name token for a foreign module stays refused)_ — a `__name__` token whose
+// occurrence resolves to a module other than the containing document's own module fails the
+// identity equality and stays refused; the equality is the whole guard.
+#[test]
+fn self_name_token_for_foreign_module_stays_refused() {
+    let source = "MODULE_NAME = __name__\n";
+    // The document's own module, per the zero-width origin marker: `pkg.m`.
+    let own_module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("pkg.m", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![py_occ("m.py", 0, 0, 0, OccurrenceRole::Definition)],
+    };
+    // A foreign module, in the bare-namespace shape `__name__` occurrences carry.
+    let foreign_module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![DescriptorSegment::new("pkg.other", SegmentKind::Module)],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::External,
+        // The `__name__` token — line 0, cols 14..22 — resolving to the foreign module.
+        occurrences: vec![py_occ("m.py", 0, 14, 22, OccurrenceRole::Reference)],
+    };
+    let index = py_synthetic_index(vec![own_module, foreign_module]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_self_name, 0,
+        "a foreign module's __name__ occurrence fails the own-module equality"
+    );
+    assert_eq!(acc.text_mismatch, 1, "the foreign occurrence is refused");
+    assert_eq!(
+        acc.aligned_module_marker, 1,
+        "only the document's own marker aligns (under the marker rule)"
+    );
+}
+
+// _(Scenario: Module origin marker accepted as its definition)_ — the committed fixture's
+// zero-width document-origin markers (one per module) align under the module-marker rule as each
+// module's definition attribution; and no `contains` edge is fabricated from those empty spans (a
+// document whose first byte sits inside a declaration must not make that declaration "contain" the
+// module — pkg/shapes.py opens with `class Base:` at byte 0).
+#[test]
+fn module_origin_marker_accepted_as_definition() {
+    let store = ingest_python_fixture();
+    for module_id in [py_consumer_module_id(), py_shapes_module_id()] {
+        let occs = store.occurrences_of(&module_id).unwrap();
+        let marker = occs
+            .iter()
+            .find(|o| o.role == "definition")
+            .unwrap_or_else(|| panic!("the origin marker aligns as the module's definition: {occs:?}"));
+        assert_eq!(
+            marker.rule, "module_marker",
+            "the acceptance carries the module-marker rule: {marker:?}"
+        );
+        assert_eq!(marker.span, (0, 0), "the marker is the empty span at the origin");
+    }
+
+    // Empty spans fabricate no enclosure: no declaration "contains" a module.
+    let contains = store.edges(EdgeKind::Contains).unwrap();
+    for module_id in [py_consumer_module_id(), py_shapes_module_id()] {
+        assert!(
+            !contains.iter().any(|(_, dst)| *dst == module_id),
+            "no contains edge is fabricated into a module from its empty marker span: {contains:?}"
+        );
+    }
+}
+
+// _(Scenario: Zero-width occurrence of a non-module stays refused)_ — the module-marker rule is
+// gated on module kind: a class symbol carrying an empty-span origin occurrence is refused.
+#[test]
+fn zero_width_non_module_stays_refused() {
+    let source = "class Widget:\n    pass\n";
+    let class_symbol = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("Widget", SegmentKind::Type),
+            ],
+        )),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        // A zero-width definition occurrence at the document origin — the marker shape on a
+        // non-module symbol.
+        occurrences: vec![py_occ("m.py", 0, 0, 0, OccurrenceRole::Definition)],
+    };
+    let index = py_synthetic_index(vec![class_symbol]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_module_marker, 0,
+        "the module-marker rule never accepts a non-module symbol"
+    );
+    assert_eq!(acc.aligned_total(), 0, "no rule accepts the zero-width occurrence");
+    assert_eq!(
+        acc.text_mismatch + acc.semantic_only,
+        1,
+        "the occurrence is refused with a typed outcome"
+    );
+}
+
+// _(Marker-rule ripple: module definition location)_ — an aligned module marker gives the module a
+// definition location: the symbol row reads back with its document at offset 0 (the empty span),
+// so `get` on a module answers with the document rather than typed absence.
+#[test]
+fn module_definition_location_is_document_origin() {
+    let store = ingest_python_fixture();
+    let row = store
+        .symbol(&py_consumer_module_id())
+        .unwrap()
+        .expect("the consumer module symbol is persisted");
+    assert_eq!(
+        row.document_path.as_deref(),
+        Some("pkg/consumer.py"),
+        "the module's definition names its document: {row:?}"
+    );
+    assert_eq!(
+        row.span,
+        Some((0, 0)),
+        "the module's definition location is the document origin: {row:?}"
+    );
+}
+
+// _(Scenario: Binding-site occurrence accepted at its binding's target token)_ — scip-python emits
+// the occurrence at `from pkg.shapes import Widget as W` with a span covering the whole
+// `Widget as W` binding text; the join re-evaluates it at the binding's target token, where it
+// aligns under the default rule (the token spells `Widget`).
+#[test]
+fn binding_site_occurrence_accepted_at_target_token() {
+    let store = ingest_python_fixture();
+    let consumer_source = support::python_fixture_sources()
+        .into_iter()
+        .find(|(path, _)| path == "pkg/consumer.py")
+        .expect("consumer.py in the fixture sources")
+        .1;
+    let binding_start = consumer_source
+        .find("Widget as W")
+        .expect("the aliased import is in the fixture");
+    let target_span = (binding_start, binding_start + "Widget".len());
+
+    let occs = store.occurrences_of(&py_widget_id()).unwrap();
+    let narrowed = occs
+        .iter()
+        .find(|o| o.document_path == "pkg/consumer.py" && o.span == target_span)
+        .unwrap_or_else(|| panic!("the binding-site occurrence aligns at the target token: {occs:?}"));
+    assert_eq!(narrowed.role, "reference");
+    assert_eq!(
+        narrowed.rule, "exact",
+        "the narrowed evidence satisfies the default rule, which is the provenance: {narrowed:?}"
+    );
+}
+
+// _(Scenario: Binding-site occurrence with a foreign target stays refused)_ — an occurrence
+// spanning a whole alias binding whose target token spells a different symbol's name fails the
+// narrowed re-evaluation and stays refused.
+#[test]
+fn binding_site_with_foreign_target_stays_refused() {
+    let source = "from m import n as c\n";
+    let other = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("Other", SegmentKind::Type),
+            ],
+        )),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        // The whole binding text `n as c` — line 0, cols 14..20 — whose target token `n` does not
+        // spell `Other`.
+        occurrences: vec![py_occ("m.py", 0, 14, 20, OccurrenceRole::Reference)],
+    };
+    let index = py_synthetic_index(vec![other]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_total(),
+        0,
+        "the narrowed target token is not this symbol's evidence"
+    );
+    assert_eq!(acc.text_mismatch, 1, "the binding-site occurrence is refused");
+}
+
+// _(Scenario: Alias token accepted under its document's binding)_ — the fixture's `W()` use site
+// resolves straight through to `Widget`'s symbol; the token spells the alias the document declares
+// for that symbol (`from pkg.shapes import Widget as W`), whose binding site verified in the first
+// pass, so the occurrence aligns under the import-alias rule with that rule as provenance.
+#[test]
+fn alias_token_accepted_under_document_binding() {
+    let store = ingest_python_fixture();
+    let consumer_source = support::python_fixture_sources()
+        .into_iter()
+        .find(|(path, _)| path == "pkg/consumer.py")
+        .expect("consumer.py in the fixture sources")
+        .1;
+    let w_use = consumer_source
+        .find("= W()")
+        .expect("the aliased use is in the fixture")
+        + 2;
+
+    let occs = store.occurrences_of(&py_widget_id()).unwrap();
+    let alias_use = occs
+        .iter()
+        .find(|o| o.document_path == "pkg/consumer.py" && o.span == (w_use, w_use + 1))
+        .unwrap_or_else(|| panic!("the W-use occurrence aligns: {occs:?}"));
+    assert_eq!(alias_use.role, "reference");
+    assert_eq!(
+        alias_use.rule, "import_alias",
+        "the acceptance carries the import-alias rule as provenance: {alias_use:?}"
+    );
+}
+
+// _(Scenario: Alias bound to a different symbol stays refused)_ — a token spelling a declared alias
+// whose occurrence resolves to a symbol other than the one the binding's target token aligned to
+// fails the identity verification and stays refused.
+#[test]
+fn alias_bound_to_different_symbol_stays_refused() {
+    let source = "from m import n as c\nc\n";
+    // The binding's target symbol: aligned at the `n` token in the first pass.
+    let n_symbol = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("n", SegmentKind::Term),
+            ],
+        )),
+        kind: SymbolKind::Constant,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![py_occ("m.py", 0, 14, 15, OccurrenceRole::Reference)],
+    };
+    // A different symbol whose occurrence sits at the `c` use token.
+    let other_symbol = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("x", SegmentKind::Term),
+            ],
+        )),
+        kind: SymbolKind::Constant,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![py_occ("m.py", 1, 0, 1, OccurrenceRole::Reference)],
+    };
+    let index = py_synthetic_index(vec![n_symbol, other_symbol]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_import_alias, 0,
+        "the alias binds a different symbol, so the verification fails"
+    );
+    assert_eq!(acc.text_mismatch, 1, "the alias-token occurrence stays refused");
+}
+
+// _(Scenario: Alias binding outside the containing document is not evidence)_ — a refused token in
+// one document never aligns through an alias binding declared in another document.
+#[test]
+fn alias_binding_outside_document_is_not_evidence() {
+    // The binding (and its verified target) live in a.py; the refused `c` token sits in b.py.
+    let a_source = "from m import n as c\n";
+    let b_source = "c\n";
+    let n_symbol = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("n", SegmentKind::Term),
+            ],
+        )),
+        kind: SymbolKind::Constant,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            // Aligned at a.py's binding target token `n`.
+            py_occ("a.py", 0, 14, 15, OccurrenceRole::Reference),
+            // The `c` token in b.py — a document declaring no binding.
+            py_occ("b.py", 0, 0, 1, OccurrenceRole::Reference),
+        ],
+    };
+    let index = ExtractedIndex {
+        provenance: AnalyzerProvenance {
+            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_version: "0".to_string(),
+        },
+        documents: vec![
+            SourceDocument {
+                path: "a.py".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+            SourceDocument {
+                path: "b.py".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+        ],
+        symbols: vec![n_symbol],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    };
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![
+        ("a.py".to_string(), a_source.to_string()),
+        ("b.py".to_string(), b_source.to_string()),
+    ];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_import_alias, 0,
+        "a binding in another document is not evidence"
+    );
+    assert_eq!(acc.text_mismatch, 1, "the foreign-document alias token stays refused");
+}
+
+// _(Design risk pin: alias-of-alias stays refused)_ — a binding whose own target token only aligns
+// via the alias pass contributes nothing: the verification reads first-pass alignments only, so
+// both the intermediate alias token and the chained alias token stay refused.
+#[test]
+fn alias_of_alias_stays_refused() {
+    let source = "from m import n as c\nfrom p import c as d\nd\n";
+    // Nothing aligns at the first binding's target token (`n` carries no occurrence at all), so the
+    // `c` token could at best have aligned through the alias pass itself — which never feeds the
+    // verification of the second binding.
+    let n_symbol = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("n", SegmentKind::Term),
+            ],
+        )),
+        kind: SymbolKind::Constant,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            // The second binding's target token `c` — line 1, cols 14..15.
+            py_occ("m.py", 1, 14, 15, OccurrenceRole::Reference),
+            // The chained alias use `d` — line 2, cols 0..1.
+            py_occ("m.py", 2, 0, 1, OccurrenceRole::Reference),
+        ],
+    };
+    let index = py_synthetic_index(vec![n_symbol]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_import_alias, 0,
+        "an unverified binding chain contributes nothing"
+    );
+    assert_eq!(acc.aligned_total(), 0, "no rule accepts either occurrence");
+    assert_eq!(acc.text_mismatch, 2, "both occurrences stay refused");
+}
+
+// _(Import-alias rule, Rust leg)_ — the pass is language-neutral once bindings exist: a `c` token
+// whose occurrence resolves to `b`'s symbol aligns through the document's `use a::b as c;` binding,
+// verified by the first-pass aligned occurrence at the binding's target token. Conservation holds:
+// the acceptance leaves the refusal buckets.
+#[test]
+fn rust_use_alias_accepted_under_document_binding() {
+    let source = "use a::b as c;\nfn f() { c(); }\n";
+    let b_symbol = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "a",
+            vec![DescriptorSegment::new("b", SegmentKind::Method)],
+        )),
+        kind: SymbolKind::Function,
+        class: SymbolClass::External,
+        occurrences: vec![
+            // The binding target token `b` — line 0, cols 7..8 — aligns exact in the first pass.
+            ExtractedOccurrence {
+                document_path: "m.rs".to_string(),
+                range: SourceRange::new(0, 7, 0, 8),
+                role: OccurrenceRole::Reference,
+            },
+            // The alias use `c` — line 1, cols 9..10 — refused in the first pass.
+            ExtractedOccurrence {
+                document_path: "m.rs".to_string(),
+                range: SourceRange::new(1, 9, 1, 10),
+                role: OccurrenceRole::Reference,
+            },
+        ],
+    };
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![SourceDocument {
+            path: "m.rs".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![b_symbol],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    };
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(acc.aligned_exact, 1, "the binding target token aligns exact");
+    assert_eq!(
+        acc.aligned_import_alias, 1,
+        "the alias use aligns under the import-alias rule"
+    );
+    assert_eq!(
+        acc.text_mismatch, 0,
+        "the acceptance left the refusal bucket (conservation)"
+    );
+    assert_eq!(
+        acc.total_semantic(),
+        2,
+        "acceptances plus refusals still sum to the occurrences"
+    );
+
+    let id = id_of_pkg("a", &[("b", SegmentKind::Method)]);
+    let occs = store.occurrences_of(&id).unwrap();
+    assert!(
+        occs.iter().any(|o| o.rule == "import_alias" && o.role == "reference"),
+        "the persisted attribution carries the import-alias provenance: {occs:?}"
+    );
+}
+
+/// The canonical identity of a synthetic symbol under an explicit package.
+fn id_of_pkg(package: &str, segments: &[(&str, SegmentKind)]) -> CanonicalId {
+    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
+    silent_cartographer::identity::project_one(&ws(), &Descriptor::new(package, segs))
 }

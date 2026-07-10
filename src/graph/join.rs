@@ -31,7 +31,7 @@ use crate::identity::{CanonicalId, Descriptor};
 use crate::semantic::model::{ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, SymbolKind};
 
 use super::range::{ByteSpan, LineIndex, range_to_span};
-use super::syntax::{ConstructAt, Language, SyntaxDeclaration, SyntaxTree};
+use super::syntax::{AliasBinding, ConstructAt, Language, SyntaxDeclaration, SyntaxTree};
 
 /// The named alignment rule that accepted an attribution. Stored as provenance on every aligned
 /// occurrence; each rule also carries its own acceptance bucket in the accounting.
@@ -53,6 +53,15 @@ pub enum AlignmentRule {
     /// A Python occurrence resolving to a module-kind symbol, at a name-node token spelling the
     /// terminal dotted component of the module's namespace name.
     ModuleName,
+    /// A Python module occurrence at a `__name__`/`__file__` token whose resolved module is the
+    /// containing document's own module.
+    SelfName,
+    /// A Python module definition occurrence whose range is the empty span at its document's
+    /// origin — scip-python's module origin marker.
+    ModuleMarker,
+    /// A reference occurrence at a token spelling a name its containing document binds to the
+    /// occurrence's resolved symbol through a declared alias-binding form.
+    ImportAlias,
 }
 
 impl AlignmentRule {
@@ -65,6 +74,9 @@ impl AlignmentRule {
             AlignmentRule::ModuleSpan => "module_span",
             AlignmentRule::SelfKeyword => "self_keyword",
             AlignmentRule::ModuleName => "module_name",
+            AlignmentRule::SelfName => "self_name",
+            AlignmentRule::ModuleMarker => "module_marker",
+            AlignmentRule::ImportAlias => "import_alias",
         }
     }
 }
@@ -188,6 +200,12 @@ pub struct JoinAccounting {
     pub aligned_self_keyword: u64,
     /// Occurrences accepted by the module-name rule.
     pub aligned_module_name: u64,
+    /// Occurrences accepted by the self-name rule.
+    pub aligned_self_name: u64,
+    /// Occurrences accepted by the module-marker rule.
+    pub aligned_module_marker: u64,
+    /// Occurrences accepted by the import-alias rule.
+    pub aligned_import_alias: u64,
     /// Occurrences whose location satisfied no alignment rule's expectation.
     pub text_mismatch: u64,
     /// Occurrences with no syntactic construct at their location.
@@ -208,6 +226,9 @@ impl JoinAccounting {
             AlignmentRule::ModuleSpan => self.aligned_module_span += 1,
             AlignmentRule::SelfKeyword => self.aligned_self_keyword += 1,
             AlignmentRule::ModuleName => self.aligned_module_name += 1,
+            AlignmentRule::SelfName => self.aligned_self_name += 1,
+            AlignmentRule::ModuleMarker => self.aligned_module_marker += 1,
+            AlignmentRule::ImportAlias => self.aligned_import_alias += 1,
         }
     }
 
@@ -219,6 +240,9 @@ impl JoinAccounting {
             + self.aligned_module_span
             + self.aligned_self_keyword
             + self.aligned_module_name
+            + self.aligned_self_name
+            + self.aligned_module_marker
+            + self.aligned_import_alias
     }
 
     /// The total semantic occurrences processed (all acceptance buckets plus all refusal outcomes).
@@ -256,22 +280,52 @@ impl<'a> SourceCorpus<'a> {
     }
 }
 
-/// A parsed document: its syntax tree, line index, and source, keyed for reuse across occurrences.
+/// A parsed document: its syntax tree, line index, and declared alias bindings, keyed for reuse
+/// across occurrences.
 struct PreparedDocument {
     tree: SyntaxTree,
     line_index: LineIndex,
+    alias_bindings: Vec<AliasBinding>,
+}
+
+/// The position (into `index.symbols`) of the module symbol each document defines, per the
+/// zero-width origin marker scip-python emits: a definition-role occurrence of a module-kind symbol
+/// whose range is the empty span at the document origin.
+///
+/// Derived from index symbols before the join runs, so the join's self-name rule and ingest's
+/// module bookkeeping (`imports`-edge sourcing) read one derivation. Only persisted symbols (those
+/// with an identity) participate; an index without markers (Rust) yields an empty map.
+pub fn module_by_document(index: &ExtractedIndex, identities: &[Option<CanonicalId>]) -> HashMap<String, usize> {
+    use crate::semantic::model::SourceRange;
+
+    let mut by_doc: HashMap<String, usize> = HashMap::new();
+    for (idx, sym) in index.symbols.iter().enumerate() {
+        let Some(Some(_)) = identities.get(idx) else {
+            continue;
+        };
+        if sym.kind == SymbolKind::Module
+            && let Some(def) = sym.definition()
+            && def.range == SourceRange::new(0, 0, 0, 0)
+        {
+            by_doc.entry(def.document_path.clone()).or_insert(idx);
+        }
+    }
+    by_doc
 }
 
 /// Run the guarded positional join over `index` and its `corpus`, resolving each occurrence's
 /// symbol identity through `identities` (the canonical identity per index-symbol position).
 ///
 /// `identities[i]` is the canonical identity of `index.symbols[i]`. Symbols without an identity
-/// (e.g. those the caller chose not to persist) are skipped.
+/// (e.g. those the caller chose not to persist) are skipped. `doc_module` is the document→module
+/// derivation from [`module_by_document`], computed by the caller before the join so the self-name
+/// rule can compare an occurrence's resolved module against its containing document's own module.
 pub fn join(
     index: &ExtractedIndex,
     corpus: &SourceCorpus,
     identities: &[Option<CanonicalId>],
     language: Language,
+    doc_module: &HashMap<String, usize>,
 ) -> JoinResult {
     // Parse each referenced document once, as the index's language.
     let mut prepared: HashMap<String, PreparedDocument> = HashMap::new();
@@ -279,11 +333,13 @@ pub fn join(
         if let Some(source) = corpus.get(&doc.path)
             && let Some(tree) = SyntaxTree::parse(source, language)
         {
+            let alias_bindings = tree.alias_bindings();
             prepared.insert(
                 doc.path.clone(),
                 PreparedDocument {
                     tree,
                     line_index: LineIndex::new(source),
+                    alias_bindings,
                 },
             );
         }
@@ -367,7 +423,8 @@ pub fn join(
                 continue;
             };
 
-            match evaluate_rules(symbol, occ.role, span, &expected_name, &doc.tree, language) {
+            let document_module = doc_module.get(&occ.document_path).and_then(|&i| index.symbols.get(i));
+            match evaluate_rules(symbol, occ.role, span, &expected_name, doc, language, document_module) {
                 Some((rule, matched_span)) => {
                     accounting.accept(rule);
                     let enclosing = if occ.role == OccurrenceRole::Reference {
@@ -508,6 +565,7 @@ pub fn join(
                         d,
                         expected_name,
                         language,
+                        doc_module.get(&occ.document_path).and_then(|&i| index.symbols.get(i)),
                         &mut accounting,
                         &mut aligned,
                         &mut unaligned,
@@ -573,6 +631,7 @@ pub fn join(
                 d,
                 expected_name,
                 language,
+                doc_module.get(&occ.document_path).and_then(|&i| index.symbols.get(i)),
                 &mut accounting,
                 &mut aligned,
                 &mut unaligned,
@@ -580,6 +639,59 @@ pub fn join(
             );
         }
     }
+
+    // Pass 2: the import-alias rule over first-pass refusals. The whole first pass has completed,
+    // so every document's aligned occurrences are known — the per-document barrier the binding
+    // verification needs. A reference refusal at an identifier token spelling a declared alias's
+    // name is accepted iff the binding verifies: a first-pass aligned occurrence of the refused
+    // occurrence's own symbol sits at the binding's target token span or at its whole binding span
+    // (the narrowed binding-site acceptance). Verification reads pass-1 alignments only, so a
+    // binding whose target token itself aligned only through this pass contributes nothing
+    // (alias-of-alias stays refused). Accepted occurrences leave their refusal buckets before
+    // accounting is finalized — conservation holds.
+    let pass1_aligned_by_doc: HashMap<String, Vec<(ByteSpan, CanonicalId)>> = {
+        let mut by_doc: HashMap<String, Vec<(ByteSpan, CanonicalId)>> = HashMap::new();
+        for a in &aligned {
+            by_doc
+                .entry(a.document_path.clone())
+                .or_default()
+                .push((a.name_span, a.symbol.clone()));
+        }
+        by_doc
+    };
+    let mut still_unaligned = Vec::with_capacity(unaligned.len());
+    for refusal in unaligned {
+        let Some(name_span) = alias_acceptance(&refusal, &prepared, &pass1_aligned_by_doc) else {
+            still_unaligned.push(refusal);
+            continue;
+        };
+        match refusal.outcome {
+            JoinOutcome::TextMismatch => accounting.text_mismatch -= 1,
+            JoinOutcome::SemanticOnly => accounting.semantic_only -= 1,
+            JoinOutcome::DuplicateAmbiguous => accounting.duplicate_ambiguous -= 1,
+            // Refusals never carry the aligned outcome; nothing to release.
+            JoinOutcome::Aligned => {}
+        }
+        accounting.accept(AlignmentRule::ImportAlias);
+        let enclosing = prepared
+            .get(&refusal.document_path)
+            .map(|d| d.tree.enclosing_declarations(name_span.start))
+            .unwrap_or_default();
+        aligned_name_spans
+            .entry(refusal.document_path.clone())
+            .or_default()
+            .push(name_span);
+        aligned.push(AlignedOccurrence {
+            symbol: refusal.symbol,
+            document_path: refusal.document_path,
+            name_span,
+            role: refusal.role,
+            rule: AlignmentRule::ImportAlias,
+            locality: None,
+            enclosing,
+        });
+    }
+    let unaligned = still_unaligned;
 
     // Syntax-only: declarations in a parsed document whose name node no aligned occurrence matched.
     for (path, doc) in &prepared {
@@ -596,6 +708,40 @@ pub fn join(
         unaligned,
         accounting,
     }
+}
+
+/// One first-pass refusal against its containing document's declared alias bindings: the accepted
+/// token's name-node span when a binding verifies, else `None`.
+///
+/// A binding verifies iff a first-pass aligned occurrence whose symbol equals the refused
+/// occurrence's symbol sits at the binding's target token span or at its whole binding span, and
+/// the refused token spells the binding's alias name. Only reference occurrences participate, and
+/// bindings come from the refusal's own document — a binding declared elsewhere is never evidence.
+fn alias_acceptance(
+    refusal: &UnalignedOccurrence,
+    prepared: &HashMap<String, PreparedDocument>,
+    pass1_aligned_by_doc: &HashMap<String, Vec<(ByteSpan, CanonicalId)>>,
+) -> Option<ByteSpan> {
+    if refusal.role != OccurrenceRole::Reference {
+        return None;
+    }
+    let span = refusal.span?;
+    let doc = prepared.get(&refusal.document_path)?;
+    let name_span = doc.tree.name_node_containing(span)?;
+    let token = doc.tree.text_at(name_span)?;
+    let aligned_here = pass1_aligned_by_doc.get(&refusal.document_path)?;
+    for binding in &doc.alias_bindings {
+        if doc.tree.text_at(binding.alias_name_span) != Some(token) {
+            continue;
+        }
+        let verified = aligned_here.iter().any(|(sp, id)| {
+            *id == refusal.symbol && (*sp == binding.target_token_span || *sp == binding.binding_span)
+        });
+        if verified {
+            return Some(name_span);
+        }
+    }
+    None
 }
 
 /// Record one group occurrence as duplicate-ambiguous: no locality rule selected a unique twin. The
@@ -615,12 +761,21 @@ fn join_group_occurrence(
     doc: &PreparedDocument,
     expected_name: &str,
     language: Language,
+    document_module: Option<&ExtractedSymbol>,
     accounting: &mut JoinAccounting,
     aligned: &mut Vec<AlignedOccurrence>,
     unaligned: &mut Vec<UnalignedOccurrence>,
     aligned_name_spans: &mut HashMap<String, Vec<ByteSpan>>,
 ) {
-    match evaluate_rules(twin_symbol, occ.role, span, expected_name, &doc.tree, language) {
+    match evaluate_rules(
+        twin_symbol,
+        occ.role,
+        span,
+        expected_name,
+        doc,
+        language,
+        document_module,
+    ) {
         Some((rule, matched_span)) => {
             accounting.accept(rule);
             let enclosing = doc.tree.enclosing_declarations(span.start);
@@ -926,18 +1081,53 @@ fn select_twin_by_scope<'a>(
     None
 }
 
-/// Dispatch one occurrence to the alignment rules, in order: exact (the default), crate-root,
-/// operator-desugar, module-span, self-keyword, module-name.
+/// Dispatch one occurrence to the alignment rules at its own span; when every rule refuses and the
+/// span covers a whole alias-binding statement (`target as alias`), re-evaluate at the binding's
+/// target token — the shape scip-python emits at from-import binding sites, whose target token
+/// genuinely spells the symbol's name. A narrowed acceptance keeps the rule the narrowed evidence
+/// satisfies as provenance.
+fn evaluate_rules(
+    symbol: &ExtractedSymbol,
+    role: OccurrenceRole,
+    span: ByteSpan,
+    expected_name: &str,
+    doc: &PreparedDocument,
+    language: Language,
+    document_module: Option<&ExtractedSymbol>,
+) -> Option<(AlignmentRule, ByteSpan)> {
+    if let Some(hit) = evaluate_rules_at(symbol, role, span, expected_name, &doc.tree, language, document_module) {
+        return Some(hit);
+    }
+    for binding in &doc.alias_bindings {
+        if binding.binding_span == span {
+            return evaluate_rules_at(
+                symbol,
+                role,
+                binding.target_token_span,
+                expected_name,
+                &doc.tree,
+                language,
+                document_module,
+            );
+        }
+    }
+    None
+}
+
+/// The alignment rules at one span, in order: exact (the default), the Rust kind-scoped rules
+/// (crate-root, operator-desugar, module-span, self-keyword), the Python kind-scoped rules
+/// (module-name with dotted completion, self-name, module-marker).
 ///
 /// Returns the accepting rule and the matched construct's span, or `None` when no rule's exact
 /// expectation is satisfied.
-fn evaluate_rules(
+fn evaluate_rules_at(
     symbol: &ExtractedSymbol,
     role: OccurrenceRole,
     span: ByteSpan,
     expected_name: &str,
     tree: &SyntaxTree,
     language: Language,
+    document_module: Option<&ExtractedSymbol>,
 ) -> Option<(AlignmentRule, ByteSpan)> {
     let name_span = tree.name_node_containing(span);
 
@@ -1035,15 +1225,82 @@ fn evaluate_rules(
                 .filter(|text| is_relative_module_path(text))
                 .map(|text| (text, span)),
         };
-        if let Some((text, matched_span)) = candidate {
-            let run = text.trim_start_matches('.');
-            if !run.is_empty() && (run == dotted_name || dotted_name.ends_with(&format!(".{run}"))) {
-                return Some((AlignmentRule::ModuleName, matched_span));
+        if let Some((text, matched_span)) = candidate
+            && trailing_component_run_matches(text, dotted_name)
+        {
+            return Some((AlignmentRule::ModuleName, matched_span));
+        }
+
+        // Dotted completion: an occurrence whose span covers only a leading token of a dotted
+        // expression (`h2` inside `h2.connection.H2Connection`) retries the same trailing-run
+        // condition against each enclosing dotted construct's text, innermost first — the construct
+        // the parser sees is the evidence the span quirk hid. A prefix token with no enclosing
+        // dotted construct spelling the module stays refused.
+        for construct_span in tree.enclosing_dotted_constructs(span) {
+            if let Some(text) = tree.text_at(construct_span)
+                && is_relative_module_path(text)
+                && trailing_component_run_matches(text, dotted_name)
+            {
+                return Some((AlignmentRule::ModuleName, construct_span));
             }
         }
     }
 
+    // Self-name rule (Python only): a module occurrence at a token spelling exactly `__name__` or
+    // `__file__` is accepted iff the resolved module is the containing document's own module. The
+    // occurrence's symbol arrives in the bare-namespace descriptor shape (a single Module-kind
+    // segment spelling the dotted name) while the document's module — per the zero-width-marker
+    // derivation — carries the `__init__`-terminal shape, so the equality compares (package, dotted
+    // namespace name), the module identity both shapes spell. A `__name__` token resolving to any
+    // other module, or any non-module symbol, fails and stays refused.
+    if language == Language::Python
+        && symbol.kind == SymbolKind::Module
+        && let Some(ns) = name_span
+        && matches!(tree.text_at(ns), Some("__name__") | Some("__file__"))
+        && let Some(occurrence_module) = module_identity_parts(symbol)
+        && document_module.and_then(module_identity_parts) == Some(occurrence_module)
+    {
+        return Some((AlignmentRule::SelfName, ns));
+    }
+
+    // Module-marker rule (Python only): scip-python emits each module's definition as a zero-width
+    // occurrence at its document's origin; that structural shape is the module's definition
+    // attribution. The module-kind gate keeps zero-width occurrences of non-modules refused.
+    if language == Language::Python
+        && role == OccurrenceRole::Definition
+        && symbol.kind == SymbolKind::Module
+        && span.start == 0
+        && span.end == 0
+    {
+        return Some((AlignmentRule::ModuleMarker, span));
+    }
+
     None
+}
+
+/// Whether `text` — after any leading relative-import dots — equals a trailing component-run of
+/// `dotted_name` at a component boundary: the full name, or a suffix starting right after a dot.
+fn trailing_component_run_matches(text: &str, dotted_name: &str) -> bool {
+    let run = text.trim_start_matches('.');
+    !run.is_empty() && (run == dotted_name || dotted_name.ends_with(&format!(".{run}")))
+}
+
+/// The (package, dotted namespace name) a module symbol's descriptor spells, under either shape
+/// scip-python emits for a module: the `__init__`-terminal shape (namespace segment + `__init__`
+/// meta terminal — the zero-width marker's symbol) or the bare-namespace shape (a single
+/// Module-kind segment — the symbol a `__name__`/`__file__` token's occurrence resolves to).
+/// Returns `None` for any other descriptor shape: refusal over reading the wrong segment.
+fn module_identity_parts(symbol: &ExtractedSymbol) -> Option<(&str, &str)> {
+    let descriptor = symbol.descriptor.as_ref()?;
+    if let Some(dotted_name) = module_dotted_name(symbol) {
+        return Some((descriptor.package.as_str(), dotted_name));
+    }
+    match descriptor.segments.as_slice() {
+        [only] if only.kind == crate::identity::SegmentKind::Module => {
+            Some((descriptor.package.as_str(), only.name.as_str()))
+        }
+        _ => None,
+    }
 }
 
 /// Whether a span's raw text has the shape of a (possibly relative) Python module path: zero or
