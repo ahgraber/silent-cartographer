@@ -14,9 +14,10 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-use super::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex, normalize};
+use super::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex, SymbolKind, normalize};
 use super::scip::translate_index;
 use super::{Capabilities, SemanticEngine, SemanticError};
+use crate::identity::SegmentKind;
 
 /// The Python adapter, wrapping `scip-python index` and translating its output into the model.
 ///
@@ -123,6 +124,30 @@ impl PythonAdapter {
     }
 }
 
+/// Classify every symbol whose descriptor carries scip-python's module shape as `SymbolKind::Module`.
+///
+/// scip-python does not report a module kind in `SymbolInformation`, so a module's descriptor arrives
+/// with a meta-suffixed `__init__` terminal segment following the module's own namespace segment —
+/// e.g. `pkg.shapes` (module, `SegmentKind::Module`) followed by `__init__` (`SegmentKind::Meta`). This
+/// enrichment recognizes that shape once, at the adapter boundary, so every downstream consumer (the
+/// join's module-name rule, module-to-document bookkeeping, `get`/`status` display) keys off the one
+/// `module` kind vocabulary instead of re-deriving the shape from the descriptor.
+pub fn classify_module_kinds(index: &mut ExtractedIndex) {
+    for symbol in &mut index.symbols {
+        let Some(descriptor) = &symbol.descriptor else {
+            continue;
+        };
+        let is_module_shape = descriptor.segments.len() >= 2
+            && descriptor
+                .segments
+                .last()
+                .is_some_and(|seg| seg.name == "__init__" && seg.kind == SegmentKind::Meta);
+        if is_module_shape {
+            symbol.kind = SymbolKind::Module;
+        }
+    }
+}
+
 impl SemanticEngine for PythonAdapter {
     fn provenance(&self) -> AnalyzerProvenance {
         AnalyzerProvenance {
@@ -152,6 +177,7 @@ impl SemanticEngine for PythonAdapter {
         // groups fall back to the refusal path by construction.
         let mut extracted = translate_index(&index, &self.provenance());
         extracted.environment = Some(facts);
+        classify_module_kinds(&mut extracted);
         Ok(normalize(extracted))
     }
 }

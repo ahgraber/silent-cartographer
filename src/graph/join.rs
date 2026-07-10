@@ -50,6 +50,9 @@ pub enum AlignmentRule {
     /// token whose nearest enclosing impl's self type shares the expected base name (generic
     /// arguments stripped from both).
     SelfKeyword,
+    /// A Python occurrence resolving to a module-kind symbol, at a name-node token spelling the
+    /// terminal dotted component of the module's namespace name.
+    ModuleName,
 }
 
 impl AlignmentRule {
@@ -61,6 +64,7 @@ impl AlignmentRule {
             AlignmentRule::OperatorDesugar => "operator_desugar",
             AlignmentRule::ModuleSpan => "module_span",
             AlignmentRule::SelfKeyword => "self_keyword",
+            AlignmentRule::ModuleName => "module_name",
         }
     }
 }
@@ -78,6 +82,9 @@ pub enum LocalityRule {
     /// library target regardless of the containing document; the twin defined at the library
     /// target's root — per the build system's authoritative target description — is selected.
     TargetMetadata,
+    /// The innermost declaration enclosing the occurrence that contains any same-document twin's
+    /// definition contains exactly one of them; that twin is selected.
+    DeclarationScope,
 }
 
 impl LocalityRule {
@@ -87,6 +94,7 @@ impl LocalityRule {
             LocalityRule::DefiningDocument => "defining_document",
             LocalityRule::ModuleChain => "module_chain",
             LocalityRule::TargetMetadata => "target_metadata",
+            LocalityRule::DeclarationScope => "declaration_scope",
         }
     }
 }
@@ -178,6 +186,8 @@ pub struct JoinAccounting {
     pub aligned_module_span: u64,
     /// Occurrences accepted by the self-keyword rule.
     pub aligned_self_keyword: u64,
+    /// Occurrences accepted by the module-name rule.
+    pub aligned_module_name: u64,
     /// Occurrences whose location satisfied no alignment rule's expectation.
     pub text_mismatch: u64,
     /// Occurrences with no syntactic construct at their location.
@@ -197,6 +207,7 @@ impl JoinAccounting {
             AlignmentRule::OperatorDesugar => self.aligned_operator_desugar += 1,
             AlignmentRule::ModuleSpan => self.aligned_module_span += 1,
             AlignmentRule::SelfKeyword => self.aligned_self_keyword += 1,
+            AlignmentRule::ModuleName => self.aligned_module_name += 1,
         }
     }
 
@@ -207,6 +218,7 @@ impl JoinAccounting {
             + self.aligned_operator_desugar
             + self.aligned_module_span
             + self.aligned_self_keyword
+            + self.aligned_module_name
     }
 
     /// The total semantic occurrences processed (all acceptance buckets plus all refusal outcomes).
@@ -355,7 +367,7 @@ pub fn join(
                 continue;
             };
 
-            match evaluate_rules(symbol, occ.role, span, &expected_name, &doc.tree) {
+            match evaluate_rules(symbol, occ.role, span, &expected_name, &doc.tree, language) {
                 Some((rule, matched_span)) => {
                     accounting.accept(rule);
                     let enclosing = if occ.role == OccurrenceRole::Reference {
@@ -495,6 +507,7 @@ pub fn join(
                         span,
                         d,
                         expected_name,
+                        language,
                         &mut accounting,
                         &mut aligned,
                         &mut unaligned,
@@ -513,7 +526,15 @@ pub fn join(
                 continue;
             }
 
-            let selection = select_twin(&occ.document_path, twins, &parent_of);
+            // Document-grained locality first (defining-document, then module-chain); when both
+            // decline, declaration-scope locality tries to settle a same-document twin group from
+            // the occurrence's enclosing-declaration chain.
+            let selection = select_twin(&occ.document_path, twins, &parent_of).or_else(|| {
+                let d = doc?;
+                let span = span?;
+                let encoding = index.encoding_for(&occ.document_path)?;
+                select_twin_by_scope(&occ.document_path, span, twins, d, encoding)
+            });
             let Some((twin_symbol, identity, locality)) = selection else {
                 record_group_ambiguous(
                     occ,
@@ -551,6 +572,7 @@ pub fn join(
                 span,
                 d,
                 expected_name,
+                language,
                 &mut accounting,
                 &mut aligned,
                 &mut unaligned,
@@ -592,12 +614,13 @@ fn join_group_occurrence(
     span: ByteSpan,
     doc: &PreparedDocument,
     expected_name: &str,
+    language: Language,
     accounting: &mut JoinAccounting,
     aligned: &mut Vec<AlignedOccurrence>,
     unaligned: &mut Vec<UnalignedOccurrence>,
     aligned_name_spans: &mut HashMap<String, Vec<ByteSpan>>,
 ) {
-    match evaluate_rules(twin_symbol, occ.role, span, expected_name, &doc.tree) {
+    match evaluate_rules(twin_symbol, occ.role, span, expected_name, &doc.tree, language) {
         Some((rule, matched_span)) => {
             accounting.accept(rule);
             let enclosing = doc.tree.enclosing_declarations(span.start);
@@ -855,8 +878,56 @@ fn select_twin<'a>(
     }
 }
 
+/// Select the unique twin by declaration scope: the innermost declaration enclosing the occurrence
+/// whose full span contains at least one same-document twin's definition decides; exactly one twin
+/// inside it is selected, more than one declines, and a chain with no twin-bearing declaration
+/// declines. The document itself is not a deciding scope — it holds every same-document twin and
+/// discriminates nothing — and it never appears in the declaration chain.
+///
+/// Only twins defined in the occurrence's own document participate. Every participating twin's
+/// definition range must normalize onto the source: an unnormalizable definition makes containment
+/// undecidable, so the whole rule declines (refusal, never a guess over partial evidence).
+fn select_twin_by_scope<'a>(
+    document_path: &str,
+    span: ByteSpan,
+    twins: &[(&'a ExtractedSymbol, &'a CanonicalId, &'a str)],
+    doc: &PreparedDocument,
+    encoding: crate::semantic::model::PositionEncoding,
+) -> Option<(&'a ExtractedSymbol, &'a CanonicalId, LocalityRule)> {
+    // Same-document twins with their definition byte spans.
+    let mut local_twins: Vec<(ByteSpan, &'a ExtractedSymbol, &'a CanonicalId)> = Vec::new();
+    for (symbol, identity, def_doc) in twins {
+        if *def_doc != document_path {
+            continue;
+        }
+        let def = symbol.definition()?;
+        let def_span = range_to_span(doc.tree.source(), &doc.line_index, def.range, encoding)?;
+        local_twins.push((def_span, symbol, identity));
+    }
+    if local_twins.is_empty() {
+        return None;
+    }
+
+    // Innermost-outward: the first declaration containing any twin definition decides.
+    for decl in doc.tree.enclosing_declarations(span.start) {
+        let contained: Vec<_> = local_twins
+            .iter()
+            .filter(|(def_span, _, _)| decl.full_span.start <= def_span.start && def_span.end <= decl.full_span.end)
+            .collect();
+        match contained.len() {
+            0 => continue,
+            1 => {
+                let (_, symbol, identity) = contained[0];
+                return Some((symbol, identity, LocalityRule::DeclarationScope));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Dispatch one occurrence to the alignment rules, in order: exact (the default), crate-root,
-/// operator-desugar, module-span.
+/// operator-desugar, module-span, self-keyword, module-name.
 ///
 /// Returns the accepting rule and the matched construct's span, or `None` when no rule's exact
 /// expectation is satisfied.
@@ -866,6 +937,7 @@ fn evaluate_rules(
     span: ByteSpan,
     expected_name: &str,
     tree: &SyntaxTree,
+    language: Language,
 ) -> Option<(AlignmentRule, ByteSpan)> {
     let name_span = tree.name_node_containing(span);
 
@@ -876,66 +948,113 @@ fn evaluate_rules(
         return Some((AlignmentRule::Exact, ns));
     }
 
-    // Crate-root rule: a descriptor whose terminal segment is `crate` (a keyword, so it can never
-    // name a user symbol) is a crate root; its source token is the crate's own package name at
-    // external use-sites, or the `crate` path keyword (its own node kind, not an identifier).
-    if expected_name == "crate"
-        && let Some(descriptor) = &symbol.descriptor
-    {
-        if let Some(ns) = name_span
-            && let Some(found) = tree.text_at(ns)
-            && package_matches(found, &descriptor.package)
+    // The kind-scoped rules are language-gated: each evaluates only for the language whose
+    // constructs it reconciles. Ungated, the Rust module-span rule accepted zero-width Python
+    // module markers on empty documents (a zero-width span vacuously spans an empty document) —
+    // the cross-language leak the gate closes (design.md, 2026-07-09 dogfood amendment).
+    if language == Language::Rust {
+        // Crate-root rule: a descriptor whose terminal segment is `crate` (a keyword, so it can never
+        // name a user symbol) is a crate root; its source token is the crate's own package name at
+        // external use-sites, or the `crate` path keyword (its own node kind, not an identifier).
+        if expected_name == "crate"
+            && let Some(descriptor) = &symbol.descriptor
         {
-            return Some((AlignmentRule::CrateRoot, ns));
+            if let Some(ns) = name_span
+                && let Some(found) = tree.text_at(ns)
+                && package_matches(found, &descriptor.package)
+            {
+                return Some((AlignmentRule::CrateRoot, ns));
+            }
+            if let Some(construct) = tree.construct_at(span)
+                && construct.kind == "crate"
+            {
+                return Some((AlignmentRule::CrateRoot, construct.span));
+            }
         }
-        if let Some(construct) = tree.construct_at(span)
-            && construct.kind == "crate"
+
+        // Operator-desugar rule: a reference to a method in the closed correspondence, located at the
+        // construct it desugars from. The match is on the syntax-tree construct, never raw bytes: live
+        // operator spans are observed sitting adjacent to the sigil (single-byte spans on whitespace
+        // beside `==` and `+`), where byte-equality would false-refuse.
+        if role == OccurrenceRole::Reference
+            && let Some(expectation) = desugar_construct(expected_name)
+            && let Some(construct) = tree.construct_at(span)
+            && expectation.matches(&construct)
         {
-            return Some((AlignmentRule::CrateRoot, construct.span));
+            return Some((AlignmentRule::OperatorDesugar, construct.span));
+        }
+
+        // Module-span rule: a module definition whose range spans the module's whole document (the
+        // shape rust-analyzer emits for file modules). The module kind gate keeps whole-document spans
+        // on non-modules refused.
+        if role == OccurrenceRole::Definition
+            && symbol.kind == SymbolKind::Module
+            && span.start == 0
+            && span.end == tree.source().len()
+        {
+            return Some((AlignmentRule::ModuleSpan, span));
+        }
+
+        // Self-keyword rule: a reference resolving to a type — or to an implementation of one — at a
+        // `Self` keyword token (type position and `Self::` path segments are both name nodes spelling
+        // `Self`) accepts only when the nearest enclosing impl's self type shares the expected base
+        // name, generic arguments stripped from both sides. The impl cross-check is what keeps the
+        // rule exact: token presence alone would accept coordinate drift landing on any `Self`.
+        // Lowercase `self` never matches the token check, and `Self` in a trait body has no enclosing
+        // impl, so both stay refused.
+        if role == OccurrenceRole::Reference
+            && is_self_target(symbol)
+            && let Some(ns) = name_span
+            && tree.text_at(ns) == Some("Self")
+            && let Some(impl_self_type) = tree.enclosing_impl_self_type(span.start)
+            && base_type_name(&impl_self_type) == base_type_name(expected_name)
+        {
+            return Some((AlignmentRule::SelfKeyword, ns));
         }
     }
 
-    // Operator-desugar rule: a reference to a method in the closed correspondence, located at the
-    // construct it desugars from. The match is on the syntax-tree construct, never raw bytes: live
-    // operator spans are observed sitting adjacent to the sigil (single-byte spans on whitespace
-    // beside `==` and `+`), where byte-equality would false-refuse.
-    if role == OccurrenceRole::Reference
-        && let Some(expectation) = desugar_construct(expected_name)
-        && let Some(construct) = tree.construct_at(span)
-        && expectation.matches(&construct)
-    {
-        return Some((AlignmentRule::OperatorDesugar, construct.span));
-    }
-
-    // Module-span rule: a module definition whose range spans the module's whole document (the
-    // shape rust-analyzer emits for file modules). The module kind gate keeps whole-document spans
-    // on non-modules refused.
-    if role == OccurrenceRole::Definition
+    // Module-name rule (Python only): an occurrence resolving to a module-kind symbol whose span
+    // text — after stripping any leading relative-import dots — equals a trailing component-run of
+    // the module's dotted namespace name at a component boundary (design.md, 2026-07-09 dogfood
+    // amendment). The bare terminal (`shapes`), the full dotted name (`pkg.shapes`), and relative
+    // forms (`.shapes`) are all instances of the one condition; a token spelling only leading
+    // components is not evidence for the module and stays refused.
+    //
+    // Structural gates: a span inside an identifier name node uses the identifier's text (the bare-
+    // terminal case, same gate as the default rule); any other span uses its raw source bytes, which
+    // must be exactly leading dots plus a dotted identifier path. Zero-width module definition
+    // markers yield empty text and never match — no special case needed.
+    if language == Language::Python
         && symbol.kind == SymbolKind::Module
-        && span.start == 0
-        && span.end == tree.source().len()
+        && let Some(dotted_name) = module_dotted_name(symbol)
     {
-        return Some((AlignmentRule::ModuleSpan, span));
-    }
-
-    // Self-keyword rule: a reference resolving to a type — or to an implementation of one — at a
-    // `Self` keyword token (type position and `Self::` path segments are both name nodes spelling
-    // `Self`) accepts only when the nearest enclosing impl's self type shares the expected base
-    // name, generic arguments stripped from both sides. The impl cross-check is what keeps the
-    // rule exact: token presence alone would accept coordinate drift landing on any `Self`.
-    // Lowercase `self` never matches the token check, and `Self` in a trait body has no enclosing
-    // impl, so both stay refused.
-    if role == OccurrenceRole::Reference
-        && is_self_target(symbol)
-        && let Some(ns) = name_span
-        && tree.text_at(ns) == Some("Self")
-        && let Some(impl_self_type) = tree.enclosing_impl_self_type(span.start)
-        && base_type_name(&impl_self_type) == base_type_name(expected_name)
-    {
-        return Some((AlignmentRule::SelfKeyword, ns));
+        let candidate = match name_span {
+            Some(ns) => tree.text_at(ns).map(|text| (text, ns)),
+            None => tree
+                .text_at(span)
+                .filter(|text| is_relative_module_path(text))
+                .map(|text| (text, span)),
+        };
+        if let Some((text, matched_span)) = candidate {
+            let run = text.trim_start_matches('.');
+            if !run.is_empty() && (run == dotted_name || dotted_name.ends_with(&format!(".{run}"))) {
+                return Some((AlignmentRule::ModuleName, matched_span));
+            }
+        }
     }
 
     None
+}
+
+/// Whether a span's raw text has the shape of a (possibly relative) Python module path: zero or
+/// more leading dots followed by a non-empty dotted identifier path — every component non-empty and
+/// made of identifier characters only. No whitespace, operators, or any other character.
+fn is_relative_module_path(text: &str) -> bool {
+    let rest = text.trim_start_matches('.');
+    !rest.is_empty()
+        && rest
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_'))
 }
 
 /// Whether a symbol is a legitimate target for the self-keyword rule: a plain type, or the impl
@@ -959,6 +1078,24 @@ fn is_self_target(symbol: &ExtractedSymbol) -> bool {
 fn base_type_name(name: &str) -> &str {
     let no_generics = name.split('<').next().unwrap_or(name).trim();
     no_generics.rsplit("::").next().unwrap_or(no_generics).trim()
+}
+
+/// The dotted namespace name of a module symbol: the descriptor segment immediately preceding the
+/// `__init__` terminal (e.g. `pkg.shapes`), whole — the module-name rule compares span text against
+/// its trailing component-runs.
+///
+/// Returns `None` when the descriptor does not carry the module shape `classify_module_kinds`
+/// classifies on (a namespace segment followed by an `__init__`/meta terminal) — a defensive
+/// fallback for a module-kind symbol whose descriptor was constructed some other way (e.g. directly
+/// in a test).
+fn module_dotted_name(symbol: &ExtractedSymbol) -> Option<&str> {
+    let segments = &symbol.descriptor.as_ref()?.segments;
+    let terminal = segments.last()?;
+    if terminal.name != "__init__" || terminal.kind != crate::identity::SegmentKind::Meta {
+        return None;
+    }
+    let namespace = segments.len().checked_sub(2).and_then(|i| segments.get(i))?;
+    Some(&namespace.name)
 }
 
 /// Whether a source token names the descriptor's package.

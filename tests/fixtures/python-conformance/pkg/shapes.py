@@ -13,6 +13,14 @@ class Widget(Base):
             return "widget"
         return "unreachable"
 
+    @property
+    def size(self):
+        return self._size
+
+    @size.setter
+    def size(self, value):
+        self._size = value
+
 
 class Gadget(Base, Mixin):
     pass

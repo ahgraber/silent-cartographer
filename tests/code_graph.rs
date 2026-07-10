@@ -1099,6 +1099,41 @@ fn environment_provenance_round_trips_through_metadata() {
     assert_eq!(read.environment, None, "absence is typed, not defaulted");
 }
 
+// _(Join alignment accounting — the module-name bucket rides metadata)_ — a metadata round-trip
+// preserves the `aligned_module_name` count alongside every other per-rule count.
+#[test]
+fn module_name_count_rides_metadata() {
+    use silent_cartographer::graph::join::JoinAccounting;
+    use silent_cartographer::graph::store::IndexMetadata;
+
+    let store = GraphStore::open_in_memory().unwrap();
+    let accounting = JoinAccounting {
+        aligned_exact: 1,
+        aligned_crate_root: 2,
+        aligned_operator_desugar: 3,
+        aligned_module_span: 4,
+        aligned_self_keyword: 5,
+        aligned_module_name: 6,
+        text_mismatch: 7,
+        semantic_only: 8,
+        duplicate_ambiguous: 9,
+        syntax_only: 10,
+    };
+    let meta = IndexMetadata {
+        workspace_id: ws(),
+        provenance: support::provenance(),
+        content_hash: "hash".to_string(),
+        accounting,
+        environment: None,
+    };
+    store.write_metadata(&meta).unwrap();
+    let read = store.read_metadata().unwrap().expect("metadata present");
+    assert_eq!(
+        read.accounting, accounting,
+        "every per-rule count, the module-name bucket included, round-trips whole"
+    );
+}
+
 // _(Reference occurrences carry enclosing-declaration attribution)_ — inside a method.
 #[test]
 fn reference_inside_method_attributes_to_method() {
@@ -1441,6 +1476,41 @@ fn accounting_conserves_occurrence_total() {
         meta.accounting.total_semantic(),
         total_occurrences,
         "three semantic counts conserve the total"
+    );
+
+    // The module-name bucket is a write-site of the same conserved sum: a Python index mixing a
+    // module-name acceptance with a text mismatch still conserves its occurrence total.
+    let py_source = "shapes\npkg\n";
+    let py_module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("pkg.shapes", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            // "shapes" (line 0) aligns under the module-name rule; "pkg" (line 1) is refused.
+            py_occ("m.py", 0, 0, 6, OccurrenceRole::Reference),
+            py_occ("m.py", 1, 0, 3, OccurrenceRole::Reference),
+        ],
+    };
+    let py_index = py_synthetic_index(vec![py_module]);
+    let py_total: u64 = py_index.symbols.iter().map(|s| s.occurrences.len() as u64).sum();
+    let mut py_store = GraphStore::open_in_memory().unwrap();
+    let py_src = vec![("m.py".to_string(), py_source.to_string())];
+    ingest(&mut py_store, &ws(), &py_index, &py_src).unwrap();
+    let py_acc = py_store.read_metadata().unwrap().unwrap().accounting;
+    assert!(
+        py_acc.aligned_module_name > 0,
+        "the module-name bucket contributes a non-zero term"
+    );
+    assert_eq!(
+        py_acc.total_semantic(),
+        py_total,
+        "the sum including aligned_module_name conserves the occurrence total"
     );
 }
 
@@ -3466,6 +3536,219 @@ fn locality_selected_occurrence_with_mismatched_text_is_refused_not_attributed()
     );
 }
 
+/// The canonical identity of the fixture's `size`-property `self` param twin at collision rank
+/// `rank` (the getter's twin ranks 0 — its definition precedes the setter's in `pkg/shapes.py`).
+fn py_size_self_twin_id(rank: u32) -> CanonicalId {
+    CanonicalId::from_raw(format!(
+        "py-ws::python-conformance::pkg.shapes::Widget::size::self#{rank}"
+    ))
+}
+
+// _(Scenario: Same-document reference inside exactly one twin's scope is attributed to it)_ — the
+// fixture's `size` property getter/setter pair share one `self`-param descriptor (a real
+// same-document twin group in the committed index); the getter-body `self` reference attributes to
+// the getter's twin and the setter-body `self` reference to the setter's twin, each carrying
+// `declaration_scope` locality provenance.
+#[test]
+fn same_document_reference_inside_one_twin_scope_attributes() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let index = support::python_fixture_index();
+    let sources = support::python_fixture_sources();
+    let acc = ingest(&mut store, &py_ws(), &index, &sources).unwrap();
+
+    // Both twin-group references resolve by declaration scope: the ambiguous bucket is empty, and
+    // the duplicated-group disclosure still reports the twin group itself (attribution settles
+    // references, it does not un-disclose the duplicate).
+    assert_eq!(
+        acc.duplicate_ambiguous, 0,
+        "the scope-resolved references left the ambiguous bucket"
+    );
+    let groups = store.duplicated_groups().unwrap();
+    assert_eq!(
+        groups.len(),
+        1,
+        "the size-property self twin group is still disclosed: {groups:?}"
+    );
+
+    // Getter twin (#0): its definition is the `self` in `def size(self):`; the scope-attributed
+    // reference is the `self` in the getter body (`return self._size`).
+    let getter_refs = store.references_of(&py_size_self_twin_id(0)).unwrap();
+    assert_eq!(
+        getter_refs.len(),
+        1,
+        "the getter-body self reference attributes to the getter twin: {getter_refs:?}"
+    );
+    assert_eq!(getter_refs[0].document_path, "pkg/shapes.py");
+    assert_eq!(
+        getter_refs[0].locality.as_deref(),
+        Some("declaration_scope"),
+        "the attribution carries declaration_scope locality provenance: {getter_refs:?}"
+    );
+
+    // Setter twin (#1): the `self` in the setter body (`self._size = value`).
+    let setter_refs = store.references_of(&py_size_self_twin_id(1)).unwrap();
+    assert_eq!(
+        setter_refs.len(),
+        1,
+        "the setter-body self reference attributes to the setter twin: {setter_refs:?}"
+    );
+    assert_eq!(setter_refs[0].document_path, "pkg/shapes.py");
+    assert_eq!(
+        setter_refs[0].locality.as_deref(),
+        Some("declaration_scope"),
+        "the attribution carries declaration_scope locality provenance: {setter_refs:?}"
+    );
+
+    // The two references are distinct sites (getter body precedes setter body).
+    assert_ne!(getter_refs[0].span, setter_refs[0].span, "distinct reference sites");
+    assert!(
+        getter_refs[0].span.0 < setter_refs[0].span.0,
+        "the getter-body reference precedes the setter-body reference"
+    );
+}
+
+// _(Scenario: Same-document reference whose deciding scope holds several twins stays ambiguous)_ —
+// two twin definitions inside one declaration (a module block) and a reference in a sibling
+// function of that block: the innermost twin-bearing declaration (the block) holds both twins, so
+// the reference stays duplicate-ambiguous.
+#[test]
+fn same_document_reference_with_shared_deciding_scope_stays_ambiguous() {
+    let source = "\
+mod holder {
+    struct Widget;
+    struct Widget;
+    fn sib() { let _w: Widget = Widget; }
+}
+";
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "dup.rs",
+        SourceRange::new(1, 11, 1, 17),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "dup.rs",
+        SourceRange::new(2, 11, 2, 17),
+    );
+    // The reference: the first "Widget" token inside `sib` (line 3).
+    let group_occ = group_ref("dup.rs", SourceRange::new(3, 23, 3, 29));
+
+    let index = duplicate_group_index(&["dup.rs"], vec![twin_a, twin_b], widget_descriptor(), vec![group_occ]);
+    let src = vec![("dup.rs".to_string(), source.to_string())];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.duplicate_ambiguous, 1,
+        "the deciding scope holds both twins, so the reference stays ambiguous"
+    );
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    for t in &twins {
+        assert!(
+            store.references_of(&t.canonical_id).unwrap().is_empty(),
+            "no twin is attributed the ambiguous reference"
+        );
+    }
+}
+
+// _(Scenario: Same-document reference enclosed by no twin-bearing declaration stays ambiguous)_ —
+// two twins at document top level and a reference inside a function: no enclosing declaration
+// contains a twin definition (the document itself is not a deciding scope), so the reference stays
+// duplicate-ambiguous.
+#[test]
+fn same_document_reference_outside_any_twin_scope_stays_ambiguous() {
+    let source = "\
+struct Widget;
+struct Widget;
+fn use_widget() { let _w: Widget = Widget; }
+";
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "dup.rs",
+        SourceRange::new(0, 7, 0, 13),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "dup.rs",
+        SourceRange::new(1, 7, 1, 13),
+    );
+    // The reference: the first "Widget" token inside `use_widget` (line 2).
+    let group_occ = group_ref("dup.rs", SourceRange::new(2, 26, 2, 32));
+
+    let index = duplicate_group_index(&["dup.rs"], vec![twin_a, twin_b], widget_descriptor(), vec![group_occ]);
+    let src = vec![("dup.rs".to_string(), source.to_string())];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.duplicate_ambiguous, 1,
+        "no enclosing declaration contains a twin, so the reference stays ambiguous"
+    );
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    for t in &twins {
+        assert!(
+            store.references_of(&t.canonical_id).unwrap().is_empty(),
+            "no twin is attributed the ambiguous reference"
+        );
+    }
+}
+
+// _(Scenario: Scope locality does not bypass the guarded join)_ — a reference inside exactly one
+// twin's scope whose source token satisfies no alignment rule is refused with zero aligned rows;
+// scope locality selects the target, it never overrides a text refusal.
+#[test]
+fn scope_locality_does_not_bypass_alignment() {
+    let source = "\
+fn a() {
+    struct Widget;
+    let _x = OTHER;
+}
+fn b() {
+    struct Widget;
+}
+";
+    let twin_a = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "dup.rs",
+        SourceRange::new(1, 11, 1, 17),
+    );
+    let twin_b = twin(
+        widget_descriptor(),
+        SymbolKind::Type,
+        "dup.rs",
+        SourceRange::new(5, 11, 5, 17),
+    );
+    // The reference: the "OTHER" token inside `a` — exactly one twin (twin_a) is in scope, but the
+    // token does not spell "Widget".
+    let group_occ = group_ref("dup.rs", SourceRange::new(2, 13, 2, 18));
+
+    let index = duplicate_group_index(&["dup.rs"], vec![twin_a, twin_b], widget_descriptor(), vec![group_occ]);
+    let src = vec![("dup.rs".to_string(), source.to_string())];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.text_mismatch, 1,
+        "scope locality selects the twin but the text still refuses"
+    );
+    assert_eq!(
+        acc.duplicate_ambiguous, 0,
+        "scope locality found a unique twin, so it is not ambiguous"
+    );
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    for t in &twins {
+        assert!(
+            store.references_of(&t.canonical_id).unwrap().is_empty(),
+            "no twin is attributed the mismatched reference"
+        );
+    }
+}
+
 // _(Reference outside every duplicate's territory is typed ambiguous)_ — a group reference whose
 // document is associated with no twin (no defining-document match, no module-chain path) is typed
 // duplicate-ambiguous.
@@ -4012,26 +4295,28 @@ fn python_name_token_aligns_under_default_rule() {
     }
 }
 
-// _(Scenario: Python occurrence outside the default rule stays refused)_ — the import line's module
-// occurrence spans `pkg.shapes`, which does not spell the module symbol's name token (`__init__`);
-// with no Python kind-scoped rule it lands in a typed discrepancy, never an aligned attribution.
+// _(Scenario: Python occurrence outside every rule stays refused)_ — the consumer module's own
+// zero-width definition marker (scip-python's document-origin marker, no identifier at that span)
+// satisfies neither the default rule (no name token to compare) nor the module-name rule (the
+// structural name-node gate finds nothing there); it lands in a typed discrepancy, never an aligned
+// attribution.
 #[test]
-fn python_non_name_occurrence_is_refused() {
+fn python_occurrence_outside_every_rule_stays_refused() {
     let store = ingest_python_fixture();
 
-    // Not aligned: the shapes module symbol has no aligned occurrence anywhere.
-    let module_occs = store.occurrences_of(&py_shapes_module_id()).unwrap();
+    // Not aligned: the consumer module symbol has no aligned occurrence anywhere.
+    let module_occs = store.occurrences_of(&py_consumer_module_id()).unwrap();
     assert!(
         module_occs.is_empty(),
-        "module occurrences stay refused under the default rule: {module_occs:?}"
+        "module occurrences stay refused: {module_occs:?}"
     );
 
-    // Surfaced: the refusal is a typed discrepancy at the import site.
+    // Surfaced: the refusal is a typed discrepancy at the zero-width definition marker.
     let rows = store.all_discrepancies().unwrap();
     let refused = rows
         .iter()
-        .find(|r| r.document_path == "pkg/consumer.py" && r.expected_name == "__init__" && r.span == Some((5, 15)))
-        .unwrap_or_else(|| panic!("import-site module occurrence surfaces as a discrepancy: {rows:?}"));
+        .find(|r| r.document_path == "pkg/consumer.py" && r.expected_name == "__init__" && r.span == Some((0, 0)))
+        .unwrap_or_else(|| panic!("zero-width module definition marker surfaces as a discrepancy: {rows:?}"));
     assert!(
         refused.outcome == "text_mismatch" || refused.outcome == "semantic_only",
         "typed refusal outcome: {refused:?}"
@@ -4079,4 +4364,306 @@ fn python_multiple_bases_produce_one_edge_each() {
     ];
     expected.sort();
     assert_eq!(edges, expected, "exactly one edge per declared base");
+}
+
+// _(Scenario: Python module reference accepted under the module-name rule)_ — the `from pkg.shapes
+// import Widget` line's module token (`shapes`, the terminal component of `pkg.shapes`) aligns under
+// the module-name rule, with that rule as its persisted provenance.
+#[test]
+fn python_module_reference_aligns_under_module_name_rule() {
+    let store = ingest_python_fixture();
+    let occs = store.occurrences_of(&py_shapes_module_id()).unwrap();
+    assert!(
+        occs.iter().any(|o| o.role == "reference" && o.rule == "module_name"),
+        "the import-site module reference aligns under the module-name rule: {occs:?}"
+    );
+}
+
+// _(Module kind classification)_ — every `__init__`-terminal symbol in the committed fixture index
+// carries `SymbolKind::Module`, and no class/function/parameter symbol does: classification keys off
+// kind everywhere downstream, not scip-python's naming convention.
+#[test]
+fn python_module_symbols_classify_as_module_kind() {
+    let index = support::python_fixture_index();
+    for symbol in &index.symbols {
+        let is_init_terminal = symbol
+            .descriptor
+            .as_ref()
+            .and_then(|d| d.segments.last())
+            .is_some_and(|seg| seg.name == "__init__");
+        if is_init_terminal {
+            assert_eq!(
+                symbol.kind,
+                SymbolKind::Module,
+                "__init__-terminal symbol classifies as module kind: {symbol:?}"
+            );
+        } else {
+            assert_ne!(
+                symbol.kind,
+                SymbolKind::Module,
+                "non-__init__-terminal symbol does not classify as module kind: {symbol:?}"
+            );
+        }
+    }
+}
+
+// _(Scenario: Python module import produces a module-to-module edge)_ — `from pkg import shapes`
+// names another module by its terminal component; the aligned module-name occurrence is attributed
+// to the importing module itself, yielding an `imports` edge from `pkg.consumer` to `pkg.shapes`.
+#[test]
+fn python_module_import_produces_module_to_module_edge() {
+    let store = ingest_python_fixture();
+    let imports = store.edges(EdgeKind::Imports).unwrap();
+    assert!(
+        imports.contains(&(py_consumer_module_id(), py_shapes_module_id())),
+        "imports edge from the importing module to the imported module: {imports:?}"
+    );
+}
+
+/// A synthetic Python-language index: one symbol, `provenance.analyzer_name` set to the Python
+/// adapter's name so `ingest` selects `Language::Python` for the join.
+fn py_synthetic_index(symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
+    ExtractedIndex {
+        provenance: AnalyzerProvenance {
+            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_version: "0".to_string(),
+        },
+        documents: vec![SourceDocument {
+            path: "m.py".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols,
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    }
+}
+
+fn py_occ(document_path: &str, line: u32, start: u32, end: u32, role: OccurrenceRole) -> ExtractedOccurrence {
+    ExtractedOccurrence {
+        document_path: document_path.to_string(),
+        range: SourceRange::new(line, start, line, end),
+        role,
+    }
+}
+
+// _(Scenario: Nested module accepted at trailing component-runs only — bare-terminal instance)_ —
+// in one build, a reference occurrence of a two-component module (`pkg.shapes`) at a token spelling
+// the bare terminal component (`shapes`) aligns under the module-name rule while an occurrence of
+// the same module at a leading-component token (`pkg`) is refused. The full-dotted-path acceptance
+// and the standalone prefix refusal are pinned by `python_module_dotted_path_aligns_under_module_name_rule`
+// and `python_module_prefix_token_stays_refused`.
+#[test]
+fn nested_module_bare_terminal_aligns_and_prefix_refused() {
+    let source = "shapes\npkg\n";
+    let module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("pkg.shapes", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            // "shapes" at line 0, cols 0..6 — the terminal component.
+            py_occ("m.py", 0, 0, 6, OccurrenceRole::Reference),
+            // "pkg" at line 1, cols 0..3 — a non-terminal component.
+            py_occ("m.py", 1, 0, 3, OccurrenceRole::Reference),
+        ],
+    };
+    let index = py_synthetic_index(vec![module]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_module_name, 1,
+        "exactly the terminal-component token aligns"
+    );
+    assert_eq!(acc.text_mismatch, 1, "the non-terminal-component token is refused");
+}
+
+// A module-kind symbol whose descriptor lacks the `__init__`/meta terminal is outside the
+// module-name rule: the rule reconciles exactly the shape `classify_module_kinds` classifies on,
+// and any other descriptor shape refuses rather than reading a component from the wrong segment.
+#[test]
+fn module_kind_without_init_terminal_is_outside_module_name_rule() {
+    let source = "pkg\n";
+    let module = ExtractedSymbol {
+        // Two plain segments, no `__init__` terminal: were the rule to read the second-to-last
+        // segment without checking the terminal shape, the `pkg` token would misalign here.
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("shapes", SegmentKind::Module),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        // "pkg" at line 0, cols 0..3 — spells neither "shapes" (the default rule's expectation)
+        // nor any admissible module-name component (the descriptor lacks the module shape).
+        occurrences: vec![py_occ("m.py", 0, 0, 3, OccurrenceRole::Reference)],
+    };
+    let index = py_synthetic_index(vec![module]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_module_name, 0,
+        "the module-name rule refuses a descriptor without the __init__ terminal"
+    );
+    assert_eq!(acc.aligned_total(), 0, "no rule accepts the occurrence");
+    assert_eq!(acc.text_mismatch, 1, "the occurrence is refused");
+}
+
+// _(Scenario: Non-module occurrence is outside the module-name rule)_ — a class-kind occurrence at a
+// non-matching token is refused, not rescued by the module-name rule (which is gated on module kind).
+#[test]
+fn non_module_occurrence_is_outside_module_name_rule() {
+    let source = "shapes\n";
+    let class_symbol = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![DescriptorSegment::new("Widget", SegmentKind::Type)],
+        )),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        // Points at "shapes", which spells neither "Widget" (the default rule) nor any module-name
+        // component (the symbol is not module-kind).
+        occurrences: vec![py_occ("m.py", 0, 0, 6, OccurrenceRole::Reference)],
+    };
+    let index = py_synthetic_index(vec![class_symbol]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_module_name, 0,
+        "the module-name rule never fires for a non-module symbol"
+    );
+    assert_eq!(acc.aligned_total(), 0, "no rule accepts the mismatched token");
+    assert_eq!(acc.text_mismatch, 1, "the occurrence is refused");
+}
+
+// _(Kind-scoped rules are language-gated)_ — the four Rust rules never evaluate for a Python
+// document. The pinned leak: a zero-width Python module marker on an EMPTY document vacuously spans
+// the whole (empty) document, which the un-gated module-span rule accepted; gated, it refuses.
+#[test]
+fn rust_kind_scoped_rules_do_not_fire_for_python() {
+    let source = "";
+    let module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        // scip-python's zero-width definition marker at the origin of an empty __init__.py.
+        occurrences: vec![py_occ("pkg/__init__.py", 0, 0, 0, OccurrenceRole::Definition)],
+    };
+    let mut index = py_synthetic_index(vec![module]);
+    index.documents[0].path = "pkg/__init__.py".to_string();
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("pkg/__init__.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_module_span, 0,
+        "the Rust module-span rule never accepts a Python occurrence"
+    );
+    assert_eq!(acc.aligned_total(), 0, "the zero-width marker aligns under no rule");
+    assert_eq!(
+        acc.text_mismatch + acc.semantic_only,
+        1,
+        "the marker is refused with a typed outcome"
+    );
+}
+
+// _(Scenario: Relative-import module reference accepted)_ — a module occurrence whose span covers a
+// relative-import token (leading dots plus a trailing component-run, `.shapes` for module
+// `pkg.shapes`) aligns under the module-name rule.
+#[test]
+fn python_module_relative_import_aligns_under_module_name_rule() {
+    let source = "from .shapes import Widget\n";
+    let module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("pkg.shapes", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        // The `.shapes` token: bytes 5..12 on line 0 (the dot plus the identifier — no single
+        // identifier node contains this span, so the raw-span-text gate carries it).
+        occurrences: vec![py_occ("m.py", 0, 5, 12, OccurrenceRole::Reference)],
+    };
+    let index = py_synthetic_index(vec![module]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_module_name, 1,
+        "the relative-import token aligns under the module-name rule"
+    );
+    assert_eq!(acc.text_mismatch, 0, "nothing refused");
+}
+
+// _(Scenario: Nested module accepted at trailing component-runs only — full-dotted-path half)_ —
+// the fixture's `from pkg.shapes import Widget` line carries a module occurrence spanning the full
+// dotted path `pkg.shapes`; it aligns under the module-name rule.
+#[test]
+fn python_module_dotted_path_aligns_under_module_name_rule() {
+    let store = ingest_python_fixture();
+    let occs = store.occurrences_of(&py_shapes_module_id()).unwrap();
+    let dotted = occs
+        .iter()
+        .find(|o| o.document_path == "pkg/consumer.py" && o.span == (5, 15))
+        .unwrap_or_else(|| panic!("the full-dotted-path import occurrence aligns: {occs:?}"));
+    assert_eq!(dotted.role, "reference");
+    assert_eq!(
+        dotted.rule, "module_name",
+        "the dotted-path acceptance carries the module-name rule: {dotted:?}"
+    );
+}
+
+// _(Scenario: Nested module accepted at trailing component-runs only — refusal half)_ — a token
+// spelling only a leading component of the module's dotted name (`pkg` for module `pkg.shapes`)
+// breaks the trailing-run condition and is refused.
+#[test]
+fn python_module_prefix_token_stays_refused() {
+    let source = "pkg\n";
+    let module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("pkg.shapes", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        // "pkg" at line 0, cols 0..3 — a leading component, not a trailing run.
+        occurrences: vec![py_occ("m.py", 0, 0, 3, OccurrenceRole::Reference)],
+    };
+    let index = py_synthetic_index(vec![module]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.aligned_module_name, 0,
+        "a leading-component token is not evidence for the module"
+    );
+    assert_eq!(acc.aligned_total(), 0, "no rule accepts the prefix token");
+    assert_eq!(acc.text_mismatch, 1, "the occurrence is refused");
 }

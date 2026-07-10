@@ -150,6 +150,7 @@ pub fn python_fixture_root() -> std::path::PathBuf {
 /// exactly as `PythonAdapter::analyze` takes the tool's live output.
 pub fn python_fixture_index() -> ExtractedIndex {
     use silent_cartographer::semantic::model::normalize;
+    use silent_cartographer::semantic::python_adapter::classify_module_kinds;
     use silent_cartographer::semantic::scip::translate_index;
 
     let path = python_fixture_root().join("index.scip");
@@ -159,7 +160,9 @@ pub fn python_fixture_index() -> ExtractedIndex {
         analyzer_name: index.metadata.tool_info.name.clone(),
         analyzer_version: index.metadata.tool_info.version.clone(),
     };
-    normalize(translate_index(&index, &provenance))
+    let mut extracted = translate_index(&index, &provenance);
+    classify_module_kinds(&mut extracted);
+    normalize(extracted)
 }
 
 /// The Python fixture's sources, `(scip_document_path, text)`, read from the committed project.

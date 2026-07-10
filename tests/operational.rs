@@ -426,6 +426,7 @@ fn status_reports_per_rule_acceptance_buckets() {
         Some(0),
         "self-keyword bucket reported"
     );
+    assert_eq!(aligned["module_name"].as_u64(), Some(0), "module-name bucket reported");
     assert_eq!(
         aligned["total"].as_u64().unwrap(),
         aligned["exact"].as_u64().unwrap(),

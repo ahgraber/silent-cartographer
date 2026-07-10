@@ -200,7 +200,8 @@ pub fn ingest(
             let Some(Some(id)) = identities.get(idx) else {
                 continue;
             };
-            if let Some(def) = sym.definition()
+            if sym.kind == SymbolKind::Module
+                && let Some(def) = sym.definition()
                 && def.range == SourceRange::new(0, 0, 0, 0)
             {
                 module_by_doc

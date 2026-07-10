@@ -1,4 +1,5 @@
 from pkg.shapes import Widget
+from pkg import shapes
 
 
 def build():

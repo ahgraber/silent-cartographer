@@ -98,13 +98,13 @@ pub struct OccurrenceRow {
     /// The role tag (`definition` or `reference`).
     pub role: String,
     /// The alignment rule that accepted the attribution (`exact`, `crate_root`, `operator_desugar`,
-    /// `module_span`, or `self_keyword`) — its provenance.
+    /// `module_span`, `self_keyword`, or `module_name`) — its provenance.
     pub rule: String,
     /// The nearest enclosing persisted declaration, if attributed.
     pub enclosing_id: Option<CanonicalId>,
-    /// The locality rule (`defining_document` or `module_chain`) that selected this attribution's
-    /// twin, for an occurrence resolved from a duplicated descriptor's group; `None` for an ordinary
-    /// (non-duplicated) attribution.
+    /// The locality rule (`defining_document`, `module_chain`, `target_metadata`, or
+    /// `declaration_scope`) that selected this attribution's twin, for an occurrence resolved from a
+    /// duplicated descriptor's group; `None` for an ordinary (non-duplicated) attribution.
     pub locality: Option<String>,
 }
 
@@ -366,9 +366,9 @@ impl GraphStore {
             "INSERT OR REPLACE INTO index_metadata
                 (id, schema_version, workspace_id, analyzer_name, analyzer_version, environment, content_hash,
                  aligned_exact_count, aligned_crate_root_count, aligned_operator_desugar_count,
-                 aligned_module_span_count, aligned_self_keyword_count, text_mismatch_count,
-                 semantic_only_count, duplicate_ambiguous_count, syntax_only_count)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 aligned_module_span_count, aligned_self_keyword_count, aligned_module_name_count,
+                 text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 SCHEMA_VERSION,
                 meta.workspace_id.as_str(),
@@ -381,6 +381,7 @@ impl GraphStore {
                 meta.accounting.aligned_operator_desugar as i64,
                 meta.accounting.aligned_module_span as i64,
                 meta.accounting.aligned_self_keyword as i64,
+                meta.accounting.aligned_module_name as i64,
                 meta.accounting.text_mismatch as i64,
                 meta.accounting.semantic_only as i64,
                 meta.accounting.duplicate_ambiguous as i64,
@@ -396,8 +397,8 @@ impl GraphStore {
             .query_row(
                 "SELECT workspace_id, analyzer_name, analyzer_version, environment, content_hash,
                         aligned_exact_count, aligned_crate_root_count, aligned_operator_desugar_count,
-                        aligned_module_span_count, aligned_self_keyword_count, text_mismatch_count,
-                        semantic_only_count, duplicate_ambiguous_count, syntax_only_count
+                        aligned_module_span_count, aligned_self_keyword_count, aligned_module_name_count,
+                        text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count
                  FROM index_metadata WHERE id = 1",
                 [],
                 |r| {
@@ -426,10 +427,11 @@ impl GraphStore {
                             aligned_operator_desugar: r.get::<_, i64>(7)? as u64,
                             aligned_module_span: r.get::<_, i64>(8)? as u64,
                             aligned_self_keyword: r.get::<_, i64>(9)? as u64,
-                            text_mismatch: r.get::<_, i64>(10)? as u64,
-                            semantic_only: r.get::<_, i64>(11)? as u64,
-                            duplicate_ambiguous: r.get::<_, i64>(12)? as u64,
-                            syntax_only: r.get::<_, i64>(13)? as u64,
+                            aligned_module_name: r.get::<_, i64>(10)? as u64,
+                            text_mismatch: r.get::<_, i64>(11)? as u64,
+                            semantic_only: r.get::<_, i64>(12)? as u64,
+                            duplicate_ambiguous: r.get::<_, i64>(13)? as u64,
+                            syntax_only: r.get::<_, i64>(14)? as u64,
                         },
                     })
                 },

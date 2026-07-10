@@ -50,13 +50,15 @@ fn main() -> Result<()> {
             )?;
             println!(
                 "built: aligned={} (exact={} crate_root={} operator_desugar={} module_span={} \
-                 self_keyword={}) text_mismatch={} semantic_only={} duplicate_ambiguous={} syntax_only={}",
+                 self_keyword={} module_name={}) text_mismatch={} semantic_only={} duplicate_ambiguous={} \
+                 syntax_only={}",
                 accounting.aligned_total(),
                 accounting.aligned_exact,
                 accounting.aligned_crate_root,
                 accounting.aligned_operator_desugar,
                 accounting.aligned_module_span,
                 accounting.aligned_self_keyword,
+                accounting.aligned_module_name,
                 accounting.text_mismatch,
                 accounting.semantic_only,
                 accounting.duplicate_ambiguous,

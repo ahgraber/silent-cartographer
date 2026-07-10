@@ -273,6 +273,7 @@ pub fn run_status(
                 "operator_desugar": meta.accounting.aligned_operator_desugar,
                 "module_span": meta.accounting.aligned_module_span,
                 "self_keyword": meta.accounting.aligned_self_keyword,
+                "module_name": meta.accounting.aligned_module_name,
                 "total": meta.accounting.aligned_total(),
             },
             "text_mismatch": meta.accounting.text_mismatch,
