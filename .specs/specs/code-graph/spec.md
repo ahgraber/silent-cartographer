@@ -12,6 +12,7 @@ The system SHALL attribute each semantic occurrence to the syntactic construct a
 The default rule is name-token equality: the source text at the location matches the occurrence's expected symbol name — its name token, the terminal segment of the descriptor, not the qualified path.
 Kind-scoped rules extend the default rule, each scoped to the language whose constructs it reconciles.
 For Rust, four: a crate-root module occurrence is accepted when the source token is the descriptor's own package name or the keyword `crate`; a reference occurrence of a desugared-operator method is accepted when its location holds the operator construct that method desugars from, per a closed correspondence; a module definition occurrence is accepted when its range spans the module's whole document; and a reference occurrence resolving to a type — or to an implementation of one — is accepted at a self-type keyword when the enclosing implementation's self type is that type, generic arguments aside.
+For Python, one: a module occurrence is accepted when its source token, after any leading relative-import dots, equals a trailing component-run of the module's dotted namespace name — the full name and the bare terminal component included; a token spelling only leading components, or any other text, is not evidence for that module.
 A language for which no kind-scoped rule has been established accepts occurrences under the default rule only, refusing the rest; rule families are added per language as calibration evidence justifies each one.
 Every aligned attribution SHALL carry the rule that accepted it as provenance.
 An occurrence satisfying no rule SHALL NOT be persisted as an aligned attribution; when a semantic occurrence and the syntax at its location cannot be reconciled under any rule, the system SHALL surface the discrepancy and SHALL NOT persist it as a confident attribution.
@@ -100,9 +101,33 @@ An occurrence satisfying no rule SHALL NOT be persisted as an aligned attributio
 - **WHEN** the join runs
 - **THEN** the occurrence is persisted as aligned under the default rule
 
-#### Scenario: Python occurrence outside the default rule stays refused
+#### Scenario: Python module reference accepted under the module-name rule
 
-- **GIVEN** a Python semantic occurrence whose source location does not spell the symbol's name token, in the absence of any Python kind-scoped rule covering it
+- **GIVEN** a Python reference occurrence resolving to a module descriptor, at a source token spelling the terminal component of that module's dotted namespace name
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the module-name rule with that rule as provenance
+
+#### Scenario: Nested module accepted at trailing component-runs only
+
+- **GIVEN** a Python reference occurrence resolving to a nested module (a dotted namespace of several components), at a source token spelling the namespace's terminal component or its full dotted name
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the module-name rule, and an occurrence of the same module at a token spelling only a leading (non-terminal) component is refused
+
+#### Scenario: Relative-import module reference accepted
+
+- **GIVEN** a Python reference occurrence resolving to a module, at a relative-import token consisting of leading dots followed by a trailing component-run of the module's dotted namespace name
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the module-name rule
+
+#### Scenario: Non-module occurrence is outside the module-name rule
+
+- **GIVEN** a Python occurrence resolving to a non-module symbol whose source location does not spell its name token
+- **WHEN** the join runs
+- **THEN** the module-name rule does not accept it and the occurrence is refused
+
+#### Scenario: Python occurrence outside every rule stays refused
+
+- **GIVEN** a Python semantic occurrence whose source location neither spells the symbol's name token nor satisfies the module-name rule
 - **WHEN** the join runs
 - **THEN** the occurrence is refused and surfaced as a discrepancy, never persisted as a confident attribution
 
@@ -201,7 +226,7 @@ The system SHALL record, for every build, the number of semantic occurrences acc
 
 ### Requirement: Occurrences of duplicated descriptors are never arbitrarily attributed
 
-When more than one distinct definition shares an identical resolved descriptor, the system SHALL attribute each definition occurrence to the definition at its own location; SHALL attribute a non-definition occurrence of that descriptor to one of the duplicates only when the occurrence's containing document is associated with exactly that one duplicate and the occurrence also satisfies the guarded join's alignment rules, except that an occurrence whose source token spells the package's own name rather than the descriptor's name — a token that denotes the package's library target regardless of where it sits — SHALL be attributed to the duplicate whose definition document the build system's authoritative target description names as the library target's root, and SHALL be recorded duplicate-ambiguous when no authoritative target description is available or it names no persisted duplicate; every attribution SHALL carry its locality evidence as provenance; and SHALL record a non-definition occurrence whose containing document is associated with no duplicate, or with more than one, as a typed duplicate-ambiguous outcome — never attributing it to any single duplicate arbitrarily.
+When more than one distinct definition shares an identical resolved descriptor, the system SHALL attribute each definition occurrence to the definition at its own location; SHALL attribute a non-definition occurrence of that descriptor to one of the duplicates only when the occurrence's containing document is associated with exactly that one duplicate and the occurrence also satisfies the guarded join's alignment rules, except that an occurrence whose source token spells the package's own name rather than the descriptor's name — a token that denotes the package's library target regardless of where it sits — SHALL be attributed to the duplicate whose definition document the build system's authoritative target description names as the library target's root, and SHALL be recorded duplicate-ambiguous when no authoritative target description is available or it names no persisted duplicate; SHALL, when the occurrence's containing document is associated with more than one duplicate, attribute the occurrence to a duplicate by declaration scope — the innermost declaration enclosing the occurrence that contains at least one of the duplicates' definitions decides, and the occurrence is attributed to the single duplicate defined within it — only when exactly one duplicate's definition lies within that deciding declaration and the occurrence also satisfies the guarded join's alignment rules; every attribution SHALL carry its locality evidence as provenance; and SHALL record a non-definition occurrence for which no locality evidence discriminates a single duplicate — a containing document associated with no duplicate, or shared territory whose deciding declaration contains more than one duplicate or does not exist — as a typed duplicate-ambiguous outcome, never attributing it to any single duplicate arbitrarily.
 
 #### Scenario: Definition occurrences attach to their own duplicate
 
@@ -239,11 +264,29 @@ When more than one distinct definition shares an identical resolved descriptor, 
 - **WHEN** the join runs
 - **THEN** the occurrence is recorded as a duplicate-ambiguous outcome and is attributed to no single duplicate
 
-#### Scenario: Reference in shared territory is typed ambiguous
+#### Scenario: Same-document reference inside exactly one twin's scope is attributed to it
 
-- **GIVEN** a non-definition occurrence of a duplicated descriptor whose containing document is associated with more than one of the duplicates
+- **GIVEN** several definitions sharing an identical resolved descriptor within one document, and a non-definition occurrence of that descriptor whose innermost enclosing declaration containing any of the definitions contains exactly one of them
+- **WHEN** the join runs
+- **THEN** the occurrence is attributed to that single duplicate and the attribution carries the declaration-scope evidence as locality provenance
+
+#### Scenario: Same-document reference whose deciding scope holds several twins stays ambiguous
+
+- **GIVEN** several definitions sharing an identical resolved descriptor within one document, and a non-definition occurrence whose innermost enclosing declaration containing any of the definitions contains more than one of them
 - **WHEN** the join runs
 - **THEN** the occurrence is recorded as a duplicate-ambiguous outcome and is attributed to no single duplicate
+
+#### Scenario: Same-document reference enclosed by no twin-bearing declaration stays ambiguous
+
+- **GIVEN** several definitions sharing an identical resolved descriptor at the top level of one document, and a non-definition occurrence elsewhere in that document none of whose enclosing declarations contains any of the definitions
+- **WHEN** the join runs
+- **THEN** the occurrence is recorded as a duplicate-ambiguous outcome and is attributed to no single duplicate
+
+#### Scenario: Scope locality does not bypass the guarded join
+
+- **GIVEN** a non-definition occurrence inside exactly one twin's scope whose source text satisfies no alignment rule's expectation
+- **WHEN** the join runs
+- **THEN** the occurrence is refused by the guarded join and is not attributed to the duplicate
 
 #### Scenario: Unduplicated descriptors are unaffected
 
@@ -371,6 +414,12 @@ The system SHALL persist an `imports` dependency edge from a module to a symbol 
 - **GIVEN** a Python module containing an import statement naming a symbol defined in another module
 - **WHEN** the index is built
 - **THEN** an `imports` edge from the importing module to that symbol is persisted
+
+#### Scenario: Python module import produces a module-to-module edge
+
+- **GIVEN** a Python module containing an import statement naming another module
+- **WHEN** the index is built
+- **THEN** an `imports` edge from the importing module to the imported module's symbol is persisted
 
 #### Scenario: Reference inside a declaration is not an import
 
