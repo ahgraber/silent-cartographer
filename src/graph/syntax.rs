@@ -105,6 +105,23 @@ pub struct ConstructAt {
     pub operator: Option<String>,
 }
 
+/// The shape of a Rust range construct (`range_expression` or `range_pattern`) at its operator
+/// token: which ends are present, and whether the operator is inclusive.
+///
+/// The six Rust range forms reduce to these two axes rather than being named after their `std::ops`
+/// types (`Range`, `RangeFrom`, `RangeTo`, `RangeFull`, `RangeInclusive`, `RangeToInclusive`) — the
+/// axes are what the syntax layer can read off the operator token and its neighbors without
+/// consulting type information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeShape {
+    /// Whether a start operand precedes the operator (`a..`, `a..b`, `a..=b`).
+    pub has_start: bool,
+    /// Whether an end operand follows the operator (`..b`, `a..b`, `..=b`, `a..=b`).
+    pub has_end: bool,
+    /// Whether the operator is the inclusive form `..=` rather than `..`.
+    pub inclusive: bool,
+}
+
 /// tree-sitter node kinds that correspond to persisted Rust declarations.
 const RUST_DECLARATION_KINDS: &[&str] = &[
     "mod_item",
@@ -414,6 +431,45 @@ impl SyntaxTree {
         })
     }
 
+    /// The shape of the range construct whose operator token (`..` or `..=`) is at `span`: which
+    /// ends are present, and whether the operator is inclusive.
+    ///
+    /// Matches both `range_expression` (`a..b` and its four siblings) and `range_pattern` (a match
+    /// arm's `1..=3`) uniformly — both are the same six shapes at the syntax layer, and `..=b` with
+    /// no start operand has no unambiguous parse as a `range_expression` in the grammar. Returns
+    /// `None` for a span anywhere else, including on a range's own operand.
+    pub fn range_shape(&self, span: ByteSpan) -> Option<RangeShape> {
+        let root = self.tree.root_node();
+        let end = span.end.max(span.start + 1).min(root.end_byte());
+        let node = root.descendant_for_byte_range(span.start, end)?;
+        if node.is_named() || !matches!(node.kind(), ".." | "..=") {
+            return None;
+        }
+        let parent = node.parent()?;
+        if !matches!(parent.kind(), "range_expression" | "range_pattern") {
+            return None;
+        }
+        // `range_pattern` exposes named operands under `left`/`right` fields; `range_expression`
+        // exposes them as unnamed-field siblings of the operator token, so presence is read
+        // positionally there instead.
+        let (has_start, has_end) = if parent.kind() == "range_pattern" {
+            (
+                parent.child_by_field_name("left").is_some(),
+                parent.child_by_field_name("right").is_some(),
+            )
+        } else {
+            (
+                node.prev_sibling().is_some_and(|s| s.is_named()),
+                node.next_sibling().is_some_and(|s| s.is_named()),
+            )
+        };
+        Some(RangeShape {
+            has_start,
+            has_end,
+            inclusive: node.kind() == "..=",
+        })
+    }
+
     /// The self-type text of the nearest `impl` block enclosing `offset`, if any.
     ///
     /// Walks the ancestor chain to the innermost `impl_item` and reads its `type` field verbatim
@@ -427,6 +483,26 @@ impl SyntaxTree {
                 && let Some(ty) = n.child_by_field_name("type")
             {
                 return self.text_at(span_of(ty)).map(str::to_string);
+            }
+            node = n.parent();
+        }
+        None
+    }
+
+    /// The trait-name text of the nearest `impl` block enclosing `offset`, if any.
+    ///
+    /// Walks the ancestor chain to the innermost `impl_item` and reads its `trait` field verbatim
+    /// (generic arguments included — the caller strips them for base-name comparison), the trait-side
+    /// analog of [`Self::enclosing_impl_self_type`]. An inherent `impl` (no trait) and `Self` inside a
+    /// trait body both yield `None`.
+    pub fn enclosing_impl_trait_name(&self, offset: usize) -> Option<String> {
+        let root = self.tree.root_node();
+        let mut node = root.descendant_for_byte_range(offset, offset);
+        while let Some(n) = node {
+            if n.kind() == "impl_item"
+                && let Some(tr) = n.child_by_field_name("trait")
+            {
+                return self.text_at(span_of(tr)).map(str::to_string);
             }
             node = n.parent();
         }
@@ -467,6 +543,92 @@ impl SyntaxTree {
             && parent
                 .child_by_field_name("name")
                 .is_some_and(|name| span_of(name) == span_of(node))
+    }
+
+    /// The span of the terminal segment of the nearest enclosing use path, for a `span` sitting on a
+    /// `self` token inside a `use_list` (`use a::walk::{self, x};` — the `self` resolves to `walk`).
+    /// An aliased self-import (`use a::walk::{self as w};`) resolves the same way: the `self` sits
+    /// one level deeper, as the path of a `use_as_clause` inside the list.
+    ///
+    /// Returns `None` for a `self` token anywhere else: a method's `self` parameter, a path-start
+    /// `self::` reference (no enclosing `use_list`), or any span not on a `self` token at all.
+    pub fn use_list_self_context(&self, span: ByteSpan) -> Option<ByteSpan> {
+        let root = self.tree.root_node();
+        let end = span.end.max(span.start + 1).min(root.end_byte());
+        let mut node = root.descendant_for_byte_range(span.start, end)?;
+        while !node.is_named() {
+            node = node.parent()?;
+        }
+        if node.kind() != "self" {
+            return None;
+        }
+        let mut holder = node.parent()?;
+        if holder.kind() == "use_as_clause" {
+            holder = holder.parent()?;
+        }
+        let use_list = Some(holder).filter(|p| p.kind() == "use_list")?;
+        let scoped_use_list = use_list.parent().filter(|p| p.kind() == "scoped_use_list")?;
+        let path = scoped_use_list.child_by_field_name("path")?;
+        rust_use_path_terminal(path).map(span_of)
+    }
+
+    /// Whether `span` sits on a path-start `self` token — the leading segment of a `self::…` path
+    /// (`use self::x;`, `self::helper()`), where the keyword names the containing module itself.
+    ///
+    /// A `self` anywhere else is not path-start: a method receiver or parameter, a use-list `self`
+    /// (the use-list-self rule's shape), or a `self` as a use path's terminal segment.
+    pub fn path_start_self(&self, span: ByteSpan) -> bool {
+        let root = self.tree.root_node();
+        let end = span.end.max(span.start + 1).min(root.end_byte());
+        let Some(mut node) = root.descendant_for_byte_range(span.start, end) else {
+            return false;
+        };
+        while !node.is_named() {
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            node = parent;
+        }
+        if node.kind() != "self" {
+            return false;
+        }
+        node.parent().is_some_and(|parent| {
+            matches!(parent.kind(), "scoped_identifier" | "scoped_use_list")
+                && parent.child_by_field_name("path").is_some_and(|path| path == node)
+        })
+    }
+
+    /// 1 plus the number of `super` path segments preceding `span`'s `super` token in the same path
+    /// (`super::super::y` — the second `super` has depth 2). Returns `None` for a span not on a
+    /// `super` token.
+    ///
+    /// A chained `super::super::...` path left-nests as `scoped_identifier { path: scoped_identifier {
+    /// path: super, name: super }, name: ... }`, so the token sits at either the `path` or `name` field
+    /// of its immediate `scoped_identifier` parent. A `path`-field `super` has no preceding segment at
+    /// its own level (it is the chain's leftmost token). A `name`-field `super` is preceded by every
+    /// `super` in its parent's `path` subtree — that subtree is itself the rest of the chain, so it is
+    /// counted directly rather than walking further up.
+    pub fn super_chain_depth(&self, span: ByteSpan) -> Option<usize> {
+        let root = self.tree.root_node();
+        let end = span.end.max(span.start + 1).min(root.end_byte());
+        let mut node = root.descendant_for_byte_range(span.start, end)?;
+        while !node.is_named() {
+            node = node.parent()?;
+        }
+        if node.kind() != "super" {
+            return None;
+        }
+        let Some(parent) = node.parent().filter(|p| p.kind() == "scoped_identifier") else {
+            // A bare `super` with no `scoped_identifier` parent (e.g. `use super;`) is its own,
+            // unpreceded segment.
+            return Some(1);
+        };
+        if parent.child_by_field_name("name").is_some_and(|n| n == node) {
+            let preceding = parent.child_by_field_name("path").map(count_super_tokens).unwrap_or(0);
+            Some(preceding + 1)
+        } else {
+            Some(1)
+        }
     }
 
     /// The chain of `attribute`/`dotted_name` node spans enclosing `span`, innermost first (Python).
@@ -528,8 +690,23 @@ fn name_token(node: Node) -> Option<Node> {
 }
 
 /// Whether a node is an identifier-like name node for `language`.
+///
+/// An `integer_literal` is a name node only when it is the `field` child of a `field_expression` —
+/// a Rust tuple-field index (`x.0`). The same node kind anywhere else (a standalone literal, an
+/// array length) is ordinary syntax, not a name.
 fn is_name_node(node: Node, language: Language) -> bool {
-    name_node_kinds(language).contains(&node.kind())
+    if name_node_kinds(language).contains(&node.kind()) {
+        return true;
+    }
+    language == Language::Rust && node.kind() == "integer_literal" && is_tuple_field_index(node)
+}
+
+/// Whether `node` is the `field` child of a `field_expression` — the tuple-field index position
+/// (`x.0` → the `0`).
+fn is_tuple_field_index(node: Node) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "field_expression" && parent.child_by_field_name("field").is_some_and(|field| field == node)
+    })
 }
 
 /// The terminal segment of a Rust `use_as_clause`'s `path` field: the node itself for a bare
@@ -541,6 +718,21 @@ fn rust_use_path_terminal(node: Node) -> Option<Node> {
         "identifier" | "crate" | "self" | "super" => Some(node),
         "scoped_identifier" => node.child_by_field_name("name"),
         _ => None,
+    }
+}
+
+/// The number of `super` tokens in `node`'s own path chain: 1 if `node` is itself a `super` token, or
+/// the count within its `path` field plus its own `name`-field `super` (if any) when `node` is a
+/// `scoped_identifier`. Zero for any other shape.
+fn count_super_tokens(node: Node) -> usize {
+    match node.kind() {
+        "super" => 1,
+        "scoped_identifier" => {
+            let path_count = node.child_by_field_name("path").map(count_super_tokens).unwrap_or(0);
+            let name_count = node.child_by_field_name("name").is_some_and(|n| n.kind() == "super") as usize;
+            path_count + name_count
+        }
+        _ => 0,
     }
 }
 
@@ -721,6 +913,86 @@ mod net {
         assert_eq!(c.kind, "crate");
     }
 
+    // Each of the six Rust range forms yields its shape at the operator token; a span not on a range
+    // operator yields `None`. `..=b` (no start operand) has no unambiguous expression-position parse
+    // in the grammar, so it is exercised in pattern position, which `range_shape` reads uniformly
+    // with expression position.
+    #[test]
+    fn range_shape_reads_all_six_shapes() {
+        let src = "fn f(a: usize, b: usize) -> usize { let _r1 = a..b; let _r2 = a..; let _r3 = ..b; \
+                    let _r4 = ..; let _r5 = a..=b; a }\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let span = |token: &str, occurrence: usize| {
+            let abs = src.match_indices(token).nth(occurrence - 1).expect("token present").0;
+            ByteSpan {
+                start: abs,
+                end: abs + token.len(),
+            }
+        };
+
+        assert_eq!(
+            tree.range_shape(span("..", 1)), // a..b
+            Some(RangeShape {
+                has_start: true,
+                has_end: true,
+                inclusive: false
+            })
+        );
+        assert_eq!(
+            tree.range_shape(span("..", 2)), // a..
+            Some(RangeShape {
+                has_start: true,
+                has_end: false,
+                inclusive: false
+            })
+        );
+        assert_eq!(
+            tree.range_shape(span("..", 3)), // ..b
+            Some(RangeShape {
+                has_start: false,
+                has_end: true,
+                inclusive: false
+            })
+        );
+        assert_eq!(
+            tree.range_shape(span("..", 4)), // ..
+            Some(RangeShape {
+                has_start: false,
+                has_end: false,
+                inclusive: false
+            })
+        );
+        assert_eq!(
+            tree.range_shape(span("..=", 1)), // a..=b
+            Some(RangeShape {
+                has_start: true,
+                has_end: true,
+                inclusive: true
+            })
+        );
+
+        // `..=b` (no start) in pattern position: the only grammar shape that parses it as a range
+        // rather than an assignment.
+        let pat_src = "fn f(n: i32) -> i32 { match n { ..=3 => 1, _ => 0 } }\n";
+        let pat_tree = SyntaxTree::parse(pat_src, Language::Rust).unwrap();
+        let pat_pos = pat_src.find("..=3").unwrap();
+        assert_eq!(
+            pat_tree.range_shape(ByteSpan {
+                start: pat_pos,
+                end: pat_pos + 3,
+            }),
+            Some(RangeShape {
+                has_start: false,
+                has_end: true,
+                inclusive: true
+            })
+        );
+
+        // A span not on a range operator (an operand, or unrelated syntax) yields `None`.
+        assert_eq!(tree.range_shape(span("a..b", 1)), None);
+        assert_eq!(tree.range_shape(span("fn", 1)), None);
+    }
+
     // A module-declaration name token is recognized; a use-style path segment spelling the same
     // module name, and non-module identifiers, are not.
     #[test]
@@ -792,6 +1064,44 @@ trait Tr {
         // Inside the trait body: no impl to cross-check against.
         let in_trait = src.rfind("Self").unwrap();
         assert_eq!(tree.enclosing_impl_self_type(in_trait), None);
+    }
+
+    // A tuple-field index (`x.0`) is a name node only in field position; the same digit as a
+    // standalone integer literal, or as an array-length operand, is not.
+    #[test]
+    fn tuple_index_is_name_node_only_in_field_position() {
+        let src = "fn f(x: (u8, u8)) -> u8 { x.0 }\nfn g() { let _a = [0; 4]; let _b = 0; }\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let span = |token: &str, occurrence: usize| {
+            let abs = src.match_indices(token).nth(occurrence - 1).expect("token present").0;
+            ByteSpan {
+                start: abs,
+                end: abs + token.len(),
+            }
+        };
+
+        // The `0` in `x.0` is the field child of a `field_expression`: a name node.
+        let field_zero = span("x.0", 1);
+        let field_zero = ByteSpan {
+            start: field_zero.end - 1,
+            end: field_zero.end,
+        };
+        let name = tree
+            .name_node_containing(field_zero)
+            .expect("tuple field index is a name node");
+        assert_eq!(tree.text_at(name), Some("0"));
+
+        // The array-length `4` in `[0; 4]` is an integer literal outside field position: not a name
+        // node.
+        assert_eq!(tree.name_node_containing(span("4]", 1)), None);
+
+        // A standalone integer literal (`let _b = 0;`) is not a name node.
+        let standalone_zero = span("_b = 0", 1);
+        let standalone_zero = ByteSpan {
+            start: standalone_zero.end - 1,
+            end: standalone_zero.end,
+        };
+        assert_eq!(tree.name_node_containing(standalone_zero), None);
     }
 
     const PY_SRC: &str = "\
@@ -965,6 +1275,108 @@ TOP_LEVEL = 1
             "`pub use delta as epsilon;` binds alias `epsilon` to target `delta` across the whole clause: \
              {bindings:?}"
         );
+    }
+
+    // A `self` token inside a use-list resolves to the terminal segment of its nearest enclosing use
+    // path, at any nesting depth; a method's `self` parameter is not inside a use-list and yields
+    // `None`.
+    #[test]
+    fn use_list_self_resolves_enclosing_path_terminal() {
+        let src = "use a::walk::{self, x};\nuse a::{b::{self}};\nstruct S; impl S { fn f(self) {} }\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let span = |token: &str, occurrence: usize| {
+            let abs = src.match_indices(token).nth(occurrence - 1).expect("token present").0;
+            ByteSpan {
+                start: abs,
+                end: abs + token.len(),
+            }
+        };
+
+        // `use a::walk::{self, x};` — `self` resolves to the enclosing path's terminal segment `walk`.
+        let walk_self = span("self", 1);
+        let resolved = tree.use_list_self_context(walk_self).expect("use-list self resolves");
+        assert_eq!(tree.text_at(resolved), Some("walk"));
+
+        // `use a::{b::{self}};` — nested use-list, terminal segment `b`.
+        let nested_self = span("self", 2);
+        let resolved = tree
+            .use_list_self_context(nested_self)
+            .expect("nested use-list self resolves");
+        assert_eq!(tree.text_at(resolved), Some("b"));
+
+        // A method's `self` parameter is not inside a use-list.
+        let param_self = span("self", 3);
+        assert_eq!(tree.use_list_self_context(param_self), None);
+
+        // An aliased self-import resolves through its `use_as_clause` to the same path terminal.
+        let aliased_src = "use a::walk::{self as w};\n";
+        let aliased_tree = SyntaxTree::parse(aliased_src, Language::Rust).unwrap();
+        let aliased_self = ByteSpan {
+            start: aliased_src.find("self").unwrap(),
+            end: aliased_src.find("self").unwrap() + 4,
+        };
+        let resolved = aliased_tree
+            .use_list_self_context(aliased_self)
+            .expect("aliased use-list self resolves");
+        assert_eq!(aliased_tree.text_at(resolved), Some("walk"));
+
+        // Path-start `self::` (no use-list) is not a use-list self context.
+        let path_start_src = "use self::x;\n";
+        let path_start_tree = SyntaxTree::parse(path_start_src, Language::Rust).unwrap();
+        let path_start_self = ByteSpan {
+            start: path_start_src.find("self").unwrap(),
+            end: path_start_src.find("self").unwrap() + 4,
+        };
+        assert_eq!(path_start_tree.use_list_self_context(path_start_self), None);
+    }
+
+    // A `super` token's chain depth is 1 plus the number of `super` segments preceding it in the same
+    // path; a span off a `super` token yields `None`.
+    #[test]
+    fn super_chain_depth_counts_position() {
+        let src = "use super::x;\nuse super::super::y;\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let span = |token: &str, occurrence: usize| {
+            let abs = src.match_indices(token).nth(occurrence - 1).expect("token present").0;
+            ByteSpan {
+                start: abs,
+                end: abs + token.len(),
+            }
+        };
+
+        // `use super::x;` — the single `super` is the first segment: depth 1.
+        assert_eq!(tree.super_chain_depth(span("super", 1)), Some(1));
+
+        // `use super::super::y;` — the first `super` is depth 1, the second is depth 2.
+        assert_eq!(tree.super_chain_depth(span("super", 2)), Some(1));
+        assert_eq!(tree.super_chain_depth(span("super", 3)), Some(2));
+
+        // A span not on a `super` token yields `None`.
+        assert_eq!(tree.super_chain_depth(span("x", 1)), None);
+    }
+
+    // A path-start `self` (the leading segment of a `self::…` path) is recognized in use and
+    // expression position; receiver, parameter, and use-list shapes are not path-start.
+    #[test]
+    fn path_start_self_recognized_only_at_path_start() {
+        let src = "use self::x;\nfn f(&self) { self.a; self::h(); }\nuse a::{self};\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let span = |occurrence: usize| {
+            let abs = src.match_indices("self").nth(occurrence - 1).expect("token present").0;
+            ByteSpan {
+                start: abs,
+                end: abs + 4,
+            }
+        };
+
+        // `use self::x;` and the expression path `self::h()` are path-start.
+        assert!(tree.path_start_self(span(1)));
+        assert!(tree.path_start_self(span(4)));
+
+        // A method parameter, a receiver, and a use-list `self` are not.
+        assert!(!tree.path_start_self(span(2)));
+        assert!(!tree.path_start_self(span(3)));
+        assert!(!tree.path_start_self(span(5)));
     }
 
     // The chain at a prefix token inside a multi-segment dotted construct contains every enclosing

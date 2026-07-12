@@ -27,11 +27,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::identity::{CanonicalId, Descriptor};
+use crate::identity::{CanonicalId, Descriptor, SegmentKind};
 use crate::semantic::model::{ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, SymbolKind};
 
 use super::range::{ByteSpan, LineIndex, range_to_span};
-use super::syntax::{AliasBinding, ConstructAt, Language, SyntaxDeclaration, SyntaxTree};
+use super::syntax::{AliasBinding, ConstructAt, Language, RangeShape, SyntaxDeclaration, SyntaxTree};
 
 /// The named alignment rule that accepted an attribution. Stored as provenance on every aligned
 /// occurrence; each rule also carries its own acceptance bucket in the accounting.
@@ -62,6 +62,15 @@ pub enum AlignmentRule {
     /// A reference occurrence at a token spelling a name its containing document binds to the
     /// occurrence's resolved symbol through a declared alias-binding form.
     ImportAlias,
+    /// A reference resolving to a range type at a range operator token whose shape matches the
+    /// type under the closed range correspondence.
+    RangeLiteral,
+    /// A module-kind occurrence at a use-list `self` token whose enclosing path terminal spells the
+    /// module's expected name.
+    UseListSelf,
+    /// A module-kind occurrence at a `super` token whose chain depth resolves to the expected
+    /// module as the document's own module's ancestor.
+    SuperKeyword,
 }
 
 impl AlignmentRule {
@@ -77,6 +86,9 @@ impl AlignmentRule {
             AlignmentRule::SelfName => "self_name",
             AlignmentRule::ModuleMarker => "module_marker",
             AlignmentRule::ImportAlias => "import_alias",
+            AlignmentRule::RangeLiteral => "range_literal",
+            AlignmentRule::UseListSelf => "use_list_self",
+            AlignmentRule::SuperKeyword => "super_keyword",
         }
     }
 }
@@ -206,6 +218,12 @@ pub struct JoinAccounting {
     pub aligned_module_marker: u64,
     /// Occurrences accepted by the import-alias rule.
     pub aligned_import_alias: u64,
+    /// Occurrences accepted by the range-literal rule.
+    pub aligned_range_literal: u64,
+    /// Occurrences accepted by the use-list-self rule.
+    pub aligned_use_list_self: u64,
+    /// Occurrences accepted by the super-keyword rule.
+    pub aligned_super_keyword: u64,
     /// Occurrences whose location satisfied no alignment rule's expectation.
     pub text_mismatch: u64,
     /// Occurrences with no syntactic construct at their location.
@@ -229,6 +247,9 @@ impl JoinAccounting {
             AlignmentRule::SelfName => self.aligned_self_name += 1,
             AlignmentRule::ModuleMarker => self.aligned_module_marker += 1,
             AlignmentRule::ImportAlias => self.aligned_import_alias += 1,
+            AlignmentRule::RangeLiteral => self.aligned_range_literal += 1,
+            AlignmentRule::UseListSelf => self.aligned_use_list_self += 1,
+            AlignmentRule::SuperKeyword => self.aligned_super_keyword += 1,
         }
     }
 
@@ -243,6 +264,9 @@ impl JoinAccounting {
             + self.aligned_self_name
             + self.aligned_module_marker
             + self.aligned_import_alias
+            + self.aligned_range_literal
+            + self.aligned_use_list_self
+            + self.aligned_super_keyword
     }
 
     /// The total semantic occurrences processed (all acceptance buckets plus all refusal outcomes).
@@ -288,14 +312,24 @@ struct PreparedDocument {
     alias_bindings: Vec<AliasBinding>,
 }
 
-/// The position (into `index.symbols`) of the module symbol each document defines, per the
-/// zero-width origin marker scip-python emits: a definition-role occurrence of a module-kind symbol
-/// whose range is the empty span at the document origin.
+/// The position (into `index.symbols`) of the module symbol each document defines, dispatched by
+/// language on each definition occurrence's structural shape: Python's zero-width origin marker (a
+/// definition-role occurrence of a module-kind symbol whose range is the empty span at the document
+/// origin), or Rust's whole-document module definition (a definition-role occurrence of a
+/// module-kind symbol whose range spans the entire document from byte 0 — the same shape the join's
+/// module-span rule accepts).
 ///
-/// Derived from index symbols before the join runs, so the join's self-name rule and ingest's
-/// module bookkeeping (`imports`-edge sourcing) read one derivation. Only persisted symbols (those
-/// with an identity) participate; an index without markers (Rust) yields an empty map.
-pub fn module_by_document(index: &ExtractedIndex, identities: &[Option<CanonicalId>]) -> HashMap<String, usize> {
+/// Derived from index symbols before the join runs, so the join's self-name and super-keyword rules
+/// and ingest's module bookkeeping (`imports`-edge sourcing) read one derivation. Only persisted
+/// symbols (those with an identity) participate; a document whose module definition does not
+/// normalize onto its source (no corpus entry, or coordinates that don't reconcile) contributes no
+/// entry for that document — refusal over a guessed module.
+pub fn module_by_document(
+    index: &ExtractedIndex,
+    identities: &[Option<CanonicalId>],
+    corpus: &SourceCorpus,
+    language: Language,
+) -> HashMap<String, usize> {
     use crate::semantic::model::SourceRange;
 
     let mut by_doc: HashMap<String, usize> = HashMap::new();
@@ -303,10 +337,29 @@ pub fn module_by_document(index: &ExtractedIndex, identities: &[Option<Canonical
         let Some(Some(_)) = identities.get(idx) else {
             continue;
         };
-        if sym.kind == SymbolKind::Module
-            && let Some(def) = sym.definition()
-            && def.range == SourceRange::new(0, 0, 0, 0)
-        {
+        if sym.kind != SymbolKind::Module {
+            continue;
+        }
+        let Some(def) = sym.definition() else {
+            continue;
+        };
+        let is_module_def = match language {
+            Language::Python => def.range == SourceRange::new(0, 0, 0, 0),
+            Language::Rust => {
+                let Some(source) = corpus.get(&def.document_path) else {
+                    continue;
+                };
+                let Some(encoding) = index.encoding_for(&def.document_path) else {
+                    continue;
+                };
+                let line_index = LineIndex::new(source);
+                let Some(span) = range_to_span(source, &line_index, def.range, encoding) else {
+                    continue;
+                };
+                span.start == 0 && span.end == source.len()
+            }
+        };
+        if is_module_def {
             by_doc.entry(def.document_path.clone()).or_insert(idx);
         }
     }
@@ -319,7 +372,8 @@ pub fn module_by_document(index: &ExtractedIndex, identities: &[Option<Canonical
 /// `identities[i]` is the canonical identity of `index.symbols[i]`. Symbols without an identity
 /// (e.g. those the caller chose not to persist) are skipped. `doc_module` is the document→module
 /// derivation from [`module_by_document`], computed by the caller before the join so the self-name
-/// rule can compare an occurrence's resolved module against its containing document's own module.
+/// and super-keyword rules can compare an occurrence's resolved module against its containing
+/// document's own module.
 pub fn join(
     index: &ExtractedIndex,
     corpus: &SourceCorpus,
@@ -1187,19 +1241,103 @@ fn evaluate_rules_at(
 
         // Self-keyword rule: a reference resolving to a type — or to an implementation of one — at a
         // `Self` keyword token (type position and `Self::` path segments are both name nodes spelling
-        // `Self`) accepts only when the nearest enclosing impl's self type shares the expected base
-        // name, generic arguments stripped from both sides. The impl cross-check is what keeps the
-        // rule exact: token presence alone would accept coordinate drift landing on any `Self`.
-        // Lowercase `self` never matches the token check, and `Self` in a trait body has no enclosing
-        // impl, so both stay refused.
+        // `Self`) accepts when the nearest enclosing impl's self type OR trait name shares the
+        // expected base name, generic arguments stripped from both sides. The trait side covers the
+        // shape rust-analyzer actually emits at `Self` inside a trait impl (a synthetic impl-block
+        // symbol whose trailing identity segment is the trait's name) and a direct trait reference
+        // alike. The impl cross-check is what keeps the rule exact: token presence alone would accept
+        // coordinate drift landing on any `Self`. Lowercase `self` never matches the token check, and
+        // `Self` in a trait body has no enclosing impl, so both stay refused.
         if role == OccurrenceRole::Reference
             && is_self_target(symbol)
             && let Some(ns) = name_span
             && tree.text_at(ns) == Some("Self")
-            && let Some(impl_self_type) = tree.enclosing_impl_self_type(span.start)
-            && base_type_name(&impl_self_type) == base_type_name(expected_name)
         {
-            return Some((AlignmentRule::SelfKeyword, ns));
+            let expected_base = base_type_name(expected_name);
+            let self_type_matches = tree
+                .enclosing_impl_self_type(span.start)
+                .is_some_and(|t| base_type_name(&t) == expected_base);
+            let trait_name_matches = tree
+                .enclosing_impl_trait_name(span.start)
+                .is_some_and(|t| base_type_name(&t) == expected_base);
+            if self_type_matches || trait_name_matches {
+                return Some((AlignmentRule::SelfKeyword, ns));
+            }
+        }
+
+        // Range-literal rule: a reference resolving to a range type at a range operator token (`..`
+        // or `..=`) accepts when the operator's shape — which ends are present, and inclusivity —
+        // matches the expected type under the closed correspondence, base name compared (generic
+        // arguments stripped, the same convention as the self-keyword rule).
+        if role == OccurrenceRole::Reference
+            && let Some(shape) = tree.range_shape(span)
+            && let Some(expectation) = range_type_name(shape)
+            && base_type_name(expected_name) == expectation
+        {
+            return Some((AlignmentRule::RangeLiteral, span));
+        }
+
+        // Use-list-self rule: a module-kind occurrence at a use-list `self` token is accepted when
+        // the enclosing use path's terminal segment (per `use_list_self_context`) spells the
+        // occurrence's expected module name — `use crate::walk::{self};` resolves `self` to `walk`.
+        // The accepted span is the `self` token itself (where the occurrence sits), so an aliased
+        // self-import's binding target (`{self as w}`) holds a pass-1 alignment the import-alias
+        // pass can verify against.
+        if role == OccurrenceRole::Reference
+            && symbol.kind == SymbolKind::Module
+            && let Some(path_terminal) = tree.use_list_self_context(span)
+            && tree.text_at(path_terminal) == Some(expected_name)
+        {
+            return Some((AlignmentRule::UseListSelf, span));
+        }
+
+        // Path-start-self rule (rides the self-name bucket): a module-kind occurrence at a
+        // path-start `self` token (`use self::x;`, `self::helper()`) is accepted when the expected
+        // module IS the containing module — the document's own module extended by any inline `mod`
+        // blocks enclosing the token. The same meaning as Python's `__name__` acceptance: a token
+        // that denotes "this module", verified against the document's own module identity.
+        if role == OccurrenceRole::Reference
+            && symbol.kind == SymbolKind::Module
+            && tree.path_start_self(span)
+            && let Some(doc_symbol) = document_module
+            && let Some(expected_descriptor) = &symbol.descriptor
+            && let Some(doc_descriptor) = &doc_symbol.descriptor
+            && expected_descriptor.package == doc_descriptor.package
+            && containing_module_ancestor_matches(
+                expected_descriptor,
+                doc_descriptor,
+                &inline_module_chain(tree, span.start),
+                0,
+            )
+        {
+            return Some((AlignmentRule::SelfName, span));
+        }
+
+        // Super-keyword rule: a module-kind occurrence at a `super` token is accepted when the
+        // expected module is the CONTAINING module's ancestor at the token's chain depth. The
+        // containing module is the document's own module extended by any inline `mod` blocks
+        // enclosing the token (a `use super::…` inside `mod tests { … }` resolves from
+        // `doc_module::tests`, not from the document module itself). No doc module for the
+        // document, a different package, a chain deeper than the containing module's nesting, or
+        // any segment mismatch all stay refused: an ancestry result that would land on the crate
+        // root (an empty segment chain) never matches the crate root module's own identity, since
+        // the crate root's descriptor carries its own segment rather than an empty prefix — so that
+        // case is correctly refused too, never guessed.
+        if role == OccurrenceRole::Reference
+            && symbol.kind == SymbolKind::Module
+            && let Some(depth) = tree.super_chain_depth(span)
+            && let Some(doc_symbol) = document_module
+            && let Some(expected_descriptor) = &symbol.descriptor
+            && let Some(doc_descriptor) = &doc_symbol.descriptor
+            && expected_descriptor.package == doc_descriptor.package
+            && containing_module_ancestor_matches(
+                expected_descriptor,
+                doc_descriptor,
+                &inline_module_chain(tree, span.start),
+                depth,
+            )
+        {
+            return Some((AlignmentRule::SuperKeyword, span));
         }
     }
 
@@ -1335,6 +1473,70 @@ fn is_self_target(symbol: &ExtractedSymbol) -> bool {
 fn base_type_name(name: &str) -> &str {
     let no_generics = name.split('<').next().unwrap_or(name).trim();
     no_generics.rsplit("::").next().unwrap_or(no_generics).trim()
+}
+
+/// The `std::ops` range type name a range operator's shape corresponds to, under the closed
+/// range-literal correspondence (design.md). Any other combination of ends/inclusivity has no
+/// corresponding type and yields `None` — refusal, not a guess.
+fn range_type_name(shape: RangeShape) -> Option<&'static str> {
+    Some(match (shape.has_start, shape.has_end, shape.inclusive) {
+        (true, true, false) => "Range",
+        (true, false, false) => "RangeFrom",
+        (false, true, false) => "RangeTo",
+        (false, false, false) => "RangeFull",
+        (true, true, true) => "RangeInclusive",
+        (false, true, true) => "RangeToInclusive",
+        // `has_start && !has_end && inclusive` has no `std::ops` type at all; `!has_start &&
+        // !has_end && inclusive` has no valid grammar shape either — both refuse.
+        (true, false, true) | (false, false, true) => return None,
+    })
+}
+
+/// The inline `mod` block names enclosing `offset`, outermost first — syntax facts of the
+/// document itself, extending the document module's identity chain the same way the module-chain
+/// locality anchors on declaring documents.
+fn inline_module_chain(tree: &SyntaxTree, offset: usize) -> Vec<String> {
+    let mut names: Vec<String> = tree
+        .enclosing_declarations(offset)
+        .into_iter()
+        .filter(|d| d.node_kind == "mod_item")
+        .filter_map(|d| tree.text_at(d.name_span).map(str::to_string))
+        .collect();
+    names.reverse();
+    names
+}
+
+/// Whether `expected` is the ancestor of the containing module — the document module's descriptor
+/// extended by the inline `mod` names enclosing the occurrence — at `depth` `super` hops; depth 0
+/// is the containing module itself.
+///
+/// The containing chain peels its innermost `depth` segments; the remainder must equal `expected`'s
+/// segments exactly. The remainder's identity part compares as full segments against the document
+/// module's descriptor; any part still inside the inline extension compares by name against the
+/// inline `mod` names, which must be module-kind segments on the expected side. An empty remainder
+/// (the crate root) never matches, and a `depth` beyond the chain refuses.
+fn containing_module_ancestor_matches(
+    expected: &Descriptor,
+    doc: &Descriptor,
+    inline_modules: &[String],
+    depth: usize,
+) -> bool {
+    let total = doc.segments.len() + inline_modules.len();
+    if depth >= total {
+        return false;
+    }
+    let ancestor_len = total - depth;
+    if expected.segments.len() != ancestor_len {
+        return false;
+    }
+    let identity_len = ancestor_len.min(doc.segments.len());
+    if expected.segments[..identity_len] != doc.segments[..identity_len] {
+        return false;
+    }
+    expected.segments[identity_len..]
+        .iter()
+        .zip(&inline_modules[..ancestor_len - identity_len])
+        .all(|(seg, name)| seg.kind == SegmentKind::Module && seg.name == *name)
 }
 
 /// The dotted namespace name of a module symbol: the descriptor segment immediately preceding the

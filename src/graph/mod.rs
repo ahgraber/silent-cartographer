@@ -137,11 +137,11 @@ pub fn ingest(
 ) -> Result<JoinAccounting, IngestError> {
     let identities = project_identities(workspace, index);
     let language = index_language(index);
-    // The document→module derivation runs before the join: the join's self-name rule compares each
-    // occurrence against its containing document's own module, and the module bookkeeping below
-    // reads the same map — one derivation, two consumers.
-    let doc_module = module_by_document(index, &identities);
     let corpus = SourceCorpus::new(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
+    // The document→module derivation runs before the join: the join's self-name and super-keyword
+    // rules compare each occurrence against its containing document's own module, and the module
+    // bookkeeping below reads the same map — one derivation, two consumers.
+    let doc_module = module_by_document(index, &identities, &corpus, language);
     let join_result = join(index, &corpus, &identities, language, &doc_module);
 
     let source_map: HashMap<&str, &str> = sources.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();

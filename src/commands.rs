@@ -226,8 +226,8 @@ pub fn run_build(
 pub fn build_accounting_line(accounting: &JoinAccounting) -> String {
     format!(
         "built: aligned={} (exact={} crate_root={} operator_desugar={} module_span={} self_keyword={} \
-         module_name={} self_name={} module_marker={} import_alias={}) text_mismatch={} semantic_only={} \
-         duplicate_ambiguous={} syntax_only={}",
+         module_name={} self_name={} module_marker={} import_alias={} range_literal={} use_list_self={} \
+         super_keyword={}) text_mismatch={} semantic_only={} duplicate_ambiguous={} syntax_only={}",
         accounting.aligned_total(),
         accounting.aligned_exact,
         accounting.aligned_crate_root,
@@ -238,6 +238,9 @@ pub fn build_accounting_line(accounting: &JoinAccounting) -> String {
         accounting.aligned_self_name,
         accounting.aligned_module_marker,
         accounting.aligned_import_alias,
+        accounting.aligned_range_literal,
+        accounting.aligned_use_list_self,
+        accounting.aligned_super_keyword,
         accounting.text_mismatch,
         accounting.semantic_only,
         accounting.duplicate_ambiguous,
@@ -307,6 +310,9 @@ pub fn run_status(
                 "self_name": meta.accounting.aligned_self_name,
                 "module_marker": meta.accounting.aligned_module_marker,
                 "import_alias": meta.accounting.aligned_import_alias,
+                "range_literal": meta.accounting.aligned_range_literal,
+                "use_list_self": meta.accounting.aligned_use_list_self,
+                "super_keyword": meta.accounting.aligned_super_keyword,
                 "total": meta.accounting.aligned_total(),
             },
             "text_mismatch": meta.accounting.text_mismatch,

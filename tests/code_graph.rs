@@ -1137,9 +1137,10 @@ fn module_name_count_rides_metadata() {
     );
 }
 
-// _(Join alignment accounting — the self-name, module-marker, and import-alias buckets ride
-// metadata)_ — a metadata round-trip with every field non-zero preserves the three new per-rule
-// counts alongside the rest.
+// _(Join alignment accounting — every per-rule bucket rides metadata)_ — a metadata round-trip
+// with every field non-zero preserves all twelve per-rule counts alongside the refusal counts. The
+// exhaustive struct literal (no `..default()`) is deliberate: adding a `JoinAccounting` field
+// without persisting it fails compilation here.
 #[test]
 fn new_rule_counts_ride_metadata() {
     use silent_cartographer::graph::join::JoinAccounting;
@@ -1156,10 +1157,13 @@ fn new_rule_counts_ride_metadata() {
         aligned_self_name: 7,
         aligned_module_marker: 8,
         aligned_import_alias: 9,
-        text_mismatch: 10,
-        semantic_only: 11,
-        duplicate_ambiguous: 12,
-        syntax_only: 13,
+        aligned_range_literal: 10,
+        aligned_use_list_self: 11,
+        aligned_super_keyword: 12,
+        text_mismatch: 13,
+        semantic_only: 14,
+        duplicate_ambiguous: 15,
+        syntax_only: 16,
     };
     let meta = IndexMetadata {
         workspace_id: ws(),
@@ -1172,7 +1176,7 @@ fn new_rule_counts_ride_metadata() {
     let read = store.read_metadata().unwrap().expect("metadata present");
     assert_eq!(
         read.accounting, accounting,
-        "all three new per-rule counts round-trip whole alongside the rest"
+        "every per-rule count round-trips whole alongside the refusal counts"
     );
 }
 
@@ -2357,6 +2361,51 @@ fn whole_document_span_on_non_module_stays_refused() {
     assert_eq!(acc.text_mismatch, 1, "the non-module whole-document span is refused");
 }
 
+// _(Document→module derivation — Rust branch)_ — a Rust document's whole-document module definition
+// (the same shape the module-span rule accepts) derives that document's own module, the same
+// structural evidence the self-name/super-keyword rules depend on for Python and Rust respectively.
+#[test]
+fn rust_doc_module_derived_from_whole_document_definition() {
+    use silent_cartographer::graph::join::{SourceCorpus, module_by_document};
+    use silent_cartographer::graph::syntax::Language;
+    use silent_cartographer::identity::project_all;
+    use silent_cartographer::identity::{DefinitionSite, ProjectionInput};
+
+    let source = "fn a() {}\n";
+    let module = one_occ_symbol(
+        "mycrate",
+        &[("mymod", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "mymod.rs",
+        SourceRange::new(0, 0, 1, 0),
+        OccurrenceRole::Definition,
+    );
+    let index = one_doc_index("mymod.rs", vec![module.clone()]);
+    let identities: Vec<Option<CanonicalId>> = project_all(
+        &ws(),
+        &[ProjectionInput {
+            descriptor: module.descriptor.clone().unwrap(),
+            definition: Some(DefinitionSite {
+                document_path: "mymod.rs".to_string(),
+                range: SourceRange::new(0, 0, 1, 0),
+            }),
+            fallback: None,
+        }],
+    )
+    .into_iter()
+    .map(Some)
+    .collect();
+    let corpus = SourceCorpus::new([("mymod.rs", source)]);
+
+    let by_doc = module_by_document(&index, &identities, &corpus, Language::Rust);
+    assert_eq!(
+        by_doc.get("mymod.rs"),
+        Some(&0),
+        "the document's whole-document module definition derives its own module"
+    );
+}
+
 // _(Guarded positional join — provenance)_ — attributions accepted under the default rule and under
 // a kind-scoped rule each carry their rule tag.
 #[test]
@@ -2475,6 +2524,9 @@ fn f(a: u8, b: u8) -> u8 { a + b }
 fn g() { let _w: Widget = Widget; }
 struct Holder;
 impl Holder { fn h() -> Self { Holder } }
+use crate::helper::{self};
+use super::x;
+fn r(a: u8, b: u8) -> u8 { for _i in a..b {} a }
 ";
     let doc = "m.rs";
 
@@ -2518,15 +2570,56 @@ impl Holder { fn h() -> Self { Holder } }
         SourceRange::new(pl, pc, pl, pc + 1),
         OccurrenceRole::Reference,
     );
-    // module-span: a module definition spanning the whole document (7 lines + final newline).
+    // module-span: a module definition spanning the whole document (10 lines + final newline). Its
+    // two-segment descriptor gives the super-keyword occurrence below a parent to resolve to.
     let module = one_occ_symbol(
         "mycrate",
-        &[("m", SegmentKind::Module)],
+        &[("outer", SegmentKind::Module), ("m", SegmentKind::Module)],
         SymbolKind::Module,
         SymbolClass::InWorkspace,
         doc,
-        SourceRange::new(0, 0, 7, 0),
+        SourceRange::new(0, 0, 10, 0),
         OccurrenceRole::Definition,
+    );
+    // use-list-self: a `helper` module occurrence at the `self` of `use crate::helper::{self};`.
+    let uls_self = source.find("{self}").unwrap() + 1;
+    let (ul, uc) = line_col(source, uls_self);
+    let helper_self = one_occ_symbol(
+        "mycrate",
+        &[
+            ("outer", SegmentKind::Module),
+            ("m", SegmentKind::Module),
+            ("helper", SegmentKind::Module),
+        ],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        doc,
+        SourceRange::new(ul, uc, ul, uc + 4),
+        OccurrenceRole::Reference,
+    );
+    // super-keyword: an `outer` module occurrence at the `super` of `use super::x;`.
+    let super_tok = source.find("super").unwrap();
+    let (sl, sc) = line_col(source, super_tok);
+    let outer_super = one_occ_symbol(
+        "mycrate",
+        &[("outer", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        doc,
+        SourceRange::new(sl, sc, sl, sc + 5),
+        OccurrenceRole::Reference,
+    );
+    // range-literal: a `Range` type occurrence at the `..` of `a..b`.
+    let range_op = source.find("..b").unwrap();
+    let (rl, rc) = line_col(source, range_op);
+    let range_ref = one_occ_symbol(
+        "core",
+        &[("ops", SegmentKind::Module), ("Range", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::External,
+        doc,
+        SourceRange::new(rl, rc, rl, rc + 2),
+        OccurrenceRole::Reference,
     );
     // self-keyword: a `Holder` reference at the `Self` token inside `impl Holder`.
     let self_tok = source.find("Self").unwrap();
@@ -2596,7 +2689,20 @@ impl Holder { fn h() -> Self { Holder } }
 
     let index = one_doc_index(
         doc,
-        vec![f_sym, root, add, module, holder_self, drifted, ghost, twin_a, twin_b],
+        vec![
+            f_sym,
+            root,
+            add,
+            module,
+            helper_self,
+            outer_super,
+            range_ref,
+            holder_self,
+            drifted,
+            ghost,
+            twin_a,
+            twin_b,
+        ],
     );
     let total: u64 = index.symbols.iter().map(|s| s.occurrences.len() as u64).sum();
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -2609,6 +2715,9 @@ impl Holder { fn h() -> Self { Holder } }
     assert!(acc.aligned_operator_desugar > 0, "operator bucket non-zero");
     assert!(acc.aligned_module_span > 0, "module-span bucket non-zero");
     assert!(acc.aligned_self_keyword > 0, "self-keyword bucket non-zero");
+    assert!(acc.aligned_range_literal > 0, "range-literal bucket non-zero");
+    assert!(acc.aligned_use_list_self > 0, "use-list-self bucket non-zero");
+    assert!(acc.aligned_super_keyword > 0, "super-keyword bucket non-zero");
     assert!(acc.text_mismatch > 0, "text-mismatch bucket non-zero");
     assert!(acc.semantic_only > 0, "semantic-only bucket non-zero");
     assert!(acc.duplicate_ambiguous > 0, "duplicate-ambiguous bucket non-zero");
@@ -2725,13 +2834,15 @@ fn self_in_foreign_impl_stays_refused() {
     let source = "\
 struct A;
 struct B;
-impl A {
+trait Tr {}
+impl Tr for A {
     fn f() -> Self { A }
 }
 ";
     let self_tok = source.find("Self").unwrap();
     let (sl, sc) = line_col(source, self_tok);
-    // A reference resolving to `B`, drifted onto the `Self` inside `impl A`.
+    // A reference resolving to `B` — neither the impl's self type (`A`) nor its trait (`Tr`) —
+    // drifted onto the `Self` inside `impl Tr for A`. The trait-name arm must not over-accept this.
     let b_ref = one_occ_symbol(
         "mycrate",
         &[("B", SegmentKind::Type)],
@@ -2808,6 +2919,505 @@ impl<T> Answer<T> {
     let occs = store.occurrences_of(&id).unwrap();
     assert_eq!(occs.len(), 1);
     assert_eq!(occs[0].rule, "self_keyword", "the attribution carries its rule");
+}
+
+// _(Guarded positional join — self-keyword branch, trait-name arm)_ — the emitted shape at `Self`
+// inside a trait impl (a synthetic impl-block symbol whose trailing identity segment is the trait's
+// name) aligns via the enclosing impl's trait name, not just its self type.
+#[test]
+fn trait_reference_accepted_at_self_keyword() {
+    let source = "\
+struct X;
+struct Y;
+impl From<X> for Y {
+    fn from(_: X) -> Self {
+        Y
+    }
+}
+";
+    let self_tok = source.find("-> Self").unwrap() + 3;
+    let (sl, sc) = line_col(source, self_tok);
+    let trait_ref = one_occ_symbol(
+        "mycrate",
+        &[("From<X>", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(sl, sc, sl, sc + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![trait_ref]), &src).unwrap();
+    assert_eq!(
+        acc.aligned_self_keyword, 1,
+        "the trait reference at `Self` accepted by the self-keyword rule"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// ---- Range-literal family coverage ----
+
+// _(Guarded positional join — range-literal branch)_ — `Range` at `a..b` and `RangeFrom` at `a..`
+// both align under the range-literal rule, per the closed shape correspondence.
+#[test]
+fn range_literal_accepted_under_shape_correspondence() {
+    let source = "fn f(a: usize, b: usize) -> usize { let _r1 = a..b; let _r2 = a..; a }\n";
+    let dotdot_1 = source.find("..").unwrap();
+    let (l1, c1) = line_col(source, dotdot_1);
+    let dotdot_2 = source[dotdot_1 + 2..].find("..").unwrap() + dotdot_1 + 2;
+    let (l2, c2) = line_col(source, dotdot_2);
+
+    let range_ref = one_occ_symbol(
+        "core",
+        &[("ops", SegmentKind::Module), ("Range", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(l1, c1, l1, c1 + 2),
+        OccurrenceRole::Reference,
+    );
+    let range_from_ref = one_occ_symbol(
+        "core",
+        &[("ops", SegmentKind::Module), ("RangeFrom", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(l2, c2, l2, c2 + 2),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        &one_doc_index("m.rs", vec![range_ref, range_from_ref]),
+        &src,
+    )
+    .unwrap();
+    assert_eq!(
+        acc.aligned_range_literal, 2,
+        "`Range` at `a..b` and `RangeFrom` at `a..` both accepted"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — range-literal negative branch)_ — `RangeInclusive` at a plain `a..b`
+// operator (exclusive, not `..=`) stays refused: the shape must match exactly.
+#[test]
+fn range_occurrence_with_mismatched_shape_stays_refused() {
+    let source = "fn f(a: usize, b: usize) -> usize { let _r = a..b; a }\n";
+    let dotdot = source.find("..").unwrap();
+    let (line, col) = line_col(source, dotdot);
+    let mismatched_ref = one_occ_symbol(
+        "core",
+        &[("ops", SegmentKind::Module), ("RangeInclusive", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::External,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 2),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![mismatched_ref]), &src).unwrap();
+    assert_eq!(
+        acc.aligned_range_literal, 0,
+        "`RangeInclusive` does not match the exclusive `a..b` shape"
+    );
+    assert_eq!(acc.aligned_total(), 0);
+    assert_eq!(
+        acc.text_mismatch, 1,
+        "the mismatched occurrence is refused and surfaced"
+    );
+}
+
+// ---- Use-list-self family coverage ----
+
+// _(Guarded positional join — use-list-self branch)_ — a module occurrence at the `self` in
+// `use crate::walk::{self};` aligns under the use-list-self rule when it spells the enclosing path's
+// terminal segment.
+#[test]
+fn use_list_self_token_accepted_for_path_module() {
+    let source = "use crate::walk::{self};\n";
+    let self_tok = source.find("self").unwrap();
+    let (line, col) = line_col(source, self_tok);
+    let walk_ref = one_occ_symbol(
+        "mycrate",
+        &[("walk", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![walk_ref]), &src).unwrap();
+    assert_eq!(
+        acc.aligned_use_list_self, 1,
+        "the use-list `self` token accepted for the path module `walk`"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — use-list-self negative branch)_ — a module occurrence resolving to a
+// different module than the enclosing use path's terminal segment stays refused.
+#[test]
+fn use_list_self_for_different_module_stays_refused() {
+    let source = "use crate::walk::{self};\n";
+    let self_tok = source.find("self").unwrap();
+    let (line, col) = line_col(source, self_tok);
+    let other_ref = one_occ_symbol(
+        "mycrate",
+        &[("other", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![other_ref]), &src).unwrap();
+    assert_eq!(
+        acc.aligned_use_list_self, 0,
+        "a module occurrence naming a different module is not accepted"
+    );
+    assert_eq!(acc.aligned_total(), 0);
+    assert_eq!(
+        acc.text_mismatch, 1,
+        "the mismatched occurrence is refused and surfaced"
+    );
+}
+
+// _(Guarded positional join — use-list-self and import-alias composition)_ — the module occurrence
+// at the `self` of an aliased self-import aligns in pass 1 at the `self` token itself, which is the
+// alias binding's target token, so alias-name reference tokens accept under the import-alias rule
+// in pass 2.
+#[test]
+fn aliased_use_list_self_composes_with_import_alias() {
+    let source = "\
+use crate::walk::{self as w};
+fn f() { w::go(); }
+";
+    let self_tok = source.find("self").unwrap();
+    let (l1, c1) = line_col(source, self_tok);
+    let w_tok = source.find("w::go").unwrap();
+    let (l2, c2) = line_col(source, w_tok);
+    // One module symbol `walk` with two reference occurrences: the `self` target token and the
+    // aliased `w` token.
+    let mut walk_module = one_occ_symbol(
+        "mycrate",
+        &[("walk", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(l1, c1, l1, c1 + 4),
+        OccurrenceRole::Reference,
+    );
+    walk_module.occurrences.push(ExtractedOccurrence {
+        document_path: "m.rs".to_string(),
+        range: SourceRange::new(l2, c2, l2, c2 + 1),
+        role: OccurrenceRole::Reference,
+    });
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![walk_module]), &src).unwrap();
+    assert_eq!(
+        acc.aligned_use_list_self, 1,
+        "the `self` target token aligns under the use-list-self rule"
+    );
+    assert_eq!(
+        acc.aligned_import_alias, 1,
+        "the aliased `w` token verifies against the pass-1 alignment at the binding target"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — path-start-self branch, riding the self-name bucket)_ — a module
+// occurrence at a path-start `self` token accepts when the expected module is the containing
+// module: the document's own module at file level, or its inline-extended chain inside a `mod`
+// block.
+#[test]
+fn path_start_self_token_accepted_for_containing_module() {
+    let source = "\
+use self::x;
+mod m {
+    use self::y;
+}
+";
+    // Document module `a::b`, referenced by the file-level `self` as a second occurrence of the
+    // same symbol.
+    let first_self = source.find("self").unwrap();
+    let (l1, c1) = line_col(source, first_self);
+    let mut doc_module = one_occ_symbol(
+        "mycrate",
+        &[("a", SegmentKind::Module), ("b", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 0, 4, 0),
+        OccurrenceRole::Definition,
+    );
+    doc_module.occurrences.push(ExtractedOccurrence {
+        document_path: "m.rs".to_string(),
+        range: SourceRange::new(l1, c1, l1, c1 + 4),
+        role: OccurrenceRole::Reference,
+    });
+    // Inside `mod m`, `self::` names the inline module `a::b::m`.
+    let second_self = source.match_indices("self").nth(1).unwrap().0;
+    let (l2, c2) = line_col(source, second_self);
+    let inline_ref = one_occ_symbol(
+        "mycrate",
+        &[
+            ("a", SegmentKind::Module),
+            ("b", SegmentKind::Module),
+            ("m", SegmentKind::Module),
+        ],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(l2, c2, l2, c2 + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        &one_doc_index("m.rs", vec![doc_module, inline_ref]),
+        &src,
+    )
+    .unwrap();
+    assert_eq!(
+        acc.aligned_self_name, 2,
+        "file-level and inline-module path-start `self` both accept under the self-name bucket"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — path-start-self negative branch)_ — a path-start `self` occurrence
+// resolving to a module that is not the containing module stays refused.
+#[test]
+fn path_start_self_for_foreign_module_stays_refused() {
+    let source = "use self::x;\n";
+    let doc_module = one_occ_symbol(
+        "mycrate",
+        &[("a", SegmentKind::Module), ("b", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 0, 1, 0),
+        OccurrenceRole::Definition,
+    );
+    let self_tok = source.find("self").unwrap();
+    let (line, col) = line_col(source, self_tok);
+    // Sibling module `a::d`, not the containing module `a::b`.
+    let foreign_ref = one_occ_symbol(
+        "mycrate",
+        &[("a", SegmentKind::Module), ("d", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 4),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        &one_doc_index("m.rs", vec![doc_module, foreign_ref]),
+        &src,
+    )
+    .unwrap();
+    assert_eq!(
+        acc.aligned_self_name, 0,
+        "a foreign module is never accepted at a path-start `self`"
+    );
+    assert_eq!(
+        acc.text_mismatch, 1,
+        "the mismatched occurrence is refused and surfaced"
+    );
+}
+
+// ---- Super-keyword family coverage ----
+
+// _(Guarded positional join — super-keyword branch)_ — a `super` token resolving to the document's
+// own module's parent aligns, and a `super::super` token (depth 2) resolving to the grandparent
+// aligns too.
+#[test]
+fn super_token_accepted_for_parent_module() {
+    let source = "\
+use super::x;
+use super::super::y;
+";
+    // The document's own module is `a::b::c` (a three-segment Rust module chain), per the
+    // whole-document module definition the module-span rule and `module_by_document` both key on.
+    let doc_module = one_occ_symbol(
+        "mycrate",
+        &[
+            ("a", SegmentKind::Module),
+            ("b", SegmentKind::Module),
+            ("c", SegmentKind::Module),
+        ],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 0, 2, 0),
+        OccurrenceRole::Definition,
+    );
+    // Line 1 (`use super::x;`) carries the depth-1 `super`; line 2 (`use super::super::y;`) carries
+    // depth 1 then depth 2 — its second `super` is the one under test here.
+    let first_super = source.find("super").unwrap();
+    let (l1, c1) = line_col(source, first_super);
+    let line2_start = source.find("use super::super").unwrap();
+    let second_super = source[line2_start + 5..].find("super").unwrap() + line2_start + 5;
+    let (l2, c2) = line_col(source, second_super);
+
+    // depth 1: `a::b` (the parent of `a::b::c`).
+    let parent_ref = one_occ_symbol(
+        "mycrate",
+        &[("a", SegmentKind::Module), ("b", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(l1, c1, l1, c1 + 5),
+        OccurrenceRole::Reference,
+    );
+    // depth 2: `a` (the grandparent).
+    let grandparent_ref = one_occ_symbol(
+        "mycrate",
+        &[("a", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(l2, c2, l2, c2 + 5),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        &one_doc_index("m.rs", vec![doc_module, parent_ref, grandparent_ref]),
+        &src,
+    )
+    .unwrap();
+    assert_eq!(
+        acc.aligned_super_keyword, 2,
+        "both `super` (depth 1) and `super::super` (depth 2) accepted"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — super-keyword negative branch)_ — a `super` token resolving to a
+// sibling module (not an ancestor of the document's own module) stays refused.
+#[test]
+fn super_token_for_non_parent_module_stays_refused() {
+    let source = "use super::x;\n";
+    let doc_module = one_occ_symbol(
+        "mycrate",
+        &[
+            ("a", SegmentKind::Module),
+            ("b", SegmentKind::Module),
+            ("c", SegmentKind::Module),
+        ],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 0, 1, 0),
+        OccurrenceRole::Definition,
+    );
+    let super_tok = source.find("super").unwrap();
+    let (line, col) = line_col(source, super_tok);
+    // Sibling module `a::d`, not an ancestor of `a::b::c`.
+    let sibling_ref = one_occ_symbol(
+        "mycrate",
+        &[("a", SegmentKind::Module), ("d", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 5),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        &one_doc_index("m.rs", vec![doc_module, sibling_ref]),
+        &src,
+    )
+    .unwrap();
+    assert_eq!(
+        acc.aligned_super_keyword, 0,
+        "a sibling module is never accepted as an ancestor"
+    );
+    assert_eq!(
+        acc.text_mismatch, 1,
+        "the mismatched occurrence is refused and surfaced"
+    );
+}
+
+// _(Guarded positional join — super-keyword inline-module branch)_ — a `super` token inside an
+// inline `mod` block resolves from the containing module (the document's module extended by the
+// inline chain), so depth 1 reaches the document module itself and depth 2 its parent.
+#[test]
+fn super_inside_inline_module_resolves_from_the_inline_chain() {
+    let source = "\
+mod tests {
+    use super::x;
+    use super::super::y;
+}
+";
+    // Document module `a::b`; inside `mod tests` the containing module is `a::b::tests`, so the
+    // depth-1 `super` resolves to `a::b` — the document module itself, referenced here as a second
+    // occurrence of the same symbol.
+    let first_super = source.find("super").unwrap();
+    let (l1, c1) = line_col(source, first_super);
+    let mut doc_module = one_occ_symbol(
+        "mycrate",
+        &[("a", SegmentKind::Module), ("b", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 0, 4, 0),
+        OccurrenceRole::Definition,
+    );
+    doc_module.occurrences.push(ExtractedOccurrence {
+        document_path: "m.rs".to_string(),
+        range: SourceRange::new(l1, c1, l1, c1 + 5),
+        role: OccurrenceRole::Reference,
+    });
+    // The depth-2 `super::super` reaches the document module's parent `a`.
+    let line3_start = source.find("use super::super").unwrap();
+    let second_super = source[line3_start + 5..].find("super").unwrap() + line3_start + 5;
+    let (l2, c2) = line_col(source, second_super);
+    let grandparent_ref = one_occ_symbol(
+        "mycrate",
+        &[("a", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(l2, c2, l2, c2 + 5),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        &one_doc_index("m.rs", vec![doc_module, grandparent_ref]),
+        &src,
+    )
+    .unwrap();
+    assert_eq!(
+        acc.aligned_super_keyword, 2,
+        "depth 1 resolves to the document module, depth 2 to its parent, through the inline chain"
+    );
+    assert_eq!(acc.text_mismatch, 0);
 }
 
 // ---- Operator-desugar family coverage: one acceptance test per correspondence family ----
@@ -2920,6 +3530,104 @@ fn for_loop_aligns_for_into_iter() {
     assert_eq!(
         acc.aligned_operator_desugar, 1,
         "the `for` construct accepted for `into_iter`"
+    );
+    assert_eq!(acc.text_mismatch, 0);
+}
+
+// _(Guarded positional join — operator branch, index family)_ — rust-analyzer emits one `index`
+// occurrence per bracket token; both independently accept under the operator-desugar rule (no
+// dedup), while an `index` occurrence away from any index expression stays refused.
+#[test]
+fn indexing_occurrences_accepted_at_both_brackets() {
+    let source = "fn f(v: &[u8]) -> u8 { v[0] }\nfn g() {}\n";
+    let bracket_open = source.find('[').unwrap() + 1; // `v[0]`'s '[' (skip past `&[u8]`'s own '[')
+    let bracket_open = source[bracket_open..].find('[').unwrap() + bracket_open;
+    let bracket_close = source.find(']').unwrap() + 1;
+    let bracket_close = source[bracket_close..].find(']').unwrap() + bracket_close;
+    let (ol, oc) = line_col(source, bracket_open);
+    let (cl, cc) = line_col(source, bracket_close);
+    let elsewhere = source.find("fn g").unwrap();
+    let (el, ec) = line_col(source, elsewhere);
+
+    let make = |line: u32, col: u32| {
+        one_occ_symbol(
+            "core",
+            &[
+                ("ops", SegmentKind::Module),
+                ("Index", SegmentKind::Type),
+                ("index", SegmentKind::Method),
+            ],
+            SymbolKind::Method,
+            SymbolClass::External,
+            "m.rs",
+            SourceRange::new(line, col, line, col + 1),
+            OccurrenceRole::Reference,
+        )
+    };
+    let at_open = make(ol, oc);
+    let at_close = make(cl, cc);
+    let elsewhere_occ = make(el, ec);
+
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        &one_doc_index("m.rs", vec![at_open, at_close, elsewhere_occ]),
+        &src,
+    )
+    .unwrap();
+
+    assert_eq!(
+        acc.aligned_operator_desugar, 2,
+        "both bracket occurrences accepted independently, no dedup"
+    );
+    assert_eq!(acc.text_mismatch, 1, "the off-index occurrence stays refused");
+}
+
+// _(Guarded positional join — operator branch, extended-family coverage)_ — one occurrence each for
+// `not`, `gt`, `add`, and `deref` aligns under the operator-desugar rule; a method outside the
+// correspondence still stays refused (`method_outside_correspondence_stays_refused` unchanged).
+#[test]
+fn extended_operators_accepted_under_desugar_rule() {
+    let not_acc = desugar_case("fn f(a: bool) -> bool { !a }\n", "!", "not");
+    assert_eq!(not_acc.aligned_operator_desugar, 1, "`!` accepted for `not`");
+
+    // `desugar_case` locates the token by `find`, and the function signature's own `->` contains a
+    // `>`; anchoring on `" > "` (with surrounding spaces) skips past it to the comparison operator.
+    let gt_acc = desugar_case("fn f(a: u8, b: u8) -> bool { a > b }\n", " > ", "gt");
+    assert_eq!(gt_acc.aligned_operator_desugar, 1, "`>` accepted for `gt`");
+
+    let add_acc = desugar_case("fn f(a: u8, b: u8) -> u8 { a + b }\n", "+", "add");
+    assert_eq!(add_acc.aligned_operator_desugar, 1, "`+` accepted for `add`");
+
+    let deref_acc = desugar_case("fn f(p: &u8) -> u8 { *p }\n", "*", "deref");
+    assert_eq!(deref_acc.aligned_operator_desugar, 1, "`*` accepted for `deref`");
+}
+
+// _(Guarded positional join — default rule, tuple-field branch)_ — a field occurrence named `0` at
+// the `0` token of `x.0` aligns under the default (exact) rule, via the tuple-field name-node
+// extension.
+#[test]
+fn tuple_field_index_accepted_under_default_rule() {
+    let source = "fn f(x: (u8, u8)) -> u8 { x.0 }\n";
+    let field_tok = source.find(".0").unwrap() + 1;
+    let (line, col) = line_col(source, field_tok);
+    let field_ref = one_occ_symbol(
+        "mycrate",
+        &[("0", SegmentKind::Term)],
+        SymbolKind::Field,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(line, col, line, col + 1),
+        OccurrenceRole::Reference,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![field_ref]), &src).unwrap();
+    assert_eq!(
+        acc.aligned_exact, 1,
+        "the tuple-field index accepted under the default rule"
     );
     assert_eq!(acc.text_mismatch, 0);
 }

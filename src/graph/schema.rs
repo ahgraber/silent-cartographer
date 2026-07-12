@@ -8,7 +8,7 @@
 /// The current schema version. Bumped on any schema-affecting change under the reproducibility
 /// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
 /// before any table access; the `index_metadata.schema_version` column carries it as provenance.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS index_metadata (
     aligned_self_name_count        INTEGER NOT NULL DEFAULT 0,
     aligned_module_marker_count    INTEGER NOT NULL DEFAULT 0,
     aligned_import_alias_count     INTEGER NOT NULL DEFAULT 0,
+    aligned_range_literal_count    INTEGER NOT NULL DEFAULT 0,
+    aligned_use_list_self_count    INTEGER NOT NULL DEFAULT 0,
+    aligned_super_keyword_count    INTEGER NOT NULL DEFAULT 0,
     text_mismatch_count            INTEGER NOT NULL DEFAULT 0,
     semantic_only_count            INTEGER NOT NULL DEFAULT 0,
     duplicate_ambiguous_count      INTEGER NOT NULL DEFAULT 0,

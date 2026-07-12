@@ -442,6 +442,21 @@ fn status_reports_per_rule_acceptance_buckets() {
         "import-alias bucket reported"
     );
     assert_eq!(
+        aligned["range_literal"].as_u64(),
+        Some(0),
+        "range-literal bucket reported"
+    );
+    assert_eq!(
+        aligned["use_list_self"].as_u64(),
+        Some(0),
+        "use-list-self bucket reported"
+    );
+    assert_eq!(
+        aligned["super_keyword"].as_u64(),
+        Some(0),
+        "super-keyword bucket reported"
+    );
+    assert_eq!(
         aligned["total"].as_u64().unwrap(),
         aligned["exact"].as_u64().unwrap(),
         "the total is the sum of the rule buckets"
@@ -469,10 +484,13 @@ fn accounting_line_renders_every_bucket() {
         aligned_self_name: 7,
         aligned_module_marker: 8,
         aligned_import_alias: 9,
-        text_mismatch: 10,
-        semantic_only: 11,
-        duplicate_ambiguous: 12,
-        syntax_only: 13,
+        aligned_range_literal: 10,
+        aligned_use_list_self: 11,
+        aligned_super_keyword: 12,
+        text_mismatch: 13,
+        semantic_only: 14,
+        duplicate_ambiguous: 15,
+        syntax_only: 16,
     };
     let line = build_accounting_line(&accounting);
 
