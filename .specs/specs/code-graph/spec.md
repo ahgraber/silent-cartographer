@@ -9,9 +9,9 @@ Defines the persistent store that unifies the syntax and semantic oracles into o
 ### Requirement: Guarded positional join
 
 The system SHALL attribute each semantic occurrence to the syntactic construct at the corresponding source location, and SHALL persist an attribution as aligned only when the occurrence satisfies a named alignment rule's exact expectation.
-The default rule is name-token equality: the source text at the location matches the occurrence's expected symbol name — its name token, the terminal segment of the descriptor, not the qualified path.
+The default rule is name-token equality: the source text at the location matches the occurrence's expected symbol name — its name token, the terminal segment of the descriptor, not the qualified path; a tuple-field index token is a name token for this purpose.
 Kind-scoped rules extend the default rule, each scoped to the language whose constructs it reconciles.
-For Rust, four: a crate-root module occurrence is accepted when the source token is the descriptor's own package name or the keyword `crate`; a reference occurrence of a desugared-operator method is accepted when its location holds the operator construct that method desugars from, per a closed correspondence; a module definition occurrence is accepted when its range spans the module's whole document; and a reference occurrence resolving to a type — or to an implementation of one — is accepted at a self-type keyword when the enclosing implementation's self type is that type, generic arguments aside.
+For Rust, eight: a crate-root module occurrence is accepted when the source token is the descriptor's own package name or the keyword `crate`; a reference occurrence of a desugared-operator method is accepted when its location holds the operator construct that method desugars from, per a closed correspondence, each occurrence the construct carries accepted independently; a reference occurrence resolving to a range type is accepted at a range expression's operator token when the expression's shape corresponds to that type, per a closed shape correspondence; a module definition occurrence is accepted when its range spans the module's whole document; a reference occurrence resolving to a type — or to an implementation of one — is accepted at a self-type keyword when the enclosing implementation's self type is that type, generic arguments aside, and a reference occurrence resolving to a trait — or to an implementation of one — is accepted at a self-type keyword when the enclosing implementation implements that trait, generic arguments aside; a module occurrence at a `self` token inside a use-list is accepted when the enclosing use path names that module; a module occurrence at a path-start `self` token is accepted when the resolved module is the containing module; and a module occurrence at a `super` token is accepted when the resolved module is the containing module's parent — the containing module being the document's own module extended by any inline module blocks enclosing the location.
 For Python, three: a module occurrence is accepted when its source token — or the smallest dotted construct enclosing its location — after any leading relative-import dots, equals a trailing component-run of the module's dotted namespace name, a token spelling only leading components remaining no evidence for that module; a module occurrence at a `__name__` or `__file__` token is accepted when the resolved module is the containing document's own module; and a module definition occurrence whose range is the empty span at its document's origin is accepted as that module's definition attribution.
 An import-alias rule applies across languages to the alias-binding forms each language's syntax declares: a reference occurrence is accepted at a token spelling a name that the occurrence's containing document binds to the occurrence's resolved symbol through a declared alias-binding form; a language declaring no binding forms never accepts under this rule, and a binding outside the containing document is not evidence.
 An occurrence whose span covers an alias-binding statement's whole binding text is evaluated at the binding's target token, accepted under whichever alignment rule that token's evidence satisfies for the occurrence's resolved symbol.
@@ -43,6 +43,12 @@ An occurrence satisfying no rule SHALL NOT be persisted as an aligned attributio
 - **WHEN** the join runs
 - **THEN** the construct is retained with its structural information and is not assigned a fabricated identity
 
+#### Scenario: Tuple-field index accepted under the default rule
+
+- **GIVEN** a reference occurrence of a tuple field at a source token spelling that field's index
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the default rule
+
 #### Scenario: Crate-root reference accepted under its rule
 
 - **GIVEN** a reference occurrence resolving to a crate-root descriptor at a source token spelling that crate's package name
@@ -55,11 +61,29 @@ An occurrence satisfying no rule SHALL NOT be persisted as an aligned attributio
 - **WHEN** the join runs
 - **THEN** the occurrence is persisted as aligned under the operator-desugar rule
 
+#### Scenario: Indexing occurrences accepted at both bracket tokens
+
+- **GIVEN** two reference occurrences of the indexing method, one at each bracket token of a single index expression
+- **WHEN** the join runs
+- **THEN** both occurrences are persisted as aligned under the operator-desugar rule
+
 #### Scenario: Method outside the correspondence stays refused
 
 - **GIVEN** a reference occurrence of a method not in the desugar correspondence, whose location does not spell its name token
 - **WHEN** the join runs
 - **THEN** the occurrence is refused, not accepted by any rule
+
+#### Scenario: Range literal accepted under its shape correspondence
+
+- **GIVEN** a reference occurrence resolving to a range type, at the operator token of a range expression whose shape corresponds to that type
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the range-literal rule with that rule as provenance
+
+#### Scenario: Range occurrence with a mismatched shape stays refused
+
+- **GIVEN** a reference occurrence resolving to a range type, at the operator token of a range expression whose shape corresponds to a different range type
+- **WHEN** the join runs
+- **THEN** the range-literal rule does not accept it and the occurrence is refused
 
 #### Scenario: Module definition span accepted under its rule
 
@@ -85,11 +109,59 @@ An occurrence satisfying no rule SHALL NOT be persisted as an aligned attributio
 - **WHEN** the join runs
 - **THEN** the occurrence is accepted under the self-keyword rule by comparing base names with generic arguments stripped
 
+#### Scenario: Trait reference accepted at a self-type keyword within its implementation
+
+- **GIVEN** a reference occurrence resolving to a trait or to an implementation of that trait, located at a self-type keyword inside an implementation of that trait
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the self-keyword rule
+
 #### Scenario: Self keyword in a foreign implementation stays refused
 
-- **GIVEN** a reference occurrence whose expected type differs from the self type of the implementation enclosing its location
+- **GIVEN** a reference occurrence whose expected symbol matches neither the self type nor the implemented trait of the implementation enclosing its location
 - **WHEN** the join runs
 - **THEN** the self-keyword rule does not accept it and the occurrence is refused
+
+#### Scenario: Use-list self token accepted for the path's module
+
+- **GIVEN** a module occurrence at a `self` token inside a use-list, where the enclosing use path names that module
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the use-list-self rule with that rule as provenance
+
+#### Scenario: Use-list self token for a different module stays refused
+
+- **GIVEN** a module occurrence at a `self` token inside a use-list, where the enclosing use path names a different module
+- **WHEN** the join runs
+- **THEN** the use-list-self rule does not accept it and the occurrence is refused
+
+#### Scenario: Path-start self token accepted for the containing module
+
+- **GIVEN** a module occurrence at a path-start `self` token, where the resolved module is the containing module — at file level or inside an inline module block
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the self-name rule
+
+#### Scenario: Path-start self token for a foreign module stays refused
+
+- **GIVEN** a module occurrence at a path-start `self` token, where the resolved module is not the containing module
+- **WHEN** the join runs
+- **THEN** the self-name rule does not accept it and the occurrence is refused
+
+#### Scenario: Super token accepted for the parent module
+
+- **GIVEN** a module occurrence at a `super` token, where the resolved module is the containing module's parent
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the super-keyword rule with that rule as provenance
+
+#### Scenario: Super token inside an inline module resolves from the inline chain
+
+- **GIVEN** a module occurrence at a `super` token inside an inline module block, where the resolved module is the parent of the inline-extended containing module
+- **WHEN** the join runs
+- **THEN** the occurrence is persisted as aligned under the super-keyword rule
+
+#### Scenario: Super token for a non-parent module stays refused
+
+- **GIVEN** a module occurrence at a `super` token, where the resolved module is not the containing module's parent
+- **WHEN** the join runs
+- **THEN** the super-keyword rule does not accept it and the occurrence is refused
 
 #### Scenario: Every acceptance carries its rule
 
