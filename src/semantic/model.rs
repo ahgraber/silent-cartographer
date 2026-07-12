@@ -447,8 +447,8 @@ mod tests {
         );
     }
 
-    // An external symbol (reference-only, no definition occurrence) is never split: zero definitions
-    // takes the same pass-through path as exactly one.
+    // _(External symbols are never split)_ — an external symbol (reference-only, no definition
+    // occurrence) is never split: zero definitions takes the same pass-through path as exactly one.
     #[test]
     fn external_symbol_with_no_definition_is_never_split() {
         let descriptor = descriptor("thirdparty", "g", SegmentKind::Method);

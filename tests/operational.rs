@@ -384,7 +384,8 @@ fn matching_version_store_operates_normally() {
     );
 }
 
-// The reindex doorbell hook exists, is executable, and invokes `c10r build`.
+// _(Reindex doorbell)_ — the post-commit hook is present, executable, and invokes `c10r build`, so a
+// commit reindexes the workspace without a manual trigger.
 #[test]
 fn reindex_doorbell_hook_is_present_and_invokes_build() {
     let hook = Path::new(env!("CARGO_MANIFEST_DIR")).join("hooks/post-commit");

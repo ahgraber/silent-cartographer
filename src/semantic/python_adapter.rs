@@ -372,6 +372,9 @@ mod tests {
         assert_eq!(index.symbols[0].kind, SymbolKind::Module);
     }
 
+    // Precedence among the three environment-resolution mechanisms: an explicit path outranks an
+    // activated $VIRTUAL_ENV, which outranks the workspace's .venv, which outranks a bare venv
+    // directory.
     #[test]
     fn env_resolution_prefers_explicit_then_virtual_env_then_dot_venv() {
         let (_root_guard, root) = canonical_tempdir();
@@ -398,7 +401,8 @@ mod tests {
         assert_eq!(resolved, root.join("venv"), "venv is the final directory candidate");
     }
 
-    // (Scenario: Unresolvable environment refuses with guidance — adapter-level half.)
+    // A refusal when no mechanism resolves an environment names every mechanism it tried, so the
+    // caller knows what to fix.
     #[test]
     fn env_resolution_refuses_when_nothing_resolves() {
         let (_root_guard, root) = canonical_tempdir();
@@ -437,8 +441,8 @@ mod tests {
         assert_eq!(after, reordered, "the fingerprint is a function of the set, not order");
     }
 
-    // (Scenario: Missing indexer tool refuses with guidance — adapter half.) The tool is looked up
-    // at an executable path inside an empty directory, so it is deterministically absent.
+    // A missing indexer tool refuses with guidance naming the tool and how to install it. The tool
+    // is looked up at an executable path inside an empty directory, so it is deterministically absent.
     #[test]
     fn python_adapter_reports_unavailable_when_tool_missing() {
         let (_empty_guard, empty) = canonical_tempdir();

@@ -148,6 +148,11 @@ pub fn python_fixture_root() -> std::path::PathBuf {
 
 /// The committed Python fixture SCIP index, taken through the shared translation and normalization
 /// exactly as `PythonAdapter::analyze` takes the tool's live output.
+///
+/// # Panics
+///
+/// Panics if `index.scip` is missing from the fixture directory or fails to parse as a SCIP
+/// protobuf.
 pub fn python_fixture_index() -> ExtractedIndex {
     use silent_cartographer::semantic::model::normalize;
     use silent_cartographer::semantic::python_adapter::classify_module_kinds;
@@ -166,6 +171,10 @@ pub fn python_fixture_index() -> ExtractedIndex {
 }
 
 /// The Python fixture's sources, `(scip_document_path, text)`, read from the committed project.
+///
+/// # Panics
+///
+/// Panics if any of the fixture's source files is missing.
 pub fn python_fixture_sources() -> Vec<(String, String)> {
     let root = python_fixture_root();
     ["pkg/__init__.py", "pkg/consumer.py", "pkg/shapes.py"]

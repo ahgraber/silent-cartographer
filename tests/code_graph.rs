@@ -512,7 +512,7 @@ impl Greet for Person {}
 }
 
 // _(Trait-implementation edges (type_hierarchy) — generic branch)_ — a trait name carrying generic
-// parameters resolves through the name-token occurrence, closing the previously-dropped case.
+// parameters resolves through the name-token occurrence.
 #[test]
 fn generic_trait_impl_yields_type_hierarchy_edge() {
     let source = "\
@@ -1364,7 +1364,7 @@ use thing::Thing;
     );
 }
 
-// _(design.md ingest policy — local symbols)_ — a parameter or let-binding does not appear in the
+// _(Ingest policy — local symbols)_ — a parameter or let-binding does not appear in the
 // persisted symbol table.
 #[test]
 fn local_symbols_are_excluded() {
@@ -1390,7 +1390,7 @@ fn local_symbols_are_excluded() {
     );
 }
 
-// _(design.md ingest policy — external symbols)_ — a reference to a third-party symbol persists under
+// _(Ingest policy — external symbols)_ — a reference to a third-party symbol persists under
 // the external class with no fabricated definition span.
 #[test]
 fn external_symbol_persists_without_definition_span() {
@@ -2104,7 +2104,8 @@ fn oversized_found_text_is_classified_on_full_bytes_and_truncated_on_a_boundary(
     );
 }
 
-// content-hash gate: a non-matching tree is refused (design.md guard).
+// _(Content-hash gate)_ — ingest refuses a source tree whose content hash does not match the
+// expected hash, guarding the join from running against a stale or wrong tree.
 #[test]
 fn content_hash_gate_refuses_non_matching_sources() {
     let index = support::fixture_index();
@@ -2903,7 +2904,7 @@ impl<T> Answer<T> {
     );
     assert_eq!(
         acc.text_mismatch, 0,
-        "the live Self shape no longer lands in text_mismatch"
+        "the impl-symbol resolution is accepted, not refused as a mismatch"
     );
     let id = silent_cartographer::identity::project_one(
         &ws(),
@@ -4792,8 +4793,8 @@ fn conservation_holds_with_locality_attributed_and_ambiguous_group_references() 
 
 // _(Store & Schema — per-target imports edges)_ — after normalization splits twin crate roots into
 // distinct symbols, each target's own module-scope reference produces an `imports` edge from that
-// target's own crate-root identity, not a shared/collapsed one (the blast-radius dedup-collapse
-// caveat the crate-root workaround existed for).
+// target's own crate-root identity, not a shared/collapsed one (each twin's imports stay
+// independently attributable rather than collapsing into a shared blast radius).
 #[test]
 fn twin_crate_roots_produce_per_target_imports_edges_after_normalization() {
     // Two crate roots sharing an identical descriptor (the rust-analyzer true-duplicate defect),
@@ -5314,9 +5315,9 @@ fn nested_module_bare_terminal_aligns_and_prefix_refused() {
     assert_eq!(acc.text_mismatch, 1, "the non-terminal-component token is refused");
 }
 
-// A module-kind symbol whose descriptor lacks the `__init__`/meta terminal is outside the
-// module-name rule: the rule reconciles exactly the shape `classify_module_kinds` classifies on,
-// and any other descriptor shape refuses rather than reading a component from the wrong segment.
+// _(Scenario: Module-kind symbol without __init__ terminal is outside the module-name rule)_ — the
+// module-name rule reconciles only the `__init__`/meta-terminal descriptor shape; any other
+// descriptor shape refuses rather than reading a component from the wrong segment.
 #[test]
 fn module_kind_without_init_terminal_is_outside_module_name_rule() {
     let source = "pkg\n";

@@ -439,8 +439,8 @@ fn location_of(row: &SymbolRow) -> Option<Location> {
 
 /// The signature of a symbol: the declaration text up to its body.
 ///
-/// The signature is the span text truncated at the first `{` (the body opener) or `;`, whichever
-/// comes first — the declaration without the body. A symbol whose declaration is not distinct from
+/// The signature is the span text truncated at the first `{` (the body opener), or the first `;` if
+/// there is no `{` — the declaration without the body. A symbol whose declaration is not distinct from
 /// its body (e.g. a unit struct) falls back to its full span rather than a contract change (the
 /// open question in `proposal.md`, settled here as a presentation fall-back).
 fn signature_of(row: &SymbolRow) -> Option<String> {

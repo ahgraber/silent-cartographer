@@ -798,9 +798,6 @@ fn alias_acceptance(
     None
 }
 
-/// Record one group occurrence as duplicate-ambiguous: no locality rule selected a unique twin. The
-/// occurrence's location is still recorded (normalized when the source is available) so the ambiguity
-/// is inspectable, exactly as the prior unconditional-refusal path did.
 /// Run one group-addressed occurrence, its twin already selected by a locality rule, through the
 /// ordinary alignment rules: locality selects the target, it never overrides a text refusal — the
 /// occurrence is accepted or refused exactly as it would be for a non-duplicated symbol, with the
@@ -888,6 +885,9 @@ fn join_group_occurrence(
     }
 }
 
+/// Record one group occurrence as duplicate-ambiguous: no locality rule selected a unique twin. The
+/// occurrence's location is still recorded (normalized when the source is available) so the ambiguity
+/// is inspectable.
 fn record_group_ambiguous(
     occ: &ExtractedOccurrence,
     group: &crate::semantic::model::DuplicateGroup,

@@ -5,6 +5,9 @@
 //! satisfy: produce symbols with resolved descriptors and role-classified occurrences carrying
 //! mappable ranges, plus analyzer provenance. Capabilities only some backends offer are exposed as
 //! queryable feature detection ([`Capabilities`]), never assumed.
+//!
+//! What this module calls a "backend" is the semantic oracle referenced by the graph and identity
+//! layers' docs, paired there with the syntax oracle.
 
 pub mod capabilities;
 pub mod conformance;
@@ -54,6 +57,14 @@ pub trait SemanticEngine {
     ///
     /// Every produced symbol carries a resolved descriptor (or is classified local/external), and
     /// every occurrence is role-classified and carries a range that maps unambiguously to a file
-    /// position via the owning document's declared position encoding.
+    /// position via the owning document's declared position encoding. An in-workspace symbol with
+    /// more than one definition occurrence is split one symbol per definition before this method
+    /// returns, so callers can rely on at most one definition occurrence per returned symbol.
+    ///
+    /// Returns [`SemanticError::Unavailable`] when the backend's tool could not be invoked at all,
+    /// [`SemanticError::Analysis`] when an invoked tool failed to produce a usable index, and
+    /// [`SemanticError::Environment`] when the project's interpreter environment could not be
+    /// resolved well enough to produce a faithful index — a typed refusal naming the remedy, never a
+    /// silent fallback to a system interpreter.
     fn analyze(&self, project_root: &std::path::Path) -> Result<ExtractedIndex, SemanticError>;
 }

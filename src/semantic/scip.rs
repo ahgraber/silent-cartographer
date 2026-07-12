@@ -86,6 +86,7 @@ pub(super) fn read_range(range: &[i32]) -> Option<SourceRange> {
     }
 }
 
+/// The bit corresponding to SCIP's `SymbolRole::Definition` in an occurrence's `symbol_roles` bitset.
 pub(super) const DEFINITION_ROLE_BIT: i32 = 1;
 
 /// Map a symbol kind from the SCIP terminal descriptor suffix.

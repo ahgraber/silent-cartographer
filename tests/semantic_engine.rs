@@ -326,11 +326,6 @@ fn exemplar_scip_fixture_translates_and_passes_conformance() {
     );
 }
 
-/// The committed Python conformance fixture directory.
-fn python_fixture_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python-conformance")
-}
-
 /// One-off generator for the checked-in Python fixture index. Run explicitly to (re)create it:
 /// `cargo test --test semantic_engine -- --ignored generate_python_conformance_scip_fixture`
 ///
@@ -343,7 +338,7 @@ fn python_fixture_root() -> std::path::PathBuf {
 fn generate_python_conformance_scip_fixture() {
     use silent_cartographer::semantic::python_adapter::PythonAdapter;
 
-    let root = python_fixture_root();
+    let root = support::python_fixture_root();
     let venv = root.join(".venv");
     if !venv.is_dir() {
         let status = std::process::Command::new("python3")
@@ -453,9 +448,9 @@ fn nonconformant_backend_does_not_affect_the_other() {
     assert!(!by_label["broken"], "the broken backend is gated out");
 }
 
-// _(Live leg)_ — the real scip-python over the fixture project must match the committed index's
-// shape. When the tool (or python3 for the venv) is absent this leg SKIPs explicitly, never
-// silently passing.
+// _(Live backend conformance)_ — the real scip-python over the fixture project must match the
+// committed index's shape. When the tool (or python3 for the venv) is absent this leg SKIPs
+// explicitly, never silently passing.
 #[test]
 fn python_live_tool_matches_committed_fixture_shape() {
     use silent_cartographer::semantic::python_adapter::PythonAdapter;
