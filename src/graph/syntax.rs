@@ -44,6 +44,21 @@ pub struct SyntaxDeclaration {
     pub full_span: ByteSpan,
 }
 
+/// A declaration's tier content: its signature (declaration form without a body) and its interface
+/// (the signature together with its own documentation).
+///
+/// Total by construction: [`SyntaxTree::declaration_tiers`] never fails to produce one, degrading to
+/// coarser content for shapes it does not specifically recognize rather than erroring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationTiers {
+    /// The declaration form without its body: a header cut at its body delimiter, or the full
+    /// declaration text when the declaration has no body distinct from its form.
+    pub signature: String,
+    /// The signature together with the declaration's own documentation, in source order. Equal to
+    /// the signature when the declaration carries no documentation of its own.
+    pub interface: String,
+}
+
 /// The name-token spans of the trait and the implementing type in one `impl Trait for Type` block.
 ///
 /// Each span points at the terminal identifier token — the identifier inside a generic type
@@ -675,6 +690,149 @@ impl SyntaxTree {
         }
         out
     }
+
+    /// The signature and interface tier content for `decl`.
+    ///
+    /// Total: a declaration whose node can no longer be located in this tree (a stale or fabricated
+    /// [`SyntaxDeclaration`]) or whose kind carries no specific extraction rule degrades to
+    /// signature = the full declaration text, interface = signature — never a panic or an error.
+    pub fn declaration_tiers(&self, decl: &SyntaxDeclaration) -> DeclarationTiers {
+        let full_text = || self.text_at(decl.full_span).unwrap_or_default().to_string();
+        let Some(node) = self.locate_declaration_node(decl) else {
+            let signature = full_text();
+            return DeclarationTiers {
+                interface: signature.clone(),
+                signature,
+            };
+        };
+        match self.language {
+            Language::Rust => self.rust_declaration_tiers(node, decl, full_text),
+            Language::Python => self.python_declaration_tiers(node, decl, full_text),
+        }
+    }
+
+    /// The document-level documentation, if the document opens with one: Rust's leading `//!`/`/*!
+    /// */` run, or a Python module's docstring (its first statement, when it is a string expression).
+    pub fn module_documentation(&self) -> Option<String> {
+        match self.language {
+            Language::Rust => self.rust_module_documentation(),
+            Language::Python => self.python_module_documentation(),
+        }
+    }
+
+    /// The tree-sitter node backing `decl`: the smallest node containing its name span, walked up to
+    /// the ancestor whose kind matches `decl.node_kind`. `None` when no such ancestor exists (the
+    /// declaration does not correspond to any node in this tree).
+    fn locate_declaration_node(&self, decl: &SyntaxDeclaration) -> Option<Node<'_>> {
+        let root = self.tree.root_node();
+        if decl.name_span.start >= root.end_byte() {
+            return None;
+        }
+        let end = decl.name_span.end.max(decl.name_span.start + 1).min(root.end_byte());
+        let mut node = root.descendant_for_byte_range(decl.name_span.start, end)?;
+        loop {
+            if node.kind() == decl.node_kind {
+                return Some(node);
+            }
+            node = node.parent()?;
+        }
+    }
+
+    /// Rust tier extraction for a located declaration node.
+    ///
+    /// The signature spans from the declaration's start — extended backward over a contiguous run of
+    /// preceding `attribute_item` siblings, since attributes are part of the declaration form — through
+    /// its body delimiter (the `body` field's start, for a brace-delimited body) or its own end when it
+    /// has no distinct body. The interface extends that same end point backward to the start of the
+    /// contiguous outer-doc-comment run immediately above the declaration (tolerating attributes
+    /// interleaved between the docs and the item), so it is a single contiguous source slice.
+    fn rust_declaration_tiers(
+        &self,
+        node: Node,
+        decl: &SyntaxDeclaration,
+        full_text: impl Fn() -> String,
+    ) -> DeclarationTiers {
+        let source = &self.source;
+        let attr_start = rust_attribute_extended_start(node);
+        let signature_end = rust_braced_body_start(node).unwrap_or(decl.full_span.end);
+        let signature = source
+            .get(attr_start..signature_end)
+            .map(|s| s.trim_end().to_string())
+            .unwrap_or_else(&full_text);
+        let interface = match rust_outer_doc_run_start(node) {
+            Some(doc_start) => source
+                .get(doc_start..signature_end)
+                .map(|s| s.trim_end().to_string())
+                .unwrap_or_else(|| signature.clone()),
+            None => signature.clone(),
+        };
+        DeclarationTiers { signature, interface }
+    }
+
+    /// Python tier extraction for a located declaration node.
+    ///
+    /// The signature spans from the declaration's start (decorators included — `decl.full_span`
+    /// already starts at the `decorated_definition` wrapper when one wraps the declaration) through the
+    /// header-ending `:` token — cut at the token itself, not at the body's start, because a comment
+    /// between the header and the body sits outside the `body` field and must not leak into the
+    /// signature. The interface extends that same start through the end of the body's docstring (its
+    /// first statement, when it is a string expression), the Python analog of the Rust doc-comment run.
+    fn python_declaration_tiers(
+        &self,
+        node: Node,
+        decl: &SyntaxDeclaration,
+        full_text: impl Fn() -> String,
+    ) -> DeclarationTiers {
+        let source = &self.source;
+        let body = node.child_by_field_name("body");
+        let signature_end = python_header_end(node)
+            .or_else(|| body.map(|b| b.start_byte()))
+            .unwrap_or(decl.full_span.end);
+        let signature = source
+            .get(decl.full_span.start..signature_end)
+            .map(|s| s.trim_end().to_string())
+            .unwrap_or_else(&full_text);
+        let docstring_end = body.and_then(python_leading_docstring).map(|d| d.end_byte());
+        let interface = match docstring_end {
+            Some(end) => source
+                .get(decl.full_span.start..end)
+                .map(|s| s.trim_end().to_string())
+                .unwrap_or_else(|| signature.clone()),
+            None => signature.clone(),
+        };
+        DeclarationTiers { signature, interface }
+    }
+
+    /// Rust document-level documentation: the leading inner-doc-comment run (`//!`, `/*! */`) at the
+    /// start of the document, tolerating interleaved inner attributes (`#![...]`). `None` when the
+    /// document does not open with an inner doc comment.
+    fn rust_module_documentation(&self) -> Option<String> {
+        let root = self.tree.root_node();
+        let mut cursor = root.walk();
+        let mut first: Option<usize> = None;
+        let mut last: Option<usize> = None;
+        for child in root.named_children(&mut cursor) {
+            if is_inner_doc_comment(child) {
+                first.get_or_insert(child.start_byte());
+                last = Some(child.end_byte());
+                continue;
+            }
+            if child.kind() == "inner_attribute_item" {
+                continue;
+            }
+            break;
+        }
+        let (start, end) = (first?, last?);
+        self.text_at(ByteSpan { start, end }).map(str::to_string)
+    }
+
+    /// Python document-level documentation: the module's docstring — the document's first statement,
+    /// when it is an expression statement holding a string.
+    fn python_module_documentation(&self) -> Option<String> {
+        let root = self.tree.root_node();
+        let docstring = python_leading_docstring(root)?;
+        self.text_at(span_of(docstring)).map(str::to_string)
+    }
 }
 
 /// The terminal identifier token of a type or trait node: the identifier inside a generic type
@@ -778,6 +936,101 @@ fn declaration_full_span(node: Node) -> ByteSpan {
         Some(parent) if parent.kind() == "decorated_definition" => span_of(parent),
         _ => span_of(node),
     }
+}
+
+/// The byte offset of a Rust item's declaration start, extended backward over a contiguous run of
+/// preceding `attribute_item` siblings — attributes are part of the declaration form, so they stay in
+/// the signature. Stops at the first preceding sibling that is not an attribute (a doc comment, or
+/// nothing).
+fn rust_attribute_extended_start(node: Node) -> usize {
+    let mut start = node.start_byte();
+    let mut sibling = node.prev_sibling();
+    while let Some(s) = sibling {
+        if s.kind() != "attribute_item" {
+            break;
+        }
+        start = s.start_byte();
+        sibling = s.prev_sibling();
+    }
+    start
+}
+
+/// The byte offset of a Rust item's brace-delimited body, if it has one distinct from its declaration
+/// form.
+///
+/// Every item kind with a `body` field is brace-delimited except `struct_item`, whose body is
+/// brace-delimited (`field_declaration_list`, a named struct) only sometimes — a tuple struct's body
+/// is parenthesized (`ordered_field_declaration_list`), which does not count as a distinct body cut
+/// point; a unit struct has no body field at all.
+fn rust_braced_body_start(node: Node) -> Option<usize> {
+    let body = node.child_by_field_name("body")?;
+    if node.kind() == "struct_item" && body.kind() != "field_declaration_list" {
+        return None;
+    }
+    Some(body.start_byte())
+}
+
+/// The byte offset of the first comment in the contiguous outer-doc-comment run immediately above a
+/// Rust item, if any: walks preceding siblings, tolerating interposed `attribute_item` nodes, and
+/// stops at the first sibling that is neither an outer doc comment nor an attribute — the doc run's
+/// association point.
+fn rust_outer_doc_run_start(node: Node) -> Option<usize> {
+    let mut doc_start = None;
+    let mut sibling = node.prev_sibling();
+    while let Some(s) = sibling {
+        if s.kind() == "attribute_item" {
+            sibling = s.prev_sibling();
+            continue;
+        }
+        if is_outer_doc_comment(s) {
+            doc_start = Some(s.start_byte());
+            sibling = s.prev_sibling();
+            continue;
+        }
+        break;
+    }
+    doc_start
+}
+
+/// Whether `node` is an outer doc comment (`///` or `/** */`) — a `line_comment`/`block_comment` node
+/// carrying tree-sitter's `outer` field. An inner doc comment (`//!`, `/*! */`, the `inner` field)
+/// never attaches to an item.
+fn is_outer_doc_comment(node: Node) -> bool {
+    matches!(node.kind(), "line_comment" | "block_comment") && node.child_by_field_name("outer").is_some()
+}
+
+/// Whether `node` is an inner doc comment (`//!` or `/*! */`) — a `line_comment`/`block_comment` node
+/// carrying tree-sitter's `inner` field, the document-level documentation form.
+fn is_inner_doc_comment(node: Node) -> bool {
+    matches!(node.kind(), "line_comment" | "block_comment") && node.child_by_field_name("inner").is_some()
+}
+
+/// The byte offset just past the header-ending `:` of a Python `def`/`class` node — the anonymous
+/// `:` token that is a direct child of the definition node (a `:` inside the parameter list is
+/// nested deeper and never a direct child). `None` for a node carrying no such token.
+fn python_header_end(node: Node) -> Option<usize> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| !child.is_named() && child.kind() == ":")
+        .map(|colon| colon.end_byte())
+}
+
+/// The docstring node of a Python declaration or module body: its first statement, when that
+/// statement is an expression statement holding a string — plain or implicitly concatenated
+/// (adjacent literals concatenate at compile time and still form the docstring). Comments are not
+/// statements (a shebang line is a comment), so they are skipped rather than ending the search.
+/// `None` for an empty body or one whose first statement is not a bare string expression.
+fn python_leading_docstring(container: Node) -> Option<Node> {
+    let mut cursor = container.walk();
+    let first = container
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "comment")?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    let mut inner_cursor = first.walk();
+    let inner = first.named_children(&mut inner_cursor).next()?;
+    matches!(inner.kind(), "string" | "concatenated_string").then_some(inner)
 }
 
 #[cfg(test)]
@@ -1409,6 +1662,217 @@ TOP_LEVEL = 1
             tree.enclosing_dotted_constructs(bare),
             Vec::new(),
             "a bare identifier outside any dotted construct has no enclosing chain"
+        );
+    }
+
+    /// The declaration named `name` in `tree`'s declarations.
+    fn decl_named(tree: &SyntaxTree, name: &str) -> SyntaxDeclaration {
+        tree.all_declarations()
+            .into_iter()
+            .find(|d| tree.text_at(d.name_span) == Some(name))
+            .unwrap_or_else(|| panic!("declaration named {name} not found"))
+    }
+
+    // A documented Rust function's signature is the header without its body; its interface carries
+    // the doc comment and the signature, and never the body.
+    #[test]
+    fn documented_rust_function_signature_excludes_body_interface_carries_doc() {
+        let src = "/// Connects to the peer.\npub fn connect(x: u8) -> u8 {\n    x\n}\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let tiers = tree.declaration_tiers(&decl_named(&tree, "connect"));
+        assert_eq!(tiers.signature, "pub fn connect(x: u8) -> u8");
+        assert!(
+            !tiers.signature.contains('\n'),
+            "signature excludes the body: {tiers:?}"
+        );
+        assert_eq!(
+            tiers.interface,
+            "/// Connects to the peer.\npub fn connect(x: u8) -> u8"
+        );
+        assert!(
+            !tiers.interface.contains("    x"),
+            "interface excludes the body: {tiers:?}"
+        );
+    }
+
+    // Rust items with no body distinct from their declaration form — `;`-terminated consts, statics,
+    // type aliases, a bodiless trait function, a unit struct, and a tuple struct — each take their
+    // full declaration text as their signature.
+    #[test]
+    fn bodyless_rust_items_take_the_full_declaration_as_signature() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("pub const X: u8 = 1;\n", "X", "pub const X: u8 = 1;"),
+            ("pub static X: u8 = 1;\n", "X", "pub static X: u8 = 1;"),
+            ("pub type X = u8;\n", "X", "pub type X = u8;"),
+            ("pub trait T { fn f(&self); }\n", "f", "fn f(&self);"),
+            ("pub struct Unit;\n", "Unit", "pub struct Unit;"),
+            ("pub struct Tuple(u8, u8);\n", "Tuple", "pub struct Tuple(u8, u8);"),
+        ];
+        for (src, name, expected_signature) in cases {
+            let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+            let tiers = tree.declaration_tiers(&decl_named(&tree, name));
+            assert_eq!(tiers.signature, *expected_signature, "source: {src}");
+            assert_eq!(tiers.interface, tiers.signature, "no documentation: {src}");
+        }
+    }
+
+    // A struct, enum, and trait header each cut at their `{`; a generic parameter and where-clause
+    // (which precede the body) stay in the signature.
+    #[test]
+    fn struct_enum_trait_headers_cut_at_body_generics_and_where_clause_stay() {
+        let struct_src = "pub struct S<T: Clone> where T: Sized { x: T }\n";
+        let tree = SyntaxTree::parse(struct_src, Language::Rust).unwrap();
+        let tiers = tree.declaration_tiers(&decl_named(&tree, "S"));
+        assert_eq!(tiers.signature, "pub struct S<T: Clone> where T: Sized");
+
+        let enum_src = "pub enum E { A, B }\n";
+        let tree = SyntaxTree::parse(enum_src, Language::Rust).unwrap();
+        let tiers = tree.declaration_tiers(&decl_named(&tree, "E"));
+        assert_eq!(tiers.signature, "pub enum E");
+
+        let trait_src = "pub trait Tr { fn f(&self) {} }\n";
+        let tree = SyntaxTree::parse(trait_src, Language::Rust).unwrap();
+        let tiers = tree.declaration_tiers(&decl_named(&tree, "Tr"));
+        assert_eq!(tiers.signature, "pub trait Tr");
+    }
+
+    // A `#[derive(...)]` attribute sitting between a doc comment and the item does not break the
+    // doc run's association: the interface still carries the doc comment.
+    #[test]
+    fn doc_run_tolerates_an_interleaved_attribute() {
+        let src = "/// doc\n#[derive(Debug)]\npub struct S { x: u8 }\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let tiers = tree.declaration_tiers(&decl_named(&tree, "S"));
+        assert_eq!(tiers.signature, "#[derive(Debug)]\npub struct S");
+        assert_eq!(tiers.interface, "/// doc\n#[derive(Debug)]\npub struct S");
+    }
+
+    // A document opening with a `//!` run reports it as module documentation; a document with no
+    // leading inner doc comments reports none.
+    #[test]
+    fn rust_module_documentation_is_the_leading_inner_doc_run() {
+        let src = "//! module docs\n//! more\nfn f() {}\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        assert_eq!(
+            tree.module_documentation().as_deref(),
+            Some("//! module docs\n//! more\n")
+        );
+
+        let no_docs = SyntaxTree::parse("fn f() {}\n", Language::Rust).unwrap();
+        assert_eq!(no_docs.module_documentation(), None);
+    }
+
+    // A decorated Python function with a multi-line parameter list has a signature spanning the
+    // decorator through the header-ending `:`; its docstring extends the interface past the header.
+    #[test]
+    fn python_function_signature_and_interface_with_decorator_and_docstring() {
+        let src = "@dec\ndef f(x,\n     y):\n    \"\"\"doc here\"\"\"\n    pass\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+        let tiers = tree.declaration_tiers(&decl_named(&tree, "f"));
+        assert_eq!(tiers.signature, "@dec\ndef f(x,\n     y):");
+        assert_eq!(tiers.interface, "@dec\ndef f(x,\n     y):\n    \"\"\"doc here\"\"\"");
+    }
+
+    // A Python class's docstring extends its interface past the header; the module's own docstring is
+    // readable as the document-level documentation.
+    #[test]
+    fn python_class_docstring_and_module_docstring() {
+        let src = "class C:\n    \"\"\"class doc\"\"\"\n    pass\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+        let tiers = tree.declaration_tiers(&decl_named(&tree, "C"));
+        assert_eq!(tiers.signature, "class C:");
+        assert_eq!(tiers.interface, "class C:\n    \"\"\"class doc\"\"\"");
+
+        let module_src = "\"\"\"module doc\"\"\"\nx = 1\n";
+        let module_tree = SyntaxTree::parse(module_src, Language::Python).unwrap();
+        assert_eq!(
+            module_tree.module_documentation().as_deref(),
+            Some("\"\"\"module doc\"\"\"")
+        );
+    }
+
+    // A symbol with no documentation of its own has an interface tier equal to its signature, in both
+    // languages.
+    #[test]
+    fn undocumented_item_interface_equals_signature() {
+        let rust_tree = SyntaxTree::parse("pub fn undocumented() {}\n", Language::Rust).unwrap();
+        let rust_tiers = rust_tree.declaration_tiers(&decl_named(&rust_tree, "undocumented"));
+        assert_eq!(rust_tiers.interface, rust_tiers.signature);
+
+        let py_tree = SyntaxTree::parse("def undoc():\n    pass\n", Language::Python).unwrap();
+        let py_tiers = py_tree.declaration_tiers(&decl_named(&py_tree, "undoc"));
+        assert_eq!(py_tiers.interface, py_tiers.signature);
+    }
+
+    // A declaration whose kind carries no extraction rule — and whose spans do not correspond to any
+    // real node in the tree — degrades to signature = interface = the full declaration text, never a
+    // panic.
+    #[test]
+    fn unrecognized_declaration_kind_degrades_without_panicking() {
+        let src = "pub fn f() {}\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let fabricated = SyntaxDeclaration {
+            node_kind: "not_a_real_node_kind".to_string(),
+            name_span: ByteSpan { start: 3, end: 4 },
+            full_span: ByteSpan {
+                start: 0,
+                end: src.len(),
+            },
+        };
+        let tiers = tree.declaration_tiers(&fabricated);
+        assert_eq!(tiers.signature, src);
+        assert_eq!(tiers.interface, tiers.signature);
+
+        // Spans reaching past the end of the source degrade the same way, without panicking.
+        let out_of_bounds = SyntaxDeclaration {
+            node_kind: "not_a_real_node_kind".to_string(),
+            name_span: ByteSpan {
+                start: src.len() + 100,
+                end: src.len() + 200,
+            },
+            full_span: ByteSpan {
+                start: src.len() + 100,
+                end: src.len() + 200,
+            },
+        };
+        let tiers = tree.declaration_tiers(&out_of_bounds);
+        assert_eq!(tiers.signature, "");
+        assert_eq!(tiers.interface, "");
+    }
+
+    // A shebang line is a comment, not a statement, so a module docstring beneath it is still the
+    // module documentation.
+    #[test]
+    fn python_module_docstring_survives_a_shebang_line() {
+        let src = "#!/usr/bin/env python\n\"\"\"module doc\"\"\"\nx = 1\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+        assert_eq!(tree.module_documentation().as_deref(), Some("\"\"\"module doc\"\"\""));
+    }
+
+    // A comment above a function's docstring is not a statement, so the docstring beneath it still
+    // extends the interface; the interface slice keeps the source order (comment included).
+    #[test]
+    fn python_docstring_survives_a_leading_comment() {
+        let src = "def f():\n    # note\n    \"\"\"doc\"\"\"\n    pass\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+        let tiers = tree.declaration_tiers(&decl_named(&tree, "f"));
+        assert_eq!(tiers.signature, "def f():");
+        assert_eq!(tiers.interface, "def f():\n    # note\n    \"\"\"doc\"\"\"");
+    }
+
+    // Adjacent string literals concatenate at compile time and still form the docstring.
+    #[test]
+    fn python_concatenated_string_is_a_docstring() {
+        let src = "def f():\n    \"part one \" \"part two\"\n    pass\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+        let tiers = tree.declaration_tiers(&decl_named(&tree, "f"));
+        assert_eq!(tiers.interface, "def f():\n    \"part one \" \"part two\"");
+
+        let module_src = "\"mod one \" \"mod two\"\nx = 1\n";
+        let module_tree = SyntaxTree::parse(module_src, Language::Python).unwrap();
+        assert_eq!(
+            module_tree.module_documentation().as_deref(),
+            Some("\"mod one \" \"mod two\"")
         );
     }
 }

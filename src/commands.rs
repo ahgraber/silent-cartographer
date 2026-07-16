@@ -433,6 +433,7 @@ pub fn run_get(
 /// reach (default 1). Supplying it with any other relation is a typed teaching error that names the
 /// flag, the offending relation, and the relations that accept it — rather than silently ignoring a
 /// meaningless flag.
+#[allow(clippy::too_many_arguments)] // the CLI's flat query-command surface travels together
 pub fn run_trace(
     db: &Path,
     root: &Path,
@@ -440,6 +441,7 @@ pub fn run_trace(
     reference: &str,
     relation: Relation,
     depth: Option<u32>,
+    detail: Option<Detail>,
     json: bool,
 ) -> Result<String> {
     if !matches!(relation, Relation::Dependents) && depth.is_some() {
@@ -453,10 +455,10 @@ pub fn run_trace(
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment);
     if matches!(relation, Relation::Dependents) {
-        let answer = engine.dependents(reference, depth.unwrap_or(1))?;
+        let answer = engine.dependents(reference, depth.unwrap_or(1), detail)?;
         return Ok(render(&answer, json));
     }
-    let answer = engine.trace(reference, relation)?;
+    let answer = engine.trace(reference, relation, detail)?;
     Ok(render(&answer, json))
 }
 

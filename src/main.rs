@@ -34,6 +34,7 @@ fn main() -> Result<()> {
                 &args.reference,
                 args.relation.into(),
                 args.depth,
+                args.detail.map(Into::into),
                 cli.json,
             )?;
             println!("{out}");

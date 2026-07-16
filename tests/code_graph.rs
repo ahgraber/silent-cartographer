@@ -140,6 +140,23 @@ fn rebuilding_over_the_same_store_supersedes_all_derived_rows() {
     assert_eq!(first.0, second.0, "symbol rows are identical after a rebuild");
     assert_eq!(first.1, second.1, "occurrence rows are identical after a rebuild");
     assert_eq!(first.2, second.2, "edge rows are identical after a rebuild");
+    // `first.0 == second.0` already covers every `SymbolRow` field, including the tier columns; call
+    // the tier columns out explicitly, with a sanity check that they were actually populated (not
+    // vacuously equal because both builds produced only `None`).
+    assert!(
+        first.0.iter().any(|r| r.signature_text.is_some()),
+        "sanity: the first build populated signature tiers"
+    );
+    fn tiers(rows: &[SymbolRow]) -> Vec<(&CanonicalId, &Option<String>, &Option<String>)> {
+        rows.iter()
+            .map(|r| (&r.canonical_id, &r.signature_text, &r.interface_text))
+            .collect()
+    }
+    assert_eq!(
+        tiers(&first.0),
+        tiers(&second.0),
+        "signature and interface tiers are identical after a rebuild"
+    );
 
     // Staleness clearing, not just dedup: a symbol present only in the earlier index is absent after
     // a build of an index without it.
@@ -676,6 +693,8 @@ fn put_symbol(store: &GraphStore, name: &str) {
             document_path: None,
             span: None,
             span_text: None,
+            signature_text: None,
+            interface_text: None,
             duplicated: false,
         })
         .unwrap();
@@ -972,6 +991,51 @@ fn symbol_round_trips_with_exact_span_text() {
     // Occurrences round-trip.
     let occs = store.occurrences_of(&connect_id()).unwrap();
     assert_eq!(occs.len(), 2);
+}
+
+// _(Tier content round-trips)_ — a symbol inserted with signature and interface tier content reads
+// both back unchanged; a symbol inserted with no tier content reads both back as absent.
+#[test]
+fn tier_content_round_trips_and_nulls_read_back_as_absent() {
+    let store = GraphStore::open_in_memory().unwrap();
+    let with_tiers = sid("with_tiers");
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: with_tiers.clone(),
+            display_name: "with_tiers".to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: Some("m.rs".to_string()),
+            span: Some((0, 10)),
+            span_text: Some("fn with_tiers() {}".to_string()),
+            signature_text: Some("fn with_tiers()".to_string()),
+            interface_text: Some("/// docs\nfn with_tiers()".to_string()),
+            duplicated: false,
+        })
+        .unwrap();
+    let without_tiers = sid("without_tiers");
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: without_tiers.clone(),
+            display_name: "without_tiers".to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: Some("m.rs".to_string()),
+            span: Some((20, 30)),
+            span_text: Some("fn without_tiers() {}".to_string()),
+            signature_text: None,
+            interface_text: None,
+            duplicated: false,
+        })
+        .unwrap();
+
+    let with_row = store.symbol(&with_tiers).unwrap().expect("with_tiers persisted");
+    assert_eq!(with_row.signature_text.as_deref(), Some("fn with_tiers()"));
+    assert_eq!(with_row.interface_text.as_deref(), Some("/// docs\nfn with_tiers()"));
+
+    let without_row = store.symbol(&without_tiers).unwrap().expect("without_tiers persisted");
+    assert_eq!(without_row.signature_text, None);
+    assert_eq!(without_row.interface_text, None);
 }
 
 // _(Enclosure is persisted)_ — a method's enclosing type is returned, and a module's direct contents
@@ -1447,6 +1511,70 @@ fn external_symbol_persists_without_definition_span() {
     assert_eq!(sym.class, PersistedClass::External);
     assert!(sym.span.is_none(), "external symbol has no fabricated definition span");
     assert!(sym.span_text.is_none());
+}
+
+// _(Ingest policy — external symbols)_ — a symbol resolved outside the workspace persists no tier
+// content: an external symbol carries no definition span, so it carries no signature or interface
+// either.
+#[test]
+fn external_symbol_persists_null_tiers() {
+    let source = "fn f() { g(); }\n";
+    let g_col = source.find("g(").unwrap() as u32;
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![SourceDocument {
+            path: "m.rs".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![
+            ExtractedSymbol {
+                descriptor: Some(Descriptor::new(
+                    "c",
+                    vec![DescriptorSegment::new("f", SegmentKind::Method)],
+                )),
+                kind: SymbolKind::Function,
+                class: SymbolClass::InWorkspace,
+                occurrences: vec![ExtractedOccurrence {
+                    document_path: "m.rs".to_string(),
+                    range: SourceRange::new(0, 3, 0, 4),
+                    role: OccurrenceRole::Definition,
+                }],
+            },
+            ExtractedSymbol {
+                descriptor: Some(Descriptor::new(
+                    "thirdparty",
+                    vec![DescriptorSegment::new("g", SegmentKind::Method)],
+                )),
+                kind: SymbolKind::Function,
+                class: SymbolClass::External,
+                occurrences: vec![ExtractedOccurrence {
+                    document_path: "m.rs".to_string(),
+                    range: SourceRange::new(0, g_col, 0, g_col + 1),
+                    role: OccurrenceRole::Reference,
+                }],
+            },
+        ],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    };
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let g = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("thirdparty", vec![DescriptorSegment::new("g", SegmentKind::Method)]),
+    );
+    let sym = store.symbol(&g).unwrap().expect("external symbol persisted");
+    assert_eq!(
+        sym.signature_text, None,
+        "an external symbol persists no signature tier"
+    );
+    assert_eq!(
+        sym.interface_text, None,
+        "an external symbol persists no interface tier"
+    );
 }
 
 // _(Join alignment accounting)_ — a build records all four join-outcome counts.
@@ -2407,6 +2535,287 @@ fn rust_doc_module_derived_from_whole_document_definition() {
     );
 }
 
+/// The tier content the syntax layer computes for the declaration named `name` in `source` — used to
+/// derive a persistence-wiring test's expectation independently of hand-computed literals (tier
+/// extraction itself is exercised directly in `graph::syntax`'s own tests).
+fn declaration_tiers_by_name(
+    source: &str,
+    language: silent_cartographer::graph::syntax::Language,
+    name: &str,
+) -> silent_cartographer::graph::syntax::DeclarationTiers {
+    let tree = silent_cartographer::graph::syntax::SyntaxTree::parse(source, language).unwrap();
+    let decl = tree
+        .all_declarations()
+        .into_iter()
+        .find(|d| tree.text_at(d.name_span) == Some(name))
+        .unwrap_or_else(|| panic!("declaration named {name} not found"));
+    tree.declaration_tiers(&decl)
+}
+
+// _(Scenario: Documented Rust function tiers)_, _(Scenario: Undocumented symbol falls back to
+// signature)_, _(Scenario: Declaration without a distinct body)_ — a built Rust workspace persists
+// tiers for a documented function (signature excludes its body, interface additionally carries the
+// doc comment), an undocumented function (interface equal to signature), and a `const` (signature
+// equal to the full declaration, since a `;`-terminated item has no body distinct from its form).
+#[test]
+fn rust_build_persists_signature_and_interface_tiers() {
+    let source = "\
+/// Doubles a number.
+pub fn double(x: u8) -> u8 {
+    x * 2
+}
+
+pub fn triple(x: u8) -> u8 {
+    x * 3
+}
+
+pub const LIMIT: u8 = 10;
+";
+    let (dl, dc) = line_col(source, source.find("double").unwrap());
+    let (tl, tc) = line_col(source, source.find("triple").unwrap());
+    let (ll, lc) = line_col(source, source.find("LIMIT").unwrap());
+
+    let double = one_occ_symbol(
+        "c",
+        &[("double", SegmentKind::Method)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(dl, dc, dl, dc + 6),
+        OccurrenceRole::Definition,
+    );
+    let triple = one_occ_symbol(
+        "c",
+        &[("triple", SegmentKind::Method)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(tl, tc, tl, tc + 6),
+        OccurrenceRole::Definition,
+    );
+    let limit = one_occ_symbol(
+        "c",
+        &[("LIMIT", SegmentKind::Term)],
+        SymbolKind::Constant,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(ll, lc, ll, lc + 5),
+        OccurrenceRole::Definition,
+    );
+
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let index = one_doc_index("m.rs", vec![double, triple, limit]);
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let id = |name: &str, kind: SegmentKind| {
+        silent_cartographer::identity::project_one(
+            &ws(),
+            &Descriptor::new("c", vec![DescriptorSegment::new(name, kind)]),
+        )
+    };
+
+    let double_row = store
+        .symbol(&id("double", SegmentKind::Method))
+        .unwrap()
+        .expect("double persisted");
+    let double_tiers = declaration_tiers_by_name(source, silent_cartographer::graph::syntax::Language::Rust, "double");
+    assert_eq!(
+        double_row.signature_text.as_deref(),
+        Some(double_tiers.signature.as_str())
+    );
+    assert_eq!(
+        double_row.interface_text.as_deref(),
+        Some(double_tiers.interface.as_str())
+    );
+    assert_ne!(
+        double_row.interface_text, double_row.signature_text,
+        "the documented function's interface carries its doc comment, distinct from its signature: {double_row:?}"
+    );
+    assert!(
+        double_row.interface_text.as_deref().unwrap().starts_with("///"),
+        "the interface leads with the doc comment: {double_row:?}"
+    );
+
+    let triple_row = store
+        .symbol(&id("triple", SegmentKind::Method))
+        .unwrap()
+        .expect("triple persisted");
+    let triple_tiers = declaration_tiers_by_name(source, silent_cartographer::graph::syntax::Language::Rust, "triple");
+    assert_eq!(
+        triple_row.signature_text.as_deref(),
+        Some(triple_tiers.signature.as_str())
+    );
+    assert_eq!(
+        triple_row.interface_text, triple_row.signature_text,
+        "an undocumented symbol's interface equals its signature: {triple_row:?}"
+    );
+
+    let limit_row = store
+        .symbol(&id("LIMIT", SegmentKind::Term))
+        .unwrap()
+        .expect("LIMIT persisted");
+    let limit_tiers = declaration_tiers_by_name(source, silent_cartographer::graph::syntax::Language::Rust, "LIMIT");
+    assert_eq!(
+        limit_row.signature_text.as_deref(),
+        Some(limit_tiers.signature.as_str())
+    );
+    assert_eq!(
+        limit_row.signature_text, limit_row.span_text,
+        "a declaration with no distinct body has a signature equal to its full declaration: {limit_row:?}"
+    );
+}
+
+// _(Scenario: Rust module body equals its document)_ — a built Rust workspace's file-module symbol
+// (a whole-file definition occurrence matching no declaration in the tree) persists the whole
+// document as its body, its qualified name as its signature, and the document's leading `//!` run as
+// its interface.
+#[test]
+fn rust_file_module_persists_whole_document_qualified_name_and_module_doc() {
+    let source = "//! Module doc.\npub fn helper() {}\n";
+    let module = one_occ_symbol(
+        "mycrate",
+        &[("mymod", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "mymod.rs",
+        // One past the final newline (two newlines in `source`): the whole document.
+        SourceRange::new(0, 0, 2, 0),
+        OccurrenceRole::Definition,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("mymod.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("mymod.rs", vec![module]), &src).unwrap();
+
+    let id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("mycrate", vec![DescriptorSegment::new("mymod", SegmentKind::Module)]),
+    );
+    let row = store.symbol(&id).unwrap().expect("module symbol persisted");
+    assert_eq!(
+        row.span,
+        Some((0, source.len())),
+        "the module span is the whole document: {row:?}"
+    );
+    assert_eq!(
+        row.span_text.as_deref(),
+        Some(source),
+        "the module body is the document byte-for-byte: {row:?}"
+    );
+    let expected_qualified = id.as_str().split_once("::").map(|(_, rest)| rest).unwrap();
+    assert_eq!(
+        row.signature_text.as_deref(),
+        Some(expected_qualified),
+        "the module's signature tier is its qualified name: {row:?}"
+    );
+    let tree = silent_cartographer::graph::syntax::SyntaxTree::parse(
+        source,
+        silent_cartographer::graph::syntax::Language::Rust,
+    )
+    .unwrap();
+    let docs = tree.module_documentation().expect("the document opens with `//!` docs");
+    assert_eq!(
+        row.interface_text,
+        Some(format!("{expected_qualified}\n{}", docs.trim_end())),
+        "the module's interface tier is its signature followed by the leading `//!` run: {row:?}"
+    );
+}
+
+// _(Per-symbol tier content — declaration-less fallback)_ — a symbol whose definition name-span
+// matches no persisted declaration kind (a struct field here; enum-variant constants and
+// derive-synthesized methods take the same path) persists its bare name token as body, signature,
+// and interface alike — the honest total degradation, never an error or an absent tier.
+#[test]
+fn declaration_less_symbol_persists_name_token_tiers() {
+    let source = "pub struct Config {\n    pub retries: u8,\n}\n";
+    let name = source.find("retries").unwrap();
+    let (nl, nc) = line_col(source, name);
+    let field = one_occ_symbol(
+        "mycrate",
+        &[("Config", SegmentKind::Type), ("retries", SegmentKind::Term)],
+        SymbolKind::Field,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(nl, nc, nl, nc + 7),
+        OccurrenceRole::Definition,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![field]), &src).unwrap();
+
+    let id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new(
+            "mycrate",
+            vec![
+                DescriptorSegment::new("Config", SegmentKind::Type),
+                DescriptorSegment::new("retries", SegmentKind::Term),
+            ],
+        ),
+    );
+    let row = store.symbol(&id).unwrap().expect("field symbol persisted");
+    assert_eq!(
+        row.span,
+        Some((name, name + 7)),
+        "no declaration matches a field: the span is the name token: {row:?}"
+    );
+    assert_eq!(row.span_text.as_deref(), Some("retries"), "body is the token: {row:?}");
+    assert_eq!(
+        row.signature_text.as_deref(),
+        Some("retries"),
+        "the fallback signature mirrors the token: {row:?}"
+    );
+    assert_eq!(
+        row.interface_text.as_deref(),
+        Some("retries"),
+        "the fallback interface mirrors the token: {row:?}"
+    );
+}
+
+// _(Scenario: Inline module declarations keep their declaration spans)_ — a module defined by an
+// in-document `mod name { .. }` declaration persists that declaration's span and text, never the
+// whole document; its tiers come from ordinary declaration extraction.
+#[test]
+fn inline_module_declaration_keeps_its_declaration_span() {
+    let source = "pub fn outside() {}\n\nmod inner {\n    pub fn helper() {}\n}\n";
+    let name = source.find("inner").unwrap();
+    let (nl, nc) = line_col(source, name);
+    let module = one_occ_symbol(
+        "mycrate",
+        &[("inner", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "lib.rs",
+        SourceRange::new(nl, nc, nl, nc + 5),
+        OccurrenceRole::Definition,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("lib.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("lib.rs", vec![module]), &src).unwrap();
+
+    let id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new("mycrate", vec![DescriptorSegment::new("inner", SegmentKind::Module)]),
+    );
+    let row = store.symbol(&id).unwrap().expect("module symbol persisted");
+    let mod_start = source.find("mod inner").unwrap();
+    assert_eq!(
+        row.span,
+        Some((mod_start, source.len() - 1)),
+        "the inline module's span is its `mod` declaration, not the whole document: {row:?}"
+    );
+    assert_eq!(
+        row.span_text.as_deref(),
+        Some("mod inner {\n    pub fn helper() {}\n}"),
+        "the inline module's body is its declaration text: {row:?}"
+    );
+    assert_eq!(
+        row.signature_text.as_deref(),
+        Some("mod inner"),
+        "the inline module's signature comes from ordinary declaration extraction: {row:?}"
+    );
+}
+
 // _(Guarded positional join — provenance)_ — attributions accepted under the default rule and under
 // a kind-scoped rule each carry their rule tag.
 #[test]
@@ -2498,7 +2907,7 @@ fn trace_references_includes_operator_aligned_site() {
     ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![add]), &src).unwrap();
 
     let engine = QueryEngine::new(&store, support::provenance(), content_hash(&src), None);
-    let answer = engine.trace("ops::Add::add", Relation::References).unwrap();
+    let answer = engine.trace("ops::Add::add", Relation::References, None).unwrap();
     match answer.outcome {
         Outcome::Found { results } => {
             assert_eq!(results.len(), 1, "the operator-aligned reference is reported");
@@ -5250,6 +5659,51 @@ fn python_module_import_produces_module_to_module_edge() {
     );
 }
 
+// _(Scenario: Python function tiers carry the docstring)_ — a built Python function with a docstring
+// persists a signature tier that is its header through the header-ending `:`, and an interface tier
+// that additionally carries the docstring.
+#[test]
+fn python_build_persists_docstring_bearing_function_tiers() {
+    let source = "def greet(name):\n    \"\"\"Greets somebody.\"\"\"\n    return f\"hi {name}\"\n";
+    let name_pos = source.find("greet").unwrap();
+    let (line, col) = line_col(source, name_pos);
+    let greet = one_occ_symbol(
+        "pkg",
+        &[("m", SegmentKind::Module), ("greet", SegmentKind::Term)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.py",
+        SourceRange::new(line, col, line, col + 5),
+        OccurrenceRole::Definition,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let index = py_synthetic_index(vec![greet]);
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new(
+            "pkg",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("greet", SegmentKind::Term),
+            ],
+        ),
+    );
+    let row = store.symbol(&id).unwrap().expect("greet persisted");
+    assert_eq!(
+        row.signature_text.as_deref(),
+        Some("def greet(name):"),
+        "the signature is the header through the header-ending colon: {row:?}"
+    );
+    assert_eq!(
+        row.interface_text.as_deref(),
+        Some("def greet(name):\n    \"\"\"Greets somebody.\"\"\""),
+        "the interface carries the header together with the docstring: {row:?}"
+    );
+}
+
 /// A synthetic Python-language index: one symbol, `provenance.analyzer_name` set to the Python
 /// adapter's name so `ingest` selects `Language::Python` for the join.
 fn py_synthetic_index(symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
@@ -5677,11 +6131,14 @@ fn zero_width_non_module_stays_refused() {
 }
 
 // _(Marker-rule ripple: module definition location)_ — an aligned module marker gives the module a
-// definition location: the symbol row reads back with its document at offset 0 (the empty span),
-// so `get` on a module answers with the document rather than typed absence.
+// definition location: the symbol row reads back with its document at offset 0, spanning the whole
+// document (not the marker's own empty span — persistence widens a module's aligned zero-width
+// marker to the whole document, so `get` on a module answers with real body content rather than
+// typed absence or an empty span).
 #[test]
 fn module_definition_location_is_document_origin() {
     let store = ingest_python_fixture();
+    let sources: std::collections::HashMap<String, String> = support::python_fixture_sources().into_iter().collect();
     let row = store
         .symbol(&py_consumer_module_id())
         .unwrap()
@@ -5691,10 +6148,84 @@ fn module_definition_location_is_document_origin() {
         Some("pkg/consumer.py"),
         "the module's definition names its document: {row:?}"
     );
+    let source = &sources["pkg/consumer.py"];
     assert_eq!(
         row.span,
-        Some((0, 0)),
-        "the module's definition location is the document origin: {row:?}"
+        Some((0, source.len())),
+        "the module's definition location spans the whole document: {row:?}"
+    );
+    assert_eq!(
+        row.span_text.as_deref(),
+        Some(source.as_str()),
+        "the module's persisted body is the document byte-for-byte: {row:?}"
+    );
+    // The signature tier is the module's qualified name: its canonical identity with the leading
+    // workspace segment stripped.
+    let id = py_consumer_module_id();
+    let expected_qualified = id.as_str().split_once("::").map(|(_, rest)| rest).unwrap();
+    assert_eq!(
+        row.signature_text.as_deref(),
+        Some(expected_qualified),
+        "the module's signature tier is its qualified name: {row:?}"
+    );
+}
+
+// _(Scenario: Python module interface carries its module docstring)_ — a Python module whose zero-
+// width origin marker aligns as its definition persists a whole-document body, its qualified name as
+// its signature, and its signature followed by its module docstring as its interface (the committed
+// fixture's modules carry no docstring, so the docstring-present path is exercised here on a
+// synthetic module).
+#[test]
+fn python_module_marker_persists_whole_document_and_docstring() {
+    let source = "\"\"\"Module docs.\"\"\"\n\ndef helper():\n    pass\n";
+    let module = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![py_occ("m.py", 0, 0, 0, OccurrenceRole::Definition)],
+    };
+    let index = py_synthetic_index(vec![module]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+
+    let id = silent_cartographer::identity::project_one(
+        &ws(),
+        &Descriptor::new(
+            "synthetic",
+            vec![
+                DescriptorSegment::new("m", SegmentKind::Module),
+                DescriptorSegment::new("__init__", SegmentKind::Meta),
+            ],
+        ),
+    );
+    let row = store.symbol(&id).unwrap().expect("module symbol persisted");
+    assert_eq!(
+        row.span,
+        Some((0, source.len())),
+        "the module span widens the marker to the whole document: {row:?}"
+    );
+    assert_eq!(
+        row.span_text.as_deref(),
+        Some(source),
+        "the module body is the document byte-for-byte: {row:?}"
+    );
+    let expected_qualified = id.as_str().split_once("::").map(|(_, rest)| rest).unwrap();
+    assert_eq!(
+        row.signature_text.as_deref(),
+        Some(expected_qualified),
+        "the module's signature tier is its qualified name: {row:?}"
+    );
+    assert_eq!(
+        row.interface_text,
+        Some(format!("{expected_qualified}\n\"\"\"Module docs.\"\"\"")),
+        "the module's interface tier is its signature followed by its module docstring: {row:?}"
     );
 }
 

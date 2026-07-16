@@ -4,14 +4,19 @@
 mod support;
 
 use silent_cartographer::graph::ingest;
-use silent_cartographer::graph::store::{DEPENDENTS_HORIZON, EdgeKind, GraphStore, PersistedClass, SymbolRow};
+use silent_cartographer::graph::store::{
+    DEPENDENTS_HORIZON, EdgeKind, GraphStore, OccurrenceRow, PersistedClass, SymbolRow,
+};
 use silent_cartographer::identity::{
     CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one,
 };
 use silent_cartographer::query::output::Outcome;
 use silent_cartographer::query::resolve::Resolution;
 use silent_cartographer::query::{Detail, QueryEngine, Relation};
-use silent_cartographer::semantic::model::AnalyzerProvenance;
+use silent_cartographer::semantic::model::{
+    AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
+    SourceDocument, SourceRange, SymbolClass, SymbolKind,
+};
 
 fn ws() -> WorkspaceId {
     WorkspaceId::new("test-ws")
@@ -48,6 +53,228 @@ fn connect_id() -> CanonicalId {
 
 fn client_id() -> CanonicalId {
     id_of(&[("net", SegmentKind::Module), ("Client", SegmentKind::Type)])
+}
+
+/// The identity of a symbol under an arbitrary package, for hand-built tier fixtures.
+fn id_of_pkg(package: &str, segments: &[(&str, SegmentKind)]) -> CanonicalId {
+    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
+    project_one(&ws(), &Descriptor::new(package, segs))
+}
+
+/// A one-document index over `path`, for hand-built tier fixtures.
+fn one_doc_index(path: &str, provenance: AnalyzerProvenance, symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
+    ExtractedIndex {
+        provenance,
+        documents: vec![SourceDocument {
+            path: path.to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols,
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    }
+}
+
+/// A symbol with one occurrence, for hand-built tier fixtures.
+fn one_occ_symbol(
+    package: &str,
+    segments: &[(&str, SegmentKind)],
+    kind: SymbolKind,
+    class: SymbolClass,
+    doc: &str,
+    range: SourceRange,
+    role: OccurrenceRole,
+) -> ExtractedSymbol {
+    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
+    ExtractedSymbol {
+        descriptor: Some(Descriptor::new(package, segs)),
+        kind,
+        class,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: doc.to_string(),
+            range,
+            role,
+        }],
+    }
+}
+
+/// The zero-based `(line, col)` of the byte at `pos` in single-byte-per-char test sources.
+fn line_col(source: &str, pos: usize) -> (u32, u32) {
+    let line = source[..pos].matches('\n').count() as u32;
+    let line_start = source[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    (line, (pos - line_start) as u32)
+}
+
+/// A store over a documented Rust function (`double`) and an undocumented one (`triple`), for the
+/// interface-detail `get` scenarios.
+fn tier_store() -> (GraphStore, CanonicalId, CanonicalId) {
+    let source = "\
+/// Doubles a number.
+pub fn double(x: u8) -> u8 {
+    x * 2
+}
+
+pub fn triple(x: u8) -> u8 {
+    x * 3
+}
+";
+    let (dl, dc) = line_col(source, source.find("double").unwrap());
+    let (tl, tc) = line_col(source, source.find("triple").unwrap());
+    let double = one_occ_symbol(
+        "tierscrate",
+        &[("double", SegmentKind::Method)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "tiers.rs",
+        SourceRange::new(dl, dc, dl, dc + 6),
+        OccurrenceRole::Definition,
+    );
+    let triple = one_occ_symbol(
+        "tierscrate",
+        &[("triple", SegmentKind::Method)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "tiers.rs",
+        SourceRange::new(tl, tc, tl, tc + 6),
+        OccurrenceRole::Definition,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("tiers.rs".to_string(), source.to_string())];
+    let index = one_doc_index("tiers.rs", support::provenance(), vec![double, triple]);
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    (
+        store,
+        id_of_pkg("tierscrate", &[("double", SegmentKind::Method)]),
+        id_of_pkg("tierscrate", &[("triple", SegmentKind::Method)]),
+    )
+}
+
+/// A store over a single Rust file module whose document opens with a `//!` doc comment, for the
+/// module-detail `get` scenarios.
+fn module_tier_store() -> (GraphStore, String, CanonicalId) {
+    let source = "//! Networking primitives.\npub fn helper() {}\n";
+    let module = one_occ_symbol(
+        "tierscrate",
+        &[("mymod", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "mymod.rs",
+        // One past the final newline (two newlines in `source`): the whole document.
+        SourceRange::new(0, 0, 2, 0),
+        OccurrenceRole::Definition,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("mymod.rs".to_string(), source.to_string())];
+    let index = one_doc_index("mymod.rs", support::provenance(), vec![module]);
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    (
+        store,
+        source.to_string(),
+        id_of_pkg("tierscrate", &[("mymod", SegmentKind::Module)]),
+    )
+}
+
+/// A synthetic Python-language index: `provenance.analyzer_name` set to the Python adapter's name so
+/// `ingest` selects the Python backend for the join and tier extraction.
+fn py_synthetic_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
+    ExtractedIndex {
+        provenance: AnalyzerProvenance {
+            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_version: "0".to_string(),
+        },
+        documents: vec![SourceDocument {
+            path: path.to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols,
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    }
+}
+
+/// A store over a docstring-bearing Python function (`greet`), for the Python interface-detail `get`
+/// scenario.
+fn python_tier_store() -> (GraphStore, CanonicalId) {
+    let source = "def greet(name):\n    \"\"\"Greets somebody.\"\"\"\n    return f\"hi {name}\"\n";
+    let (line, col) = line_col(source, source.find("greet").unwrap());
+    let greet = one_occ_symbol(
+        "pkg",
+        &[("m", SegmentKind::Module), ("greet", SegmentKind::Term)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.py",
+        SourceRange::new(line, col, line, col + 5),
+        OccurrenceRole::Definition,
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let index = py_synthetic_index("m.py", vec![greet]);
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    (
+        store,
+        id_of_pkg("pkg", &[("m", SegmentKind::Module), ("greet", SegmentKind::Term)]),
+    )
+}
+
+/// A store with a method whose body references a constant, for the reference-attribution `trace`
+/// scenario: the reference site's enclosing declaration is the method, not the referenced constant.
+fn method_reference_store() -> (GraphStore, CanonicalId, CanonicalId) {
+    let source = "\
+pub struct Registry;
+
+impl Registry {
+    pub fn lookup(&self, key: u8) -> u8 {
+        key + OFFSET
+    }
+}
+
+pub const OFFSET: u8 = 1;
+";
+    let (lookup_l, lookup_c) = line_col(source, source.find("lookup").unwrap());
+    let (offset_ref_l, offset_ref_c) = line_col(source, source.find("OFFSET").unwrap());
+    let (offset_def_l, offset_def_c) = line_col(source, source.rfind("OFFSET").unwrap());
+
+    let lookup = one_occ_symbol(
+        "tierscrate",
+        &[("lookup", SegmentKind::Method)],
+        SymbolKind::Method,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(lookup_l, lookup_c, lookup_l, lookup_c + 6),
+        OccurrenceRole::Definition,
+    );
+    let offset = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "tierscrate",
+            vec![DescriptorSegment::new("OFFSET", SegmentKind::Term)],
+        )),
+        kind: SymbolKind::Constant,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![
+            ExtractedOccurrence {
+                document_path: "m.rs".to_string(),
+                range: SourceRange::new(offset_def_l, offset_def_c, offset_def_l, offset_def_c + 6),
+                role: OccurrenceRole::Definition,
+            },
+            ExtractedOccurrence {
+                document_path: "m.rs".to_string(),
+                range: SourceRange::new(offset_ref_l, offset_ref_c, offset_ref_l, offset_ref_c + 6),
+                role: OccurrenceRole::Reference,
+            },
+        ],
+    };
+
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let index = one_doc_index("m.rs", support::provenance(), vec![lookup, offset]);
+    ingest(&mut store, &ws(), &index, &src).unwrap();
+    (
+        store,
+        id_of_pkg("tierscrate", &[("lookup", SegmentKind::Method)]),
+        id_of_pkg("tierscrate", &[("OFFSET", SegmentKind::Term)]),
+    )
 }
 
 // _(Symbol reference resolution — canonical path)_ — a qualified name denoting one symbol resolves
@@ -167,6 +394,167 @@ fn get_signature_returns_signature_without_body() {
     }
 }
 
+// _(Scenario: Retrieve interface by name)_ — a documented Rust symbol at interface detail returns its
+// doc comment together with its signature, without the body.
+#[test]
+fn get_interface_returns_docs_and_signature_without_body() {
+    use silent_cartographer::query::DetailPayload;
+    let (store, double_id, _triple_id) = tier_store();
+    let engine = dep_engine(&store);
+    let answer = engine.get(double_id.as_str(), Detail::Interface).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    match &results[0].payload {
+        DetailPayload::Interface { interface: Some(text) } => {
+            assert!(
+                text.contains("Doubles a number."),
+                "interface carries the doc comment: {text}"
+            );
+            assert!(
+                text.contains("pub fn double(x: u8) -> u8"),
+                "interface carries the signature: {text}"
+            );
+            assert!(!text.contains("x * 2"), "interface omits the body: {text}");
+        }
+        other => panic!("expected an interface, got {other:?}"),
+    }
+}
+
+// _(Scenario: Interface without documentation falls back to signature)_ — a symbol with no
+// documentation of its own returns its signature at interface detail.
+#[test]
+fn get_interface_without_documentation_falls_back_to_signature() {
+    use silent_cartographer::query::DetailPayload;
+    let (store, _double_id, triple_id) = tier_store();
+    let engine = dep_engine(&store);
+
+    let signature = engine.get(triple_id.as_str(), Detail::Signature).unwrap();
+    let Outcome::Found { results: sig_results } = &signature.outcome else {
+        panic!("expected found");
+    };
+    let DetailPayload::Signature {
+        signature: Some(sig_text),
+    } = &sig_results[0].payload
+    else {
+        panic!("expected a signature, got {:?}", sig_results[0].payload);
+    };
+
+    let interface = engine.get(triple_id.as_str(), Detail::Interface).unwrap();
+    let Outcome::Found { results: iface_results } = &interface.outcome else {
+        panic!("expected found");
+    };
+    let DetailPayload::Interface {
+        interface: Some(iface_text),
+    } = &iface_results[0].payload
+    else {
+        panic!("expected an interface, got {:?}", iface_results[0].payload);
+    };
+
+    assert_eq!(
+        iface_text, sig_text,
+        "an undocumented symbol's interface equals its signature"
+    );
+}
+
+// `get --json` at interface detail carries the interface content within the serialized payload.
+#[test]
+fn get_json_interface_detail_carries_interface_content() {
+    let (store, double_id, _triple_id) = tier_store();
+    let engine = dep_engine(&store);
+    let answer = engine.get(double_id.as_str(), Detail::Interface).unwrap();
+    let json = answer.to_json();
+    assert!(
+        json.contains("\"detail\": \"interface\""),
+        "JSON carries the interface detail tag: {json}"
+    );
+    assert!(
+        json.contains("Doubles a number."),
+        "JSON carries the interface content: {json}"
+    );
+}
+
+// _(Scenario: Retrieve module interface)_ — a module whose document opens with `//!` docs returns its
+// signature and the module documentation at interface detail, not the whole document.
+#[test]
+fn get_module_interface_returns_module_documentation_without_whole_document() {
+    use silent_cartographer::query::DetailPayload;
+    let (store, source, module_id) = module_tier_store();
+    let engine = dep_engine(&store);
+    let answer = engine.get(module_id.as_str(), Detail::Interface).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    let docs = silent_cartographer::graph::syntax::SyntaxTree::parse(
+        &source,
+        silent_cartographer::graph::syntax::Language::Rust,
+    )
+    .unwrap()
+    .module_documentation()
+    .unwrap();
+    let qualified = module_id.as_str().split_once("::").map(|(_, rest)| rest).unwrap();
+    let expected = format!("{qualified}\n{}", docs.trim_end());
+    match &results[0].payload {
+        DetailPayload::Interface { interface: Some(text) } => {
+            assert_eq!(
+                text, &expected,
+                "the interface is the module's signature followed by its documentation"
+            );
+            assert!(
+                !text.contains("pub fn helper"),
+                "the interface is not the whole document: {text}"
+            );
+        }
+        other => panic!("expected an interface, got {other:?}"),
+    }
+}
+
+// _(Scenario: Retrieve module body returns the whole document)_ — a module at body detail returns the
+// document byte-for-byte.
+#[test]
+fn get_module_body_returns_whole_document() {
+    use silent_cartographer::query::DetailPayload;
+    let (store, source, module_id) = module_tier_store();
+    let engine = dep_engine(&store);
+    let answer = engine.get(module_id.as_str(), Detail::Body).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    match &results[0].payload {
+        DetailPayload::Body { body: Some(text) } => {
+            assert_eq!(text, &source, "the body is the whole document, byte-for-byte");
+        }
+        other => panic!("expected a body, got {other:?}"),
+    }
+}
+
+// _(Scenario: Retrieve Python interface)_ — a Python function with a docstring at interface detail
+// returns its header and docstring, without the body.
+#[test]
+fn get_python_interface_returns_header_and_docstring_without_body() {
+    use silent_cartographer::query::DetailPayload;
+    let (store, greet_id) = python_tier_store();
+    let engine = dep_engine(&store);
+    let answer = engine.get(greet_id.as_str(), Detail::Interface).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    match &results[0].payload {
+        DetailPayload::Interface { interface: Some(text) } => {
+            assert!(
+                text.contains("def greet(name):"),
+                "interface carries the header: {text}"
+            );
+            assert!(
+                text.contains("Greets somebody."),
+                "interface carries the docstring: {text}"
+            );
+            assert!(!text.contains("return f"), "interface omits the body: {text}");
+        }
+        other => panic!("expected an interface, got {other:?}"),
+    }
+}
+
 // _(Symbol retrieval at a chosen detail — position write-site)_ — `get` for a position returns the
 // enclosing symbol.
 #[test]
@@ -193,14 +581,14 @@ fn get_by_position_returns_enclosing_symbol() {
 fn trace_contains_returns_direct_members() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.trace("net::Client", Relation::Contains).unwrap();
+    let answer = engine.trace("net::Client", Relation::Contains, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
     let names: Vec<&str> = results
         .iter()
         .filter_map(|item| match item {
-            silent_cartographer::query::TraceItem::Symbol(v) => Some(v.name.as_str()),
+            silent_cartographer::query::TraceItem::Symbol { symbol, .. } => Some(symbol.name.as_str()),
             _ => None,
         })
         .collect();
@@ -214,12 +602,14 @@ fn trace_contains_returns_direct_members() {
 fn trace_containers_returns_enclosing_type() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.trace("net::Client::connect", Relation::Containers).unwrap();
+    let answer = engine
+        .trace("net::Client::connect", Relation::Containers, None)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
     match &results[0] {
-        silent_cartographer::query::TraceItem::Symbol(v) => assert_eq!(v.canonical_id, client_id()),
+        silent_cartographer::query::TraceItem::Symbol { symbol, .. } => assert_eq!(symbol.canonical_id, client_id()),
         other => panic!("expected a symbol, got {other:?}"),
     }
 }
@@ -231,7 +621,7 @@ fn trace_references_returns_all_sites() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     // Client is referenced at three sites in the fixture (impl, return type, let binding).
-    let answer = engine.trace("net::Client", Relation::References).unwrap();
+    let answer = engine.trace("net::Client", Relation::References, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -244,7 +634,7 @@ fn trace_references_returns_all_sites() {
 fn trace_type_references_returns_use_sites_with_locations() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.trace("net::Client", Relation::References).unwrap();
+    let answer = engine.trace("net::Client", Relation::References, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -259,6 +649,290 @@ fn trace_type_references_returns_use_sites_with_locations() {
     }
 }
 
+// _(Scenario: Default trace rows carry no tier content)_ — `trace` with no detail requested returns
+// rows identifying symbol and location, carrying no tier content.
+#[test]
+fn trace_default_detail_carries_no_content() {
+    use silent_cartographer::query::TraceItem;
+    let store = built_store();
+    let engine = engine_over(&store, support::provenance());
+    let answer = engine.trace("net::Client", Relation::References, None).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    for item in results {
+        match item {
+            TraceItem::Reference { content, .. } => assert!(content.is_none(), "no detail requested: no content"),
+            other => panic!("expected a reference, got {other:?}"),
+        }
+    }
+    let json = answer.to_json();
+    assert!(
+        !json.contains("\"content\""),
+        "the default JSON shape carries no content field: {json}"
+    );
+}
+
+// _(Scenario: Trace at signature detail)_ — `trace` over `references` at signature detail carries
+// each row's tier content.
+#[test]
+fn trace_signature_detail_carries_tier_content() {
+    use silent_cartographer::query::TraceItem;
+    let store = built_store();
+    let engine = engine_over(&store, support::provenance());
+    let answer = engine
+        .trace("net::Client", Relation::References, Some(Detail::Signature))
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    assert!(!results.is_empty(), "Client has reference sites in the fixture");
+    for item in results {
+        match item {
+            TraceItem::Reference {
+                content,
+                enclosing,
+                location,
+                ..
+            } => {
+                // Each row carries exactly the signature tier of its attribution target: the
+                // enclosing declaration when one is attributed, the document's module otherwise.
+                let expected = match enclosing {
+                    Some(id) => store.symbol(id).unwrap().expect("enclosing persisted").signature_text,
+                    None => store
+                        .module_of_document(&location.document_path)
+                        .unwrap()
+                        .and_then(|row| row.signature_text),
+                };
+                assert_eq!(
+                    content, &expected,
+                    "signature detail carries the attributed declaration's signature tier: {item:?}"
+                );
+                assert!(content.is_some(), "signature detail carries tier content: {item:?}");
+            }
+            other => panic!("expected a reference, got {other:?}"),
+        }
+    }
+}
+
+// _(Scenario: Detail does not change the result set)_ — the same trace at two detail levels returns
+// the same symbols in the same order.
+#[test]
+fn trace_detail_does_not_change_the_result_set() {
+    use silent_cartographer::query::TraceItem;
+    let store = built_store();
+    let engine = engine_over(&store, support::provenance());
+    let location = engine.trace("net::Client", Relation::References, None).unwrap();
+    let signature = engine
+        .trace("net::Client", Relation::References, Some(Detail::Signature))
+        .unwrap();
+
+    let sites = |a: &silent_cartographer::query::output::Answer<TraceItem>| {
+        let Outcome::Found { results } = &a.outcome else {
+            panic!("expected found");
+        };
+        results
+            .iter()
+            .map(|item| match item {
+                TraceItem::Reference { location, .. } => {
+                    (location.document_path.clone(), location.span_start, location.span_end)
+                }
+                other => panic!("expected a reference, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        sites(&location),
+        sites(&signature),
+        "detail does not change which results are returned or their order"
+    );
+}
+
+// _(Scenario: Reference sites project their enclosing declaration)_ — a reference site inside a
+// method body carries the method's signature (the attributed enclosing declaration), not the
+// referenced subject's.
+#[test]
+fn trace_reference_site_projects_enclosing_declaration_signature() {
+    use silent_cartographer::query::TraceItem;
+    let (store, lookup_id, offset_id) = method_reference_store();
+    let engine = dep_engine(&store);
+
+    let answer = engine
+        .trace(offset_id.as_str(), Relation::References, Some(Detail::Signature))
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    assert_eq!(results.len(), 1, "OFFSET is referenced once, inside lookup's body");
+
+    let lookup_row = store.symbol(&lookup_id).unwrap().expect("lookup persisted");
+    let offset_row = store.symbol(&offset_id).unwrap().expect("OFFSET persisted");
+    match &results[0] {
+        TraceItem::Reference { enclosing, content, .. } => {
+            assert_eq!(enclosing.as_ref(), Some(&lookup_id), "the site attributes to lookup");
+            assert_eq!(
+                content.as_deref(),
+                lookup_row.signature_text.as_deref(),
+                "the row carries the enclosing method's signature"
+            );
+            assert_ne!(
+                content.as_deref(),
+                offset_row.signature_text.as_deref(),
+                "the row carries the enclosing declaration's signature, not the referenced subject's"
+            );
+        }
+        other => panic!("expected a reference, got {other:?}"),
+    }
+}
+
+// _(Reference sites project their enclosing declaration — module attribution)_ — a site attributed
+// to the module/file itself (`enclosing_id` NULL) projects the FILE module's tiers even when a
+// re-export-defined module row shares the document with an identical whole-document span: the file
+// module's own definition occurrence spans the document, the re-export's sits on a name token, and
+// that definition width — not row-identity order — decides. The re-export's identity sorts first
+// here precisely so an identity-order tie-break would fail this test.
+#[test]
+fn module_scope_site_projects_the_file_module_over_a_reexport_twin() {
+    use silent_cartographer::query::TraceItem;
+    let store = GraphStore::open_in_memory().unwrap();
+    let doc = "facade.rs";
+    let put_module = |name: &str, signature: &str| {
+        store
+            .insert_symbol(&SymbolRow {
+                canonical_id: dep_id(name),
+                display_name: name.to_string(),
+                kind: "module".to_string(),
+                class: PersistedClass::InWorkspace,
+                document_path: Some(doc.to_string()),
+                span: Some((0, 100)),
+                span_text: Some("whole document".to_string()),
+                signature_text: Some(signature.to_string()),
+                interface_text: Some(signature.to_string()),
+                duplicated: false,
+            })
+            .unwrap();
+    };
+    put_module("alpha_reexport", "alpha_reexport");
+    put_module("zzz_file_module", "zzz_file_module");
+    let put_definition = |name: &str, span: (usize, usize)| {
+        store
+            .insert_occurrence(&OccurrenceRow {
+                symbol_id: dep_id(name),
+                document_path: doc.to_string(),
+                span,
+                role: "definition".to_string(),
+                rule: "exact".to_string(),
+                enclosing_id: None,
+                locality: None,
+            })
+            .unwrap();
+    };
+    put_definition("zzz_file_module", (0, 100));
+    put_definition("alpha_reexport", (10, 24));
+    put_dep_symbol(&store, "target");
+    store
+        .insert_occurrence(&OccurrenceRow {
+            symbol_id: dep_id("target"),
+            document_path: doc.to_string(),
+            span: (40, 46),
+            role: "reference".to_string(),
+            rule: "exact".to_string(),
+            enclosing_id: None,
+            locality: None,
+        })
+        .unwrap();
+
+    let engine = dep_engine(&store);
+    let answer = engine
+        .trace("test-ws::target", Relation::References, Some(Detail::Signature))
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    match &results[0] {
+        TraceItem::Reference { content, .. } => assert_eq!(
+            content.as_deref(),
+            Some("zzz_file_module"),
+            "the module-scope site projects the file module (whole-document definition), not the \
+             re-export module its identity sorts behind"
+        ),
+        other => panic!("expected a reference, got {other:?}"),
+    }
+}
+
+// _(Trace results at a chosen detail — symbol rows)_ — a `containers` row denotes a symbol, so at
+// body detail it carries that symbol's own full body.
+#[test]
+fn trace_containers_at_body_detail_carries_the_container_body() {
+    use silent_cartographer::query::TraceItem;
+    let store = GraphStore::open_in_memory().unwrap();
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: dep_id("Holder"),
+            display_name: "Holder".to_string(),
+            kind: "type".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: Some("m.rs".to_string()),
+            span: Some((0, 40)),
+            span_text: Some("struct Holder {\n    member: u8,\n}".to_string()),
+            signature_text: Some("struct Holder".to_string()),
+            interface_text: Some("struct Holder".to_string()),
+            duplicated: false,
+        })
+        .unwrap();
+    put_dep_symbol(&store, "member");
+    store
+        .insert_edge(EdgeKind::Contains, &dep_id("Holder"), &dep_id("member"))
+        .unwrap();
+
+    let engine = dep_engine(&store);
+    let answer = engine
+        .trace("test-ws::member", Relation::Containers, Some(Detail::Body))
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    match &results[0] {
+        TraceItem::Symbol { symbol, content } => {
+            assert_eq!(symbol.name, "Holder");
+            assert_eq!(
+                content.as_deref(),
+                Some("struct Holder {\n    member: u8,\n}"),
+                "a symbol-denoting row at body detail carries its own full body"
+            );
+        }
+        other => panic!("expected a symbol row, got {other:?}"),
+    }
+}
+
+// _(Trace results at a chosen detail — location is the default projection)_ — explicitly requesting
+// location detail is the no-content shape: the location already sits on every row.
+#[test]
+fn trace_explicit_location_detail_carries_no_content() {
+    use silent_cartographer::query::TraceItem;
+    let store = built_store();
+    let engine = engine_over(&store, support::provenance());
+    let answer = engine
+        .trace("net::Client", Relation::References, Some(Detail::Location))
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    for item in results {
+        match item {
+            TraceItem::Reference { content, .. } => {
+                assert!(content.is_none(), "location detail carries no content field")
+            }
+            other => panic!("expected a reference, got {other:?}"),
+        }
+    }
+    assert!(
+        !answer.to_json().contains("\"content\""),
+        "explicit location detail keeps the no-content JSON shape"
+    );
+}
+
 // _(Relationship trace — empty branch)_ — a subject with no instances of a relation returns typed
 // absence.
 #[test]
@@ -266,7 +940,9 @@ fn trace_empty_relation_is_typed_absence() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     // disconnect has no references in the fixture.
-    let answer = engine.trace("net::Client::disconnect", Relation::References).unwrap();
+    let answer = engine
+        .trace("net::Client::disconnect", Relation::References, None)
+        .unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Empty),
         "empty relation is a typed Empty, not a failure: {:?}",
@@ -317,7 +993,7 @@ fn stale_result_flagged_through_get_and_trace() {
     let get_answer = engine.get("net::Client::connect", Detail::Location).unwrap();
     assert!(get_answer.stale, "get result over changed sources is stale");
 
-    let trace_answer = engine.trace("net::Client", Relation::Contains).unwrap();
+    let trace_answer = engine.trace("net::Client", Relation::Contains, None).unwrap();
     assert!(trace_answer.stale, "trace result over changed sources is stale");
 }
 
@@ -399,7 +1075,9 @@ fn get_unknown_reference_returns_typed_absence_in_json() {
 
     // Absent is distinct from an empty relation: a subject with no instances of a relation yields
     // Empty, and the two render with different outcome tags.
-    let empty = engine.trace("net::Client::disconnect", Relation::References).unwrap();
+    let empty = engine
+        .trace("net::Client::disconnect", Relation::References, None)
+        .unwrap();
     assert!(matches!(empty.outcome, Outcome::Empty));
 
     let absent_json = answer.to_json();
@@ -440,6 +1118,26 @@ fn put_dep_symbol(store: &GraphStore, name: &str) {
             document_path: None,
             span: None,
             span_text: None,
+            signature_text: None,
+            interface_text: None,
+            duplicated: false,
+        })
+        .unwrap();
+}
+
+/// Persist a dependent-graph symbol carrying the given tier content, for detail-projection scenarios.
+fn put_dep_symbol_with_tiers(store: &GraphStore, name: &str, signature: Option<&str>, interface: Option<&str>) {
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: dep_id(name),
+            display_name: name.to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: None,
+            span: None,
+            span_text: None,
+            signature_text: signature.map(str::to_string),
+            interface_text: interface.map(str::to_string),
             duplicated: false,
         })
         .unwrap();
@@ -471,7 +1169,7 @@ fn dependents_reports_kind_and_distance() {
     use silent_cartographer::query::DependentsReport;
     let store = dep_graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 1).unwrap();
+    let answer = engine.dependents("test-ws::seed", 1, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -493,7 +1191,7 @@ fn dependents_reach_ends_within_bound() {
         &[(EdgeKind::Uses, "a", "seed"), (EdgeKind::Uses, "b", "seed")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 1).unwrap();
+    let answer = engine.dependents("test-ws::seed", 1, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -514,7 +1212,7 @@ fn dependents_beyond_bound_aggregates_by_kind_and_distance() {
         &[(EdgeKind::Uses, "mid", "seed"), (EdgeKind::Uses, "outer", "mid")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 1).unwrap();
+    let answer = engine.dependents("test-ws::seed", 1, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -546,7 +1244,7 @@ fn dependents_aggregate_discloses_the_horizon() {
         .collect();
     let store = dep_graph(&name_refs, &edges);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::f0", 1).unwrap();
+    let answer = engine.dependents("test-ws::f0", 1, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -578,7 +1276,7 @@ fn dependents_discloses_cut_when_depth_equals_horizon() {
         .collect();
     let store = dep_graph(&name_refs, &edges);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::f0", DEPENDENTS_HORIZON).unwrap();
+    let answer = engine.dependents("test-ws::f0", DEPENDENTS_HORIZON, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -603,7 +1301,7 @@ fn dependents_discloses_cut_when_depth_exceeds_horizon() {
         .collect();
     let store = dep_graph(&name_refs, &edges);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::f0", DEPENDENTS_HORIZON + 5).unwrap();
+    let answer = engine.dependents("test-ws::f0", DEPENDENTS_HORIZON + 5, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -627,7 +1325,7 @@ fn dependents_shallow_network_ends_within_bound_even_at_large_depth() {
         &[(EdgeKind::Uses, "mid", "seed"), (EdgeKind::Uses, "outer", "mid")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", DEPENDENTS_HORIZON).unwrap();
+    let answer = engine.dependents("test-ws::seed", DEPENDENTS_HORIZON, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -649,7 +1347,7 @@ fn dependents_depth_zero_is_aggregate_only() {
         &[(EdgeKind::Uses, "a", "seed"), (EdgeKind::Uses, "b", "seed")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 0).unwrap();
+    let answer = engine.dependents("test-ws::seed", 0, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -667,7 +1365,7 @@ fn dependents_of_leaf_is_typed_absence() {
     let store = dep_graph(&["lonely"], &[]);
     let engine = dep_engine(&store);
     let answer = engine
-        .dependents("test-ws::lonely", 1)
+        .dependents("test-ws::lonely", 1, None)
         .expect("no dependents is a successful typed answer, not a failure");
     assert!(
         matches!(answer.outcome, Outcome::Empty),
@@ -675,6 +1373,70 @@ fn dependents_of_leaf_is_typed_absence() {
         answer.outcome
     );
     assert!(answer.to_json().contains("\"empty\""), "renders the empty outcome tag");
+}
+
+// _(Scenario: Trace dependents at interface detail)_ — each detailed dependent row carries its own
+// interface tier alongside the edge kind and distance.
+#[test]
+fn trace_dependents_interface_detail_carries_dependent_interface() {
+    use silent_cartographer::query::DependentsReport;
+    let store = GraphStore::open_in_memory().unwrap();
+    put_dep_symbol(&store, "seed");
+    put_dep_symbol_with_tiers(&store, "caller", None, Some("fn caller() -- calls seed"));
+    store
+        .insert_edge(EdgeKind::Uses, &dep_id("caller"), &dep_id("seed"))
+        .unwrap();
+    let engine = dep_engine(&store);
+
+    let answer = engine.dependents("test-ws::seed", 1, Some(Detail::Interface)).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    let report: &DependentsReport = &results[0];
+    assert_eq!(report.detail.len(), 1);
+    assert_eq!(report.detail[0].kind, "uses", "detail carries the connecting kind");
+    assert_eq!(report.detail[0].distance, 1, "detail carries the hop distance");
+    assert_eq!(
+        report.detail[0].content.as_deref(),
+        Some("fn caller() -- calls seed"),
+        "the detailed row carries the dependent's own interface"
+    );
+}
+
+// trace `--json` with detail carries per-row content; dependents beyond-bound aggregate rows carry no
+// content field.
+#[test]
+fn trace_json_with_detail_carries_content_and_aggregates_carry_none() {
+    let store = GraphStore::open_in_memory().unwrap();
+    put_dep_symbol(&store, "seed");
+    put_dep_symbol_with_tiers(&store, "mid", Some("fn mid()"), None);
+    put_dep_symbol(&store, "outer");
+    store
+        .insert_edge(EdgeKind::Uses, &dep_id("mid"), &dep_id("seed"))
+        .unwrap();
+    store
+        .insert_edge(EdgeKind::Uses, &dep_id("outer"), &dep_id("mid"))
+        .unwrap();
+    let engine = dep_engine(&store);
+
+    let answer = engine.dependents("test-ws::seed", 1, Some(Detail::Signature)).unwrap();
+    let json = answer.to_json();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let report = &value["outcome"]["results"][0];
+
+    let detail_rows = report["detail"].as_array().unwrap();
+    assert_eq!(detail_rows.len(), 1, "only mid is within the depth-1 bound");
+    assert_eq!(
+        detail_rows[0]["content"], "fn mid()",
+        "the detailed row carries mid's signature: {detail_rows:?}"
+    );
+
+    let beyond_bound = report["beyond_bound"].as_array().unwrap();
+    assert_eq!(beyond_bound.len(), 1, "outer is aggregated beyond the bound");
+    assert!(
+        beyond_bound[0].get("content").is_none(),
+        "aggregate rows never carry a content field: {beyond_bound:?}"
+    );
 }
 
 // _(`trace` refuses the dependents relation)_ — `trace` cannot express the depth-bounded, horizon
@@ -685,7 +1447,7 @@ fn trace_with_dependents_relation_errors_instead_of_empty() {
     let store = dep_graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
     let engine = dep_engine(&store);
     let err = engine
-        .trace("test-ws::seed", Relation::Dependents)
+        .trace("test-ws::seed", Relation::Dependents, None)
         .expect_err("trace must refuse the dependents relation, not answer empty");
     assert!(
         matches!(err, silent_cartographer::query::QueryError::DependentsNotTraceable),
@@ -708,6 +1470,7 @@ fn depth_with_non_dependents_relation_is_a_teaching_error() {
         "net::Client",
         Relation::Contains,
         Some(2),
+        None,
         false,
     )
     .expect_err("--depth with contains must fail");
@@ -743,8 +1506,8 @@ fn trace_self_description_frames_dependents_as_impact() {
 fn deterministic_ordering_across_repeated_queries() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let first = engine.trace("net::Client", Relation::References).unwrap();
-    let second = engine.trace("net::Client", Relation::References).unwrap();
+    let first = engine.trace("net::Client", Relation::References, None).unwrap();
+    let second = engine.trace("net::Client", Relation::References, None).unwrap();
     let locs = |a: &silent_cartographer::query::output::Answer<silent_cartographer::query::TraceItem>| {
         if let Outcome::Found { results } = &a.outcome {
             results
@@ -877,7 +1640,7 @@ fn python_dependents_trace_carries_kind_and_distance() {
     use silent_cartographer::query::DependentsReport;
     let store = py_store();
     let engine = py_engine(&store);
-    let answer = engine.dependents(py_widget_id().as_str(), 1).unwrap();
+    let answer = engine.dependents(py_widget_id().as_str(), 1, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };

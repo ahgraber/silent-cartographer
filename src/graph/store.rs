@@ -80,6 +80,13 @@ pub struct SymbolRow {
     pub span: Option<(usize, usize)>,
     /// The exact source text of the definition span, if any.
     pub span_text: Option<String>,
+    /// The signature tier: the declaration form without its body. `None` for externals and for
+    /// in-workspace symbols carrying no definition span.
+    pub signature_text: Option<String>,
+    /// The interface tier: the signature together with the symbol's own documentation, equal to
+    /// the signature when the symbol carries no documentation. `None` for externals and for
+    /// in-workspace symbols carrying no definition span.
+    pub interface_text: Option<String>,
     /// Whether this symbol is a true same-descriptor twin: an in-workspace definition whose
     /// identical resolved descriptor is shared by at least one other definition. Distinct
     /// descriptors whose canonical projections merely collide are not duplicated.
@@ -459,8 +466,9 @@ impl GraphStore {
     pub fn insert_symbol(&self, row: &SymbolRow) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO symbols
-                (canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                 signature_text, interface_text, duplicated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 row.canonical_id.as_str(),
                 row.display_name,
@@ -470,6 +478,8 @@ impl GraphStore {
                 row.span.map(|s| s.0 as i64),
                 row.span.map(|s| s.1 as i64),
                 row.span_text,
+                row.signature_text,
+                row.interface_text,
                 row.duplicated as i64,
             ],
         )?;
@@ -625,7 +635,8 @@ impl GraphStore {
     pub fn symbol(&self, id: &CanonicalId) -> rusqlite::Result<Option<SymbolRow>> {
         self.conn
             .query_row(
-                "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
+                "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                        signature_text, interface_text, duplicated
                  FROM symbols WHERE canonical_id = ?1",
                 params![id.as_str()],
                 Self::map_symbol,
@@ -648,14 +659,17 @@ impl GraphStore {
             document_path: r.get(4)?,
             span,
             span_text: r.get(7)?,
-            duplicated: r.get::<_, i64>(8)? != 0,
+            signature_text: r.get(8)?,
+            interface_text: r.get(9)?,
+            duplicated: r.get::<_, i64>(10)? != 0,
         })
     }
 
     /// All symbols whose display name equals `shortname`.
     pub fn symbols_by_shortname(&self, shortname: &str) -> rusqlite::Result<Vec<SymbolRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
+            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                    signature_text, interface_text, duplicated
              FROM symbols WHERE display_name = ?1 ORDER BY canonical_id",
         )?;
         let rows = stmt.query_map(params![shortname], Self::map_symbol)?;
@@ -667,7 +681,8 @@ impl GraphStore {
     pub fn symbols_by_qualified_suffix(&self, qualified: &str) -> rusqlite::Result<Vec<SymbolRow>> {
         let suffix = format!("::{qualified}");
         let mut stmt = self.conn.prepare(
-            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
+            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                    signature_text, interface_text, duplicated
              FROM symbols
              WHERE canonical_id = ?1 OR canonical_id LIKE ?2 ESCAPE '\\'
              ORDER BY canonical_id",
@@ -690,7 +705,8 @@ impl GraphStore {
     /// a query failure.
     pub fn duplicated_groups(&self) -> rusqlite::Result<Vec<DuplicatedGroup>> {
         let mut stmt = self.conn.prepare(
-            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
+            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                    signature_text, interface_text, duplicated
              FROM symbols WHERE class = 'in_workspace' AND duplicated = 1 ORDER BY canonical_id",
         )?;
         let rows: Vec<SymbolRow> = stmt.query_map([], Self::map_symbol)?.collect::<rusqlite::Result<_>>()?;
@@ -746,13 +762,42 @@ impl GraphStore {
     ) -> rusqlite::Result<Option<SymbolRow>> {
         self.conn
             .query_row(
-                "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text, duplicated
+                "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                        signature_text, interface_text, duplicated
                  FROM symbols
                  WHERE document_path = ?1 AND span_start IS NOT NULL
                    AND span_start <= ?2 AND ?2 < span_end
                  ORDER BY (span_end - span_start) ASC, canonical_id ASC
                  LIMIT 1",
                 params![document, byte_offset as i64],
+                Self::map_symbol,
+            )
+            .optional()
+    }
+
+    /// The module-kind symbol persisted for `document` — the symbol a reference site attributes to
+    /// when it carries no narrower enclosing declaration (`enclosing_id` is `None`).
+    ///
+    /// When several module rows share the document, the module whose own definition occurrence in
+    /// that document is widest wins: a file module's definition occurrence spans the whole document,
+    /// while an inline `mod` block's or a re-export-defined module's definition sits on a name token
+    /// — so the file module is selected even when persisted spans tie (a re-export-defined module
+    /// persists the same whole-document span as the file module it is declared in). Ties beyond that
+    /// fall to the wider persisted span, then canonical identity, keeping the answer deterministic.
+    pub fn module_of_document(&self, document: &str) -> rusqlite::Result<Option<SymbolRow>> {
+        self.conn
+            .query_row(
+                "SELECT s.canonical_id, s.display_name, s.kind, s.class, s.document_path, s.span_start, s.span_end,
+                        s.span_text, s.signature_text, s.interface_text, s.duplicated
+                 FROM symbols s
+                 LEFT JOIN occurrences o
+                   ON o.symbol_id = s.canonical_id AND o.document_path = ?1 AND o.role = 'definition'
+                 WHERE s.document_path = ?1 AND s.kind = 'module'
+                 ORDER BY COALESCE(o.span_end - o.span_start, -1) DESC,
+                          (s.span_end - s.span_start) DESC,
+                          s.canonical_id ASC
+                 LIMIT 1",
+                params![document],
                 Self::map_symbol,
             )
             .optional()

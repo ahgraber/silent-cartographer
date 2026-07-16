@@ -18,6 +18,8 @@ pub enum Detail {
     Location,
     /// The symbol's signature, without its body.
     Signature,
+    /// The signature together with the symbol's own documentation.
+    Interface,
     /// The symbol's full source body.
     Body,
 }
@@ -144,8 +146,18 @@ impl<'a> QueryEngine<'a> {
         }
     }
 
-    /// `trace`: return the symbols standing in `relation` to the subject `reference`.
-    pub fn trace(&self, reference: &str, relation: Relation) -> Result<Answer<TraceItem>, QueryError> {
+    /// `trace`: return the symbols standing in `relation` to the subject `reference`, each optionally
+    /// carrying its tier content at `detail`.
+    ///
+    /// `detail` never changes which results are returned or their order — `None` and
+    /// `Some(Detail::Location)` both mean "no content field" (the location is already on every row);
+    /// any other detail projects tier content onto each row, as described on [`TraceItem`].
+    pub fn trace(
+        &self,
+        reference: &str,
+        relation: Relation,
+        detail: Option<Detail>,
+    ) -> Result<Answer<TraceItem>, QueryError> {
         // The dependents relation carries a depth bound and a horizon aggregate that do not fit the
         // plain relation payload; it is answered by `dependents()`, not `trace`. A confident empty
         // answer here would misrepresent a subject that may have many dependents, so this is an error
@@ -170,21 +182,24 @@ impl<'a> QueryEngine<'a> {
                 .contains(&subject.canonical_id)?
                 .into_iter()
                 .filter_map(|id| self.store.symbol(&id).ok().flatten())
-                .map(|row| TraceItem::symbol(symbol_view(&row)))
+                .map(|row| TraceItem::symbol(symbol_view(&row), projected_content(&row, detail)))
                 .collect(),
             Relation::Containers => self
                 .store
                 .containers(&subject.canonical_id)?
                 .into_iter()
                 .filter_map(|id| self.store.symbol(&id).ok().flatten())
-                .map(|row| TraceItem::symbol(symbol_view(&row)))
+                .map(|row| TraceItem::symbol(symbol_view(&row), projected_content(&row, detail)))
                 .collect(),
-            Relation::References => self
-                .store
-                .references_of(&subject.canonical_id)?
-                .into_iter()
-                .map(|occ| TraceItem::reference(&subject, occ))
-                .collect(),
+            Relation::References => {
+                let occs = self.store.references_of(&subject.canonical_id)?;
+                let mut items = Vec::with_capacity(occs.len());
+                for occ in occs {
+                    let content = self.reference_content(&occ.document_path, occ.enclosing_id.as_ref(), detail)?;
+                    items.push(TraceItem::reference(&subject, occ, content));
+                }
+                items
+            }
             Relation::Dependents => unreachable!("returned above"),
         };
 
@@ -199,11 +214,17 @@ impl<'a> QueryEngine<'a> {
     /// it, directly or transitively, to `depth`.
     ///
     /// Detailed results run to the requested depth; each carries the dependent symbol, the connecting
-    /// edge kind, its hop distance, and its location. Dependents deeper than the bound are reported in
-    /// aggregate — counts by edge kind and distance — up to the internal horizon, and the answer
-    /// always discloses whether reach ends within the bound, extends beyond it, or is itself cut off
-    /// at the horizon. A subject with no dependents is typed absence (`Empty`), not a failure.
-    pub fn dependents(&self, reference: &str, depth: u32) -> Result<Answer<DependentsReport>, QueryError> {
+    /// edge kind, its hop distance, its location, and (when `detail` requests it) the dependent's own
+    /// tier content. Dependents deeper than the bound are reported in aggregate — counts by edge kind
+    /// and distance, never carrying tier content — up to the internal horizon, and the answer always
+    /// discloses whether reach ends within the bound, extends beyond it, or is itself cut off at the
+    /// horizon. A subject with no dependents is typed absence (`Empty`), not a failure.
+    pub fn dependents(
+        &self,
+        reference: &str,
+        depth: u32,
+        detail: Option<Detail>,
+    ) -> Result<Answer<DependentsReport>, QueryError> {
         let (provenance, freshness) = self.provenance_and_freshness()?;
         let subject = match self.resolve(reference)? {
             Resolution::Unique(row) => row,
@@ -219,12 +240,12 @@ impl<'a> QueryEngine<'a> {
             return Ok(Answer::empty(provenance, freshness));
         }
 
-        // Split at the depth bound: detail rows up to the bound (already ordered by the store),
+        // Split at the depth bound: detailed rows up to the bound (already ordered by the store),
         // aggregate counts by (distance, kind) beyond it. `cut_at_horizon` is computed independently
         // of that split: a dependent at the horizon depth means deeper reach may exist unexplored,
         // regardless of whether that row is detailed or aggregated, so it must not depend on
         // `depth < DEPENDENTS_HORIZON` to be observed.
-        let mut detail = Vec::new();
+        let mut detailed = Vec::new();
         let mut aggregate: std::collections::BTreeMap<(u32, String), u64> = std::collections::BTreeMap::new();
         let mut beyond_exists = false;
         let mut cut_at_horizon = false;
@@ -238,7 +259,8 @@ impl<'a> QueryEngine<'a> {
                     // store's invariant was violated, not a legitimate absence.
                     return Err(QueryError::MissingSymbol(r.id.clone()));
                 };
-                detail.push(DependentItem {
+                detailed.push(DependentItem {
+                    content: projected_content(&row, detail),
                     symbol: symbol_view(&row),
                     kind: r.kind.clone(),
                     distance: r.depth,
@@ -269,7 +291,7 @@ impl<'a> QueryEngine<'a> {
             depth_bound: depth,
             horizon: DEPENDENTS_HORIZON,
             disclosure,
-            detail,
+            detail: detailed,
             beyond_bound,
         };
         Ok(Answer::found(vec![report], provenance, freshness))
@@ -282,14 +304,37 @@ impl<'a> QueryEngine<'a> {
             Detail::Location => DetailPayload::Location {
                 location: location_of(row),
             },
+            Detail::Signature => DetailPayload::Signature {
+                signature: row.signature_text.clone(),
+            },
+            Detail::Interface => DetailPayload::Interface {
+                interface: row.interface_text.clone(),
+            },
             Detail::Body => DetailPayload::Body {
                 body: row.span_text.clone(),
             },
-            Detail::Signature => DetailPayload::Signature {
-                signature: signature_of(row),
-            },
         };
         SymbolDetail { symbol: view, payload }
+    }
+
+    /// The tier content for a `references` row at `detail`: the tiers of the declaration the
+    /// reference site is attributed to (`enclosing_id`), or, when the site attributes to the
+    /// module/file itself (`enclosing_id` is `None`), the tiers of that document's module symbol.
+    fn reference_content(
+        &self,
+        document_path: &str,
+        enclosing_id: Option<&CanonicalId>,
+        detail: Option<Detail>,
+    ) -> Result<Option<String>, QueryError> {
+        let Some(detail) = detail else { return Ok(None) };
+        if detail == Detail::Location {
+            return Ok(None);
+        }
+        let row = match enclosing_id {
+            Some(id) => self.store.symbol(id)?,
+            None => self.store.module_of_document(document_path)?,
+        };
+        Ok(row.and_then(|row| projected_content(&row, Some(detail))))
     }
 }
 
@@ -316,6 +361,11 @@ pub enum DetailPayload {
         /// The signature text, or `None` when the symbol has no persisted span.
         signature: Option<String>,
     },
+    /// The signature together with the symbol's own documentation.
+    Interface {
+        /// The interface text, or `None` when the symbol has no persisted span.
+        interface: Option<String>,
+    },
     /// The full source body.
     Body {
         /// The exact span text, or `None` when the symbol has no persisted span.
@@ -323,12 +373,24 @@ pub enum DetailPayload {
     },
 }
 
-/// An item returned by `trace`: either a related symbol or a reference occurrence.
+/// An item returned by `trace`: either a related symbol or a reference occurrence, each optionally
+/// carrying tier content projected at the requested detail (`None` when no detail was requested, or
+/// when the projected tier itself carries no content).
+///
+/// A `Symbol` row projects its own tiers; a `Reference` row projects the tiers of the declaration its
+/// site is attributed to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "item", rename_all = "snake_case")]
 pub enum TraceItem {
     /// A symbol standing in the relation (containers / contains).
-    Symbol(SymbolView),
+    Symbol {
+        /// The related symbol's identity and name.
+        #[serde(flatten)]
+        symbol: SymbolView,
+        /// The symbol's own tier content at the requested detail.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+    },
     /// A reference site of the subject (references).
     Reference {
         /// The referenced subject.
@@ -337,15 +399,18 @@ pub enum TraceItem {
         location: Location,
         /// The enclosing declaration the reference is attributed to, if any.
         enclosing: Option<CanonicalId>,
+        /// The tier content of the declaration the site is attributed to, at the requested detail.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
     },
 }
 
 impl TraceItem {
-    fn symbol(view: SymbolView) -> Self {
-        TraceItem::Symbol(view)
+    fn symbol(view: SymbolView, content: Option<String>) -> Self {
+        TraceItem::Symbol { symbol: view, content }
     }
 
-    fn reference(subject: &SymbolRow, occ: OccurrenceRow) -> Self {
+    fn reference(subject: &SymbolRow, occ: OccurrenceRow, content: Option<String>) -> Self {
         TraceItem::Reference {
             subject: symbol_view(subject),
             location: Location {
@@ -354,12 +419,14 @@ impl TraceItem {
                 span_end: occ.span.1,
             },
             enclosing: occ.enclosing_id,
+            content,
         }
     }
 }
 
 /// One detailed dependent in an impact answer: the depending symbol, the kind of dependency edge
-/// that connected it, its hop distance from the subject, and its definition location.
+/// that connected it, its hop distance from the subject, its definition location, and (when
+/// requested) its own tier content at the requested detail.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DependentItem {
     /// The dependent symbol's identity and name.
@@ -370,6 +437,9 @@ pub struct DependentItem {
     pub distance: u32,
     /// The dependent's definition location, or `None` for an external symbol with no source here.
     pub location: Option<Location>,
+    /// The dependent's own tier content at the requested detail, absent when no detail was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 /// An aggregate count of dependents beyond the requested depth: how many were reached at a given
@@ -437,14 +507,15 @@ fn location_of(row: &SymbolRow) -> Option<Location> {
     }
 }
 
-/// The signature of a symbol: the declaration text up to its body.
-///
-/// The signature is the span text truncated at the first `{` (the body opener), or the first `;` if
-/// there is no `{` — the declaration without the body. A symbol whose declaration is not distinct from
-/// its body (e.g. a unit struct) falls back to its full span rather than a contract change (the
-/// open question in `proposal.md`, settled here as a presentation fall-back).
-fn signature_of(row: &SymbolRow) -> Option<String> {
-    let text = row.span_text.as_ref()?;
-    let cut = text.find('{').or_else(|| text.find(';')).unwrap_or(text.len());
-    Some(text[..cut].trim_end().to_string())
+/// The tier content a `trace`/`dependents` row projects at `detail`: `None` when no detail was
+/// requested or the requested detail is `Location` (the location is already on every row), otherwise
+/// the row's persisted tier text at that detail — itself `None` for a tier the row carries no content
+/// for (e.g. an external symbol).
+fn projected_content(row: &SymbolRow, detail: Option<Detail>) -> Option<String> {
+    match detail? {
+        Detail::Location => None,
+        Detail::Signature => row.signature_text.clone(),
+        Detail::Interface => row.interface_text.clone(),
+        Detail::Body => row.span_text.clone(),
+    }
 }

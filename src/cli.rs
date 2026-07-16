@@ -46,13 +46,15 @@ pub enum Command {
     Status(StatusArgs),
 }
 
-/// The detail axis for `get`.
+/// The detail axis for `get` (and, optionally, `trace`).
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum DetailArg {
     /// The definition file and position.
     Location,
     /// The signature, without the body.
     Signature,
+    /// The signature together with the symbol's own documentation.
+    Interface,
     /// The full source body.
     Body,
 }
@@ -62,6 +64,7 @@ impl From<DetailArg> for Detail {
         match d {
             DetailArg::Location => Detail::Location,
             DetailArg::Signature => Detail::Signature,
+            DetailArg::Interface => Detail::Interface,
             DetailArg::Body => Detail::Body,
         }
     }
@@ -123,6 +126,12 @@ pub struct TraceArgs {
     /// Supplying it with any other relation is an error.
     #[arg(long)]
     pub depth: Option<u32>,
+
+    /// Project each result row's tier content at this detail, in addition to its identity and
+    /// location. Omitted, rows carry no tier content and the output shape is unchanged; the flag
+    /// never changes which rows are returned or their order.
+    #[arg(long, value_enum)]
+    pub detail: Option<DetailArg>,
 }
 
 /// Arguments for `status`.

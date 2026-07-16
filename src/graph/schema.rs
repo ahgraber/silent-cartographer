@@ -8,7 +8,7 @@
 /// The current schema version. Bumped on any schema-affecting change under the reproducibility
 /// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
 /// before any table access; the `index_metadata.schema_version` column carries it as provenance.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -50,19 +50,24 @@ CREATE TABLE IF NOT EXISTS index_metadata (
 -- `duplicated` marks a true same-descriptor twin: an in-workspace definition whose identical
 -- resolved descriptor is shared by at least one other definition. Distinct descriptors whose
 -- canonical projections merely collide (and so carry a `#<rank>` disambiguator) are NOT duplicated.
+-- `signature_text` and `interface_text` are the signature and interface tiers: the declaration form
+-- without its body, and the signature together with the symbol's own documentation. Both are NULL
+-- for externals and for in-workspace symbols carrying no definition span.
 -- The reserved `embedding` column holds the deferred semantic-pillar vector; its shape is not yet
 -- committed, so it is a nullable BLOB placeholder that a future additive migration reshapes.
 CREATE TABLE IF NOT EXISTS symbols (
-    canonical_id   TEXT    PRIMARY KEY,
-    display_name   TEXT    NOT NULL,
-    kind           TEXT    NOT NULL,
-    class          TEXT    NOT NULL,
-    document_path  TEXT,
-    span_start     INTEGER,
-    span_end       INTEGER,
-    span_text      TEXT,
-    duplicated     INTEGER NOT NULL DEFAULT 0,
-    embedding      BLOB
+    canonical_id     TEXT    PRIMARY KEY,
+    display_name     TEXT    NOT NULL,
+    kind             TEXT    NOT NULL,
+    class            TEXT    NOT NULL,
+    document_path    TEXT,
+    span_start       INTEGER,
+    span_end         INTEGER,
+    span_text        TEXT,
+    signature_text   TEXT,
+    interface_text   TEXT,
+    duplicated       INTEGER NOT NULL DEFAULT 0,
+    embedding        BLOB
 );
 
 -- One row per occurrence of a symbol. `role` is 'definition' or 'reference'. `rule` is the

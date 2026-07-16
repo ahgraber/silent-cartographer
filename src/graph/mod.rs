@@ -240,15 +240,17 @@ pub fn ingest(
                 .descriptor
                 .as_ref()
                 .is_some_and(|d| definition_count_by_descriptor.get(d).copied().unwrap_or(0) > 1);
-        let (document_path, span, span_text) = definition_span(sym, id, &def_name_span, &source_map, language);
+        let content = definition_content(sym, id, &def_name_span, &source_map, language);
         store.insert_symbol(&SymbolRow {
             canonical_id: id.clone(),
             display_name,
             kind: kind_tag(sym.kind).to_string(),
             class,
-            document_path,
-            span,
-            span_text,
+            document_path: content.document_path,
+            span: content.span,
+            span_text: content.span_text,
+            signature_text: content.signature_text,
+            interface_text: content.interface_text,
             duplicated,
         })?;
     }
@@ -430,38 +432,104 @@ pub fn join_guarded(
     ingest(store, workspace, index, sources)
 }
 
-/// The definition span (document, byte span, exact text) for a symbol, from its aligned definition
-/// name-span expanded to the enclosing declaration's full span.
-fn definition_span(
+/// The definition content persisted for a symbol: its document, byte span, and the body/signature/
+/// interface tier text. All fields default to `None` (no document, no persisted content).
+#[derive(Default)]
+struct DefinitionContent {
+    document_path: Option<String>,
+    span: Option<(usize, usize)>,
+    span_text: Option<String>,
+    signature_text: Option<String>,
+    interface_text: Option<String>,
+}
+
+/// The definition content for a symbol, from its aligned definition name-span expanded to the
+/// enclosing declaration's full span, with the declaration's tier content alongside it.
+///
+/// A symbol whose name-span matches a declaration in its document's syntax tree — the ordinary
+/// case, which includes an inline `mod name { .. }` declaration — persists that declaration's full
+/// span and text as its body, with its signature and interface tiers read off the same tree. A
+/// module-kind symbol whose name-span matches no declaration (a Rust file module's whole-file
+/// definition occurrence, or a Python module's zero-width origin marker) persists the whole
+/// document as its body, its qualified name as its signature, and its signature followed by its
+/// module documentation as its interface (the signature alone when the document carries no
+/// documentation — the same fallback every symbol's interface obeys). Any other
+/// symbol matching no declaration persists its name-span text as body, signature, and interface
+/// alike — the honest, total degradation for a shape the declaration walk did not recognize. An
+/// external symbol, or an in-workspace symbol whose document carries no source, persists no
+/// content.
+fn definition_content(
     sym: &ExtractedSymbol,
     id: &CanonicalId,
     def_name_span: &HashMap<CanonicalId, (String, ByteSpan)>,
     sources: &HashMap<&str, &str>,
     language: Language,
-) -> (Option<String>, Option<(usize, usize)>, Option<String>) {
+) -> DefinitionContent {
     if sym.class == SymbolClass::External {
-        return (None, None, None);
+        return DefinitionContent::default();
     }
     let Some((doc, name_span)) = def_name_span.get(id) else {
-        return (None, None, None);
+        return DefinitionContent::default();
     };
     let Some(source) = sources.get(doc.as_str()) else {
-        return (Some(doc.clone()), None, None);
+        return DefinitionContent {
+            document_path: Some(doc.clone()),
+            ..Default::default()
+        };
     };
-    if let Some(tree) = syntax::SyntaxTree::parse(source, language) {
-        for decl in tree.all_declarations() {
-            if decl.name_span == *name_span {
-                let text = source.get(decl.full_span.start..decl.full_span.end).map(str::to_string);
-                return (
-                    Some(doc.clone()),
-                    Some((decl.full_span.start, decl.full_span.end)),
-                    text,
-                );
-            }
-        }
+    let tree = syntax::SyntaxTree::parse(source, language);
+    let matched = tree.as_ref().and_then(|tree| {
+        tree.all_declarations()
+            .into_iter()
+            .find(|decl| decl.name_span == *name_span)
+    });
+
+    if let Some(decl) = matched {
+        let tree = tree.as_ref().expect("a matched declaration implies a parsed tree");
+        let text = source.get(decl.full_span.start..decl.full_span.end).map(str::to_string);
+        let tiers = tree.declaration_tiers(&decl);
+        return DefinitionContent {
+            document_path: Some(doc.clone()),
+            span: Some((decl.full_span.start, decl.full_span.end)),
+            span_text: text,
+            signature_text: Some(tiers.signature),
+            interface_text: Some(tiers.interface),
+        };
     }
+
+    if sym.kind == SymbolKind::Module {
+        let qualified = qualified_name(id);
+        let interface = match tree.as_ref().and_then(|tree| tree.module_documentation()) {
+            Some(docs) => format!("{qualified}\n{}", docs.trim_end()),
+            None => qualified.to_string(),
+        };
+        return DefinitionContent {
+            document_path: Some(doc.clone()),
+            span: Some((0, source.len())),
+            span_text: Some(source.to_string()),
+            signature_text: Some(qualified.to_string()),
+            interface_text: Some(interface),
+        };
+    }
+
     let text = source.get(name_span.start..name_span.end).map(str::to_string);
-    (Some(doc.clone()), Some((name_span.start, name_span.end)), text)
+    DefinitionContent {
+        document_path: Some(doc.clone()),
+        span: Some((name_span.start, name_span.end)),
+        span_text: text.clone(),
+        signature_text: text.clone(),
+        interface_text: text,
+    }
+}
+
+/// The qualified-name portion of a canonical identity: the identity with its leading workspace
+/// segment stripped (`<workspace>::<qualified>` → `<qualified>`). A trailing `#<rank>`
+/// disambiguator, when the identity carries one, stays — it is part of the identity, not decoration.
+fn qualified_name(id: &CanonicalId) -> &str {
+    id.as_str()
+        .split_once("::")
+        .map(|(_, rest)| rest)
+        .unwrap_or(id.as_str())
 }
 
 /// Map an enclosing syntax-declaration chain to the identity of the nearest persisted declaration.
