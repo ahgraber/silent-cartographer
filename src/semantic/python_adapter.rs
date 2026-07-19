@@ -15,6 +15,7 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 
 use super::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex, SymbolKind, normalize};
+use super::probe::{PROBE_DEADLINE, ProbeOutcome, run_bounded};
 use super::scip::translate_index;
 use super::{Capabilities, SemanticEngine, SemanticError};
 use crate::identity::SegmentKind;
@@ -71,18 +72,32 @@ impl PythonAdapter {
 
     /// Discover the scip-python version by running `<executable> --version`.
     ///
-    /// Fails with a typed [`SemanticError::Unavailable`] naming the tool and how to install it when
-    /// the executable cannot be run.
+    /// The probe is bounded: a missing executable is [`SemanticError::Unavailable`] naming the tool
+    /// and how to install it, and one that is present but does not answer within the probe deadline is
+    /// [`SemanticError::Timeout`] — present but unresponsive, distinct from missing.
     pub fn discover_version(executable: &str) -> Result<String, SemanticError> {
-        let output = Command::new(executable).arg("--version").output().map_err(|e| {
-            SemanticError::Unavailable(format!("cannot run scip-python ({executable}): {e}; {INSTALL_HINT}"))
-        })?;
-        if !output.status.success() {
+        let mut command = Command::new(executable);
+        command.arg("--version");
+        let capture = match run_bounded(command, PROBE_DEADLINE) {
+            Ok(ProbeOutcome::Completed(capture)) => capture,
+            Ok(ProbeOutcome::TimedOut) => {
+                return Err(SemanticError::Timeout(format!(
+                    "scip-python ({executable}) --version did not respond within {}s",
+                    PROBE_DEADLINE.as_secs()
+                )));
+            }
+            Err(e) => {
+                return Err(SemanticError::Unavailable(format!(
+                    "cannot run scip-python ({executable}): {e}; {INSTALL_HINT}"
+                )));
+            }
+        };
+        if !capture.status.success() {
             return Err(SemanticError::Unavailable(format!(
                 "scip-python ({executable}) --version failed; {INSTALL_HINT}"
             )));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(String::from_utf8_lossy(&capture.stdout).trim().to_string())
     }
 
     /// Run the adapter's real `scip-python index` invocation over `project_root`, writing the raw
@@ -205,22 +220,36 @@ fn prepend_to_path(bin: &Path) -> Result<std::ffi::OsString, SemanticError> {
 /// installed-package fingerprint over its site-packages.
 pub fn environment_facts(environment: &Path) -> Result<EnvironmentFacts, SemanticError> {
     let interpreter = environment.join("bin").join("python");
-    let output = Command::new(&interpreter).arg("--version").output().map_err(|e| {
-        SemanticError::Environment(format!(
-            "cannot run the environment's interpreter {}: {e}",
-            interpreter.display()
-        ))
-    })?;
-    if !output.status.success() {
+    let mut command = Command::new(&interpreter);
+    command.arg("--version");
+    // Bounded probe: a present-but-unresponsive interpreter is a distinct timeout the freshness
+    // consumer discloses, never an indefinite hang on a query.
+    let capture = match run_bounded(command, PROBE_DEADLINE) {
+        Ok(ProbeOutcome::Completed(capture)) => capture,
+        Ok(ProbeOutcome::TimedOut) => {
+            return Err(SemanticError::Timeout(format!(
+                "the environment's interpreter {} --version did not respond within {}s",
+                interpreter.display(),
+                PROBE_DEADLINE.as_secs()
+            )));
+        }
+        Err(e) => {
+            return Err(SemanticError::Environment(format!(
+                "cannot run the environment's interpreter {}: {e}",
+                interpreter.display()
+            )));
+        }
+    };
+    if !capture.status.success() {
         return Err(SemanticError::Environment(format!(
             "{} --version failed",
             interpreter.display()
         )));
     }
     // Python prints its version on stdout (stderr on some older builds); take whichever spoke.
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = String::from_utf8_lossy(&capture.stdout).trim().to_string();
     let interpreter_version = if stdout.is_empty() {
-        String::from_utf8_lossy(&output.stderr).trim().to_string()
+        String::from_utf8_lossy(&capture.stderr).trim().to_string()
     } else {
         stdout
     };

@@ -2,13 +2,16 @@
 //! detail, relationship tracing, and the calibrated output contract every answer carries.
 
 pub mod output;
+pub mod page;
 pub mod resolve;
 
-use crate::graph::store::{DEPENDENTS_HORIZON, Freshness, GraphStore, OccurrenceRow, PersistedClass, SymbolRow};
+use crate::graph::store::{
+    DEPENDENTS_HORIZON, EdgeKind, Freshness, GraphStore, OccurrenceRow, PersistedClass, SymbolRow,
+};
 use crate::identity::CanonicalId;
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
 
-use output::{Answer, Location, Provenance, SymbolView};
+use output::{Answer, ContentLines, Location, Provenance, SymbolView};
 use resolve::{Resolution, resolve};
 
 /// The detail level at which `get` retrieves a symbol.
@@ -35,6 +38,11 @@ pub enum Relation {
     References,
     /// The symbols that depend on the subject, directly or transitively (the impact assessment).
     Dependents,
+    /// The modules that import the subject.
+    Importers,
+    /// The types that declare the subject as a supertype — a trait's implementors or a base type's
+    /// subtypes.
+    Implementers,
 }
 
 /// A query error distinct from a typed-absence answer (which is a successful "none").
@@ -111,14 +119,22 @@ impl<'a> QueryEngine<'a> {
         Ok(resolve(self.store, reference)?)
     }
 
-    /// `get`: retrieve the symbol denoted by `reference` at `detail`.
+    /// `get`: retrieve the symbol denoted by `reference` at `detail`, returning a window of its tier
+    /// content — the lines `[from, from + max_lines)`, 1-based — with a `None` `max_lines` meaning "to
+    /// the end of the content."
     ///
     /// An ambiguous reference yields a typed candidate set rather than an arbitrary choice.
-    pub fn get(&self, reference: &str, detail: Detail) -> Result<Answer<SymbolDetail>, QueryError> {
+    pub fn get(
+        &self,
+        reference: &str,
+        detail: Detail,
+        max_lines: Option<usize>,
+        from: usize,
+    ) -> Result<Answer<SymbolDetail>, QueryError> {
         let (provenance, freshness) = self.provenance_and_freshness()?;
         match self.resolve(reference)? {
             Resolution::Unique(row) => {
-                let payload = self.detail_of(&row, detail);
+                let payload = self.detail_of(&row, detail, max_lines, from);
                 Ok(Answer::found(vec![payload], provenance, freshness))
             }
             Resolution::Ambiguous(rows) => {
@@ -129,17 +145,20 @@ impl<'a> QueryEngine<'a> {
         }
     }
 
-    /// `get` by source position: retrieve the symbol enclosing `(document, byte_offset)`.
+    /// `get` by source position: retrieve the symbol enclosing `(document, byte_offset)`, returning a
+    /// window of its tier content as [`QueryEngine::get`] does.
     pub fn get_by_position(
         &self,
         document: &str,
         byte_offset: usize,
         detail: Detail,
+        max_lines: Option<usize>,
+        from: usize,
     ) -> Result<Answer<SymbolDetail>, QueryError> {
         let (provenance, freshness) = self.provenance_and_freshness()?;
         match self.store.symbol_enclosing_position(document, byte_offset)? {
             Some(row) => {
-                let payload = self.detail_of(&row, detail);
+                let payload = self.detail_of(&row, detail, max_lines, from);
                 Ok(Answer::found(vec![payload], provenance, freshness))
             }
             None => Ok(Answer::absent(provenance, freshness)),
@@ -157,6 +176,7 @@ impl<'a> QueryEngine<'a> {
         reference: &str,
         relation: Relation,
         detail: Option<Detail>,
+        max_lines: Option<usize>,
     ) -> Result<Answer<TraceItem>, QueryError> {
         // The dependents relation carries a depth bound and a horizon aggregate that do not fit the
         // plain relation payload; it is answered by `dependents()`, not `trace`. A confident empty
@@ -182,24 +202,51 @@ impl<'a> QueryEngine<'a> {
                 .contains(&subject.canonical_id)?
                 .into_iter()
                 .filter_map(|id| self.store.symbol(&id).ok().flatten())
-                .map(|row| TraceItem::symbol(symbol_view(&row), projected_content(&row, detail)))
+                .map(|row| {
+                    let (content, truncated) = projected_content(&row, detail, max_lines);
+                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
+                })
                 .collect(),
             Relation::Containers => self
                 .store
                 .containers(&subject.canonical_id)?
                 .into_iter()
                 .filter_map(|id| self.store.symbol(&id).ok().flatten())
-                .map(|row| TraceItem::symbol(symbol_view(&row), projected_content(&row, detail)))
+                .map(|row| {
+                    let (content, truncated) = projected_content(&row, detail, max_lines);
+                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
+                })
                 .collect(),
             Relation::References => {
                 let occs = self.store.references_of(&subject.canonical_id)?;
                 let mut items = Vec::with_capacity(occs.len());
                 for occ in occs {
-                    let content = self.reference_content(&occ.document_path, occ.enclosing_id.as_ref(), detail)?;
-                    items.push(TraceItem::reference(&subject, occ, content));
+                    let (content, truncated) =
+                        self.reference_content(&occ.document_path, occ.enclosing_id.as_ref(), detail, max_lines)?;
+                    items.push(TraceItem::reference(&subject, occ, content, truncated));
                 }
                 items
             }
+            Relation::Importers => self
+                .store
+                .edge_sources(EdgeKind::Imports, &subject.canonical_id)?
+                .into_iter()
+                .filter_map(|id| self.store.symbol(&id).ok().flatten())
+                .map(|row| {
+                    let (content, truncated) = projected_content(&row, detail, max_lines);
+                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
+                })
+                .collect(),
+            Relation::Implementers => self
+                .store
+                .edge_sources(EdgeKind::TypeHierarchy, &subject.canonical_id)?
+                .into_iter()
+                .filter_map(|id| self.store.symbol(&id).ok().flatten())
+                .map(|row| {
+                    let (content, truncated) = projected_content(&row, detail, max_lines);
+                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
+                })
+                .collect(),
             Relation::Dependents => unreachable!("returned above"),
         };
 
@@ -224,6 +271,7 @@ impl<'a> QueryEngine<'a> {
         reference: &str,
         depth: u32,
         detail: Option<Detail>,
+        max_lines: Option<usize>,
     ) -> Result<Answer<DependentsReport>, QueryError> {
         let (provenance, freshness) = self.provenance_and_freshness()?;
         let subject = match self.resolve(reference)? {
@@ -259,8 +307,10 @@ impl<'a> QueryEngine<'a> {
                     // store's invariant was violated, not a legitimate absence.
                     return Err(QueryError::MissingSymbol(r.id.clone()));
                 };
+                let (content, content_truncated) = projected_content(&row, detail, max_lines);
                 detailed.push(DependentItem {
-                    content: projected_content(&row, detail),
+                    content,
+                    content_truncated,
                     symbol: symbol_view(&row),
                     kind: r.kind.clone(),
                     distance: r.depth,
@@ -297,44 +347,82 @@ impl<'a> QueryEngine<'a> {
         Ok(Answer::found(vec![report], provenance, freshness))
     }
 
-    /// Render a symbol at a detail level.
-    fn detail_of(&self, row: &SymbolRow, detail: Detail) -> SymbolDetail {
-        let view = symbol_view(row);
-        let payload = match detail {
-            Detail::Location => DetailPayload::Location {
+    /// `find`: return every symbol whose name contains `fragment`, matched case-insensitively,
+    /// independent of exact reference resolution. A fragment matching no symbol is typed absence.
+    pub fn find(&self, fragment: &str) -> Result<Answer<FindItem>, QueryError> {
+        let (provenance, freshness) = self.provenance_and_freshness()?;
+        let rows = self.store.symbols_by_fragment(fragment)?;
+        if rows.is_empty() {
+            return Ok(Answer::absent(provenance, freshness));
+        }
+        let items = rows
+            .iter()
+            .map(|row| FindItem {
+                symbol: symbol_view(row),
                 location: location_of(row),
-            },
-            Detail::Signature => DetailPayload::Signature {
-                signature: row.signature_text.clone(),
-            },
-            Detail::Interface => DetailPayload::Interface {
-                interface: row.interface_text.clone(),
-            },
-            Detail::Body => DetailPayload::Body {
-                body: row.span_text.clone(),
-            },
-        };
-        SymbolDetail { symbol: view, payload }
+            })
+            .collect();
+        Ok(Answer::found(items, provenance, freshness))
     }
 
-    /// The tier content for a `references` row at `detail`: the tiers of the declaration the
-    /// reference site is attributed to (`enclosing_id`), or, when the site attributes to the
-    /// module/file itself (`enclosing_id` is `None`), the tiers of that document's module symbol.
+    /// Render a symbol at a detail level, returning the tier content windowed to the lines
+    /// `[from, from + max_lines)` (1-based). Every content-bearing tier passes through the single
+    /// [`window_content`] cap point; a `location` detail carries no content, so the window is
+    /// irrelevant to it.
+    fn detail_of(&self, row: &SymbolRow, detail: Detail, max_lines: Option<usize>, from: usize) -> SymbolDetail {
+        let view = symbol_view(row);
+        let (payload, content_lines, content_truncated) = match detail {
+            Detail::Location => (
+                DetailPayload::Location {
+                    location: location_of(row),
+                },
+                None,
+                false,
+            ),
+            Detail::Signature => {
+                let (signature, lines, truncated) = window_content(row.signature_text.clone(), from, max_lines);
+                (DetailPayload::Signature { signature }, lines, truncated)
+            }
+            Detail::Interface => {
+                let (interface, lines, truncated) = window_content(row.interface_text.clone(), from, max_lines);
+                (DetailPayload::Interface { interface }, lines, truncated)
+            }
+            Detail::Body => {
+                let (body, lines, truncated) = window_content(row.span_text.clone(), from, max_lines);
+                (DetailPayload::Body { body }, lines, truncated)
+            }
+        };
+        SymbolDetail {
+            symbol: view,
+            payload,
+            content_lines,
+            content_truncated,
+        }
+    }
+
+    /// The tier content for a `references` row at `detail`, capped at `max_lines`: the tiers of the
+    /// declaration the reference site is attributed to (`enclosing_id`), or, when the site attributes
+    /// to the module/file itself (`enclosing_id` is `None`), the tiers of that document's module
+    /// symbol. The `bool` reports whether the content was truncated by the cap.
     fn reference_content(
         &self,
         document_path: &str,
         enclosing_id: Option<&CanonicalId>,
         detail: Option<Detail>,
-    ) -> Result<Option<String>, QueryError> {
-        let Some(detail) = detail else { return Ok(None) };
+        max_lines: Option<usize>,
+    ) -> Result<(Option<String>, bool), QueryError> {
+        let Some(detail) = detail else { return Ok((None, false)) };
         if detail == Detail::Location {
-            return Ok(None);
+            return Ok((None, false));
         }
         let row = match enclosing_id {
             Some(id) => self.store.symbol(id)?,
             None => self.store.module_of_document(document_path)?,
         };
-        Ok(row.and_then(|row| projected_content(&row, Some(detail))))
+        match row {
+            Some(row) => Ok(projected_content(&row, Some(detail), max_lines)),
+            None => Ok((None, false)),
+        }
     }
 }
 
@@ -345,6 +433,14 @@ pub struct SymbolDetail {
     pub symbol: SymbolView,
     /// The detail payload.
     pub payload: DetailPayload,
+    /// The line window the content covers, disclosed only when the content is windowed or truncated
+    /// (i.e. it is not the whole tier text); absent when the whole content is returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_lines: Option<ContentLines>,
+    /// Whether the payload's content is a proper subset of the whole tier text — the window did not
+    /// cover it end to end (`--from` past line 1, or `--max-lines` cut the tail).
+    #[serde(skip_serializing_if = "is_false")]
+    pub content_truncated: bool,
 }
 
 /// The payload of a `get` at a chosen detail.
@@ -382,14 +478,21 @@ pub enum DetailPayload {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "item", rename_all = "snake_case")]
 pub enum TraceItem {
-    /// A symbol standing in the relation (containers / contains).
+    /// A symbol standing in the relation (containers / contains / importers / implementers).
     Symbol {
         /// The related symbol's identity and name.
         #[serde(flatten)]
         symbol: SymbolView,
+        /// The symbol's own definition location, absent for an external symbol with no source in
+        /// this workspace.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        location: Option<Location>,
         /// The symbol's own tier content at the requested detail.
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// Whether that content was truncated by the `--max-lines` bound.
+        #[serde(skip_serializing_if = "is_false")]
+        content_truncated: bool,
     },
     /// A reference site of the subject (references).
     Reference {
@@ -402,15 +505,23 @@ pub enum TraceItem {
         /// The tier content of the declaration the site is attributed to, at the requested detail.
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// Whether that content was truncated by the `--max-lines` bound.
+        #[serde(skip_serializing_if = "is_false")]
+        content_truncated: bool,
     },
 }
 
 impl TraceItem {
-    fn symbol(view: SymbolView, content: Option<String>) -> Self {
-        TraceItem::Symbol { symbol: view, content }
+    fn symbol(view: SymbolView, location: Option<Location>, content: Option<String>, content_truncated: bool) -> Self {
+        TraceItem::Symbol {
+            symbol: view,
+            location,
+            content,
+            content_truncated,
+        }
     }
 
-    fn reference(subject: &SymbolRow, occ: OccurrenceRow, content: Option<String>) -> Self {
+    fn reference(subject: &SymbolRow, occ: OccurrenceRow, content: Option<String>, content_truncated: bool) -> Self {
         TraceItem::Reference {
             subject: symbol_view(subject),
             location: Location {
@@ -420,8 +531,20 @@ impl TraceItem {
             },
             enclosing: occ.enclosing_id,
             content,
+            content_truncated,
         }
     }
+}
+
+/// One symbol returned by `find`: its identity and name, plus its definition location, when it has
+/// one (`None` for an external symbol with no source in this workspace).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FindItem {
+    /// The matched symbol's identity and name.
+    #[serde(flatten)]
+    pub symbol: SymbolView,
+    /// The symbol's definition location, or `None` for an external symbol.
+    pub location: Option<Location>,
 }
 
 /// One detailed dependent in an impact answer: the depending symbol, the kind of dependency edge
@@ -440,6 +563,9 @@ pub struct DependentItem {
     /// The dependent's own tier content at the requested detail, absent when no detail was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Whether that content was truncated by the `--max-lines` bound.
+    #[serde(skip_serializing_if = "is_false")]
+    pub content_truncated: bool,
 }
 
 /// An aggregate count of dependents beyond the requested depth: how many were reached at a given
@@ -507,15 +633,180 @@ fn location_of(row: &SymbolRow) -> Option<Location> {
     }
 }
 
-/// The tier content a `trace`/`dependents` row projects at `detail`: `None` when no detail was
-/// requested or the requested detail is `Location` (the location is already on every row), otherwise
-/// the row's persisted tier text at that detail — itself `None` for a tier the row carries no content
-/// for (e.g. an external symbol).
-fn projected_content(row: &SymbolRow, detail: Option<Detail>) -> Option<String> {
-    match detail? {
-        Detail::Location => None,
-        Detail::Signature => row.signature_text.clone(),
-        Detail::Interface => row.interface_text.clone(),
-        Detail::Body => row.span_text.clone(),
+/// The tier content a `trace`/`dependents` row projects at `detail`, capped to its first `max_lines`
+/// lines: `None` when no detail was requested or the requested detail is `Location` (the location is
+/// already on every row), otherwise the row's persisted tier text at that detail — itself `None` for a
+/// tier the row carries no content for (e.g. an external symbol). The `bool` reports whether the cap
+/// truncated the content. Trace rows are never windowed (they start at line 1); every content-bearing
+/// path routes through the single [`cap_lines`] cap point.
+fn projected_content(row: &SymbolRow, detail: Option<Detail>, max_lines: Option<usize>) -> (Option<String>, bool) {
+    let raw = match detail {
+        None | Some(Detail::Location) => None,
+        Some(Detail::Signature) => row.signature_text.clone(),
+        Some(Detail::Interface) => row.interface_text.clone(),
+        Some(Detail::Body) => row.span_text.clone(),
+    };
+    cap_lines(raw, max_lines)
+}
+
+/// Cap `text` to its first `max_lines` lines, reporting whether the tail was dropped. Lines are split
+/// on `\n`, which never falls inside a multibyte UTF-8 code point (a `\n` byte cannot appear as a
+/// continuation byte), so the cut is always on a line boundary and never splits a character. A `None`
+/// bound, or content already within the bound, passes through untruncated. This is the row-content
+/// cap point for `trace`/`dependents`; `get` windows content through [`window_content`].
+fn cap_lines(text: Option<String>, max_lines: Option<usize>) -> (Option<String>, bool) {
+    match (text, max_lines) {
+        (Some(text), Some(max)) => {
+            let total = text.split('\n').count();
+            if max == 0 || total <= max {
+                (Some(text), false)
+            } else {
+                let kept = text.split('\n').take(max).collect::<Vec<_>>().join("\n");
+                (Some(kept), true)
+            }
+        }
+        (text, _) => (text, false),
+    }
+}
+
+/// The single content-window point for `get`: return the lines `[from, from + max_lines)` of `text`
+/// (1-based `from`), with a `None` `max_lines` meaning "to the end." Alongside the windowed text it
+/// returns the [`ContentLines`] disclosure (present only when the window is a proper subset of the
+/// whole text) and whether the content was truncated (the window did not cover the whole text).
+///
+/// Lines split on `\n` and rejoin with `\n`, so taking the whole text reconstructs it byte-for-byte.
+/// A `from` past the end of the content returns empty content with a disclosure naming the total line
+/// count — a data-dependent outcome, not an error.
+fn window_content(
+    text: Option<String>,
+    from: usize,
+    max_lines: Option<usize>,
+) -> (Option<String>, Option<ContentLines>, bool) {
+    let Some(text) = text else {
+        return (None, None, false);
+    };
+    let lines: Vec<&str> = text.split('\n').collect();
+    let total = lines.len();
+    let start = from;
+
+    // Requested past the end: no lines to return, but the total is disclosed so a caller can recover.
+    if start > total {
+        let disclosure = ContentLines {
+            start,
+            end: start - 1,
+            total,
+        };
+        return (Some(String::new()), Some(disclosure), true);
+    }
+
+    // `max_lines` of `None` (unbounded) or `0` both mean "to the end of the content."
+    let count = match max_lines {
+        None | Some(0) => total - (start - 1),
+        Some(n) => n,
+    };
+    // Saturating: a caller-supplied `--max-lines` near `usize::MAX` must not overflow `start - 1 +
+    // count`; the window simply reaches the end of the content.
+    let end = (start - 1).saturating_add(count).min(total);
+    let windowed = lines[(start - 1)..end].join("\n");
+    let covers_whole = start == 1 && end == total;
+    let disclosure = (!covers_whole).then_some(ContentLines { start, end, total });
+    (Some(windowed), disclosure, !covers_whole)
+}
+
+/// Whether a truncation flag is unset — the `skip_serializing_if` predicate that keeps an untruncated
+/// result's shape unchanged.
+fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cap_lines, window_content};
+    use crate::query::output::ContentLines;
+
+    // _(Content bounded with truncation disclosed — line cap)_ — a row-content cap keeps the first
+    // `max_lines` lines and discloses the drop; the whole text passes through untouched otherwise.
+    #[test]
+    fn cap_lines_keeps_the_first_n_lines() {
+        let text = || Some("one\ntwo\nthree\nfour".to_string());
+        assert_eq!(cap_lines(text(), Some(2)), (Some("one\ntwo".to_string()), true));
+        // A bound at or beyond the line count passes the text through untruncated.
+        assert_eq!(cap_lines(text(), Some(4)), (text(), false));
+        assert_eq!(cap_lines(text(), Some(9)), (text(), false));
+        // No bound, or no content, passes through with no disclosure.
+        assert_eq!(cap_lines(text(), None), (text(), false));
+        assert_eq!(cap_lines(None, Some(2)), (None, false));
+    }
+
+    // _(Content bounded with truncation disclosed — UTF-8 safety)_ — splitting on `\n` never lands
+    // inside a multibyte code point, so lines carrying multibyte characters survive the cap intact.
+    #[test]
+    fn cap_lines_preserves_multibyte_lines() {
+        // Each line holds multibyte characters (é, 😀, 汉); a byte-based cut could split one, a
+        // line-based cut cannot.
+        let text = || Some("café\n😀 emoji\n汉字".to_string());
+        assert_eq!(
+            cap_lines(text(), Some(2)),
+            (Some("café\n😀 emoji".to_string()), true),
+            "the kept lines are byte-for-byte intact"
+        );
+        assert_eq!(cap_lines(text(), Some(3)), (text(), false));
+    }
+
+    // _(Windowed content access on `get`)_ — the window is the lines `[from, from + max_lines)`, the
+    // disclosure carries its position and the total, and the whole text carries neither.
+    #[test]
+    fn window_content_returns_the_requested_slice_and_discloses_it() {
+        let text = || Some("l1\nl2\nl3\nl4\nl5".to_string());
+
+        // A middle window: three lines from line 2, truncated on both ends, position disclosed.
+        assert_eq!(
+            window_content(text(), 2, Some(3)),
+            (
+                Some("l2\nl3\nl4".to_string()),
+                Some(ContentLines {
+                    start: 2,
+                    end: 4,
+                    total: 5,
+                }),
+                true,
+            )
+        );
+
+        // The whole text (from line 1, unbounded): no disclosure, not truncated, byte-for-byte.
+        assert_eq!(window_content(text(), 1, None), (text(), None, false));
+        // From line 1 with a bound covering everything is also the whole text.
+        assert_eq!(window_content(text(), 1, Some(5)), (text(), None, false));
+
+        // A window reaching the end but starting past line 1 is truncated (it omits the head).
+        assert_eq!(
+            window_content(text(), 4, None),
+            (
+                Some("l4\nl5".to_string()),
+                Some(ContentLines {
+                    start: 4,
+                    end: 5,
+                    total: 5,
+                }),
+                true,
+            )
+        );
+
+        // Past the end: empty content, disclosure names the total line count, truncated.
+        assert_eq!(
+            window_content(text(), 9, Some(3)),
+            (
+                Some(String::new()),
+                Some(ContentLines {
+                    start: 9,
+                    end: 8,
+                    total: 5,
+                }),
+                true,
+            )
+        );
+
+        // No content passes through with no disclosure.
+        assert_eq!(window_content(None, 1, Some(3)), (None, None, false));
     }
 }

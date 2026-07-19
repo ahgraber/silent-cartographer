@@ -1,5 +1,6 @@
-//! The `c10r` command-line surface: two query meta-operations (`get`, `trace`) and the operational
-//! pair (`build`, `status`).
+//! The `c10r` command-line surface: the query commands (`get`, `trace`, `find`), the operational
+//! set (`build`, `status`, `doctor`, `cache`), and the self-describing surface (`manifest`,
+//! `completions`).
 //!
 //! `get` folds definition-lookup and enclosure-by-position onto a detail axis; `trace` folds the
 //! relation taxonomy onto a relation argument. Every answer carries the calibrated output contract
@@ -8,6 +9,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 
 use crate::graph::syntax::Language;
 use crate::query::{Detail, Relation};
@@ -29,8 +31,23 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// When to apply color and styling to the human rendering.
+    #[arg(long, value_enum, default_value = "auto", global = true)]
+    pub color: ColorArg,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// When the human rendering applies color and styling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ColorArg {
+    /// Style only when standard output is a terminal.
+    Auto,
+    /// Always apply styling.
+    Always,
+    /// Never apply styling.
+    Never,
 }
 
 /// The top-level commands.
@@ -40,10 +57,28 @@ pub enum Command {
     Get(GetArgs),
     /// Return the symbols standing in a named relation to a subject.
     Trace(TraceArgs),
+    /// Return the indexed symbols whose name contains a fragment, matched case-insensitively.
+    ///
+    /// Case folding is ASCII-only: an ASCII letter in the fragment matches regardless of case, while
+    /// a non-ASCII character matches only exactly.
+    Find(FindArgs),
     /// Build or refresh the index for the workspace.
     Build(BuildArgs),
     /// Report the index's provenance, freshness, and join-alignment counts.
     Status(StatusArgs),
+    /// Report whether each required language indexer is present, and its version.
+    Doctor,
+    /// Remove the stored index at the discovered `--db` path.
+    Cache,
+    /// Emit the command/flag structure and the current index state as JSON, for machine
+    /// orientation; always JSON, regardless of `--json`.
+    Manifest,
+    /// Emit a shell completion script for a supported shell, generated from the same command
+    /// definition the parser executes, so the completed surface cannot drift from the real one.
+    ///
+    /// Install the emitted script into your shell's completion path, e.g. `c10r completions zsh >
+    /// ~/.zfunc/_c10r`; see the README for the install pattern per shell.
+    Completions(CompletionsArgs),
 }
 
 /// The detail axis for `get` (and, optionally, `trace`).
@@ -83,6 +118,11 @@ pub enum RelationArg {
     /// assessment — "what could break if this symbol changes." Reference-grade, so any mention counts
     /// (a type usage or constant read, not only a call); the set is inclusive by design.
     Dependents,
+    /// The modules that import the subject.
+    Importers,
+    /// The types that declare the subject as a supertype — a trait's implementors or a base type's
+    /// subtypes.
+    Implementers,
 }
 
 impl From<RelationArg> for Relation {
@@ -92,23 +132,55 @@ impl From<RelationArg> for Relation {
             RelationArg::Contains => Relation::Contains,
             RelationArg::References => Relation::References,
             RelationArg::Dependents => Relation::Dependents,
+            RelationArg::Importers => Relation::Importers,
+            RelationArg::Implementers => Relation::Implementers,
         }
     }
+}
+
+/// The result-set paging bounds shared by the query commands (`get`, `trace`, `find`). Defined
+/// per-command rather than globally so clap rejects them on commands they are meaningless for
+/// (`build`, `status`, `doctor`, `cache`, `manifest`) as a usage error before any side effect.
+#[derive(Debug, Args)]
+pub struct PageArgs {
+    /// Cap the number of results a result-bearing answer returns. Defaults to 25; `0` means
+    /// unbounded (the whole set, with no page block).
+    #[arg(long, default_value_t = 25)]
+    pub limit: usize,
+
+    /// Resume a prior result set from its opaque continuation token.
+    #[arg(long)]
+    pub cursor: Option<String>,
 }
 
 /// Arguments for `get`.
 #[derive(Debug, Args)]
 pub struct GetArgs {
     /// The symbol reference (identity, qualified name, or shortname). Omit when using `--at`.
+    #[arg(conflicts_with = "at")]
     pub reference: Option<String>,
 
     /// The detail level to retrieve.
     #[arg(long, value_enum, default_value = "location")]
     pub detail: DetailArg,
 
-    /// Retrieve the symbol enclosing a source position, given as `path:byte_offset`.
+    /// Retrieve the symbol enclosing a source position, given as `path:byte_offset`. Mutually
+    /// exclusive with a positional reference.
     #[arg(long)]
     pub at: Option<String>,
+
+    /// Cap the lines of content returned for a content-bearing detail (signature, interface, body).
+    /// Defaults to 100; `0` means unbounded. Applies only to a content-bearing detail.
+    #[arg(long, default_value_t = 100)]
+    pub max_lines: usize,
+
+    /// The 1-based line within the retrieved content where the returned window starts (default 1).
+    /// The window is the lines `[from, from + max-lines)`. Applies only to a content-bearing detail.
+    #[arg(long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub from: usize,
+
+    #[command(flatten)]
+    pub paging: PageArgs,
 }
 
 /// Arguments for `trace`.
@@ -132,6 +204,32 @@ pub struct TraceArgs {
     /// never changes which rows are returned or their order.
     #[arg(long, value_enum)]
     pub detail: Option<DetailArg>,
+
+    /// Cap the lines of content projected onto each row, for a content-bearing detail. Defaults to
+    /// 10; `0` means unbounded. Applies only when `--detail` selects a content-bearing tier.
+    #[arg(long, default_value_t = 10)]
+    pub max_lines: usize,
+
+    #[command(flatten)]
+    pub paging: PageArgs,
+}
+
+/// Arguments for `find`.
+#[derive(Debug, Args)]
+pub struct FindArgs {
+    /// The name fragment to search for.
+    pub fragment: String,
+
+    #[command(flatten)]
+    pub paging: PageArgs,
+}
+
+/// Arguments for `completions`.
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// The shell to generate a completion script for. An unsupported value is rejected with the
+    /// supported set.
+    pub shell: Shell,
 }
 
 /// Arguments for `status`.

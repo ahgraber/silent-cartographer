@@ -345,7 +345,7 @@ fn get_location_returns_definition_position() {
     use silent_cartographer::query::DetailPayload;
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.get("net::Client::connect", Detail::Location).unwrap();
+    let answer = engine.get("net::Client::connect", Detail::Location, None, 1).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -364,7 +364,7 @@ fn get_body_returns_exact_span_text() {
     use silent_cartographer::query::DetailPayload;
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.get("net::Client::connect", Detail::Body).unwrap();
+    let answer = engine.get("net::Client::connect", Detail::Body, None, 1).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -381,7 +381,7 @@ fn get_signature_returns_signature_without_body() {
     use silent_cartographer::query::DetailPayload;
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.get("net::Client::connect", Detail::Signature).unwrap();
+    let answer = engine.get("net::Client::connect", Detail::Signature, None, 1).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -401,7 +401,7 @@ fn get_interface_returns_docs_and_signature_without_body() {
     use silent_cartographer::query::DetailPayload;
     let (store, double_id, _triple_id) = tier_store();
     let engine = dep_engine(&store);
-    let answer = engine.get(double_id.as_str(), Detail::Interface).unwrap();
+    let answer = engine.get(double_id.as_str(), Detail::Interface, None, 1).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -429,7 +429,7 @@ fn get_interface_without_documentation_falls_back_to_signature() {
     let (store, _double_id, triple_id) = tier_store();
     let engine = dep_engine(&store);
 
-    let signature = engine.get(triple_id.as_str(), Detail::Signature).unwrap();
+    let signature = engine.get(triple_id.as_str(), Detail::Signature, None, 1).unwrap();
     let Outcome::Found { results: sig_results } = &signature.outcome else {
         panic!("expected found");
     };
@@ -440,7 +440,7 @@ fn get_interface_without_documentation_falls_back_to_signature() {
         panic!("expected a signature, got {:?}", sig_results[0].payload);
     };
 
-    let interface = engine.get(triple_id.as_str(), Detail::Interface).unwrap();
+    let interface = engine.get(triple_id.as_str(), Detail::Interface, None, 1).unwrap();
     let Outcome::Found { results: iface_results } = &interface.outcome else {
         panic!("expected found");
     };
@@ -462,7 +462,7 @@ fn get_interface_without_documentation_falls_back_to_signature() {
 fn get_json_interface_detail_carries_interface_content() {
     let (store, double_id, _triple_id) = tier_store();
     let engine = dep_engine(&store);
-    let answer = engine.get(double_id.as_str(), Detail::Interface).unwrap();
+    let answer = engine.get(double_id.as_str(), Detail::Interface, None, 1).unwrap();
     let json = answer.to_json();
     assert!(
         json.contains("\"detail\": \"interface\""),
@@ -481,7 +481,7 @@ fn get_module_interface_returns_module_documentation_without_whole_document() {
     use silent_cartographer::query::DetailPayload;
     let (store, source, module_id) = module_tier_store();
     let engine = dep_engine(&store);
-    let answer = engine.get(module_id.as_str(), Detail::Interface).unwrap();
+    let answer = engine.get(module_id.as_str(), Detail::Interface, None, 1).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -516,7 +516,7 @@ fn get_module_body_returns_whole_document() {
     use silent_cartographer::query::DetailPayload;
     let (store, source, module_id) = module_tier_store();
     let engine = dep_engine(&store);
-    let answer = engine.get(module_id.as_str(), Detail::Body).unwrap();
+    let answer = engine.get(module_id.as_str(), Detail::Body, None, 1).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -535,7 +535,7 @@ fn get_python_interface_returns_header_and_docstring_without_body() {
     use silent_cartographer::query::DetailPayload;
     let (store, greet_id) = python_tier_store();
     let engine = dep_engine(&store);
-    let answer = engine.get(greet_id.as_str(), Detail::Interface).unwrap();
+    let answer = engine.get(greet_id.as_str(), Detail::Interface, None, 1).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -564,7 +564,9 @@ fn get_by_position_returns_enclosing_symbol() {
     // A byte offset inside connect's body. Find "connect(&self) {}" and point just after the brace.
     let idx = support::SOURCE.find("pub fn connect").unwrap();
     let inside = idx + "pub fn connect(&self) {".len(); // inside the method body span
-    let answer = engine.get_by_position(support::DOC, inside, Detail::Location).unwrap();
+    let answer = engine
+        .get_by_position(support::DOC, inside, Detail::Location, None, 1)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -581,7 +583,7 @@ fn get_by_position_returns_enclosing_symbol() {
 fn trace_contains_returns_direct_members() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.trace("net::Client", Relation::Contains, None).unwrap();
+    let answer = engine.trace("net::Client", Relation::Contains, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -596,6 +598,104 @@ fn trace_contains_returns_direct_members() {
     assert!(names.contains(&"disconnect"), "Client contains disconnect: {names:?}");
 }
 
+// _(Symbol rows carry their definition location)_ — a `contains` row's `Symbol` variant carries the
+// member's own definition location (document path and span), present in both the JSON answer and the
+// human row (`at <path>:<start>-<end>`); a member with no persisted span (external) carries no
+// location, honestly rendered without the suffix rather than a fabricated one.
+#[test]
+fn trace_contains_symbol_rows_carry_definition_location() {
+    use silent_cartographer::query::TraceItem;
+
+    let store = GraphStore::open_in_memory().unwrap();
+    put_dep_symbol(&store, "subject");
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: dep_id("member"),
+            display_name: "member".to_string(),
+            kind: "method".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: Some("m.rs".to_string()),
+            span: Some((10, 20)),
+            span_text: None,
+            signature_text: None,
+            interface_text: None,
+            duplicated: false,
+        })
+        .unwrap();
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: dep_id("ext_member"),
+            display_name: "ext_member".to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::External,
+            document_path: None,
+            span: None,
+            span_text: None,
+            signature_text: None,
+            interface_text: None,
+            duplicated: false,
+        })
+        .unwrap();
+    store
+        .insert_edge(EdgeKind::Contains, &dep_id("subject"), &dep_id("member"))
+        .unwrap();
+    store
+        .insert_edge(EdgeKind::Contains, &dep_id("subject"), &dep_id("ext_member"))
+        .unwrap();
+    let engine = dep_engine(&store);
+
+    let answer = engine
+        .trace("test-ws::subject", Relation::Contains, None, None)
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    assert_eq!(results.len(), 2);
+
+    for item in results {
+        match item {
+            TraceItem::Symbol { symbol, location, .. } if symbol.name == "member" => {
+                let loc = location.as_ref().expect("the in-workspace member carries a location");
+                assert_eq!(loc.document_path, "m.rs");
+                assert_eq!((loc.span_start, loc.span_end), (10, 20));
+            }
+            TraceItem::Symbol { symbol, location, .. } if symbol.name == "ext_member" => {
+                assert!(location.is_none(), "the external member carries no location, honestly");
+            }
+            other => panic!("expected a symbol row, got {other:?}"),
+        }
+    }
+
+    // The same disclosure holds on the JSON answer's own shape.
+    let value: serde_json::Value = serde_json::from_str(&answer.to_json()).unwrap();
+    let json_results = value["outcome"]["results"].as_array().unwrap();
+    let member = json_results.iter().find(|r| r["name"] == "member").unwrap();
+    assert_eq!(member["location"]["document_path"], "m.rs");
+    assert_eq!(member["location"]["span_start"], 10);
+    assert_eq!(member["location"]["span_end"], 20);
+    let ext = json_results.iter().find(|r| r["name"] == "ext_member").unwrap();
+    assert!(
+        ext.get("location").is_none(),
+        "the external member's JSON row carries no location key: {ext}"
+    );
+
+    // And on the human render: the in-workspace member's row names its location; the external
+    // member's row carries no `at <path:span>` suffix.
+    let human = silent_cartographer::render::to_human(&answer, false);
+    let member_line = human
+        .lines()
+        .find(|l| l.contains("member") && !l.contains("ext_member"));
+    assert!(
+        member_line.is_some_and(|l| l.contains(" at m.rs:10-20")),
+        "the human row names the member's location: {human}"
+    );
+    let ext_line = human.lines().find(|l| l.contains("ext_member")).unwrap();
+    assert!(
+        !ext_line.contains(" at "),
+        "the external member's human row carries no location suffix: {ext_line}"
+    );
+}
+
 // _(Relationship trace — containers write-site)_ — `trace` over `containers` for a method returns its
 // enclosing type.
 #[test]
@@ -603,7 +703,7 @@ fn trace_containers_returns_enclosing_type() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     let answer = engine
-        .trace("net::Client::connect", Relation::Containers, None)
+        .trace("net::Client::connect", Relation::Containers, None, None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
@@ -621,7 +721,7 @@ fn trace_references_returns_all_sites() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     // Client is referenced at three sites in the fixture (impl, return type, let binding).
-    let answer = engine.trace("net::Client", Relation::References, None).unwrap();
+    let answer = engine.trace("net::Client", Relation::References, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -634,7 +734,7 @@ fn trace_references_returns_all_sites() {
 fn trace_type_references_returns_use_sites_with_locations() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.trace("net::Client", Relation::References, None).unwrap();
+    let answer = engine.trace("net::Client", Relation::References, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -656,7 +756,7 @@ fn trace_default_detail_carries_no_content() {
     use silent_cartographer::query::TraceItem;
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.trace("net::Client", Relation::References, None).unwrap();
+    let answer = engine.trace("net::Client", Relation::References, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -681,7 +781,7 @@ fn trace_signature_detail_carries_tier_content() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     let answer = engine
-        .trace("net::Client", Relation::References, Some(Detail::Signature))
+        .trace("net::Client", Relation::References, Some(Detail::Signature), None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -722,9 +822,9 @@ fn trace_detail_does_not_change_the_result_set() {
     use silent_cartographer::query::TraceItem;
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let location = engine.trace("net::Client", Relation::References, None).unwrap();
+    let location = engine.trace("net::Client", Relation::References, None, None).unwrap();
     let signature = engine
-        .trace("net::Client", Relation::References, Some(Detail::Signature))
+        .trace("net::Client", Relation::References, Some(Detail::Signature), None)
         .unwrap();
 
     let sites = |a: &silent_cartographer::query::output::Answer<TraceItem>| {
@@ -759,7 +859,7 @@ fn trace_reference_site_projects_enclosing_declaration_signature() {
     let engine = dep_engine(&store);
 
     let answer = engine
-        .trace(offset_id.as_str(), Relation::References, Some(Detail::Signature))
+        .trace(offset_id.as_str(), Relation::References, Some(Detail::Signature), None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -845,7 +945,7 @@ fn module_scope_site_projects_the_file_module_over_a_reexport_twin() {
 
     let engine = dep_engine(&store);
     let answer = engine
-        .trace("test-ws::target", Relation::References, Some(Detail::Signature))
+        .trace("test-ws::target", Relation::References, Some(Detail::Signature), None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -888,13 +988,13 @@ fn trace_containers_at_body_detail_carries_the_container_body() {
 
     let engine = dep_engine(&store);
     let answer = engine
-        .trace("test-ws::member", Relation::Containers, Some(Detail::Body))
+        .trace("test-ws::member", Relation::Containers, Some(Detail::Body), None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
     match &results[0] {
-        TraceItem::Symbol { symbol, content } => {
+        TraceItem::Symbol { symbol, content, .. } => {
             assert_eq!(symbol.name, "Holder");
             assert_eq!(
                 content.as_deref(),
@@ -914,7 +1014,7 @@ fn trace_explicit_location_detail_carries_no_content() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     let answer = engine
-        .trace("net::Client", Relation::References, Some(Detail::Location))
+        .trace("net::Client", Relation::References, Some(Detail::Location), None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -941,13 +1041,98 @@ fn trace_empty_relation_is_typed_absence() {
     let engine = engine_over(&store, support::provenance());
     // disconnect has no references in the fixture.
     let answer = engine
-        .trace("net::Client::disconnect", Relation::References, None)
+        .trace("net::Client::disconnect", Relation::References, None, None)
         .unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Empty),
         "empty relation is a typed Empty, not a failure: {:?}",
         answer.outcome
     );
+}
+
+// _(Symbol search by name fragment — several matches)_ — `find` returns every symbol whose name
+// contains the fragment.
+#[test]
+fn find_returns_every_symbol_whose_name_contains_the_fragment() {
+    let store = built_store();
+    let engine = engine_over(&store, support::provenance());
+    // "conn" is a substring of both `connect` and `disconnect`.
+    let answer = engine.find("conn").unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    let names: Vec<&str> = results.iter().map(|item| item.symbol.name.as_str()).collect();
+    assert!(names.contains(&"connect"), "connect contains the fragment: {names:?}");
+    assert!(
+        names.contains(&"disconnect"),
+        "disconnect contains the fragment: {names:?}"
+    );
+}
+
+// _(Symbol search by name fragment — case-insensitive matching)_ — `find` matches regardless of the
+// fragment's case.
+#[test]
+fn find_matches_case_insensitively() {
+    let store = built_store();
+    let engine = engine_over(&store, support::provenance());
+    let answer = engine.find("CoNN").unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    assert!(
+        results.iter().any(|item| item.symbol.name == "connect"),
+        "a differently-cased fragment still matches: {results:?}"
+    );
+}
+
+// _(Symbol search by name fragment — no match is typed absence)_ — a fragment matching no symbol is
+// a definite "none", distinct from a failure.
+#[test]
+fn find_no_match_is_typed_absence() {
+    let store = built_store();
+    let engine = engine_over(&store, support::provenance());
+    let answer = engine.find("zzz_no_such_fragment").unwrap();
+    assert!(
+        matches!(answer.outcome, Outcome::Absent),
+        "a fragment matching nothing is typed absence: {:?}",
+        answer.outcome
+    );
+}
+
+// _(Symbol search by name fragment — LIKE metacharacters are literal)_ — a `_` or `%` in the
+// fragment matches only itself, never as a SQL wildcard.
+#[test]
+fn find_treats_like_metacharacters_as_literal_text() {
+    let store = GraphStore::open_in_memory().unwrap();
+    put_dep_symbol(&store, "edge");
+    put_dep_symbol(&store, "edge_sources");
+    let engine = dep_engine(&store);
+
+    // A `_` acting as a single-character wildcard would make "e_ge" match `edge`; literally it
+    // matches nothing.
+    let underscore = engine.find("e_ge").unwrap();
+    assert!(
+        matches!(underscore.outcome, Outcome::Absent),
+        "a literal `_` is not a wildcard: {:?}",
+        underscore.outcome
+    );
+
+    // A `%` acting as an any-run wildcard would make "edge%source" match `edge_sources`; literally
+    // it matches nothing.
+    let percent = engine.find("edge%source").unwrap();
+    assert!(
+        matches!(percent.outcome, Outcome::Absent),
+        "a literal `%` is not a wildcard: {:?}",
+        percent.outcome
+    );
+
+    // A `_` present in the stored name still matches as literal text.
+    let literal = engine.find("edge_s").unwrap();
+    let Outcome::Found { results } = &literal.outcome else {
+        panic!("expected found, got {:?}", literal.outcome);
+    };
+    let names: Vec<&str> = results.iter().map(|item| item.symbol.name.as_str()).collect();
+    assert_eq!(names, vec!["edge_sources"], "a literal `_` matches itself: {names:?}");
 }
 
 // _(Calibrated output contract — get write-site)_ — a fresh result carries provenance and is marked
@@ -957,7 +1142,7 @@ fn fresh_result_carries_provenance_and_is_fresh() {
     use silent_cartographer::query::output::FreshnessLabel;
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.get("net::Client::connect", Detail::Location).unwrap();
+    let answer = engine.get("net::Client::connect", Detail::Location, None, 1).unwrap();
     assert_eq!(answer.provenance.analyzer_name, "rust-analyzer");
     assert!(!answer.provenance.analyzer_version.is_empty());
     assert_eq!(answer.freshness, FreshnessLabel::Fresh);
@@ -974,7 +1159,7 @@ fn fresh_result_carries_provenance_and_is_fresh() {
 fn result_identifies_symbols_by_identity_and_name() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.get("net::Client::connect", Detail::Location).unwrap();
+    let answer = engine.get("net::Client::connect", Detail::Location, None, 1).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -990,10 +1175,10 @@ fn stale_result_flagged_through_get_and_trace() {
     // A query engine told the current hash differs (sources changed since indexing).
     let engine = QueryEngine::new(&store, support::provenance(), "different-hash".to_string(), None);
 
-    let get_answer = engine.get("net::Client::connect", Detail::Location).unwrap();
+    let get_answer = engine.get("net::Client::connect", Detail::Location, None, 1).unwrap();
     assert!(get_answer.stale, "get result over changed sources is stale");
 
-    let trace_answer = engine.trace("net::Client", Relation::Contains, None).unwrap();
+    let trace_answer = engine.trace("net::Client", Relation::Contains, None, None).unwrap();
     assert!(trace_answer.stale, "trace result over changed sources is stale");
 }
 
@@ -1028,8 +1213,8 @@ fn get_ambiguous_shortname_returns_typed_candidates_in_json() {
     ingest(&mut store, &ws(), &index, &sources()).unwrap();
     let engine = engine_over(&store, support::provenance());
 
-    let answer = engine.get("connect", Detail::Location).unwrap();
-    let Outcome::Ambiguous { candidates } = &answer.outcome else {
+    let answer = engine.get("connect", Detail::Location, None, 1).unwrap();
+    let Outcome::Ambiguous { candidates, .. } = &answer.outcome else {
         panic!("expected ambiguous, got {:?}", answer.outcome);
     };
     assert_eq!(candidates.len(), 2, "both connect symbols returned as candidates");
@@ -1065,7 +1250,7 @@ fn get_unknown_reference_returns_typed_absence_in_json() {
 
     // A reference denoting no symbol: the query SUCCEEDS (no failure) with a typed Absent outcome.
     let answer = engine
-        .get("no_such_symbol_anywhere", Detail::Location)
+        .get("no_such_symbol_anywhere", Detail::Location, None, 1)
         .expect("absence is a successful typed answer, not a failure");
     assert!(
         matches!(answer.outcome, Outcome::Absent),
@@ -1076,7 +1261,7 @@ fn get_unknown_reference_returns_typed_absence_in_json() {
     // Absent is distinct from an empty relation: a subject with no instances of a relation yields
     // Empty, and the two render with different outcome tags.
     let empty = engine
-        .trace("net::Client::disconnect", Relation::References, None)
+        .trace("net::Client::disconnect", Relation::References, None, None)
         .unwrap();
     assert!(matches!(empty.outcome, Outcome::Empty));
 
@@ -1169,7 +1354,7 @@ fn dependents_reports_kind_and_distance() {
     use silent_cartographer::query::DependentsReport;
     let store = dep_graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 1, None).unwrap();
+    let answer = engine.dependents("test-ws::seed", 1, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -1191,7 +1376,7 @@ fn dependents_reach_ends_within_bound() {
         &[(EdgeKind::Uses, "a", "seed"), (EdgeKind::Uses, "b", "seed")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 1, None).unwrap();
+    let answer = engine.dependents("test-ws::seed", 1, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1212,7 +1397,7 @@ fn dependents_beyond_bound_aggregates_by_kind_and_distance() {
         &[(EdgeKind::Uses, "mid", "seed"), (EdgeKind::Uses, "outer", "mid")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 1, None).unwrap();
+    let answer = engine.dependents("test-ws::seed", 1, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1244,7 +1429,7 @@ fn dependents_aggregate_discloses_the_horizon() {
         .collect();
     let store = dep_graph(&name_refs, &edges);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::f0", 1, None).unwrap();
+    let answer = engine.dependents("test-ws::f0", 1, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1276,7 +1461,9 @@ fn dependents_discloses_cut_when_depth_equals_horizon() {
         .collect();
     let store = dep_graph(&name_refs, &edges);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::f0", DEPENDENTS_HORIZON, None).unwrap();
+    let answer = engine
+        .dependents("test-ws::f0", DEPENDENTS_HORIZON, None, None)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1301,7 +1488,9 @@ fn dependents_discloses_cut_when_depth_exceeds_horizon() {
         .collect();
     let store = dep_graph(&name_refs, &edges);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::f0", DEPENDENTS_HORIZON + 5, None).unwrap();
+    let answer = engine
+        .dependents("test-ws::f0", DEPENDENTS_HORIZON + 5, None, None)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1325,7 +1514,9 @@ fn dependents_shallow_network_ends_within_bound_even_at_large_depth() {
         &[(EdgeKind::Uses, "mid", "seed"), (EdgeKind::Uses, "outer", "mid")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", DEPENDENTS_HORIZON, None).unwrap();
+    let answer = engine
+        .dependents("test-ws::seed", DEPENDENTS_HORIZON, None, None)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1347,7 +1538,7 @@ fn dependents_depth_zero_is_aggregate_only() {
         &[(EdgeKind::Uses, "a", "seed"), (EdgeKind::Uses, "b", "seed")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 0, None).unwrap();
+    let answer = engine.dependents("test-ws::seed", 0, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1365,7 +1556,7 @@ fn dependents_of_leaf_is_typed_absence() {
     let store = dep_graph(&["lonely"], &[]);
     let engine = dep_engine(&store);
     let answer = engine
-        .dependents("test-ws::lonely", 1, None)
+        .dependents("test-ws::lonely", 1, None, None)
         .expect("no dependents is a successful typed answer, not a failure");
     assert!(
         matches!(answer.outcome, Outcome::Empty),
@@ -1388,7 +1579,9 @@ fn trace_dependents_interface_detail_carries_dependent_interface() {
         .unwrap();
     let engine = dep_engine(&store);
 
-    let answer = engine.dependents("test-ws::seed", 1, Some(Detail::Interface)).unwrap();
+    let answer = engine
+        .dependents("test-ws::seed", 1, Some(Detail::Interface), None)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -1419,7 +1612,9 @@ fn trace_json_with_detail_carries_content_and_aggregates_carry_none() {
         .unwrap();
     let engine = dep_engine(&store);
 
-    let answer = engine.dependents("test-ws::seed", 1, Some(Detail::Signature)).unwrap();
+    let answer = engine
+        .dependents("test-ws::seed", 1, Some(Detail::Signature), None)
+        .unwrap();
     let json = answer.to_json();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     let report = &value["outcome"]["results"][0];
@@ -1447,11 +1642,176 @@ fn trace_with_dependents_relation_errors_instead_of_empty() {
     let store = dep_graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
     let engine = dep_engine(&store);
     let err = engine
-        .trace("test-ws::seed", Relation::Dependents, None)
+        .trace("test-ws::seed", Relation::Dependents, None, None)
         .expect_err("trace must refuse the dependents relation, not answer empty");
     assert!(
         matches!(err, silent_cartographer::query::QueryError::DependentsNotTraceable),
         "expected DependentsNotTraceable, got {err:?}"
+    );
+}
+
+// _(Relationship trace — importers write-site)_ — `trace` over `importers` returns exactly the
+// modules that import the subject.
+#[test]
+fn trace_importers_returns_modules_that_import_the_subject() {
+    let store = dep_graph(
+        &["subject", "importer_a", "importer_b", "unrelated"],
+        &[
+            (EdgeKind::Imports, "importer_a", "subject"),
+            (EdgeKind::Imports, "importer_b", "subject"),
+        ],
+    );
+    let engine = dep_engine(&store);
+    let answer = engine
+        .trace("test-ws::subject", Relation::Importers, None, None)
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    let ids: Vec<CanonicalId> = results
+        .iter()
+        .map(|item| match item {
+            silent_cartographer::query::TraceItem::Symbol { symbol, .. } => symbol.canonical_id.clone(),
+            other => panic!("expected a symbol row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![dep_id("importer_a"), dep_id("importer_b")],
+        "exactly the importers, ordered by identity: {ids:?}"
+    );
+}
+
+// _(Relationship trace — implementers write-site)_ — `trace` over `implementers` returns exactly the
+// types that declare the subject as a supertype.
+#[test]
+fn trace_implementers_returns_types_declaring_the_subject_as_supertype() {
+    let store = dep_graph(
+        &["subject", "impl_a", "impl_b", "unrelated"],
+        &[
+            (EdgeKind::TypeHierarchy, "impl_a", "subject"),
+            (EdgeKind::TypeHierarchy, "impl_b", "subject"),
+        ],
+    );
+    let engine = dep_engine(&store);
+    let answer = engine
+        .trace("test-ws::subject", Relation::Implementers, None, None)
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    let ids: Vec<CanonicalId> = results
+        .iter()
+        .map(|item| match item {
+            silent_cartographer::query::TraceItem::Symbol { symbol, .. } => symbol.canonical_id.clone(),
+            other => panic!("expected a symbol row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![dep_id("impl_a"), dep_id("impl_b")],
+        "exactly the implementers, ordered by identity: {ids:?}"
+    );
+}
+
+// _(Relationship trace — implementers detail projection through the shared cap point)_ — an
+// `implementers` row at signature detail carries the implementer's own tier content, capped to its
+// first `max_lines` lines with the truncation disclosed.
+#[test]
+fn trace_implementers_signature_detail_is_projected_and_capped() {
+    use silent_cartographer::query::TraceItem;
+    let store = GraphStore::open_in_memory().unwrap();
+    put_dep_symbol(&store, "subject");
+    // A multi-line signature, so a line cap has a tail to drop.
+    let signature = "struct Implementer {\n    a: u8,\n    b: u8,\n}";
+    put_dep_symbol_with_tiers(&store, "implementer", Some(signature), None);
+    store
+        .insert_edge(EdgeKind::TypeHierarchy, &dep_id("implementer"), &dep_id("subject"))
+        .unwrap();
+    let engine = dep_engine(&store);
+
+    // Uncapped: the row projects its full signature tier.
+    let full = engine
+        .trace(
+            "test-ws::subject",
+            Relation::Implementers,
+            Some(Detail::Signature),
+            None,
+        )
+        .unwrap();
+    let Outcome::Found { results } = &full.outcome else {
+        panic!("expected found, got {:?}", full.outcome);
+    };
+    match &results[0] {
+        TraceItem::Symbol {
+            content,
+            content_truncated,
+            ..
+        } => {
+            assert_eq!(content.as_deref(), Some(signature));
+            assert!(!content_truncated, "the full signature is not truncated");
+        }
+        other => panic!("expected a symbol row, got {other:?}"),
+    }
+
+    // Capped: the content is cut to the first `max_lines` lines and the truncation is disclosed.
+    let capped = engine
+        .trace(
+            "test-ws::subject",
+            Relation::Implementers,
+            Some(Detail::Signature),
+            Some(2),
+        )
+        .unwrap();
+    let Outcome::Found { results } = &capped.outcome else {
+        panic!("expected found, got {:?}", capped.outcome);
+    };
+    match &results[0] {
+        TraceItem::Symbol {
+            content,
+            content_truncated,
+            ..
+        } => {
+            assert_eq!(
+                content.as_deref(),
+                Some("struct Implementer {\n    a: u8,"),
+                "the content is capped to the first max_lines lines"
+            );
+            assert!(content_truncated, "the cap is disclosed on the row");
+        }
+        other => panic!("expected a symbol row, got {other:?}"),
+    }
+}
+
+// _(Relationship trace — importers empty branch)_ — a subject imported by nothing is typed absence,
+// consistent with the other relations' empty behavior.
+#[test]
+fn trace_importers_with_none_is_typed_absence() {
+    let store = dep_graph(&["subject"], &[]);
+    let engine = dep_engine(&store);
+    let answer = engine
+        .trace("test-ws::subject", Relation::Importers, None, None)
+        .unwrap();
+    assert!(
+        matches!(answer.outcome, Outcome::Empty),
+        "no importers is typed Empty: {:?}",
+        answer.outcome
+    );
+}
+
+// _(Relationship trace — implementers empty branch)_ — a subject implemented by nothing is typed
+// absence, consistent with `importers` and the other relations' empty behavior.
+#[test]
+fn trace_implementers_with_none_is_typed_absence() {
+    let store = dep_graph(&["subject"], &[]);
+    let engine = dep_engine(&store);
+    let answer = engine
+        .trace("test-ws::subject", Relation::Implementers, None, None)
+        .unwrap();
+    assert!(
+        matches!(answer.outcome, Outcome::Empty),
+        "no implementers is typed Empty: {:?}",
+        answer.outcome
     );
 }
 
@@ -1471,6 +1831,11 @@ fn depth_with_non_dependents_relation_is_a_teaching_error() {
         Relation::Contains,
         Some(2),
         None,
+        /* max_lines */ 10,
+        /* max_lines_explicit */ false,
+        /* limit */ 25,
+        /* cursor */ None,
+        false,
         false,
     )
     .expect_err("--depth with contains must fail");
@@ -1506,8 +1871,8 @@ fn trace_self_description_frames_dependents_as_impact() {
 fn deterministic_ordering_across_repeated_queries() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let first = engine.trace("net::Client", Relation::References, None).unwrap();
-    let second = engine.trace("net::Client", Relation::References, None).unwrap();
+    let first = engine.trace("net::Client", Relation::References, None, None).unwrap();
+    let second = engine.trace("net::Client", Relation::References, None, None).unwrap();
     let locs = |a: &silent_cartographer::query::output::Answer<silent_cartographer::query::TraceItem>| {
         if let Outcome::Found { results } = &a.outcome {
             results
@@ -1594,7 +1959,7 @@ fn python_body_retrieval_is_byte_exact() {
     use silent_cartographer::query::DetailPayload;
     let store = py_store();
     let engine = py_engine(&store);
-    let answer = engine.get(py_render_id().as_str(), Detail::Body).unwrap();
+    let answer = engine.get(py_render_id().as_str(), Detail::Body, None, 1).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -1620,7 +1985,7 @@ fn python_get_by_position_resolves_enclosing_method() {
     let source = py_source("pkg/shapes.py");
     let inside_render = source.find("return \"widget\"").unwrap();
     let answer = engine
-        .get_by_position("pkg/shapes.py", inside_render, Detail::Location)
+        .get_by_position("pkg/shapes.py", inside_render, Detail::Location, None, 1)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -1640,7 +2005,7 @@ fn python_dependents_trace_carries_kind_and_distance() {
     use silent_cartographer::query::DependentsReport;
     let store = py_store();
     let engine = py_engine(&store);
-    let answer = engine.dependents(py_widget_id().as_str(), 1, None).unwrap();
+    let answer = engine.dependents(py_widget_id().as_str(), 1, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };

@@ -2907,7 +2907,7 @@ fn trace_references_includes_operator_aligned_site() {
     ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![add]), &src).unwrap();
 
     let engine = QueryEngine::new(&store, support::provenance(), content_hash(&src), None);
-    let answer = engine.trace("ops::Add::add", Relation::References, None).unwrap();
+    let answer = engine.trace("ops::Add::add", Relation::References, None, None).unwrap();
     match answer.outcome {
         Outcome::Found { results } => {
             assert_eq!(results.len(), 1, "the operator-aligned reference is reported");

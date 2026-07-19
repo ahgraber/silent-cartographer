@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 # CLI surface (clap derive per project stack mapping).
 clap = { version = "4", features = ["derive"] }
+# Shell completion-script generation derived from the same clap `Command` tree.
+clap_complete = "4"
 # (De)serialization for the JSON output contract and config.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

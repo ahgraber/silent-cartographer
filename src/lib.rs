@@ -7,7 +7,10 @@
 
 pub mod cli;
 pub mod commands;
+pub mod exit;
 pub mod graph;
 pub mod identity;
+pub mod manifest;
 pub mod query;
+pub mod render;
 pub mod semantic;

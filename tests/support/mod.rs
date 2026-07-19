@@ -7,11 +7,29 @@
 
 #![allow(dead_code)]
 
-use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind};
+use silent_cartographer::graph::join::JoinAccounting;
+use silent_cartographer::graph::store::{GraphStore, IndexMetadata};
+use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind, WorkspaceId};
 use silent_cartographer::semantic::model::{
     AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
 };
+
+/// Stamp a directly-built fixture store — one populated through `insert_symbol` rather than the build
+/// path — with minimal index metadata, so it reads as a completed build. The read-only query path
+/// refuses a schema-stamped store that carries no build metadata (a never-completed build), so a
+/// fixture that queries through the CLI must record metadata even when the join accounting is empty.
+pub fn stamp_metadata(store: &GraphStore, workspace: &str) {
+    store
+        .write_metadata(&IndexMetadata {
+            workspace_id: WorkspaceId::new(workspace),
+            provenance: provenance(),
+            content_hash: String::new(),
+            accounting: JoinAccounting::default(),
+            environment: None,
+        })
+        .unwrap();
+}
 
 /// The workspace-relative path of the single fixture source file.
 pub const DOC: &str = "src/net.rs";

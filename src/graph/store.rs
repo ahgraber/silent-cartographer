@@ -676,6 +676,22 @@ impl GraphStore {
         rows.collect()
     }
 
+    /// All symbols whose `display_name` contains `fragment`, matched case-insensitively (SQLite's
+    /// `LIKE` case-folds ASCII by default) and ordered by canonical identity. `LIKE` metacharacters in
+    /// `fragment` are escaped, so a literal `%`/`_` in the search text matches literally rather than
+    /// as a wildcard.
+    pub fn symbols_by_fragment(&self, fragment: &str) -> rusqlite::Result<Vec<SymbolRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                    signature_text, interface_text, duplicated
+             FROM symbols WHERE display_name LIKE ?1 ESCAPE '\\'
+             ORDER BY canonical_id",
+        )?;
+        let like = format!("%{}%", escape_like(fragment));
+        let rows = stmt.query_map(params![like], Self::map_symbol)?;
+        rows.collect()
+    }
+
     /// All symbols whose canonical identity ends with the qualified-name suffix `::<qualified>`, or
     /// equals it exactly. Used to resolve a qualified name that omits the workspace prefix.
     pub fn symbols_by_qualified_suffix(&self, qualified: &str) -> rusqlite::Result<Vec<SymbolRow>> {
@@ -835,6 +851,18 @@ impl GraphStore {
             .conn
             .prepare("SELECT src_id FROM edges WHERE kind = 'contains' AND dst_id = ?1 ORDER BY src_id")?;
         let rows = stmt.query_map(params![id.as_str()], |r| {
+            Ok(CanonicalId::from_raw(r.get::<_, String>(0)?))
+        })?;
+        rows.collect()
+    }
+
+    /// The symbols whose edge of `kind` targets `id` — the reverse, source-by-destination walk used
+    /// by the `importers` (`imports`) and `implementers` (`type_hierarchy`) relations.
+    pub fn edge_sources(&self, kind: EdgeKind, id: &CanonicalId) -> rusqlite::Result<Vec<CanonicalId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT src_id FROM edges WHERE kind = ?1 AND dst_id = ?2 ORDER BY src_id")?;
+        let rows = stmt.query_map(params![kind.tag(), id.as_str()], |r| {
             Ok(CanonicalId::from_raw(r.get::<_, String>(0)?))
         })?;
         rows.collect()

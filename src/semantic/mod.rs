@@ -13,6 +13,7 @@ pub mod capabilities;
 pub mod conformance;
 pub mod fixture;
 pub mod model;
+pub mod probe;
 pub mod python_adapter;
 pub mod rust_adapter;
 pub mod scip;
@@ -34,6 +35,10 @@ pub enum SemanticError {
     /// The backend's tool was not available in the environment.
     #[error("semantic backend unavailable: {0}")]
     Unavailable(String),
+    /// A bounded probe of the backend's tool (a version/readiness check) did not respond within the
+    /// deadline — the tool is present but unresponsive, distinct from missing.
+    #[error("semantic backend probe timed out: {0}")]
+    Timeout(String),
     /// The project's interpreter environment could not be resolved well enough to produce a
     /// faithful index — a typed refusal naming the remedy, never a silent fallback to a system
     /// interpreter.

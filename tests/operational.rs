@@ -6,7 +6,8 @@ mod support;
 use std::path::Path;
 
 use silent_cartographer::commands::{
-    build_accounting_line, build_from_index, detect_language, resolve_workspace, run_build, run_status,
+    build_accounting_json, build_accounting_line, build_from_index, detect_language, resolve_workspace, run_build,
+    run_status,
 };
 use silent_cartographer::graph::content_hash;
 use silent_cartographer::graph::join::JoinAccounting;
@@ -40,7 +41,7 @@ fn build_produces_a_queryable_index() {
     // The index is queryable: resolve and retrieve a symbol from the freshly built store.
     let store = GraphStore::open(&db).unwrap();
     let engine = QueryEngine::new(&store, support::provenance(), content_hash(&sources()), None);
-    let answer = engine.get("net::Client::connect", Detail::Body).unwrap();
+    let answer = engine.get("net::Client::connect", Detail::Body, None, 1).unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Found { .. }),
         "built index answers a query"
@@ -377,7 +378,7 @@ fn matching_version_store_operates_normally() {
     assert!(report.contains("join_alignment"), "status answers normally: {report}");
     let store = GraphStore::open(&db).unwrap();
     let engine = QueryEngine::new(&store, support::provenance(), content_hash(&sources()), None);
-    let answer = engine.get("net::Client::connect", Detail::Location).unwrap();
+    let answer = engine.get("net::Client::connect", Detail::Location, None, 1).unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Found { .. }),
         "queries answer normally against a matching store"
@@ -529,6 +530,72 @@ fn accounting_line_renders_every_bucket() {
         assert!(
             line.contains(&format!("{label}={value}")),
             "{label} renders on the line: {line}"
+        );
+    }
+}
+
+// _(The `--json build` projection carries every acceptance bucket)_ — with every accounting field
+// non-zero, the machine projection's per-rule buckets sum to its aligned total, and the refusal
+// counts are present. A bucket added to the accounting without a projection site breaks this sum, so
+// a new rule can never silently vanish from `--json build`.
+#[test]
+fn build_json_projection_carries_every_bucket() {
+    let accounting = JoinAccounting {
+        aligned_exact: 1,
+        aligned_crate_root: 2,
+        aligned_operator_desugar: 3,
+        aligned_module_span: 4,
+        aligned_self_keyword: 5,
+        aligned_module_name: 6,
+        aligned_self_name: 7,
+        aligned_module_marker: 8,
+        aligned_import_alias: 9,
+        aligned_range_literal: 10,
+        aligned_use_list_self: 11,
+        aligned_super_keyword: 12,
+        text_mismatch: 13,
+        semantic_only: 14,
+        duplicate_ambiguous: 15,
+        syntax_only: 16,
+    };
+    let json = build_accounting_json(&accounting);
+
+    let aligned = json["aligned"]
+        .as_object()
+        .expect("the projection carries an aligned block");
+    assert_eq!(
+        json["aligned"]["total"].as_u64(),
+        Some(accounting.aligned_total()),
+        "the projection's aligned total is the real total"
+    );
+
+    // Every per-rule bucket except the derived `total` sums to the aligned total.
+    let bucket_sum: u64 = aligned
+        .iter()
+        .filter(|(name, _)| name.as_str() != "total")
+        .map(|(name, value)| {
+            value
+                .as_u64()
+                .unwrap_or_else(|| panic!("bucket {name} is a count: {value}"))
+        })
+        .sum();
+    assert_eq!(
+        bucket_sum,
+        accounting.aligned_total(),
+        "the projection's buckets sum to the aligned total — a bucket missing from it breaks this: {json}"
+    );
+
+    // The refusal and syntax-only counts sit alongside the acceptance buckets.
+    for (label, value) in [
+        ("text_mismatch", accounting.text_mismatch),
+        ("semantic_only", accounting.semantic_only),
+        ("duplicate_ambiguous", accounting.duplicate_ambiguous),
+        ("syntax_only", accounting.syntax_only),
+    ] {
+        assert_eq!(
+            json[label].as_u64(),
+            Some(value),
+            "{label} is carried in the projection: {json}"
         );
     }
 }

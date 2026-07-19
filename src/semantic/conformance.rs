@@ -136,13 +136,16 @@ pub fn run_all<'a>(backends: &[(&'a str, &'a dyn SemanticEngine, &'a Path)]) -> 
 pub fn run(engine: &dyn SemanticEngine, project_root: &Path) -> ConformanceReport {
     match engine.analyze(project_root) {
         Ok(index) => check_index(&index),
-        Err(SemanticError::Analysis(msg) | SemanticError::Unavailable(msg) | SemanticError::Environment(msg)) => {
-            ConformanceReport {
-                violations: vec![Violation {
-                    clause: "analyze-succeeds",
-                    detail: msg,
-                }],
-            }
-        }
+        Err(
+            SemanticError::Analysis(msg)
+            | SemanticError::Unavailable(msg)
+            | SemanticError::Environment(msg)
+            | SemanticError::Timeout(msg),
+        ) => ConformanceReport {
+            violations: vec![Violation {
+                clause: "analyze-succeeds",
+                detail: msg,
+            }],
+        },
     }
 }

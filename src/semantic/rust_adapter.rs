@@ -11,6 +11,7 @@ use std::process::Command;
 use scip::types as scip_types;
 
 use super::model::{AnalyzerProvenance, ExtractedIndex, normalize};
+use super::probe::{PROBE_DEADLINE, ProbeOutcome, run_bounded};
 pub use super::scip::translate_index;
 use super::{Capabilities, SemanticEngine, SemanticError};
 
@@ -25,18 +26,27 @@ pub struct RustAdapter {
 impl RustAdapter {
     /// Construct an adapter for the given `rust-analyzer` executable, discovering its version.
     ///
-    /// Fails if the executable cannot be run — a backend whose analyzer is unavailable is not
-    /// usable, and the caller learns so explicitly rather than by a later opaque failure.
+    /// The version probe is bounded: a missing executable is [`SemanticError::Unavailable`], and one
+    /// that is present but does not answer within the probe deadline is [`SemanticError::Timeout`], so
+    /// the caller learns explicitly rather than by a later opaque failure or an indefinite hang.
     pub fn new(executable: impl Into<String>) -> Result<Self, SemanticError> {
         let executable = executable.into();
-        let output = Command::new(&executable)
-            .arg("--version")
-            .output()
-            .map_err(|e| SemanticError::Unavailable(format!("cannot run {executable}: {e}")))?;
-        if !output.status.success() {
+        let mut command = Command::new(&executable);
+        command.arg("--version");
+        let capture = match run_bounded(command, PROBE_DEADLINE) {
+            Ok(ProbeOutcome::Completed(capture)) => capture,
+            Ok(ProbeOutcome::TimedOut) => {
+                return Err(SemanticError::Timeout(format!(
+                    "{executable} --version did not respond within {}s",
+                    PROBE_DEADLINE.as_secs()
+                )));
+            }
+            Err(e) => return Err(SemanticError::Unavailable(format!("cannot run {executable}: {e}"))),
+        };
+        if !capture.status.success() {
             return Err(SemanticError::Unavailable(format!("{executable} --version failed")));
         }
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let version = String::from_utf8_lossy(&capture.stdout).trim().to_string();
         Ok(Self { executable, version })
     }
 
@@ -92,12 +102,14 @@ impl SemanticEngine for RustAdapter {
 /// non-zero, or emits unparsable output — degrades to an empty map, and downstream consumers fall
 /// back to their typed refusals.
 fn library_roots(project_root: &Path) -> std::collections::BTreeMap<String, String> {
-    let output = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(project_root)
-        .output();
-    match output {
-        Ok(out) if out.status.success() => parse_library_roots(&out.stdout),
+        .current_dir(project_root);
+    // Bounded like every other tool probe: a hung `cargo metadata` degrades to the empty map on the
+    // timeout path, the same degrade a spawn failure or non-zero exit already takes.
+    match run_bounded(command, PROBE_DEADLINE) {
+        Ok(ProbeOutcome::Completed(capture)) if capture.status.success() => parse_library_roots(&capture.stdout),
         _ => Default::default(),
     }
 }
