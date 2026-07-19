@@ -1,0 +1,259 @@
+# Delta for command-surface
+
+> New capability. Every requirement is ADDED; there is no prior baseline for the CLI envelope.
+
+## ADDED Requirements
+
+### Requirement: Closed flag vocabulary
+
+The system SHALL expose a fixed, closed set of canonical option flags shared across its commands, and SHALL NOT accept an alternate spelling of a canonical flag, so that the option surface an agent learns is stable and uniform.
+
+Serves: scriptable-cli
+
+#### Scenario: Canonical flag accepted
+
+- **GIVEN** a command that offers structured output
+- **WHEN** it is invoked with the canonical `--json` flag
+- **THEN** the flag is accepted and structured output is produced
+
+#### Scenario: Alias spelling rejected
+
+- **GIVEN** a command that offers structured output
+- **WHEN** it is invoked with a non-canonical spelling of that option, such as `--format=json`
+- **THEN** the invocation is rejected as a usage error rather than silently honored
+
+### Requirement: Exit-code taxonomy
+
+The system SHALL signal each invocation's outcome through a closed exit-code taxonomy, using a distinct code per category, that distinguishes success — including a typed-empty result — from a usage error, an absent index, and an indexer or setup failure.
+
+Serves: scriptable-cli
+
+#### Scenario: Success on a non-empty answer
+
+- **GIVEN** an indexed workspace
+- **WHEN** a query returns one or more results
+- **THEN** the process exits with the success code
+
+#### Scenario: A typed-empty answer is still success
+
+- **GIVEN** an indexed workspace
+- **WHEN** a query resolves correctly but stands in no instance of the requested relation
+- **THEN** the process exits with the success code, not a failure code
+
+#### Scenario: Usage error is distinct
+
+- **GIVEN** any command
+- **WHEN** it is invoked with an invalid flag or malformed argument
+- **THEN** the process exits with the usage-error code, distinct from the success and failure codes
+
+#### Scenario: Absent index is distinct
+
+- **GIVEN** a directory with no built index
+- **WHEN** a query command is invoked
+- **THEN** the process exits with the no-index code, distinct from a usage error
+
+#### Scenario: Indexer setup failure is distinct
+
+- **GIVEN** a workspace whose required language indexer is not installed
+- **WHEN** a command that needs it runs
+- **THEN** the process exits with the indexer/setup-failure code, distinct from the other categories
+
+### Requirement: Rejections name valid alternatives
+
+The system SHALL validate an invocation before performing any side effect, and SHALL, when rejecting an input, emit a diagnostic that names the valid alternatives for that input — the accepted values of an enumerated option, or a corrected invocation form — so that the caller can self-correct from the message alone.
+
+Serves: scriptable-cli
+
+#### Scenario: Unknown enum value enumerates the valid set
+
+- **GIVEN** a command with an enumerated option
+- **WHEN** it is invoked with a value outside that enumeration
+- **THEN** the diagnostic lists the accepted values for that option
+
+#### Scenario: Validation precedes side effects
+
+- **GIVEN** a command that would mutate stored state
+- **WHEN** it is invoked with an invalid argument
+- **THEN** no state is changed and the invocation is rejected as a usage error
+
+### Requirement: Non-interactive operation
+
+The system SHALL complete every command without interactive prompting, taking all input from arguments and flags, and SHALL treat a non-terminal environment as headless.
+
+Serves: scriptable-cli
+
+#### Scenario: Runs to completion without a terminal
+
+- **GIVEN** a command invoked with standard input and output not attached to a terminal
+- **WHEN** it runs
+- **THEN** it completes without waiting for interactive input
+
+### Requirement: Output stream discipline
+
+The system SHALL write the machine-readable answer to standard output and every diagnostic to standard error; under `--json` the standard-output answer SHALL be the structured machine answer, and the default human rendering SHALL be a faithful projection of that same answer, presenting the same results in the same order.
+
+Serves: scriptable-cli, legible-terminal-output
+
+#### Scenario: Answer and diagnostics are separated
+
+- **GIVEN** a command that emits both an answer and a diagnostic
+- **WHEN** it runs
+- **THEN** the answer appears on standard output and the diagnostic appears on standard error
+
+#### Scenario: Human render matches the JSON answer
+
+- **GIVEN** a query with several results
+- **WHEN** it is run once with `--json` and once with the default human rendering
+- **THEN** both present the same results in the same order
+
+### Requirement: Source-faithful content rendering
+
+The system SHALL render a content-bearing detail — a signature, interface, or body — as its source text as it reads in the file, with terminal-control and bidirectional-control characters made visible as replacement characters, never executed, and SHALL emit color or styling only to a terminal by default — never to a redirected standard output unless the invocation explicitly forces styling — and never under `--json` regardless of any styling option.
+
+Serves: legible-terminal-output
+
+#### Scenario: Body renders as source
+
+- **GIVEN** a symbol whose body spans several lines
+- **WHEN** it is retrieved at body detail and rendered for a human
+- **THEN** the body is shown as multi-line source text, not as an escaped single-line scalar
+
+#### Scenario: Embedded terminal controls are made visible, not executed
+
+- **GIVEN** a symbol whose body embeds a terminal-control escape sequence
+- **WHEN** it is retrieved at body detail and rendered for a human
+- **THEN** the control characters appear as replacement characters while the surrounding source text and its own line endings are preserved, and the same body requested with `--json` round-trips byte-exactly
+
+#### Scenario: No styling to a redirected stream
+
+- **GIVEN** a content-bearing answer requested without an explicit styling override
+- **WHEN** standard output is redirected to a file or pipe
+- **THEN** the emitted text carries no color or styling control sequences
+
+#### Scenario: Forced styling is honored on a redirected stream
+
+- **GIVEN** a content-bearing answer requested with styling explicitly forced (`--color=always`)
+- **WHEN** standard output is redirected to a file or pipe
+- **THEN** styling appears on structural lines only, and the source text itself carries no styling control sequences
+
+#### Scenario: No styling under JSON
+
+- **GIVEN** a content-bearing answer
+- **WHEN** it is requested with `--json`
+- **THEN** the JSON content carries no color or styling control sequences
+
+### Requirement: Indexer readiness report
+
+The system SHALL provide a command that reports, for each required language indexer, whether it is present and its version, and an install hint when it is absent, and SHALL signal an indexer/setup failure through the exit-code taxonomy when a required indexer is missing.
+Each indexer's readiness probe SHALL complete within a bounded time, and an indexer that is present but does not respond within that bound SHALL be reported as unresponsive — distinct from absent — with an investigation hint, and SHALL likewise signal the indexer/setup failure through the exit-code taxonomy.
+
+Serves: preflight-readiness
+
+#### Scenario: All indexers present
+
+- **GIVEN** a host with every required language indexer installed
+- **WHEN** the readiness command runs
+- **THEN** each indexer is reported present with its version and the process exits with the success code
+
+#### Scenario: A missing indexer is reported with a hint
+
+- **GIVEN** a host missing a required language indexer
+- **WHEN** the readiness command runs
+- **THEN** that indexer is reported absent with an install hint and the process exits with the indexer/setup-failure code
+
+#### Scenario: An unresponsive indexer is reported within a bounded time
+
+- **GIVEN** an indexer executable that hangs when probed
+- **WHEN** the readiness command runs
+- **THEN** it reports the indexer unresponsive with an investigation hint within a bounded time and exits with the indexer/setup-failure code
+
+### Requirement: Index reset
+
+The system SHALL provide a command that removes the stored index for the workspace and reports the path affected; removal SHALL apply only to a recognizable index store, and a target that is not one SHALL be refused as a failure naming the manual alternative, leaving the target intact.
+Removing an index that is already absent SHALL be a success, and an operating-system error encountered while removing it SHALL be reported as a failure naming the affected path.
+
+Serves: reset-index
+
+#### Scenario: Existing index removed
+
+- **GIVEN** a workspace with a stored index
+- **WHEN** the reset command runs
+- **THEN** the index is removed, the affected path is reported, and the process exits with the success code
+
+#### Scenario: A non-index target is refused
+
+- **GIVEN** a file at the index path that is not a recognizable index store
+- **WHEN** the reset command runs
+- **THEN** the file is left intact and the refusal names the manual removal alternative, exiting with a failure code
+
+#### Scenario: Nothing to remove is success
+
+- **GIVEN** a workspace with no stored index
+- **WHEN** the reset command runs
+- **THEN** the process exits with the success code rather than a failure
+
+#### Scenario: Removal error names the path
+
+- **GIVEN** a stored index that cannot be removed because of an operating-system error
+- **WHEN** the reset command runs
+- **THEN** the failure is reported naming the affected path and the process exits with a failure code
+
+### Requirement: Versioned structural surface index
+
+The system SHALL provide a command that emits, as its machine-readable answer, a structural index of the CLI surface — a surface version, the commands with each command's valid argument and flag values and defaults, and the current index state — and the surface version SHALL change whenever the command or flag structure changes, so that a caller can detect that its understanding of the surface is out of date.
+
+Serves: orient-on-arrival, detect-contract-drift
+
+#### Scenario: Index enumerates the command surface
+
+- **GIVEN** an installed build
+- **WHEN** the surface-index command runs
+- **THEN** its answer lists the commands with each command's valid argument and flag values and defaults
+
+#### Scenario: Index carries a surface version
+
+- **GIVEN** an installed build
+- **WHEN** the surface-index command runs
+- **THEN** its answer carries a surface version identifier
+
+#### Scenario: Surface version distinguishes revisions
+
+- **GIVEN** two builds whose command-or-flag structure differs
+- **WHEN** the surface-index command runs against each
+- **THEN** the two answers carry different surface versions
+
+### Requirement: Shell completion scripts
+
+The system SHALL provide a command that emits, on standard output, a completion script for a named supported shell, derived from the same command definition the parser executes, so that the completed surface cannot drift from the real one, and SHALL reject an unsupported shell name as a usage error naming the supported shells.
+
+Serves: complete-at-the-shell
+
+#### Scenario: A supported shell emits a completion script
+
+- **GIVEN** an installed build
+- **WHEN** the completion-script command runs with a supported shell name (e.g. `zsh`)
+- **THEN** a completion script for the current command surface lands on standard output
+
+#### Scenario: An unknown shell is a usage error
+
+- **GIVEN** an installed build
+- **WHEN** the completion-script command runs with a shell name outside the supported set
+- **THEN** the invocation is rejected as a usage error whose diagnostic lists the accepted shells
+
+#### Scenario: The emitted script names the current commands
+
+- **GIVEN** an installed build
+- **WHEN** the completion-script command runs with a supported shell name
+- **THEN** the emitted script names the current top-level commands
+
+#### Scenario: An explicit `--json` is rejected
+
+- **GIVEN** the completion-script command
+- **WHEN** it is invoked with `--json` explicitly
+- **THEN** the invocation is rejected as a usage error, since a completion script is not a machine answer
+
+#### Scenario: Completion precedes any build
+
+- **GIVEN** a directory with no built index
+- **WHEN** the completion-script command runs with a supported shell name
+- **THEN** the script is emitted and the process exits with the success code
