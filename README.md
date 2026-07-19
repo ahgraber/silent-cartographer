@@ -14,6 +14,30 @@ Silent cartographer (`c10r`) is a persistent codebase knowledge graph that uses 
 Users and agents can query it to find code by symbol name or concept, trace the blast radius of a change, and understand architectural structure.
 In comparison to grepping through the whole codebase, `c10r` increases search precision and reduces token utilization.
 
+## Shell completions
+
+`c10r completions <shell>` emits a completion script to standard output, generated from the same command definition the parser executes, so the completed surface cannot drift from the real one.
+
+zsh:
+
+```sh
+c10r completions zsh > ~/.zfunc/_c10r
+```
+
+Add `~/.zfunc` to `fpath` before `compinit` runs (e.g. in `~/.zshrc`), then start a new shell.
+
+bash:
+
+```sh
+c10r completions bash > ~/.local/share/bash-completion/completions/c10r
+```
+
+Or source it directly in `~/.bashrc`:
+
+```sh
+source <(c10r completions bash)
+```
+
 ## References
 
 - [Why coding agents fail in large codebases (and what to do about it) | Sourcegraph](https://sourcegraph.com/blog/why-coding-agents-fail-large-codebases)
