@@ -1,6 +1,8 @@
 //! The query surface over the code graph: reference resolution, symbol retrieval at a chosen
 //! detail, relationship tracing, and the calibrated output contract every answer carries.
 
+pub mod diff;
+pub mod impact;
 pub mod output;
 pub mod page;
 pub mod resolve;

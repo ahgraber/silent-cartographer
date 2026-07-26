@@ -8,6 +8,7 @@
 pub mod cli;
 pub mod commands;
 pub mod exit;
+pub mod git;
 pub mod graph;
 pub mod identity;
 pub mod manifest;

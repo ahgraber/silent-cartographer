@@ -791,6 +791,41 @@ impl GraphStore {
             .optional()
     }
 
+    /// The symbols whose definition spans overlap the half-open byte range `[start, end)` in
+    /// `document`, ordered by `(span_start, span_end, canonical_id)` so a seed set is reproducible.
+    ///
+    /// Additive beside [`GraphStore::symbol_enclosing_position`], which resolves a single point: a
+    /// diff hunk is a byte range, and a range can straddle several declarations, so every overlapping
+    /// symbol is returned rather than only the tightest one. Selecting *which* of the overlapping
+    /// declarations seed an impact assessment is a policy the query layer applies on top of this raw
+    /// overlap.
+    pub fn symbols_overlapping_span(
+        &self,
+        document: &str,
+        start: usize,
+        end: usize,
+    ) -> rusqlite::Result<Vec<SymbolRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                    signature_text, interface_text, duplicated
+             FROM symbols
+             WHERE document_path = ?1 AND span_start IS NOT NULL AND span_start < ?3 AND ?2 < span_end
+             ORDER BY span_start, span_end, canonical_id",
+        )?;
+        let rows = stmt.query_map(params![document, start as i64, end as i64], Self::map_symbol)?;
+        rows.collect()
+    }
+
+    /// Whether the index holds any symbol defined in `document` — the test that separates a changed
+    /// region the graph simply tracks nothing in from one in a document the index never saw at all.
+    pub fn holds_document(&self, document: &str) -> rusqlite::Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM symbols WHERE document_path = ?1)",
+            params![document],
+            |r| r.get(0),
+        )
+    }
+
     /// The module-kind symbol persisted for `document` — the symbol a reference site attributes to
     /// when it carries no narrower enclosing declaration (`enclosing_id` is `None`).
     ///
@@ -1025,7 +1060,10 @@ fn truncate_on_boundary(s: &str) -> String {
 /// The fallback bucket is unreachable while `EdgeKind` stays closed to the three dependency kinds
 /// above; adding a new edge kind to the dependents walk requires adding it here too, or it will
 /// silently sort last instead of taking its intended tie-break position.
-fn kind_order(tag: &str) -> u8 {
+///
+/// `pub(crate)` because the impact seed union reuses it so a multi-seed answer's row order matches a
+/// single-seed `dependents` answer's.
+pub(crate) fn kind_order(tag: &str) -> u8 {
     match tag {
         "uses" => 0,
         "imports" => 1,
@@ -1037,4 +1075,72 @@ fn kind_order(tag: &str) -> u8 {
 /// Escape LIKE wildcards in a literal fragment (using `\` as the escape char).
 fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An in-workspace symbol row with a definition span, minimal in every other field.
+    fn symbol_at(id: &str, document: &str, start: usize, end: usize) -> SymbolRow {
+        SymbolRow {
+            canonical_id: CanonicalId::from_raw(id.to_string()),
+            display_name: id.to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: Some(document.to_string()),
+            span: Some((start, end)),
+            span_text: None,
+            signature_text: None,
+            interface_text: None,
+            duplicated: false,
+        }
+    }
+
+    // A range overlapping two symbols' spans returns both, ordered by span start.
+    #[test]
+    fn symbols_overlapping_span_returns_overlapping_symbols_in_span_order() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.insert_symbol(&symbol_at("ws::b", "doc.rs", 20, 30)).unwrap();
+        store.insert_symbol(&symbol_at("ws::a", "doc.rs", 0, 10)).unwrap();
+        store.insert_symbol(&symbol_at("ws::c", "doc.rs", 40, 50)).unwrap();
+
+        let rows = store.symbols_overlapping_span("doc.rs", 5, 25).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.canonical_id.as_str()).collect();
+        assert_eq!(ids, vec!["ws::a", "ws::b"]);
+    }
+
+    // A range touching no symbol's span returns none.
+    #[test]
+    fn symbols_overlapping_span_touching_neither_returns_none() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.insert_symbol(&symbol_at("ws::a", "doc.rs", 0, 10)).unwrap();
+        store.insert_symbol(&symbol_at("ws::b", "doc.rs", 20, 30)).unwrap();
+
+        let rows = store.symbols_overlapping_span("doc.rs", 12, 18).unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    // A zero-width range in the gap between two symbols' spans overlaps neither — the query layer
+    // never issues one (`LineIndex::byte_range` widens an insertion point before it reaches the
+    // store), but the predicate itself must not fabricate an overlap for a point outside every span.
+    #[test]
+    fn symbols_overlapping_span_zero_width_range_returns_none() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.insert_symbol(&symbol_at("ws::a", "doc.rs", 0, 10)).unwrap();
+        store.insert_symbol(&symbol_at("ws::b", "doc.rs", 20, 30)).unwrap();
+
+        let rows = store.symbols_overlapping_span("doc.rs", 15, 15).unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    // `holds_document` is true for a document holding a symbol and false for one that holds none.
+    #[test]
+    fn holds_document_true_only_when_a_symbol_is_defined_there() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.insert_symbol(&symbol_at("ws::a", "doc.rs", 0, 10)).unwrap();
+
+        assert!(store.holds_document("doc.rs").unwrap());
+        assert!(!store.holds_document("other.rs").unwrap());
+    }
 }

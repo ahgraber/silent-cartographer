@@ -1,33 +1,52 @@
-//! Command handlers backing the CLI: the query commands (`get`, `trace`, `find`) and the
+//! Command handlers backing the CLI: the query commands (`get`, `trace`, `find`, `impact`) and the
 //! operational set (`build`, `status`, `doctor`, `cache`).
 //!
 //! These are thin orchestration over the query engine and the ingest path, kept out of `main` so
 //! they are testable without spawning a process.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use sha2::{Digest, Sha256};
 
 use crate::exit::Failure;
+use crate::git::{GitError, GitRepo, SeedMode};
 use crate::graph::join::JoinAccounting;
 use crate::graph::store::GraphStore;
 use crate::graph::syntax::Language;
 use crate::graph::{content_hash, ingest};
 use crate::identity::WorkspaceId;
+use crate::query::diff::{self, FileChange};
+use crate::query::impact::{ImpactRequest, shell_quote};
 use crate::query::output::Answer;
-use crate::query::page::{PageIdentity, apply_dependents_pagination, apply_pagination, precheck_cursor};
+use crate::query::page::{
+    PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination, precheck_cursor,
+};
 use crate::query::{Detail, QueryEngine, Relation};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
 use crate::semantic::probe::PROBE_DEADLINE;
 use crate::semantic::python_adapter::{PythonAdapter, environment_facts, resolve_environment};
 use crate::semantic::{SemanticEngine, SemanticError, rust_adapter::RustAdapter};
 
+/// The file extension and skipped top-level-name directories [`collect_sources`] walks with for
+/// `language` — the single place the per-language discovery rules live, shared by
+/// [`collect_rust_sources`]/[`collect_python_sources`] and [`is_discovered_path`] so the two rule
+/// sets cannot drift.
+fn language_discovery_rules(language: Language) -> (&'static str, &'static [&'static str]) {
+    match language {
+        Language::Rust => ("rs", &["target"]),
+        Language::Python => ("py", &["venv"]),
+    }
+}
+
 /// Collect `(workspace_relative_path, source_text)` for every `.rs` file under `root`.
 ///
 /// Paths are relative to `root` and use `/` separators to match SCIP document paths. `target/` and
 /// hidden directories are skipped.
 pub fn collect_rust_sources(root: &Path) -> Result<Vec<(String, String)>> {
-    collect_sources(root, "rs", &["target"])
+    let (extension, skip_dirs) = language_discovery_rules(Language::Rust);
+    collect_sources(root, extension, skip_dirs)
 }
 
 /// Collect `(workspace_relative_path, source_text)` for every `.py` file under `root`.
@@ -36,7 +55,8 @@ pub fn collect_rust_sources(root: &Path) -> Result<Vec<(String, String)>> {
 /// hidden directories (`.venv/` included) are skipped — the environment's own sources are not the
 /// workspace's.
 pub fn collect_python_sources(root: &Path) -> Result<Vec<(String, String)>> {
-    collect_sources(root, "py", &["venv"])
+    let (extension, skip_dirs) = language_discovery_rules(Language::Python);
+    collect_sources(root, extension, skip_dirs)
 }
 
 fn collect_sources(root: &Path, extension: &str, skip_dirs: &[&str]) -> Result<Vec<(String, String)>> {
@@ -74,6 +94,68 @@ fn collect_dir(
         }
     }
     Ok(())
+}
+
+/// Whether source discovery would have collected `path` — the same extension and skipped-directory
+/// rules [`collect_sources`] walks with, applied to a path rather than to a directory entry.
+///
+/// Restoring a deleted or renamed file into the pre-change set must not add a path `build` would
+/// never have seen (a file under `target/`, a dotted directory, or one with the wrong extension),
+/// which would make the pre-change hash unreachable by any real build.
+fn is_discovered_path(path: &str, language: Language) -> bool {
+    let (extension, skip_dirs) = language_discovery_rules(language);
+    if Path::new(path).extension().is_none_or(|e| e != extension) {
+        return false;
+    }
+    // Every directory component (every segment but the last) must clear the same skip check
+    // `collect_dir` applies before it recurses into a directory.
+    let mut components = path.split('/');
+    components.next_back();
+    components.all(|dir| !dir.starts_with('.') && !skip_dirs.contains(&dir))
+}
+
+/// The workspace's discovered sources with `changes` reverted — the change's pre-change side, as
+/// `build` would have seen it.
+///
+/// Exactness is graded against the *current discovered set with the diff undone*, not against the
+/// base git tree: source discovery walks the filesystem by extension and ignores git tracking, so an
+/// untracked-but-discovered source (a scratch script, a generated module) is part of what `build`
+/// hashed. Hashing the base tree instead would leave any such file mismatched forever, putting
+/// `exact` permanently out of reach even seconds after a fresh build.
+///
+/// Reverting undoes exactly what the change did: a modified file takes its pre-change content, a
+/// file the change added is dropped, a file it deleted is restored, and a renamed file is restored
+/// at its pre-change path. Untracked files participate with their current content, exactly as
+/// `build` saw them, so an untracked source edited after the build correctly grades the answer
+/// approximate — drift a base-tree hash could never see.
+pub fn revert_changes(
+    sources: &[(String, String)],
+    changes: &[FileChange],
+    pre_contents: &BTreeMap<String, String>,
+    language: Language,
+) -> Vec<(String, String)> {
+    let mut set: BTreeMap<String, String> = sources.iter().cloned().collect();
+    for change in changes {
+        // Drop the post-change path when it differs from the pre-change path: an added file has no
+        // pre-change path at all, and a renamed file's identity moves to its pre-change path. A
+        // modified file keeps the same path on both sides, so no removal is needed — the insertion
+        // below overwrites it in place.
+        if let Some(post_path) = &change.post_path
+            && change.pre_path.as_ref() != Some(post_path)
+        {
+            set.remove(post_path);
+        }
+        // Restore the pre-change content at the pre-change path, but only when that path is one
+        // source discovery would actually have collected, and only when the boundary supplied its
+        // pre-change text.
+        if let Some(pre_path) = &change.pre_path
+            && is_discovered_path(pre_path, language)
+            && let Some(content) = pre_contents.get(pre_path)
+        {
+            set.insert(pre_path.clone(), content.clone());
+        }
+    }
+    set.into_iter().collect()
 }
 
 /// Render an answer, honoring the `--json` flag: the serialized machine answer under `--json`, or the
@@ -741,6 +823,250 @@ pub fn run_find(
     Ok(render(&answer, json, styled))
 }
 
+/// `impact`: the reverse-reachability impact of a change, seeded from a git diff rather than from a
+/// symbol the caller names.
+///
+/// Order is load-bearing:
+///
+/// 1. Argument validation runs before any side effect — clap's `conflicts_with` already refuses a
+///    revspec together with `--staged`, so what remains here is the cursor precheck.
+/// 2. The git boundary is resolved before the store is opened. Whether `git` is usable does not
+///    depend on whether an index exists, so an absent `git`, a non-worktree directory, or a bounded
+///    timeout (all [`crate::exit::ExitCode::IndexerSetup`]) and a malformed or unresolvable revision
+///    spec ([`crate::exit::ExitCode::Usage`]) are all decided — and reported — before the no-index
+///    outcome would otherwise fire, which is the more actionable diagnostic when both are unmet at
+///    once.
+/// 3. The patch is parsed once the diff is in hand, and narrowed to `paths` against the parsed change
+///    set (never as a `git diff` pathspec, which would break rename pairing) — before anything else
+///    consumes the change set, so narrowing scopes the whole assessment.
+/// 4. The store opens, and the current provenance/hash/environment are read exactly as the sibling
+///    query handlers read them.
+/// 5. Each touched file's pre-change content is fetched once per distinct path.
+/// 6. The pre-change hash — the discovered source set with the diff reverted — is computed to grade
+///    the answer's exactness.
+/// 7. Untracked discovered sources are detected: the recovery recipe's copy step must materialize
+///    them into its throwaway worktree, since a bare `git worktree add` populates only tracked files.
+/// 8. Whether the change's pre-change side can actually be reconstructed from this workspace is
+///    decided per mode — a hash match alone does not certify exactness, since the substitution that
+///    produces it can itself be lossy — and, for a revision-range seed, its head endpoint is resolved
+///    so the recovery recipe can re-run from a worktree at that head.
+/// 9. The request is assembled, the assessment run, the answer paged, and rendered.
+#[allow(clippy::too_many_arguments)] // the CLI's flat query-command surface travels together
+pub fn run_impact(
+    db: &Path,
+    root: &Path,
+    rust_analyzer: &str,
+    workspace: Option<&str>,
+    revspec: Option<&str>,
+    staged: bool,
+    depth: u32,
+    paths: &[PathBuf],
+    limit: usize,
+    cursor: Option<&str>,
+    json: bool,
+    styled: bool,
+) -> Result<String> {
+    let effective_limit = (limit != 0).then_some(limit);
+    // Store-independent cursor checks run before the store opens, so a malformed cursor or a cursor
+    // against an unbounded set is a usage error even against an absent index.
+    precheck_cursor(cursor, effective_limit)?;
+
+    let mode = match (revspec, staged) {
+        (Some(spec), _) => SeedMode::Revspec(spec.to_string()),
+        (None, true) => SeedMode::Staged,
+        (None, false) => SeedMode::WorkingTree,
+    };
+
+    // The git boundary, before the store: every `GitError` is converted through `into_failure()`, so
+    // the setup/usage split holds however the failure arose.
+    let repo = GitRepo::discover(root).map_err(GitError::into_failure)?;
+    let base_revision = repo.base_revision(&mode).map_err(GitError::into_failure)?;
+    let patch = repo.diff(&mode).map_err(GitError::into_failure)?;
+
+    // Narrowing is applied to the parsed change set, not handed to `git diff` as a pathspec: a
+    // pathspec is applied before rename detection, so narrowing to a renamed file's post-change path
+    // would leave git with nothing to pair it against. Applied immediately after parsing and before
+    // anything else consumes the change set, so the pre-change hash reversion below also sees the
+    // narrowed set — narrowing scopes the whole assessment, not just the seeds.
+    let changes = diff::narrow_to_paths(diff::parse_patch(&patch), paths);
+
+    let store = open_query_store(db)?;
+    let page_index_hash = recorded_index_hash(&store)?;
+    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let meta = store
+        .read_metadata()?
+        .expect("open_query_store guarantees a completed build's metadata");
+
+    // The language the recorded metadata's analyzer decides, which is also what source discovery
+    // would have collected.
+    let language = if meta.provenance.analyzer_name == PythonAdapter::analyzer_name() {
+        Language::Python
+    } else {
+        Language::Rust
+    };
+
+    // Only a path source discovery would have collected can carry a seed or an unmappable region. A
+    // change to a README, a lockfile, or a JSON fixture is not something the graph would ever track,
+    // so it contributes nothing at all — reporting it as a region this index cannot resolve would
+    // dress a file the graph never had an opinion about as a resolution gap, and would keep a diff
+    // touching only such files from reaching the definite-none answer it deserves.
+    let seed_changes: Vec<FileChange> = changes
+        .iter()
+        .filter(|change| {
+            change
+                .pre_path
+                .as_deref()
+                .is_some_and(|path| is_discovered_path(path, language))
+        })
+        .cloned()
+        .collect();
+
+    // Fetch the pre-change content of every touched source, once per distinct path. A path `show`
+    // reports absent (deleted upstream of the base revision, or simply never existed there) gets no
+    // entry — the query layer discloses it as unmappable rather than failing the whole assessment.
+    let mut pre_contents: BTreeMap<String, String> = BTreeMap::new();
+    for change in &seed_changes {
+        let Some(pre_path) = &change.pre_path else { continue };
+        if pre_contents.contains_key(pre_path) {
+            continue;
+        }
+        if let Some(content) = repo.show(&base_revision, pre_path).map_err(GitError::into_failure)? {
+            pre_contents.insert(pre_path.clone(), content);
+        }
+    }
+
+    // The pre-change hash: that language's currently-discovered sources with the diff reverted. The
+    // reversion sees the whole change, not just the seed-bearing part, so a rename that moves a file
+    // out of the discovered set still drops its post-change path.
+    let sources = match language {
+        Language::Python => collect_python_sources(root)?,
+        Language::Rust => collect_rust_sources(root)?,
+    };
+    let reverted = revert_changes(&sources, &changes, &pre_contents, language);
+    let pre_change_hash = content_hash(&reverted);
+
+    // A bare `git worktree add` (the recovery recipe's first step) materializes only tracked files,
+    // so a discovered source `git` does not track needs its own copy step in that recipe.
+    let tracked: BTreeSet<String> = repo
+        .tracked_files()
+        .map_err(GitError::into_failure)?
+        .into_iter()
+        .collect();
+    let untracked_sources: Vec<String> = sources
+        .iter()
+        .filter(|(path, _)| !tracked.contains(path))
+        .map(|(path, _)| path.clone())
+        .collect();
+
+    // The resolved head revision of a `Revspec` range, or `None` for every other mode and for a bare
+    // single-revision spec — both the reconstructibility check below and the recovery recipe need it.
+    let range_head = repo.range_head(&mode).map_err(GitError::into_failure)?;
+
+    // Reconstructibility gates `Exactness::Exact` alongside the hash comparison: the pre-change side
+    // is rebuilt by substituting each changed file's base content wholesale, which is lossy whenever
+    // a file carries edits the selected diff does not describe.
+    //
+    // - `WorkingTree`'s diff spans base-to-worktree by definition, so nothing is outside it.
+    // - `Staged` is reconstructible unless some unstaged path is also part of the selected diff — the
+    //   substitution would then discard that unstaged edit too, landing on a state the diff does not
+    //   actually describe.
+    // - A bare single-revision spec behaves like `WorkingTree` (`git diff <rev>` also spans that
+    //   revision to the worktree). A range is reconstructible only when its head is what is currently
+    //   checked out and no uncommitted change touches a discovered source — otherwise reverting the
+    //   range's diff from this workspace yields a hybrid no index can match.
+    let reconstructible = match &mode {
+        SeedMode::WorkingTree => true,
+        SeedMode::Staged => {
+            let unstaged: BTreeSet<String> = repo
+                .unstaged_paths()
+                .map_err(GitError::into_failure)?
+                .into_iter()
+                .collect();
+            !changes.iter().any(|change| {
+                change.pre_path.as_ref().is_some_and(|p| unstaged.contains(p))
+                    || change.post_path.as_ref().is_some_and(|p| unstaged.contains(p))
+            })
+        }
+        SeedMode::Revspec(_) => match &range_head {
+            None => true,
+            Some(head) => {
+                let current_head = repo
+                    .base_revision(&SeedMode::WorkingTree)
+                    .map_err(GitError::into_failure)?;
+                if *head != current_head {
+                    false
+                } else {
+                    let uncommitted = repo.uncommitted_paths().map_err(GitError::into_failure)?;
+                    !uncommitted.iter().any(|p| is_discovered_path(p, language))
+                }
+            }
+        },
+    };
+
+    let workspace_id = resolve_workspace(workspace, root)?;
+    let db_display = db.display().to_string();
+    let engine = QueryEngine::new(&store, provenance, hash, environment);
+    let request = ImpactRequest {
+        mode: &mode,
+        paths,
+        base_revision: &base_revision,
+        changes: &seed_changes,
+        pre_contents: &pre_contents,
+        pre_change_hash: &pre_change_hash,
+        index_hash: &meta.content_hash,
+        db: &db_display,
+        workspace: workspace_id.as_str(),
+        prefix: repo.prefix(),
+        reconstructible,
+        untracked_sources: &untracked_sources,
+        range_head: range_head.as_deref(),
+        depth,
+    };
+    let answer = engine.impact(&request)?;
+
+    // The reference a continuation token binds to: the seed mode, the resolved base revision, the
+    // narrowing paths, and a digest of the patch itself, joined by a unit separator that cannot appear
+    // in any of them. The resolved revision alone is not enough: every other query's result set is a
+    // function of the index, but an impact answer is also a function of the diff, which is not a flag
+    // — the working tree can change between two pages, and two different revision ranges sharing a
+    // base (`A..B` and `A..C`) resolve to the same base revision and flags yet seed a different
+    // answer. Binding the patch digest itself is what tells the two apart.
+    let reference = [
+        seed_mode_label(&mode).to_string(),
+        base_revision.clone(),
+        paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\u{1f}"),
+        hex_sha256(&patch),
+    ]
+    .join("\u{1f}");
+    let identity = PageIdentity {
+        command: "impact",
+        reference,
+        relation: None,
+        detail: None,
+        depth: Some(depth),
+        limit: effective_limit,
+        max_lines: None,
+        from: None,
+        index_hash: page_index_hash,
+    };
+    let answer = apply_impact_pagination(answer, effective_limit, cursor, &identity)?;
+    Ok(render(&answer, json, styled))
+}
+
+/// The seed mode label used in `impact`'s continuation-token identity: `working_tree`, `staged`, or
+/// `range` — the same category labels the answer's own `seed_mode` field reports.
+fn seed_mode_label(mode: &SeedMode) -> &'static str {
+    match mode {
+        SeedMode::WorkingTree => "working_tree",
+        SeedMode::Staged => "staged",
+        SeedMode::Revspec(_) => "range",
+    }
+}
+
 /// The readiness of one required indexer, as reported by `doctor`.
 ///
 /// Three states are distinguished so the caller can tell a tool that is not installed from one that
@@ -965,6 +1291,107 @@ pub fn render_cache_report(outcome: &CacheOutcome, json: bool) -> String {
     }
 }
 
+/// The outcome of `hooks install`: the hook path written.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HookOutcome {
+    /// The path the hook was written to.
+    pub path: String,
+}
+
+/// The post-commit hook script for a workspace at `root`, indexed at `db` under `workspace`: a
+/// `#!/bin/sh` script that reruns `c10r build` after every commit, keeping the index at the committed
+/// state the diff-seeded assessment's exact path depends on.
+///
+/// All three are substituted with resolved, absolute, shell-quoted values rather than left to
+/// defaults. Git invokes `post-commit` with the working directory at the worktree's top level, which
+/// is neither the caller's invocation directory nor — for a workspace below the repository root — the
+/// workspace at all, so a bare `c10r build` would index the wrong tree into the wrong store under the
+/// wrong identity. `--workspace` is load-bearing for the same reason it is in the recovery recipe:
+/// `build` derives the identity from the root directory name, so leaving it implicit would namespace
+/// symbols under whatever directory the hook happened to run from.
+fn post_commit_hook_script(root: &Path, db: &Path, workspace: &str) -> String {
+    format!(
+        "#!/bin/sh\nc10r build {} --db {} --workspace {}\n",
+        shell_quote(&root.display().to_string()),
+        shell_quote(&db.display().to_string()),
+        shell_quote(workspace),
+    )
+}
+
+/// `hooks install`: write the post-commit hook that refreshes the index after every commit.
+///
+/// Refuses rather than overwrites when anything already exists at the resolved hook path: a commit
+/// hook is the caller's, and silently replacing one is destructive — a query-shaped tool has no
+/// license to perform it. The written file is made executable (`0o755`), since a hook git will not
+/// execute is not installed.
+///
+/// `root` and `db` are made absolute before they are written into the script, because the hook runs
+/// from git's own working directory rather than from the caller's.
+pub fn run_hooks_install(root: &Path, db: &Path, workspace: Option<&str>) -> Result<HookOutcome> {
+    let repo = GitRepo::discover(root).map_err(GitError::into_failure)?;
+    let path = repo.post_commit_hook_path().map_err(GitError::into_failure)?;
+    let workspace_id = resolve_workspace(workspace, root)?;
+    let absolute_root = root
+        .canonicalize()
+        .with_context(|| format!("resolving the workspace root {}", root.display()))?;
+    // Joined rather than canonicalized: the index need not exist yet, and `canonicalize` requires
+    // every component to. An already-absolute `--db` wins outright, since `join` replaces rather than
+    // appends when its argument is absolute.
+    let absolute_db = absolute_root.join(db);
+
+    // `symlink_metadata` rather than `exists`, which follows symlinks: a dangling symlink at the hook
+    // path would read as absent and the write below would follow it, landing outside the hooks
+    // directory — the one case where refusing-rather-than-overwriting would do neither.
+    if path.symlink_metadata().is_ok() {
+        return Err(anyhow!(
+            "a hook already exists at {}; refusing to overwrite it — remove it first if you mean to \
+             replace it, or add `c10r build` to it by hand",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let script = post_commit_hook_script(&absolute_root, &absolute_db, workspace_id.as_str());
+    std::fs::write(&path, &script).with_context(|| format!("writing hook at {}", path.display()))?;
+
+    // Git hooks are a POSIX-shell mechanism invoked directly by the OS, so the executable bit is a
+    // Unix-only concept; there is no Windows equivalent to gate here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("marking hook executable at {}", path.display()))?;
+    }
+
+    Ok(HookOutcome {
+        path: path.display().to_string(),
+    })
+}
+
+/// The rendering of a `hooks install` report: the JSON structured answer under `--json`, or a
+/// one-line human summary naming the path written.
+pub fn render_hook_report(outcome: &HookOutcome, json: bool) -> String {
+    if json {
+        serde_json::to_string_pretty(outcome).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        format!("installed hook at {}", crate::render::sanitize(&outcome.path))
+    }
+}
+
+/// A hex SHA-256 digest of `text`, the idiom [`crate::graph::content_hash`] and
+/// [`crate::query::page::PageIdentity`]'s parameter hash both use — here, for binding an `impact`
+/// continuation token to the patch it was seeded from.
+fn hex_sha256(text: &str) -> String {
+    use std::fmt::Write;
+    let digest = Sha256::digest(text.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// The recorded index identity a continuation token binds to: the source content-hash composed with
 /// the recorded analyzer provenance (name and version), joined by a unit separator that cannot appear
 /// in either component. A rebuild that changes the sources (a new content-hash) or the analyzer
@@ -1032,4 +1459,133 @@ fn ensure_parent_dir(db: &Path) -> Result<()> {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::content_hash;
+    use crate::query::diff::ChangeKind;
+
+    fn change(kind: ChangeKind, pre_path: Option<&str>, post_path: Option<&str>) -> FileChange {
+        FileChange {
+            kind,
+            pre_path: pre_path.map(str::to_string),
+            post_path: post_path.map(str::to_string),
+            pre_ranges: Vec::new(),
+        }
+    }
+
+    // `is_discovered_path` agrees with `collect_sources` over a real temp tree: a source under a
+    // plain directory is discovered, one under `target/` or a dotted directory is not, and one with
+    // the wrong extension is not.
+    #[test]
+    fn is_discovered_path_agrees_with_collect_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".hidden")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("target/b.rs"), "fn b() {}").unwrap();
+        std::fs::write(dir.path().join(".hidden/c.rs"), "fn c() {}").unwrap();
+        std::fs::write(dir.path().join("src/d.txt"), "not rust").unwrap();
+
+        let collected = collect_rust_sources(dir.path()).unwrap();
+        let collected_paths: std::collections::BTreeSet<&str> = collected.iter().map(|(p, _)| p.as_str()).collect();
+
+        let candidates = ["src/a.rs", "target/b.rs", ".hidden/c.rs", "src/d.txt"];
+        for path in candidates {
+            assert_eq!(
+                is_discovered_path(path, Language::Rust),
+                collected_paths.contains(path),
+                "disagreement on {path}"
+            );
+        }
+        assert_eq!(collected_paths, ["src/a.rs"].into_iter().collect());
+    }
+
+    // A modified file takes its pre-change content; an added file is dropped; a deleted source is
+    // restored; a renamed file moves back to its pre-change path; a deleted file under `target/` is
+    // not restored; an untracked-in-git file untouched by the change passes through unchanged.
+    #[test]
+    fn revert_changes_undoes_each_change_kind() {
+        let sources = vec![
+            ("src/modified.rs".to_string(), "after".to_string()),
+            ("src/added.rs".to_string(), "new content".to_string()),
+            ("src/renamed_to.rs".to_string(), "renamed content".to_string()),
+            ("src/untouched.rs".to_string(), "unchanged".to_string()),
+        ];
+        let changes = vec![
+            change(ChangeKind::Modified, Some("src/modified.rs"), Some("src/modified.rs")),
+            change(ChangeKind::Added, None, Some("src/added.rs")),
+            change(ChangeKind::Deleted, Some("src/deleted.rs"), None),
+            change(ChangeKind::Deleted, Some("target/deleted.rs"), None),
+            change(
+                ChangeKind::Renamed,
+                Some("src/renamed_from.rs"),
+                Some("src/renamed_to.rs"),
+            ),
+        ];
+        let mut pre_contents = BTreeMap::new();
+        pre_contents.insert("src/modified.rs".to_string(), "before".to_string());
+        pre_contents.insert("src/deleted.rs".to_string(), "deleted content".to_string());
+        pre_contents.insert("target/deleted.rs".to_string(), "deleted under target".to_string());
+        pre_contents.insert("src/renamed_from.rs".to_string(), "pre-rename content".to_string());
+
+        let reverted = revert_changes(&sources, &changes, &pre_contents, Language::Rust);
+        let map: BTreeMap<String, String> = reverted.into_iter().collect();
+
+        assert_eq!(map.get("src/modified.rs"), Some(&"before".to_string()));
+        assert_eq!(map.get("src/added.rs"), None, "an added file is dropped");
+        assert_eq!(map.get("src/deleted.rs"), Some(&"deleted content".to_string()));
+        assert_eq!(
+            map.get("target/deleted.rs"),
+            None,
+            "a deleted file under target/ is not restored — build would never have discovered it"
+        );
+        assert_eq!(map.get("src/renamed_to.rs"), None, "the post-change path is dropped");
+        assert_eq!(map.get("src/renamed_from.rs"), Some(&"pre-rename content".to_string()));
+        assert_eq!(map.get("src/untouched.rs"), Some(&"unchanged".to_string()));
+    }
+
+    // Reverting a change over a source set whose hash matches a recorded hash: the content hash of
+    // the reverted set equals the content hash of the hand-built expected pre-change set.
+    #[test]
+    fn revert_changes_hash_matches_hand_built_pre_change_set() {
+        let sources = vec![
+            ("src/modified.rs".to_string(), "after".to_string()),
+            ("src/untouched.rs".to_string(), "unchanged".to_string()),
+        ];
+        let changes = vec![change(
+            ChangeKind::Modified,
+            Some("src/modified.rs"),
+            Some("src/modified.rs"),
+        )];
+        let mut pre_contents = BTreeMap::new();
+        pre_contents.insert("src/modified.rs".to_string(), "before".to_string());
+
+        let reverted = revert_changes(&sources, &changes, &pre_contents, Language::Rust);
+        let expected = vec![
+            ("src/modified.rs".to_string(), "before".to_string()),
+            ("src/untouched.rs".to_string(), "unchanged".to_string()),
+        ];
+        assert_eq!(content_hash(&reverted), content_hash(&expected));
+    }
+
+    // Every value the hook script carries is a path or an identity the caller chose, and any of them
+    // may contain a space — the hook is a shell script, so an unquoted space would split one argument
+    // into two and point `build` at a path that does not exist. Each of the three is single-quoted.
+    #[test]
+    fn post_commit_hook_script_shell_quotes_values_containing_a_space() {
+        let script = post_commit_hook_script(
+            Path::new("/home/dev/my project"),
+            Path::new("/home/dev/my project/.c10r/index.db"),
+            "my project",
+        );
+        assert_eq!(
+            script,
+            "#!/bin/sh\nc10r build '/home/dev/my project' --db '/home/dev/my project/.c10r/index.db' \
+             --workspace 'my project'\n"
+        );
+    }
 }

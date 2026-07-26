@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::exit::Failure;
 
+use super::impact::ImpactReport;
 use super::output::{Answer, Outcome, PageInfo};
 use super::{DependentItem, DependentsReport};
 
@@ -19,7 +20,7 @@ use super::{DependentItem, DependentsReport};
 /// the exact same identity — a different query, or an index rebuilt underneath (changed sources or a
 /// changed analyzer version), changes the hash and is rejected.
 pub struct PageIdentity {
-    /// The command name (`get` or `trace`).
+    /// The command name (`get`, `trace`, `find`, or `impact`).
     pub command: &'static str,
     /// The subject reference (or source-position string), as presented.
     pub reference: String,
@@ -201,21 +202,23 @@ pub fn apply_pagination<T>(
     })
 }
 
-/// Apply the result-set bound to a `dependents` impact answer, paging the report's detailed rows.
+/// Apply the result-set bound to a report-shaped answer, paging the detail rows `detail` selects out
+/// of the single report the answer carries.
 ///
-/// A found dependents answer is a single report whose `detail` rows are the row set a caller bounds;
-/// the depth bound, horizon, disclosure, and beyond-bound aggregate are context repeated on every
-/// page, not rows — so they accompany each page rather than being paged. Ambiguity, absence, and empty
-/// carry no report and page exactly as any other answer's envelope, so those cases delegate to
+/// A report-shaped answer is one found result whose inner row vector is the set a caller bounds,
+/// while the rest of the report — a depth bound, a horizon, a disclosure, an aggregate, a freshness
+/// grade — is context repeated on every page rather than rows to page. Ambiguity, absence, and empty
+/// carry no report and page exactly as any other answer's envelope, so those delegate to
 /// [`apply_pagination`], which also caps an ambiguous candidate list and validates the cursor. The
 /// token machinery is shared verbatim — one [`encode_token`]/[`decode_token`] path, the same identity
-/// hash — the page merely spans the inner detail rows rather than the outer result vec.
-pub fn apply_dependents_pagination(
-    answer: Answer<DependentsReport>,
+/// hash — the page merely spans the selected rows rather than the outer result vec.
+pub fn apply_report_pagination<T>(
+    answer: Answer<T>,
     limit: Option<usize>,
     cursor: Option<&str>,
     identity: &PageIdentity,
-) -> anyhow::Result<Answer<DependentsReport>> {
+    detail: impl FnOnce(&mut T) -> &mut Vec<DependentItem>,
+) -> anyhow::Result<Answer<T>> {
     if !matches!(answer.outcome, Outcome::Found { .. }) {
         return apply_pagination(answer, limit, cursor, identity);
     }
@@ -245,23 +248,24 @@ pub fn apply_dependents_pagination(
         });
     };
 
-    // A found dependents answer carries exactly one report; its detail rows are the pageable set.
+    // A found report-shaped answer carries exactly one report; its selected rows are the pageable set.
     let mut report = results
         .into_iter()
         .next()
-        .expect("a found dependents answer carries exactly one report");
-    let total = report.detail.len();
+        .expect("a found report-shaped answer carries exactly one report");
+    let rows = detail(&mut report);
+    let total = rows.len();
     let page_count = total.div_ceil(limit).max(1);
     if page_index >= page_count {
         return Err(out_of_range(page_count - 1));
     }
 
     let start = page_index * limit;
-    let page_rows: Vec<DependentItem> = report.detail.into_iter().skip(start).take(limit).collect();
+    let page_rows: Vec<DependentItem> = std::mem::take(rows).into_iter().skip(start).take(limit).collect();
     let returned = page_rows.len();
     let truncated = start + returned < total;
     let cursor = truncated.then(|| encode_token(&param_hash, page_index + 1));
-    report.detail = page_rows;
+    *rows = page_rows;
 
     // A page block is disclosure of a partial view: attached only when the detail rows were truncated
     // to the limit or a later page was resumed, so a report whose rows fit the limit reads unbounded.
@@ -280,6 +284,26 @@ pub fn apply_dependents_pagination(
         outcome: Outcome::Found { results: vec![report] },
         page,
     })
+}
+
+/// Apply the result-set bound to a `dependents` impact answer, paging the report's detailed rows.
+pub fn apply_dependents_pagination(
+    answer: Answer<DependentsReport>,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    identity: &PageIdentity,
+) -> anyhow::Result<Answer<DependentsReport>> {
+    apply_report_pagination(answer, limit, cursor, identity, |report| &mut report.detail)
+}
+
+/// Apply the result-set bound to a diff-seeded `impact` answer, paging its dependents' detailed rows.
+pub fn apply_impact_pagination(
+    answer: Answer<ImpactReport>,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    identity: &PageIdentity,
+) -> anyhow::Result<Answer<ImpactReport>> {
+    apply_report_pagination(answer, limit, cursor, identity, |report| &mut report.dependents.detail)
 }
 
 /// Resolve which page a request names: page 0 with no cursor, or the cursor's page after validating
@@ -444,6 +468,59 @@ mod tests {
         let token = encode_token(&identity.hash(), 5);
 
         let err = apply_dependents_pagination(answer, Some(1), Some(&token), &identity)
+            .expect_err("a page past the last is refused, not silently served");
+        let message = err.to_string();
+        assert!(
+            message.contains("0..=2"),
+            "the rejection names the valid page range: {message}"
+        );
+    }
+
+    // _(Bounded and resumable answers: mismatched continuation token refused — out-of-range page,
+    // impact)_ — the same refusal holds when paging an `impact` answer's dependents' detail rows,
+    // exercising [`apply_report_pagination`] through its second named entry point.
+    #[test]
+    fn impact_out_of_range_page_names_the_valid_range() {
+        use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
+
+        let identity = identity(1);
+        let detail: Vec<DependentItem> = (0..3)
+            .map(|i| DependentItem {
+                symbol: crate::query::output::SymbolView {
+                    canonical_id: crate::identity::CanonicalId::from_raw(format!("test-ws::dep{i}")),
+                    name: format!("dep{i}"),
+                    kind: "function".to_string(),
+                    external: false,
+                },
+                kind: "uses".to_string(),
+                distance: 1,
+                location: None,
+                content: None,
+                content_truncated: false,
+            })
+            .collect();
+        let report = ImpactReport {
+            seed_mode: "working_tree",
+            base_revision: "abc123".to_string(),
+            exactness: Exactness::Exact,
+            seed_outcome: SeedOutcome::Seeded,
+            recovery: None,
+            seeds: Vec::new(),
+            unmappable: Vec::new(),
+            dependents_snapshot: "current_index",
+            dependents: DependentsReport {
+                depth_bound: 1,
+                horizon: 1,
+                disclosure: HorizonDisclosure::EndsWithinBound,
+                detail,
+                beyond_bound: Vec::new(),
+            },
+        };
+        let answer = Answer::found(vec![report], provenance(), Freshness::Fresh);
+        // 3 detail rows at limit 1: pages 0..=2 are valid; page 5 is out of range.
+        let token = encode_token(&identity.hash(), 5);
+
+        let err = apply_impact_pagination(answer, Some(1), Some(&token), &identity)
             .expect_err("a page past the last is refused, not silently served");
         let message = err.to_string();
         assert!(

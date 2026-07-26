@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
-use silent_cartographer::cli::{Cli, Command, CompletionsArgs};
+use silent_cartographer::cli::{Cli, Command, CompletionsArgs, HookAction};
 use silent_cartographer::commands;
 use silent_cartographer::exit::{ExitCode, classify};
 use silent_cartographer::manifest;
@@ -159,6 +159,20 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             cli.json,
             styled,
         ),
+        Command::Impact(args) => commands::run_impact(
+            &cli.db,
+            &root,
+            &default_analyzer(),
+            cli.workspace.as_deref(),
+            args.revspec.as_deref(),
+            args.staged,
+            args.depth,
+            &args.paths,
+            args.paging.limit,
+            args.paging.cursor.as_deref(),
+            cli.json,
+            styled,
+        ),
         Command::Build(args) => {
             let accounting = commands::run_build(
                 &cli.db,
@@ -193,6 +207,12 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
         Command::Cache => {
             let outcome = commands::run_cache(&cli.db)?;
             Ok(commands::render_cache_report(&outcome, cli.json))
+        }
+        Command::Hooks(args) => {
+            let outcome = match args.action {
+                HookAction::Install => commands::run_hooks_install(&root, &cli.db, cli.workspace.as_deref())?,
+            };
+            Ok(commands::render_hook_report(&outcome, cli.json))
         }
         // The structural index is always machine-readable JSON: `--json` is accepted (it is
         // global) but changes nothing, since manifest's answer is the machine answer.

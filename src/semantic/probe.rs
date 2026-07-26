@@ -85,7 +85,28 @@ pub enum ProbeOutcome {
 /// The `wait-timeout` crate was declined: it bounds the wait on the child, but the drain-thread
 /// machinery that dominates this helper — the two capped readers and the abandon rules — would still
 /// be needed on top of it, so it removes no complexity here.
-pub fn run_bounded(mut command: Command, deadline: Duration) -> std::io::Result<ProbeOutcome> {
+pub fn run_bounded(command: Command, deadline: Duration) -> std::io::Result<ProbeOutcome> {
+    run_with_cap(command, deadline, Some(CAPTURE_CAP))
+}
+
+/// Spawn `command` and wait up to `deadline`, exactly as [`run_bounded`], but retain the full stdout
+/// and stderr rather than capping each to [`CAPTURE_CAP`]. A `git diff` payload (or a large file's
+/// content from `git show`) must not be silently truncated, since a truncated diff would under-report
+/// the changed set an `impact` assessment seeds from.
+///
+/// The drain-and-discard reasoning in [`run_bounded`]'s doc comment still holds unchanged: the pipe is
+/// always drained by a reader thread, so the child can never block on a full pipe. Lifting the
+/// retention bound only changes how much of what is drained gets kept — the deadline, kill, and
+/// reader-abandon discipline are identical.
+pub fn run_bounded_full(command: Command, deadline: Duration) -> std::io::Result<ProbeOutcome> {
+    run_with_cap(command, deadline, None)
+}
+
+/// Spawn `command`, drain its stdout and stderr into buffers retaining at most `cap` bytes each (or
+/// all of it, when `cap` is `None`), and wait up to `deadline` for it to exit. This is the shared
+/// implementation behind [`run_bounded`] and [`run_bounded_full`]; see [`run_bounded`]'s doc comment
+/// for the full deadline/kill/reader-abandon discipline, which does not depend on `cap`.
+fn run_with_cap(mut command: Command, deadline: Duration, cap: Option<usize>) -> std::io::Result<ProbeOutcome> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
 
@@ -93,8 +114,8 @@ pub fn run_bounded(mut command: Command, deadline: Duration) -> std::io::Result<
     // to piped above.
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
-    let stdout_reader = spawn_drain(stdout);
-    let stderr_reader = spawn_drain(stderr);
+    let stdout_reader = spawn_drain(stdout, cap);
+    let stderr_reader = spawn_drain(stderr, cap);
 
     let start = Instant::now();
     loop {
@@ -148,9 +169,10 @@ impl DrainHandle {
     }
 }
 
-/// Spawn a thread that drains `reader` to EOF, retaining at most [`CAPTURE_CAP`] bytes in the shared
-/// buffer and discarding the rest so the child never blocks on a full pipe.
-fn spawn_drain<R: Read + Send + 'static>(mut reader: R) -> DrainHandle {
+/// Spawn a thread that drains `reader` to EOF, retaining at most `cap` bytes in the shared buffer and
+/// discarding the rest so the child never blocks on a full pipe. `cap` of `None` retains everything
+/// read.
+fn spawn_drain<R: Read + Send + 'static>(mut reader: R, cap: Option<usize>) -> DrainHandle {
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let shared = Arc::clone(&buffer);
     let handle = thread::spawn(move || {
@@ -162,12 +184,17 @@ fn spawn_drain<R: Read + Send + 'static>(mut reader: R) -> DrainHandle {
                     let Ok(mut captured) = shared.lock() else {
                         break;
                     };
-                    if captured.len() < CAPTURE_CAP {
-                        let room = CAPTURE_CAP - captured.len();
-                        captured.extend_from_slice(&chunk[..n.min(room)]);
+                    match cap {
+                        Some(cap) if captured.len() < cap => {
+                            let room = cap - captured.len();
+                            captured.extend_from_slice(&chunk[..n.min(room)]);
+                        }
+                        Some(_) => {
+                            // Past the cap, keep reading and discard: draining the pipe is what stops
+                            // the child from blocking on a full pipe.
+                        }
+                        None => captured.extend_from_slice(&chunk[..n]),
                     }
-                    // Past the cap, keep reading and discard: draining the pipe is what stops the
-                    // child from blocking on a full pipe.
                 }
                 Err(_) => break,
             }
@@ -275,5 +302,61 @@ mod tests {
             }
             ProbeOutcome::TimedOut => panic!("a child that exits after flooding must complete"),
         }
+    }
+
+    // A child that floods stdout well past the capped variant's cap is captured in full, byte-for-byte,
+    // under `run_bounded_full` — the cap-side behavior is pinned by `flooded_output_is_capped_not_unbounded`.
+    #[test]
+    fn full_capture_retains_output_past_the_cap() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("head -c 200000 /dev/zero");
+        let outcome = run_bounded_full(cmd, Duration::from_secs(10)).expect("spawns");
+        match outcome {
+            ProbeOutcome::Completed(capture) => {
+                assert!(capture.status.success(), "the flooding child still exits zero");
+                assert_eq!(
+                    capture.stdout.len(),
+                    200_000,
+                    "the full capture is not truncated to the cap"
+                );
+            }
+            ProbeOutcome::TimedOut => panic!("a child that exits after flooding must complete"),
+        }
+    }
+
+    // `run_bounded_full` preserves the same timeout/kill/reader-abandon discipline as `run_bounded`: a
+    // hung child is killed and reported timed out promptly, and a surviving grandchild holding the pipe
+    // open does not block the probe.
+    #[test]
+    fn full_capture_hung_child_times_out_promptly() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let start = Instant::now();
+        let outcome = run_bounded_full(cmd, Duration::from_millis(150)).expect("spawns");
+        let elapsed = start.elapsed();
+        assert!(matches!(outcome, ProbeOutcome::TimedOut), "the hung child timed out");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the call returns near the deadline, not after the child's sleep: {elapsed:?}"
+        );
+    }
+
+    // A grandchild that inherits stdout and outlives its killed parent holds the pipe open; the full
+    // capture variant must still return rather than hang, exactly as the capped variant does.
+    #[test]
+    fn full_capture_descendant_holding_the_pipe_does_not_block_the_probe() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 & wait");
+        let start = Instant::now();
+        let outcome = run_bounded_full(cmd, Duration::from_millis(150)).expect("spawns");
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(outcome, ProbeOutcome::TimedOut),
+            "timed out despite the held pipe"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the probe returns without joining the pipe-blocked reader: {elapsed:?}"
+        );
     }
 }

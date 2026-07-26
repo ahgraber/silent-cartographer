@@ -11,6 +11,7 @@
 //! text is always plain.
 
 use crate::cli::ColorArg;
+use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
 use crate::query::output::{Answer, ContentLines, Location, Outcome, PageInfo, SymbolView};
 use crate::query::{DependentsReport, FindItem, HorizonDisclosure, SymbolDetail, TraceItem};
 
@@ -277,6 +278,87 @@ impl HumanRender for DependentsReport {
     }
 }
 
+impl HumanRender for ImpactReport {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+        for report in results {
+            lines.push(bold(
+                &format!(
+                    "impact: mode={} base={} exactness={}",
+                    sanitize(report.seed_mode),
+                    sanitize(&report.base_revision),
+                    exactness_label(report.exactness)
+                ),
+                styled,
+            ));
+            // A range's seeds resolve against its pre-change side while its dependents come from the
+            // one index that exists, so a range answer straddles two snapshots and says so. The other
+            // modes do not: their base revision already is the snapshot the dependents reflect, so
+            // the line would be noise there.
+            if report.seed_mode == "range" {
+                lines.push(
+                    "  dependents are those the current index holds, not those of either end of the range".to_string(),
+                );
+            }
+            match report.seed_outcome {
+                // A definite none: the change touches nothing the graph tracks, distinct from the
+                // resolution gap below.
+                SeedOutcome::NoIndexedSymbolTouched => {
+                    lines.push("none: the change touches nothing the graph tracks (a definite none)".to_string());
+                }
+                // A resolution gap: at least one changed region sat in a document the index never
+                // saw, so this is not a confident "nothing changed here."
+                SeedOutcome::NoneResolvable => {
+                    lines.push("unresolved: no changed region resolved against this index".to_string());
+                }
+                SeedOutcome::Seeded => {
+                    lines.push(bold(&format!("{} seeds", report.seeds.len()), styled));
+                    for seed in &report.seeds {
+                        lines.push(format!(
+                            "  {}  {}  [{}]{} at {}",
+                            sanitize(seed.symbol.canonical_id.as_str()),
+                            sanitize(&seed.symbol.name),
+                            sanitize(&seed.symbol.kind),
+                            external_tag(seed.symbol.external),
+                            location_at(seed.location.as_ref())
+                        ));
+                    }
+                }
+            }
+            if !report.unmappable.is_empty() {
+                lines.push(bold("regions this index cannot resolve", styled));
+                for region in &report.unmappable {
+                    lines.push(format!(
+                        "  {}:{}-{}",
+                        sanitize(&region.document_path),
+                        region.span_start,
+                        region.span_end
+                    ));
+                }
+            }
+            // A definite none carries no seed/dependent blocks: a dependents union over an empty
+            // seed set is trivially empty and would only echo the "none" line above as a redundant
+            // header.
+            if report.seed_outcome != SeedOutcome::NoIndexedSymbolTouched {
+                DependentsReport::render_found(std::slice::from_ref(&report.dependents), lines, styled);
+            }
+            if let Some(recovery) = &report.recovery {
+                lines.push(bold("approximate: run these steps to produce an exact answer", styled));
+                // The residual an approximate answer cannot rule out: unmappability is witnessed at
+                // the document level, so a declaration this index never recorded reads as a region
+                // touching nothing rather than as one it could not resolve.
+                lines.push(
+                    "  this index may be missing declarations the change touched, so a region reported as \
+                     touching nothing may be one it cannot see"
+                        .to_string(),
+                );
+                for step in &recovery.steps {
+                    lines.push(format!("  {}", sanitize(step)));
+                }
+            }
+        }
+    }
+}
+
 /// The answer header: analyzer provenance and freshness. The freshness label itself names any
 /// staleness and its reason, so a stale answer surfaces succinctly here.
 fn header_line<T>(answer: &Answer<T>, styled: bool) -> String {
@@ -407,6 +489,13 @@ fn freshness_label(freshness: crate::query::output::FreshnessLabel) -> &'static 
     }
 }
 
+fn exactness_label(exactness: Exactness) -> &'static str {
+    match exactness {
+        Exactness::Exact => "exact",
+        Exactness::Approximate => "approximate",
+    }
+}
+
 fn disclosure_label(disclosure: HorizonDisclosure) -> &'static str {
     match disclosure {
         HorizonDisclosure::EndsWithinBound => "ends within bound",
@@ -427,6 +516,7 @@ fn bold(text: &str, styled: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::impact::{RecoveryRecipe, UnmappableRegion};
 
     #[test]
     fn json_is_never_styled_whatever_the_color_gate() {
@@ -455,6 +545,225 @@ mod tests {
         assert!(
             should_style(ColorArg::Always, false, false),
             "always forces styling even redirected"
+        );
+    }
+
+    // A definite-none impact answer (`NoIndexedSymbolTouched`) renders its one-line "none" sentence
+    // and nothing else — no seed header, no dependents block — since a dependents union over an
+    // empty seed set is trivially empty and would only echo the sentence as a redundant header.
+    #[test]
+    fn impact_no_indexed_symbol_touched_renders_no_dependent_block() {
+        let report = ImpactReport {
+            seed_mode: "working_tree",
+            base_revision: "abc123".to_string(),
+            exactness: Exactness::Exact,
+            seed_outcome: SeedOutcome::NoIndexedSymbolTouched,
+            recovery: None,
+            seeds: Vec::new(),
+            unmappable: Vec::new(),
+            dependents_snapshot: "current_index",
+            dependents: DependentsReport {
+                depth_bound: 1,
+                horizon: 1,
+                disclosure: HorizonDisclosure::EndsWithinBound,
+                detail: Vec::new(),
+                beyond_bound: Vec::new(),
+            },
+        };
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("the change touches nothing the graph tracks"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("dependents:"),
+            "no dependents block for a definite none: {rendered}"
+        );
+        assert!(
+            !rendered.contains("seeds"),
+            "no seed header for a definite none: {rendered}"
+        );
+    }
+
+    /// An `ImpactReport` fixture with everything but `seed_mode`, `recovery`, and `unmappable` held
+    /// constant, so a test can vary just the field under scrutiny.
+    fn impact_report_fixture(
+        seed_mode: &'static str,
+        recovery: Option<RecoveryRecipe>,
+        unmappable: Vec<UnmappableRegion>,
+    ) -> ImpactReport {
+        ImpactReport {
+            seed_mode,
+            base_revision: "abc123".to_string(),
+            exactness: if recovery.is_some() {
+                Exactness::Approximate
+            } else {
+                Exactness::Exact
+            },
+            seed_outcome: SeedOutcome::NoIndexedSymbolTouched,
+            recovery,
+            seeds: Vec::new(),
+            unmappable,
+            dependents_snapshot: "current_index",
+            dependents: DependentsReport {
+                depth_bound: 1,
+                horizon: 1,
+                disclosure: HorizonDisclosure::EndsWithinBound,
+                detail: Vec::new(),
+                beyond_bound: Vec::new(),
+            },
+        }
+    }
+
+    // A range-seeded answer's human render discloses that its dependents come from the current
+    // index, not the range's endpoints; a working-tree-seeded answer's render carries no such line,
+    // since its base revision already is the snapshot the dependents come from.
+    #[test]
+    fn range_mode_discloses_the_dependents_snapshot_and_other_modes_do_not() {
+        let range_report = impact_report_fixture("range", None, Vec::new());
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&range_report), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("current index"),
+            "a range answer discloses the dependents snapshot: {rendered}"
+        );
+
+        let working_tree_report = impact_report_fixture("working_tree", None, Vec::new());
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&working_tree_report), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(
+            !rendered.contains("current index"),
+            "a working-tree answer carries no snapshot disclosure: {rendered}"
+        );
+    }
+
+    // An approximate answer's human render states that the index may be missing declarations the
+    // change touched; an exact answer's render carries no such caveat.
+    #[test]
+    fn approximate_answer_discloses_that_declarations_may_be_missing() {
+        let recovery = RecoveryRecipe {
+            base_revision: "abc123".to_string(),
+            db: "index.db".to_string(),
+            workspace: "ws".to_string(),
+            steps: vec!["echo rebuild".to_string()],
+        };
+        let approximate_report = impact_report_fixture("working_tree", Some(recovery), Vec::new());
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&approximate_report), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("may be missing declarations"),
+            "an approximate answer discloses that declarations may be missing: {rendered}"
+        );
+
+        let exact_report = impact_report_fixture("working_tree", None, Vec::new());
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&exact_report), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(
+            !rendered.contains("may be missing declarations"),
+            "an exact answer carries no such caveat: {rendered}"
+        );
+    }
+
+    // An exact answer's header labels itself `exact`; an approximate one labels itself
+    // `approximate` — the label a regression could invert without any other assertion catching it.
+    #[test]
+    fn exactness_label_reflects_exact_or_approximate() {
+        let exact_report = impact_report_fixture("working_tree", None, Vec::new());
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&exact_report), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("exactness=exact"), "{rendered}");
+        assert!(!rendered.contains("exactness=approximate"), "{rendered}");
+
+        let recovery = RecoveryRecipe {
+            base_revision: "abc123".to_string(),
+            db: "index.db".to_string(),
+            workspace: "ws".to_string(),
+            steps: vec!["echo rebuild".to_string()],
+        };
+        let approximate_report = impact_report_fixture("working_tree", Some(recovery), Vec::new());
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&approximate_report), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("exactness=approximate"), "{rendered}");
+        assert!(!rendered.contains("exactness=exact"), "{rendered}");
+    }
+
+    // An approximate answer's human render includes the recovery procedure's steps verbatim, and
+    // names the base revision, the index location, and the workspace identity the procedure needs —
+    // the caller must never be left to reconstruct those by hand.
+    #[test]
+    fn approximate_answer_renders_the_recovery_steps_and_names_base_db_and_workspace() {
+        let recovery = RecoveryRecipe {
+            base_revision: "deadbeef1234".to_string(),
+            db: "/tmp/c10r-exact.db".to_string(),
+            workspace: "my-workspace".to_string(),
+            steps: vec![
+                "git worktree add /tmp/c10r-wt deadbeef1234".to_string(),
+                "c10r build /tmp/c10r-wt --db /tmp/c10r-exact.db --workspace my-workspace".to_string(),
+            ],
+        };
+        let report = impact_report_fixture("working_tree", Some(recovery), Vec::new());
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("git worktree add /tmp/c10r-wt deadbeef1234"),
+            "the render includes the recovery procedure's steps verbatim: {rendered}"
+        );
+        assert!(
+            rendered.contains("c10r build /tmp/c10r-wt --db /tmp/c10r-exact.db --workspace my-workspace"),
+            "the render includes the recovery procedure's steps verbatim: {rendered}"
+        );
+        assert!(
+            rendered.contains("deadbeef1234"),
+            "the render names the base revision: {rendered}"
+        );
+        assert!(
+            rendered.contains("/tmp/c10r-exact.db"),
+            "the render names the index location: {rendered}"
+        );
+        assert!(
+            rendered.contains("my-workspace"),
+            "the render names the workspace identity: {rendered}"
+        );
+    }
+
+    // A report carrying unmappable regions renders the unresolvable-regions block, naming each
+    // region's document; a report with none renders no such block.
+    #[test]
+    fn unmappable_regions_render_the_unresolvable_block_and_absence_renders_none() {
+        let unmappable = vec![UnmappableRegion {
+            document_path: "src/unreachable.rs".to_string(),
+            span_start: 10,
+            span_end: 20,
+        }];
+        let report = impact_report_fixture("working_tree", None, unmappable);
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("regions this index cannot resolve"),
+            "unmappable regions render the unresolvable-regions block: {rendered}"
+        );
+        assert!(
+            rendered.contains("src/unreachable.rs"),
+            "the block names the region's document: {rendered}"
+        );
+
+        let report_without = impact_report_fixture("working_tree", None, Vec::new());
+        let mut lines = Vec::new();
+        ImpactReport::render_found(std::slice::from_ref(&report_without), &mut lines, false);
+        let rendered = lines.join("\n");
+        assert!(
+            !rendered.contains("regions this index cannot resolve"),
+            "no unmappable regions means no unresolvable-regions block: {rendered}"
         );
     }
 

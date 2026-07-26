@@ -1,5 +1,5 @@
 //! The `c10r` command-line surface: the query commands (`get`, `trace`, `find`), the operational
-//! set (`build`, `status`, `doctor`, `cache`), and the self-describing surface (`manifest`,
+//! set (`build`, `status`, `doctor`, `cache`, `hooks`), and the self-describing surface (`manifest`,
 //! `completions`).
 //!
 //! `get` folds definition-lookup and enclosure-by-position onto a detail axis; `trace` folds the
@@ -62,6 +62,9 @@ pub enum Command {
     /// Case folding is ASCII-only: an ASCII letter in the fragment matches regardless of case, while
     /// a non-ASCII character matches only exactly.
     Find(FindArgs),
+    /// Assess what a change could affect: the dependents of every symbol the change touched, seeded
+    /// from a git diff rather than from a symbol the caller names.
+    Impact(ImpactArgs),
     /// Build or refresh the index for the workspace.
     Build(BuildArgs),
     /// Report the index's provenance, freshness, and join-alignment counts.
@@ -70,6 +73,8 @@ pub enum Command {
     Doctor,
     /// Remove the stored index at the discovered `--db` path.
     Cache,
+    /// Install the repository hooks that keep the index current.
+    Hooks(HooksArgs),
     /// Emit the command/flag structure and the current index state as JSON, for machine
     /// orientation; always JSON, regardless of `--json`.
     Manifest,
@@ -224,12 +229,55 @@ pub struct FindArgs {
     pub paging: PageArgs,
 }
 
+/// Arguments for `impact`.
+///
+/// `impact` carries no `--detail`/`--max-lines`: it projects no tier content onto its rows.
+#[derive(Debug, Args)]
+pub struct ImpactArgs {
+    /// The revision or revision range to seed from (`A..B`, `A...B`, or a single revision, which
+    /// means that revision against the working tree, exactly as `git diff <commit>` does). Omitted,
+    /// the working-tree change against `HEAD` seeds the assessment.
+    #[arg(conflicts_with = "staged")]
+    pub revspec: Option<String>,
+
+    /// Seed from the staged change against `HEAD` rather than from the working tree.
+    #[arg(long)]
+    pub staged: bool,
+
+    /// How many hops of transitive impact to detail (default 1). Depth 0 means aggregate-only: no
+    /// detailed rows, every dependent counted in the aggregate.
+    #[arg(long, default_value_t = 1)]
+    pub depth: u32,
+
+    /// Narrow the seed to these paths, after `--`. A renamed file is reached by either its
+    /// pre-change or its post-change path.
+    #[arg(last = true)]
+    pub paths: Vec<PathBuf>,
+
+    #[command(flatten)]
+    pub paging: PageArgs,
+}
+
 /// Arguments for `completions`.
 #[derive(Debug, Args)]
 pub struct CompletionsArgs {
     /// The shell to generate a completion script for. An unsupported value is rejected with the
     /// supported set.
     pub shell: Shell,
+}
+
+/// The action `hooks` performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HookAction {
+    /// Install the post-commit hook that refreshes the index.
+    Install,
+}
+
+/// Arguments for `hooks`.
+#[derive(Debug, Args)]
+pub struct HooksArgs {
+    /// The action to perform.
+    pub action: HookAction,
 }
 
 /// Arguments for `status`.

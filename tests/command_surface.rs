@@ -400,6 +400,8 @@ fn clap_tree_matches_the_recorded_flag_vocabulary() {
         "at",
         "relation",
         "depth",
+        // `impact`'s seed-mode selector.
+        "staged",
         // Operational commands.
         "rust-analyzer",
         "language",
