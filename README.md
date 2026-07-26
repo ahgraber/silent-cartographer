@@ -38,6 +38,49 @@ Or source it directly in `~/.bashrc`:
 source <(c10r completions bash)
 ```
 
+## Usage patterns
+
+### Keep the index current
+
+`impact`, like every query, grades its answer against the index's last build.
+Rebuild after every commit so the index tracks `HEAD` and stays on the exact path rather than drifting into the disclosed-approximate one:
+
+```sh
+c10r hooks install
+```
+
+This installs a post-commit hook that reruns `c10r build`, resolved through git so it lands wherever this worktree actually keeps its hooks — a linked worktree or a relocated `core.hooksPath` included.
+It refuses rather than overwrites when a hook is already present at that path; add the `c10r build` line to your existing hook by hand instead.
+
+### Assessing impact
+
+Make an edit, then ask what it could affect:
+
+```sh
+c10r impact
+```
+
+The answer lists the seeds — the declarations the diff actually touched — followed by their dependents: everything that could break if the change lands.
+Narrow to a subtree, or scope to what's staged, exactly as `git diff` would:
+
+```sh
+c10r impact -- src/some/dir
+c10r impact --staged
+```
+
+Every answer carries an `exactness` grade.
+`exact` means the index matches the change's pre-change state, so the reach shown is the real reach.
+`approximate` means something has drifted since the build (an unrelated edit, a change made before the index was refreshed), so the dependents shown may be incomplete; treat it as directional, not a ship/no-ship verdict.
+
+### Recovering an exact answer
+
+An approximate answer carries a runnable recovery recipe: shell commands that rebuild the index at the change's exact base revision, in a throwaway worktree, and re-run the same `impact` query against it — with the base revision, the `--db` path, and the `--workspace` identity already filled in.
+Copy the steps and run them as printed:
+
+```sh
+c10r --json impact | jq -r '.outcome.results[0].recovery.steps[]'
+```
+
 ## References
 
 - [Why coding agents fail in large codebases (and what to do about it) | Sourcegraph](https://sourcegraph.com/blog/why-coding-agents-fail-large-codebases)
