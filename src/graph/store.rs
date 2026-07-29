@@ -128,6 +128,11 @@ pub const FOUND_TEXT_MAX_BYTES: usize = 120;
 /// summary marks itself truncated; its totals are computed over the full persisted set regardless.
 pub const DISCREPANCY_GROUP_CAP: usize = 50;
 
+/// The widest frontier the dependents walk binds into a single query; a wider frontier is chunked
+/// across several queries within the same round. Held safely under SQLite's lowest historical
+/// bound-parameter limit (999) so the walk never fails on a hub symbol's frontier.
+const DEPENDENTS_FRONTIER_CHUNK: usize = 900;
+
 /// The maximum hop distance the dependents traversal walks.
 ///
 /// A provisional design constant — like [`DISCREPANCY_GROUP_CAP`], it bounds the walk until the
@@ -906,50 +911,160 @@ impl GraphStore {
     /// Compute the seed's dependents: symbols whose dependency edges (`uses`, `imports`,
     /// `type_hierarchy`) reach the seed directly or transitively, walking each edge `dst → src`.
     ///
+    /// The one-element case of [`dependents_of_seeds`](Self::dependents_of_seeds); see there for the
+    /// full contract.
+    pub fn dependents(&self, seed: &CanonicalId, horizon: u32) -> rusqlite::Result<Vec<DependentRow>> {
+        self.dependents_of_seeds(std::slice::from_ref(seed), horizon)
+    }
+
+    /// Compute the combined dependents of several seeds at once: the symbols whose dependency edges
+    /// (`uses`, `imports`, `type_hierarchy`) reach any seed directly or transitively, walking each
+    /// edge `dst → src` breadth-first from the whole seed set.
+    ///
     /// Enclosure (`contains`) never propagates dependence — it supplies attribution, not impact — so
     /// it is excluded from the walk. Each dependent is returned exactly once at its shortest hop
-    /// distance, carrying the connecting edge kind chosen from a shortest-depth hop under a fixed
-    /// tie-break: kind order (`uses` < `imports` < `type_hierarchy`), then canonical identity. The
-    /// seed never appears as its own dependent (a self-loop is inert), and the walk is capped at
-    /// `horizon` hops so cycles terminate. Results are ordered by `(depth, kind order, identity)`.
-    pub fn dependents(&self, seed: &CanonicalId, horizon: u32) -> rusqlite::Result<Vec<DependentRow>> {
-        // `UNION` (not `UNION ALL`) dedupes emitted `(id, depth, kind)` rows globally as SQLite
-        // evaluates the recursion, so a node reachable through many paths is queued and expanded once
-        // rather than once per path — the row count grows with node count, not path count, which
-        // matters because fan-in makes path count exponential while node count stays polynomial. The
-        // dedup key is exactly the three projected columns, so keep them id/depth/kind, unmixed with
-        // anything path-dependent (e.g. no path list), or a distinct-per-path row would slip back in.
-        let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE reach(id, depth, kind) AS (
-                SELECT src_id, 1, kind FROM edges
-                  WHERE kind IN ('uses', 'imports', 'type_hierarchy') AND dst_id = ?1 AND src_id <> ?1
-                UNION
-                SELECT e.src_id, r.depth + 1, e.kind
-                  FROM edges e JOIN reach r ON e.dst_id = r.id
-                  WHERE e.kind IN ('uses', 'imports', 'type_hierarchy') AND e.src_id <> ?1 AND r.depth < ?2
-             )
-             SELECT id, depth, kind FROM reach",
-        )?;
-        let raw: Vec<(String, u32, String)> = stmt
-            .query_map(params![seed.as_str(), horizon as i64], |r| {
-                Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+    /// distance from any seed, carrying the connecting edge kind chosen among the edges arriving at
+    /// that distance under a fixed tie-break: kind order (`uses` < `imports` < `type_hierarchy`),
+    /// then canonical identity. A seed never appears as its own dependent — a seed is reported only
+    /// at its shortest distance to a seed *other than itself*, so one that depends on another seed
+    /// is a real dependent while one reached only through its own cycle is not. The walk ends when
+    /// the frontier empties (a closed reachable set never pays for the remaining bound) or at
+    /// `horizon` hops; the horizon is a hard cap on hop distance, so a zero horizon reports
+    /// nothing. Results are ordered by `(depth, kind order, identity)`.
+    ///
+    /// Each round expands the whole frontier level-at-a-time — one `IN`-list query over the
+    /// destination-keyed edge index, chunked at [`DEPENDENTS_FRONTIER_CHUNK`] bound parameters and
+    /// merged before filtering, so a hub symbol's frontier cannot fail the query outright. Every
+    /// symbol is expanded at most twice across the whole walk (once per distinct walk root it
+    /// carries, see below) rather than once per depth or once per seed.
+    pub fn dependents_of_seeds(&self, seeds: &[CanonicalId], horizon: u32) -> rusqlite::Result<Vec<DependentRow>> {
+        use std::collections::{BTreeSet, HashMap};
 
-        // Collapse the raw hops to one entry per symbol: the minimum depth, and among the hops at
-        // that minimum depth the connecting kind lowest under the fixed kind order.
-        let mut best: std::collections::HashMap<String, (u32, String)> = std::collections::HashMap::new();
-        for (id, depth, kind) in raw {
-            let replace = match best.get(&id) {
-                None => true,
-                Some((d, k)) => depth < *d || (depth == *d && kind_order(&kind) < kind_order(k)),
-            };
-            if replace {
-                best.insert(id, (depth, kind));
-            }
+        if seeds.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let mut out: Vec<DependentRow> = best
+        // Each node carries up to two *distinct* walk roots (seed indices). One root suffices for
+        // the union's shortest distance — breadth-first order reaches every node first along a
+        // shortest path — but seed self-exclusion needs a node's shortest distance to a root *other
+        // than* one excluded seed, and for any single excluded root at least one of two distinct
+        // roots differs from it. A node re-enters the frontier when it gains a root, so it is
+        // expanded at most twice.
+        let seed_root: HashMap<&str, u32> = {
+            let mut m = HashMap::new();
+            for (i, s) in seeds.iter().enumerate() {
+                m.entry(s.as_str()).or_insert(i as u32);
+            }
+            m
+        };
+        let mut roots_of: HashMap<String, RootPair> = HashMap::new();
+        let mut reported: HashMap<String, (u32, String)> = HashMap::new();
+        // The frontier: nodes that gained roots last round, with exactly the roots they gained.
+        let mut frontier: Vec<(String, RootPair)> = Vec::with_capacity(seeds.len());
+        for (id, root) in &seed_root {
+            let mut pair = RootPair::default();
+            pair.insert(*root);
+            roots_of.insert((*id).to_string(), pair);
+            frontier.push(((*id).to_string(), pair));
+        }
+
+        for depth in 1..=horizon {
+            if frontier.is_empty() {
+                break;
+            }
+            let new_roots: HashMap<&str, RootPair> = frontier.iter().map(|(n, p)| (n.as_str(), *p)).collect();
+
+            // One level-at-a-time query per chunk: every dependency edge into the frontier.
+            let ids: Vec<&str> = frontier.iter().map(|(n, _)| n.as_str()).collect();
+            let mut hops: Vec<(String, String, String)> = Vec::new();
+            for chunk in ids.chunks(DEPENDENTS_FRONTIER_CHUNK) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let sql = format!(
+                    "SELECT src_id, kind, dst_id FROM edges \
+                     WHERE kind IN ('uses', 'imports', 'type_hierarchy') AND dst_id IN ({placeholders})"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter().copied()), |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+                for row in rows {
+                    hops.push(row?);
+                }
+            }
+
+            let mut by_src: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+            for (src, kind, dst) in &hops {
+                by_src
+                    .entry(src.as_str())
+                    .or_default()
+                    .push((kind.as_str(), dst.as_str()));
+            }
+
+            let mut next: Vec<(String, RootPair)> = Vec::new();
+            for (src, edges_in) in by_src {
+                let existing = roots_of.get(src).copied().unwrap_or_default();
+                if existing.full() {
+                    continue;
+                }
+                // The roots newly reaching `src`: every root a frontier destination gained last
+                // round that `src` does not already carry. Sorted so root selection is
+                // deterministic; a self-loop contributes nothing because the node already carries
+                // every root its own frontier entry gained.
+                let mut cands: BTreeSet<u32> = BTreeSet::new();
+                for (_, dst) in &edges_in {
+                    let gained = new_roots.get(dst).expect("destination came from the frontier");
+                    for root in gained.iter() {
+                        if !existing.contains(root) {
+                            cands.insert(root);
+                        }
+                    }
+                }
+                if cands.is_empty() {
+                    continue;
+                }
+
+                if existing.is_empty() {
+                    // First reach of an ordinary node: this round is its shortest distance, and the
+                    // connecting kind is the lowest-ordered among the edges arriving now.
+                    let kind = edges_in
+                        .iter()
+                        .map(|(k, _)| *k)
+                        .min_by_key(|k| kind_order(k))
+                        .expect("a grouped source has at least one edge");
+                    reported.insert(src.to_string(), (depth, kind.to_string()));
+                } else if seed_root.contains_key(src) && !reported.contains_key(src) {
+                    // A seed reached by another walk root: its shortest distance to a seed other
+                    // than itself, so it is reported as that seed's dependent. Only the edges
+                    // arriving with a foreign root qualify for the kind tie-break; an unreported
+                    // seed carries exactly its own root, so any candidate root is foreign.
+                    let kind = edges_in
+                        .iter()
+                        .filter(|(_, dst)| {
+                            let gained = new_roots.get(dst).expect("destination came from the frontier");
+                            gained.iter().any(|root| !existing.contains(root))
+                        })
+                        .map(|(k, _)| *k)
+                        .min_by_key(|k| kind_order(k))
+                        .expect("a candidate root arrived on some edge");
+                    reported.insert(src.to_string(), (depth, kind.to_string()));
+                }
+
+                let mut pair = existing;
+                let mut added = RootPair::default();
+                for root in cands {
+                    if pair.full() {
+                        break;
+                    }
+                    pair.insert(root);
+                    added.insert(root);
+                }
+                roots_of.insert(src.to_string(), pair);
+                next.push((src.to_string(), added));
+            }
+            frontier = next;
+        }
+
+        let mut out: Vec<DependentRow> = reported
             .into_iter()
             .map(|(id, (depth, kind))| DependentRow {
                 id: CanonicalId::from_raw(id),
@@ -1054,16 +1169,52 @@ fn truncate_on_boundary(s: &str) -> String {
     s[..end].to_string()
 }
 
+/// Up to two distinct walk roots (seed indices) a traversal node carries, in arrival order.
+///
+/// Two is exactly enough for seed self-exclusion in [`GraphStore::dependents_of_seeds`]: for any
+/// single excluded root, at least one of two distinct roots differs from it, so a node's earliest
+/// two roots always answer "how far to a seed other than X" for every X.
+#[derive(Clone, Copy, Default)]
+struct RootPair(Option<u32>, Option<u32>);
+
+impl RootPair {
+    fn is_empty(self) -> bool {
+        self.0.is_none()
+    }
+
+    fn full(self) -> bool {
+        self.1.is_some()
+    }
+
+    fn contains(self, root: u32) -> bool {
+        self.0 == Some(root) || self.1 == Some(root)
+    }
+
+    /// Record `root` in the first free slot; a root already carried or beyond the second slot is
+    /// dropped.
+    fn insert(&mut self, root: u32) {
+        if self.contains(root) {
+            return;
+        }
+        if self.0.is_none() {
+            self.0 = Some(root);
+        } else if self.1.is_none() {
+            self.1 = Some(root);
+        }
+    }
+
+    fn iter(self) -> impl Iterator<Item = u32> {
+        [self.0, self.1].into_iter().flatten()
+    }
+}
+
 /// The fixed order dependency edge kinds break ties by, so equal-depth hops choose a connecting kind
 /// deterministically and results order reproducibly. Non-dependency tags sort last.
 ///
 /// The fallback bucket is unreachable while `EdgeKind` stays closed to the three dependency kinds
 /// above; adding a new edge kind to the dependents walk requires adding it here too, or it will
 /// silently sort last instead of taking its intended tie-break position.
-///
-/// `pub(crate)` because the impact seed union reuses it so a multi-seed answer's row order matches a
-/// single-seed `dependents` answer's.
-pub(crate) fn kind_order(tag: &str) -> u8 {
+fn kind_order(tag: &str) -> u8 {
     match tag {
         "uses" => 0,
         "imports" => 1,
@@ -1142,5 +1293,32 @@ mod tests {
 
         assert!(store.holds_document("doc.rs").unwrap());
         assert!(!store.holds_document("other.rs").unwrap());
+    }
+
+    // A frontier wider than `DEPENDENTS_FRONTIER_CHUNK` is chunked across several queries within
+    // the same round, with results merged before filtering, and still answers correctly: a
+    // dependent reaching the frontier through every chunk is reported once at its shortest
+    // distance.
+    #[test]
+    fn a_frontier_wider_than_the_chunk_limit_chunks_within_the_round() {
+        let n = DEPENDENTS_FRONTIER_CHUNK + 200;
+        let store = GraphStore::open_in_memory().unwrap();
+        let seed = CanonicalId::from_raw("ws::seed".to_string());
+        let outer = CanonicalId::from_raw("ws::outer".to_string());
+        store.insert_symbol(&symbol_at("ws::seed", "doc.rs", 0, 10)).unwrap();
+        store.insert_symbol(&symbol_at("ws::outer", "doc.rs", 20, 30)).unwrap();
+        for i in 0..n {
+            let id = format!("ws::w_{i}");
+            store.insert_symbol(&symbol_at(&id, "doc.rs", 40 + i, 41 + i)).unwrap();
+            let wide = CanonicalId::from_raw(id);
+            store.insert_edge(EdgeKind::Uses, &wide, &seed).unwrap();
+            store.insert_edge(EdgeKind::Uses, &outer, &wide).unwrap();
+        }
+
+        let deps = store.dependents(&seed, DEPENDENTS_HORIZON).unwrap();
+        assert_eq!(deps.len(), n + 1, "all direct dependents plus outer");
+        let outer_rows: Vec<_> = deps.iter().filter(|d| d.id == outer).collect();
+        assert_eq!(outer_rows.len(), 1, "outer reported once despite reaching every chunk");
+        assert_eq!(outer_rows[0].depth, 2);
     }
 }

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::git::SeedMode;
-use crate::graph::store::{DEPENDENTS_HORIZON, SymbolRow, kind_order};
+use crate::graph::store::{DEPENDENTS_HORIZON, SymbolRow};
 use crate::identity::CanonicalId;
 
 use super::diff::{FileChange, LineIndex};
@@ -285,60 +285,44 @@ impl QueryEngine<'_> {
         Ok((seeds, unmappable))
     }
 
-    /// The union of `dependents` reached from every seed, merged into one entry per dependent
-    /// identity at its shortest distance — ties among hops at the same shortest distance broken by
-    /// [`kind_order`], the same tie-break a single-seed answer uses, so orders agree — then split at
-    /// `depth` exactly as [`QueryEngine::dependents`] splits a single-seed walk.
+    /// The union of `dependents` reached from every seed: one combined walk over the whole seed set
+    /// (see [`GraphStore::dependents_of_seeds`](crate::graph::store::GraphStore::dependents_of_seeds)),
+    /// so each dependent arrives exactly once at its shortest distance from any seed, under the same
+    /// `(distance, kind order, identity)` order a single-seed answer uses — then split at `depth`
+    /// exactly as [`QueryEngine::dependents`] splits a single-seed walk.
     fn union_dependents<'a>(
         &self,
         seed_ids: impl Iterator<Item = &'a CanonicalId>,
         depth: u32,
     ) -> Result<DependentsReport, QueryError> {
-        let mut merged: std::collections::HashMap<CanonicalId, (u32, String)> = std::collections::HashMap::new();
-        for id in seed_ids {
-            for row in self.store.dependents(id, DEPENDENTS_HORIZON)? {
-                let replace = match merged.get(&row.id) {
-                    None => true,
-                    Some((d, k)) => row.depth < *d || (row.depth == *d && kind_order(&row.kind) < kind_order(k)),
-                };
-                if replace {
-                    merged.insert(row.id.clone(), (row.depth, row.kind));
-                }
-            }
-        }
+        let seeds: Vec<CanonicalId> = seed_ids.cloned().collect();
+        let rows = self.store.dependents_of_seeds(&seeds, DEPENDENTS_HORIZON)?;
 
         let mut detailed: Vec<DependentItem> = Vec::new();
         let mut aggregate: BTreeMap<(u32, String), u64> = BTreeMap::new();
         let mut beyond_exists = false;
         let mut cut_at_horizon = false;
-        for (id, (row_depth, kind)) in &merged {
-            if *row_depth >= DEPENDENTS_HORIZON {
+        for row in &rows {
+            if row.depth >= DEPENDENTS_HORIZON {
                 cut_at_horizon = true;
             }
-            if *row_depth <= depth {
-                let Some(row) = self.store.symbol(id)? else {
-                    return Err(QueryError::MissingSymbol(id.clone()));
+            if row.depth <= depth {
+                let Some(symbol) = self.store.symbol(&row.id)? else {
+                    return Err(QueryError::MissingSymbol(row.id.clone()));
                 };
                 detailed.push(DependentItem {
-                    symbol: super::symbol_view(&row),
-                    kind: kind.clone(),
-                    distance: *row_depth,
-                    location: super::location_of(&row),
+                    symbol: super::symbol_view(&symbol),
+                    kind: row.kind.clone(),
+                    distance: row.depth,
+                    location: super::location_of(&symbol),
                     content: None,
                     content_truncated: false,
                 });
             } else {
                 beyond_exists = true;
-                *aggregate.entry((*row_depth, kind.clone())).or_insert(0) += 1;
+                *aggregate.entry((row.depth, row.kind.clone())).or_insert(0) += 1;
             }
         }
-
-        detailed.sort_by(|a, b| {
-            a.distance
-                .cmp(&b.distance)
-                .then_with(|| kind_order(&a.kind).cmp(&kind_order(&b.kind)))
-                .then_with(|| a.symbol.canonical_id.cmp(&b.symbol.canonical_id))
-        });
 
         // Precedence matches `QueryEngine::dependents`: a horizon cut is disclosed first, then
         // beyond-bound reach, then the fully-within-bound case.
@@ -1161,6 +1145,106 @@ mod tests {
         let report = engine.union_dependents([&seed_a, &seed_b].into_iter(), 2).unwrap();
         assert_eq!(report.disclosure, HorizonDisclosure::EndsWithinBound);
         assert_eq!(report.detail.len(), 2);
+    }
+
+    // Multi-seed detailed rows keep the single-seed order — distance, then the fixed kind order,
+    // then identity — the ordering continuation tokens bind to. The identities are chosen so a plain
+    // identity sort would disagree with the kind order.
+    #[test]
+    fn dependents_union_orders_rows_like_a_single_seed_answer() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let seed_1 = CanonicalId::from_raw("ws::s1");
+        let seed_2 = CanonicalId::from_raw("ws::s2");
+        for (name, span) in [
+            ("ws::s1", 0),
+            ("ws::s2", 10),
+            ("ws::zz", 20),
+            ("ws::aa", 30),
+            ("ws::mm", 40),
+            ("ws::bb", 50),
+        ] {
+            store.insert_symbol(&symbol_at(name, "doc.rs", span, span + 5)).unwrap();
+        }
+        store
+            .insert_edge(EdgeKind::Uses, &CanonicalId::from_raw("ws::zz"), &seed_1)
+            .unwrap();
+        store
+            .insert_edge(EdgeKind::Imports, &CanonicalId::from_raw("ws::aa"), &seed_2)
+            .unwrap();
+        store
+            .insert_edge(EdgeKind::TypeHierarchy, &CanonicalId::from_raw("ws::mm"), &seed_1)
+            .unwrap();
+        store
+            .insert_edge(
+                EdgeKind::Uses,
+                &CanonicalId::from_raw("ws::bb"),
+                &CanonicalId::from_raw("ws::zz"),
+            )
+            .unwrap();
+
+        let hash = "h";
+        write_metadata(&store, hash);
+        let engine = engine(&store, hash);
+
+        let report = engine.union_dependents([&seed_1, &seed_2].into_iter(), 2).unwrap();
+        let ordered: Vec<(&str, u32, &str)> = report
+            .detail
+            .iter()
+            .map(|d| (d.symbol.canonical_id.as_str(), d.distance, d.kind.as_str()))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("ws::zz", 1, "uses"),
+                ("ws::aa", 1, "imports"),
+                ("ws::mm", 1, "type_hierarchy"),
+                ("ws::bb", 2, "uses"),
+            ],
+            "distance, then kind order, then identity"
+        );
+    }
+
+    // A multi-seed union whose reach extends to the internal horizon discloses the cut: a dependent
+    // at the horizon distance means deeper reach may exist unexplored, and that outranks the
+    // beyond-bound disclosure the other seed's shallow reach would produce.
+    #[test]
+    fn dependents_union_discloses_a_horizon_cut() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let seed_1 = CanonicalId::from_raw("ws::s1");
+        let seed_2 = CanonicalId::from_raw("ws::s2");
+        store.insert_symbol(&symbol_at("ws::s1", "doc.rs", 0, 5)).unwrap();
+        store.insert_symbol(&symbol_at("ws::s2", "doc.rs", 10, 15)).unwrap();
+        store.insert_symbol(&symbol_at("ws::near", "doc.rs", 20, 25)).unwrap();
+        store
+            .insert_edge(EdgeKind::Uses, &CanonicalId::from_raw("ws::near"), &seed_2)
+            .unwrap();
+        // A chain hanging off seed 1 exactly `DEPENDENTS_HORIZON` links deep: its last member is
+        // reached at the horizon distance, so the walk may have stopped short of deeper reach.
+        let mut below = seed_1.clone();
+        for i in 1..=DEPENDENTS_HORIZON {
+            let id = format!("ws::c{i}");
+            store
+                .insert_symbol(&symbol_at(
+                    &id,
+                    "doc.rs",
+                    (30 + 10 * i) as usize,
+                    (35 + 10 * i) as usize,
+                ))
+                .unwrap();
+            let link = CanonicalId::from_raw(id);
+            store.insert_edge(EdgeKind::Uses, &link, &below).unwrap();
+            below = link;
+        }
+
+        let hash = "h";
+        write_metadata(&store, hash);
+        let engine = engine(&store, hash);
+
+        let report = engine.union_dependents([&seed_1, &seed_2].into_iter(), 1).unwrap();
+        assert_eq!(report.disclosure, HorizonDisclosure::CutAtHorizon);
+        // The detailed rows still hold both seeds' distance-one reach.
+        let names: Vec<&str> = report.detail.iter().map(|d| d.symbol.canonical_id.as_str()).collect();
+        assert_eq!(names, vec!["ws::c1", "ws::near"], "{names:?}");
     }
 
     // `Exactness` is `Exact` when the two hashes match and `Approximate` otherwise, and `recovery` is

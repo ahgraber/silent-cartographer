@@ -830,6 +830,252 @@ fn dependents_ordering_is_deterministic() {
     );
 }
 
+// _(Dependents traversal — zero horizon)_ — a walk capped at zero hops reaches nothing: the horizon
+// is a hard cap on hop distance, so no dependent can sit within it.
+#[test]
+fn a_zero_horizon_walks_zero_hops_and_reports_nothing() {
+    let store = graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
+    let deps = store.dependents(&sid("seed"), 0).unwrap();
+    assert!(deps.is_empty(), "no dependent sits within a zero-hop cap: {deps:?}");
+}
+
+// _(Dependents traversal — same-depth kind tie-break)_ — a dependent arriving at its shortest
+// distance through several edge kinds carries the lowest under `uses` < `imports` <
+// `type_hierarchy`.
+#[test]
+fn same_depth_arrivals_choose_the_lowest_ordered_kind() {
+    let store = graph(
+        &["seed", "dep"],
+        &[
+            (EdgeKind::TypeHierarchy, "dep", "seed"),
+            (EdgeKind::Imports, "dep", "seed"),
+            (EdgeKind::Uses, "dep", "seed"),
+        ],
+    );
+    let deps = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
+    assert_eq!(deps.len(), 1, "{deps:?}");
+    assert_eq!(deps[0].kind, "uses", "lowest-ordered kind among same-depth arrivals");
+}
+
+// _(Dependents traversal — same-depth kind tie-break across seeds)_ — a dependent reaching two seeds
+// at the same shortest distance through different kinds is reported once with the lowest-ordered.
+#[test]
+fn same_depth_arrivals_from_different_seeds_choose_the_lowest_ordered_kind() {
+    let store = graph(
+        &["a", "b", "x"],
+        &[(EdgeKind::TypeHierarchy, "x", "a"), (EdgeKind::Uses, "x", "b")],
+    );
+    let deps = store
+        .dependents_of_seeds(&[sid("a"), sid("b")], DEPENDENTS_HORIZON)
+        .unwrap();
+    assert_eq!(deps.len(), 1, "{deps:?}");
+    assert_eq!(deps[0].id, sid("x"));
+    assert_eq!(deps[0].depth, 1);
+    assert_eq!(deps[0].kind, "uses", "lowest-ordered kind across both seeds' edges");
+}
+
+// _(Dependents traversal — seed report kind tie-break)_ — a seed reported as another seed's
+// dependent through several same-depth edges carries the lowest-ordered kind among them.
+#[test]
+fn a_reported_seed_chooses_the_lowest_ordered_kind() {
+    let store = graph(
+        &["a", "b"],
+        &[(EdgeKind::TypeHierarchy, "a", "b"), (EdgeKind::Uses, "a", "b")],
+    );
+    let deps = store
+        .dependents_of_seeds(&[sid("a"), sid("b")], DEPENDENTS_HORIZON)
+        .unwrap();
+    assert_eq!(deps.len(), 1, "{deps:?}");
+    assert_eq!(deps[0].id, sid("a"));
+    assert_eq!(deps[0].kind, "uses", "lowest-ordered kind among the qualifying edges");
+}
+
+// _(Dependents traversal — closure)_ — a reachable set closed at some distance yields an identical
+// answer at that bound and at a much larger one: membership, distances, kinds, and order.
+#[test]
+fn raising_the_bound_past_closure_changes_nothing() {
+    // Reach closes at distance 2: mid and direct at 1, outer at 2, nothing deeper.
+    let store = graph(
+        &["seed", "mid", "outer", "direct"],
+        &[
+            (EdgeKind::Uses, "mid", "seed"),
+            (EdgeKind::Uses, "outer", "mid"),
+            (EdgeKind::Imports, "direct", "seed"),
+        ],
+    );
+    let at_closure = store.dependents(&sid("seed"), 2).unwrap();
+    let far_beyond = store.dependents(&sid("seed"), 40).unwrap();
+    assert_eq!(at_closure.len(), 3, "{at_closure:?}");
+    assert_eq!(at_closure, far_beyond, "a closed set is identical at any larger bound");
+}
+
+/// A dense graph: `n` nodes that all use the seed and are all mutually connected by every dependency
+/// kind, so the whole reachable set closes at distance 1 while cycles make every node reachable
+/// again at every deeper level — the shape that makes per-depth re-expansion pathological.
+fn dense_graph(n: usize) -> GraphStore {
+    let store = GraphStore::open_in_memory().unwrap();
+    put_symbol(&store, "seed");
+    let names: Vec<String> = (0..n).map(|i| format!("node_{i}")).collect();
+    for name in &names {
+        put_symbol(&store, name);
+        store.insert_edge(EdgeKind::Uses, &sid(name), &sid("seed")).unwrap();
+    }
+    for a in &names {
+        for b in &names {
+            if a != b {
+                for kind in [EdgeKind::Uses, EdgeKind::Imports, EdgeKind::TypeHierarchy] {
+                    store.insert_edge(kind, &sid(a), &sid(b)).unwrap();
+                }
+            }
+        }
+    }
+    store
+}
+
+// _(Dependents traversal — closed set does not pay for the bound)_ — over a dense graph whose reach
+// closes at distance 1, the answer arrives within a generous wall-clock bound; work is bounded by
+// the reachable set, not by re-expansion across the remaining depth bound.
+#[test]
+fn closed_reachable_set_does_not_pay_for_the_remaining_bound() {
+    let n = 120;
+    let store = dense_graph(n);
+    let start = std::time::Instant::now();
+    let deps = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(deps.len(), n, "every node reaches the seed");
+    assert!(
+        deps.iter().all(|d| d.depth == 1 && d.kind == "uses"),
+        "all reach the seed directly via uses: {deps:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "a closed reachable set must not pay for the remaining depth bound: {elapsed:?}"
+    );
+}
+
+// _(Dependents traversal — several seeds, combined reach)_ — heavily overlapping seeds produce each
+// dependent once at its shortest distance, in time bounded by the combined reach rather than
+// growing with the seed count.
+#[test]
+fn overlapping_seeds_cost_no_more_than_their_combined_reach() {
+    let n = 120;
+    let seed_count = 10;
+    let store = dense_graph(n);
+    let seeds: Vec<_> = (0..seed_count).map(|i| sid(&format!("node_{i}"))).collect();
+    let start = std::time::Instant::now();
+    let deps = store.dependents_of_seeds(&seeds, DEPENDENTS_HORIZON).unwrap();
+    let elapsed = start.elapsed();
+    // Every clique node uses every seed: the non-seeds are dependents at distance 1, and each seed
+    // itself depends on the other seeds, so it is reported too — as their dependent, not its own.
+    assert_eq!(deps.len(), n, "each dependent exactly once: {}", deps.len());
+    assert!(deps.iter().all(|d| d.depth == 1), "all at their shortest distance");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "combined reach, not per-seed cost: {elapsed:?}"
+    );
+}
+
+// _(Dependents traversal — shared dependent)_ — a symbol at distance 1 from one seed and distance 3
+// from another is reported once, at distance 1.
+#[test]
+fn shared_dependent_takes_its_shortest_distance_from_any_seed() {
+    let store = graph(
+        &["a", "b", "x", "c1", "c2"],
+        &[
+            (EdgeKind::Uses, "x", "a"),
+            (EdgeKind::Uses, "x", "c2"),
+            (EdgeKind::Uses, "c2", "c1"),
+            (EdgeKind::Uses, "c1", "b"),
+        ],
+    );
+    let deps = store
+        .dependents_of_seeds(&[sid("a"), sid("b")], DEPENDENTS_HORIZON)
+        .unwrap();
+    let x: Vec<_> = deps.iter().filter(|d| d.id == sid("x")).collect();
+    assert_eq!(x.len(), 1, "x reported exactly once: {deps:?}");
+    assert_eq!(x[0].depth, 1, "at its shortest distance from any seed");
+}
+
+// _(Dependents traversal — seed depending on another seed)_ — a seed that uses another seed is that
+// seed's dependent and is reported; a seed nothing depends on through another seed is not.
+#[test]
+fn a_seed_depending_on_another_seed_is_reported() {
+    let store = graph(&["a", "b"], &[(EdgeKind::Uses, "a", "b")]);
+    let deps = store
+        .dependents_of_seeds(&[sid("a"), sid("b")], DEPENDENTS_HORIZON)
+        .unwrap();
+    assert_eq!(deps.len(), 1, "{deps:?}");
+    assert_eq!(deps[0].id, sid("a"), "a depends on seed b, so it is reported");
+    assert_eq!(deps[0].depth, 1);
+}
+
+// _(Dependents traversal — seed depending on another seed transitively)_ — a seed reaching another
+// seed through an intermediate is reported at that distance.
+#[test]
+fn a_seed_transitively_depending_on_another_seed_is_reported() {
+    let store = graph(
+        &["a", "b", "x"],
+        &[(EdgeKind::Uses, "a", "x"), (EdgeKind::Uses, "x", "b")],
+    );
+    let deps = store
+        .dependents_of_seeds(&[sid("a"), sid("b")], DEPENDENTS_HORIZON)
+        .unwrap();
+    let a: Vec<_> = deps.iter().filter(|d| d.id == sid("a")).collect();
+    assert_eq!(a.len(), 1, "a transitively depends on seed b: {deps:?}");
+    assert_eq!(a[0].depth, 2);
+}
+
+// _(Dependents traversal — seed excluded from its own answer)_ — a seed reached only through its own
+// dependency cycle is not reported: it is its own dependent, not another seed's.
+#[test]
+fn a_seed_reached_only_through_its_own_cycle_is_not_reported() {
+    let store = graph(
+        &["a", "b", "c", "d"],
+        &[
+            (EdgeKind::Uses, "c", "a"),
+            (EdgeKind::Uses, "a", "c"),
+            (EdgeKind::Uses, "d", "b"),
+        ],
+    );
+    let deps = store
+        .dependents_of_seeds(&[sid("a"), sid("b")], DEPENDENTS_HORIZON)
+        .unwrap();
+    assert!(
+        !deps.iter().any(|d| d.id == sid("a")),
+        "a's only reach is its own cycle, never another seed: {deps:?}"
+    );
+    let ids: Vec<&str> = deps.iter().map(|d| d.id.as_str()).collect();
+    assert_eq!(ids, vec![sid("c").as_str(), sid("d").as_str()], "c and d at distance 1");
+}
+
+// _(Dependents traversal — seed reached through a saturated intermediate)_ — a seed whose only path
+// to the other seeds passes through an intermediate depending on both of them directly is still
+// reported once, at its true distance: the intermediate's own reach does not swallow the relay.
+#[test]
+fn a_seed_reached_through_a_saturated_intermediate_is_reported_at_its_distance() {
+    let store = graph(
+        &["a", "b", "c", "x"],
+        &[
+            (EdgeKind::Uses, "x", "a"),
+            (EdgeKind::Uses, "x", "b"),
+            (EdgeKind::Uses, "c", "x"),
+        ],
+    );
+    let deps = store
+        .dependents_of_seeds(&[sid("a"), sid("b"), sid("c")], DEPENDENTS_HORIZON)
+        .unwrap();
+    let c: Vec<_> = deps.iter().filter(|d| d.id == sid("c")).collect();
+    assert_eq!(c.len(), 1, "c reported exactly once: {deps:?}");
+    assert_eq!(c[0].depth, 2, "c's distance to the nearest other seed, through x");
+    assert_eq!(c[0].kind, "uses");
+    let x: Vec<_> = deps.iter().filter(|d| d.id == sid("x")).collect();
+    assert_eq!(
+        (x.len(), x[0].depth),
+        (1, 1),
+        "the intermediate itself is a distance-one dependent"
+    );
+}
+
 // _(Guarded positional join — canonical write-site)_ — an occurrence whose location spells the
 // symbol name is persisted as an aligned attribution.
 #[test]
