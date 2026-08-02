@@ -77,9 +77,7 @@ Never name the specific thing being withheld.
 **Output:** (1) _Answer_ — purpose / vocabulary / standalone stories only. (2) _Withheld_ — category labels only from the fixed set {mechanism, schema, decomposition, second-order, out-of-scope}.
 No instance nouns, no counts.
 
-**Accepted inheritance:** that the tool has a CLI and an MCP interface is a
-deliberate carry-over chosen by the user; naming those surfaces is allowed, but
-how capability splits across them is not.
+**Accepted inheritance:** that the tool has a CLI and an MCP interface is a deliberate carry-over chosen by the user; naming those surfaces is allowed, but how capability splits across them is not.
 
 ## 1. Think Before Coding
 
@@ -101,6 +99,8 @@ Objective: write the minimum change that meets the request.
 - Prefer the golden path for internal logic; let tests define edge-case expectations.
 - Add explicit validation and error handling at external boundaries (I/O, network, persistence, auth, parsing, external APIs).
 - If you write 200 lines and it could be 50, rewrite it.
+- Extend an existing function only while it stays readable at a glance.
+  When a new requirement adds another branch or nesting level to an already-branchy function, split along the new axis instead of growing the function.
 - Apply YAGNI ruthlessly.
 
 ## 3. Surgical Changes
@@ -113,6 +113,9 @@ When editing existing code:
   Don't "improve" adjacent code, comments, or formatting.
 - Match existing style, even if you'd do it differently.
   Don't refactor existing code unless it is part of the request.
+- If the request doesn't fit the existing design, say so before writing code.
+  Reshaping is in scope when the alternative is a near-copy of an existing code path; propose the reshape and its blast radius, then implement it.
+- Never resolve a mismatch between request and design by duplicating a function, class, or module and editing the copy.
 - Remove imports/variables/functions that YOUR changes made unused.
 - Don't remove pre-existing dead code unless asked — mention it instead.
 
@@ -132,12 +135,16 @@ Testing guardrails:
   Fix the code under test.
 - If a test is genuinely wrong, explain why and await user approval before changing it.
 - Write implementations that solve the general problem, not code that special-cases specific test inputs.
+- Cover each distinct behavior once.
+  More tests of the same shape is not more coverage.
 
 For multi-step tasks, state a brief plan defining the step task and associated verification checks.
 
 ## 5. Definition of Done
 
 - The requested behavior works as specified.
+- The full existing test suite passes, not just tests for this change.
+  Previously working behavior is part of the acceptance criteria.
 - Behavior changes are covered by tests, or testing gaps are explicitly stated.
 - Public contract changes are documented.
 - Required checks were run when available; if not run, state what was skipped and why.
