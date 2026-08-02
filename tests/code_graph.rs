@@ -696,6 +696,7 @@ fn put_symbol(store: &GraphStore, name: &str) {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
 }
@@ -1257,6 +1258,7 @@ fn tier_content_round_trips_and_nulls_read_back_as_absent() {
             signature_text: Some("fn with_tiers()".to_string()),
             interface_text: Some("/// docs\nfn with_tiers()".to_string()),
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
     let without_tiers = sid("without_tiers");
@@ -1272,6 +1274,7 @@ fn tier_content_round_trips_and_nulls_read_back_as_absent() {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
 
@@ -1282,6 +1285,50 @@ fn tier_content_round_trips_and_nulls_read_back_as_absent() {
     let without_row = store.symbol(&without_tiers).unwrap().expect("without_tiers persisted");
     assert_eq!(without_row.signature_text, None);
     assert_eq!(without_row.interface_text, None);
+}
+
+// _(Per-symbol test classification — classification round-trips)_ — a symbol persisted with a
+// classification rule reads it back unchanged, and one persisted without reads back as non-test.
+#[test]
+fn test_rule_round_trips_and_null_reads_back_as_non_test() {
+    let store = GraphStore::open_in_memory().unwrap();
+    let classified = sid("classified");
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: classified.clone(),
+            display_name: "classified".to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: Some("m.rs".to_string()),
+            span: Some((0, 10)),
+            span_text: None,
+            signature_text: None,
+            interface_text: None,
+            duplicated: false,
+            test_rule: Some("test_attribute".to_string()),
+        })
+        .unwrap();
+    let plain = sid("plain");
+    store
+        .insert_symbol(&SymbolRow {
+            canonical_id: plain.clone(),
+            display_name: "plain".to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::InWorkspace,
+            document_path: Some("m.rs".to_string()),
+            span: Some((20, 30)),
+            span_text: None,
+            signature_text: None,
+            interface_text: None,
+            duplicated: false,
+            test_rule: None,
+        })
+        .unwrap();
+
+    let classified_row = store.symbol(&classified).unwrap().expect("classified persisted");
+    assert_eq!(classified_row.test_rule.as_deref(), Some("test_attribute"));
+    let plain_row = store.symbol(&plain).unwrap().expect("plain persisted");
+    assert_eq!(plain_row.test_rule, None, "no rule reads back as non-test");
 }
 
 // _(Enclosure is persisted)_ — a method's enclosing type is returned, and a module's direct contents
@@ -6778,4 +6825,653 @@ fn rust_use_alias_accepted_under_document_binding() {
 fn id_of_pkg(package: &str, segments: &[(&str, SegmentKind)]) -> CanonicalId {
     let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
     silent_cartographer::identity::project_one(&ws(), &Descriptor::new(package, segs))
+}
+
+// ---- Per-symbol test classification ----
+
+/// An index over several documents, for classification fixtures spanning more than one file.
+fn docs_index(paths: &[&str], symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
+    ExtractedIndex {
+        provenance: support::provenance(),
+        documents: paths
+            .iter()
+            .map(|p| SourceDocument {
+                path: p.to_string(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols,
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    }
+}
+
+/// A function symbol defined at the `occurrence`-th appearance of `token` in `source` under `doc`.
+fn fn_def_at(package: &str, name: &str, doc: &str, source: &str, token: &str, occurrence: usize) -> ExtractedSymbol {
+    let pos = source
+        .match_indices(token)
+        .nth(occurrence - 1)
+        .expect("token present")
+        .0;
+    sym_multi(
+        package,
+        &[(name, SegmentKind::Method)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        doc,
+        &[(pos, token.len(), OccurrenceRole::Definition)],
+        source,
+    )
+}
+
+/// The persisted `test_rule` of a symbol, by package and segments.
+fn rule_of(store: &GraphStore, package: &str, segments: &[(&str, SegmentKind)]) -> Option<String> {
+    store
+        .symbol(&id_of_pkg(package, segments))
+        .unwrap()
+        .expect("symbol persisted")
+        .test_rule
+}
+
+// _(Per-symbol test classification — test-attribute rule)_ — a plain `#[test]` function and a
+// composed `#[tokio::test]`-shaped attribute are both classified with test-attribute provenance,
+// while a production function with no signal stays non-test.
+#[test]
+fn test_attribute_classifies_plain_and_composed_forms() {
+    let source = "\
+#[test]
+fn plain_case() {}
+
+#[tokio::test]
+async fn composed_case() {}
+
+fn production() {}
+";
+    let symbols = vec![
+        fn_def_at("c", "plain_case", "src/lib.rs", source, "plain_case", 1),
+        fn_def_at("c", "composed_case", "src/lib.rs", source, "composed_case", 1),
+        fn_def_at("c", "production", "src/lib.rs", source, "production", 1),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("src/lib.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+
+    assert_eq!(
+        rule_of(&store, "c", &[("plain_case", SegmentKind::Method)]).as_deref(),
+        Some("test_attribute")
+    );
+    assert_eq!(
+        rule_of(&store, "c", &[("composed_case", SegmentKind::Method)]).as_deref(),
+        Some("test_attribute")
+    );
+    assert_eq!(rule_of(&store, "c", &[("production", SegmentKind::Method)]), None);
+}
+
+// _(Per-symbol test classification — test-configuration rule, transitive)_ — a helper without a test
+// attribute inside a `#[cfg(test)]` module classifies under the test-configuration rule, including
+// one nested more than one level deep.
+#[test]
+fn cfg_test_module_classifies_transitively() {
+    let source = "\
+#[cfg(test)]
+mod tests {
+    fn helper() {}
+    mod inner {
+        fn deep_helper() {}
+    }
+}
+
+fn production() {}
+";
+    let tests_pos = source.find("tests {").unwrap();
+    let inner_pos = source.find("inner").unwrap();
+    let symbols = vec![
+        sym_multi(
+            "c",
+            &[("tests", SegmentKind::Module)],
+            SymbolKind::Module,
+            SymbolClass::InWorkspace,
+            "src/lib.rs",
+            &[(tests_pos, 5, OccurrenceRole::Definition)],
+            source,
+        ),
+        sym_multi(
+            "c",
+            &[("tests", SegmentKind::Module), ("inner", SegmentKind::Module)],
+            SymbolKind::Module,
+            SymbolClass::InWorkspace,
+            "src/lib.rs",
+            &[(inner_pos, 5, OccurrenceRole::Definition)],
+            source,
+        ),
+        fn_def_at("c", "helper", "src/lib.rs", source, "helper", 1),
+        fn_def_at("c", "deep_helper", "src/lib.rs", source, "deep_helper", 1),
+        fn_def_at("c", "production", "src/lib.rs", source, "production", 1),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("src/lib.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+
+    assert_eq!(
+        rule_of(&store, "c", &[("helper", SegmentKind::Method)]).as_deref(),
+        Some("test_configuration"),
+        "a direct child helper is test-configured"
+    );
+    assert_eq!(
+        rule_of(&store, "c", &[("deep_helper", SegmentKind::Method)]).as_deref(),
+        Some("test_configuration"),
+        "a helper nested more than one level deep is test-configured"
+    );
+    assert_eq!(
+        rule_of(&store, "c", &[("tests", SegmentKind::Module)]).as_deref(),
+        Some("test_configuration"),
+        "the gated module classifies itself"
+    );
+    assert_eq!(rule_of(&store, "c", &[("production", SegmentKind::Method)]), None);
+}
+
+// _(Per-symbol test classification — test-configuration across documents)_ — a `#[cfg(test)]` module
+// declaration whose body lives in its own document classifies that document's symbols through its
+// gated declaration.
+#[test]
+fn out_of_line_cfg_test_module_classifies_its_document() {
+    let lib_source = "\
+#[cfg(test)]
+mod tests;
+
+pub fn production() {}
+";
+    let tests_source = "\
+pub fn helper() {}
+";
+    let mod_ref_pos = lib_source.find("tests;").unwrap();
+    let mut module = one_occ_symbol(
+        "c",
+        &[("tests", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        "src/tests_mod.rs",
+        // The whole-document definition occurrence a file module carries: line 1, char 0 is one
+        // past the final newline.
+        SourceRange::new(0, 0, 1, 0),
+        OccurrenceRole::Definition,
+    );
+    // The `mod tests;` declaration site in the parent document references the module.
+    module.occurrences.push(ExtractedOccurrence {
+        document_path: "src/lib.rs".to_string(),
+        range: {
+            let (l, c) = line_col(lib_source, mod_ref_pos);
+            SourceRange::new(l, c, l, c + 5)
+        },
+        role: OccurrenceRole::Reference,
+    });
+    let symbols = vec![
+        module,
+        fn_def_at("c", "helper", "src/tests_mod.rs", tests_source, "helper", 1),
+        fn_def_at("c", "production", "src/lib.rs", lib_source, "production", 1),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![
+        ("src/lib.rs".to_string(), lib_source.to_string()),
+        ("src/tests_mod.rs".to_string(), tests_source.to_string()),
+    ];
+    ingest(
+        &mut store,
+        &ws(),
+        &docs_index(&["src/lib.rs", "src/tests_mod.rs"], symbols),
+        &src,
+    )
+    .unwrap();
+
+    assert_eq!(
+        rule_of(&store, "c", &[("helper", SegmentKind::Method)]).as_deref(),
+        Some("test_configuration"),
+        "the out-of-line module body's symbols are test-configured"
+    );
+    assert_eq!(rule_of(&store, "c", &[("production", SegmentKind::Method)]), None);
+}
+
+// _(Per-symbol test classification — test-directory rule)_ — an attribute-less helper in an
+// integration-test directory classifies under the test-directory rule, including one in a
+// `tests/common/`-style subdirectory module.
+#[test]
+fn tests_directory_classifies_attribute_less_helpers() {
+    let integration_source = "\
+pub fn integration_helper() {}
+";
+    let common_source = "\
+pub fn shared_helper() {}
+";
+    let symbols = vec![
+        fn_def_at(
+            "c",
+            "integration_helper",
+            "tests/api.rs",
+            integration_source,
+            "integration_helper",
+            1,
+        ),
+        fn_def_at(
+            "c",
+            "shared_helper",
+            "tests/common/mod.rs",
+            common_source,
+            "shared_helper",
+            1,
+        ),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![
+        ("tests/api.rs".to_string(), integration_source.to_string()),
+        ("tests/common/mod.rs".to_string(), common_source.to_string()),
+    ];
+    ingest(
+        &mut store,
+        &ws(),
+        &docs_index(&["tests/api.rs", "tests/common/mod.rs"], symbols),
+        &src,
+    )
+    .unwrap();
+
+    assert_eq!(
+        rule_of(&store, "c", &[("integration_helper", SegmentKind::Method)]).as_deref(),
+        Some("test_directory")
+    );
+    assert_eq!(
+        rule_of(&store, "c", &[("shared_helper", SegmentKind::Method)]).as_deref(),
+        Some("test_directory"),
+        "a tests/common/-style subdirectory module is test-directory classified"
+    );
+}
+
+/// A Python-language index over several documents, for classification fixtures.
+fn py_docs_index(paths: &[&str], symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
+    ExtractedIndex {
+        provenance: AnalyzerProvenance {
+            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_version: "0".to_string(),
+        },
+        documents: paths
+            .iter()
+            .map(|p| SourceDocument {
+                path: p.to_string(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols,
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    }
+}
+
+// _(Per-symbol test classification — Python test-file rule)_ — every accepted file-name form
+// classifies its symbols (a helper without a test-prefixed name in `test_*.py`, a root-level
+// `conftest.py`, and a `tests.py`), while a `testimony.py`-style near-miss stays non-test.
+#[test]
+fn python_test_file_forms_classify_and_near_miss_stays_non_test() {
+    let helper_source = "def make_client():\n    pass\n";
+    let suffix_source = "def suffix_check():\n    pass\n";
+    let conftest_source = "def fixture_client():\n    pass\n";
+    let tests_py_source = "def check():\n    pass\n";
+    let near_miss_source = "def witness():\n    pass\n";
+    let symbols = vec![
+        fn_def_at("p", "make_client", "pkg/test_api.py", helper_source, "make_client", 1),
+        fn_def_at("p", "suffix_check", "pkg/api_test.py", suffix_source, "suffix_check", 1),
+        fn_def_at(
+            "p",
+            "fixture_client",
+            "conftest.py",
+            conftest_source,
+            "fixture_client",
+            1,
+        ),
+        fn_def_at("p", "check", "pkg/tests.py", tests_py_source, "check", 1),
+        fn_def_at("p", "witness", "pkg/testimony.py", near_miss_source, "witness", 1),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![
+        ("pkg/test_api.py".to_string(), helper_source.to_string()),
+        ("pkg/api_test.py".to_string(), suffix_source.to_string()),
+        ("conftest.py".to_string(), conftest_source.to_string()),
+        ("pkg/tests.py".to_string(), tests_py_source.to_string()),
+        ("pkg/testimony.py".to_string(), near_miss_source.to_string()),
+    ];
+    let paths = [
+        "pkg/test_api.py",
+        "pkg/api_test.py",
+        "conftest.py",
+        "pkg/tests.py",
+        "pkg/testimony.py",
+    ];
+    ingest(&mut store, &ws(), &py_docs_index(&paths, symbols), &src).unwrap();
+
+    assert_eq!(
+        rule_of(&store, "p", &[("make_client", SegmentKind::Method)]).as_deref(),
+        Some("test_file"),
+        "a helper without a test-prefixed name classifies through its test file"
+    );
+    assert_eq!(
+        rule_of(&store, "p", &[("suffix_check", SegmentKind::Method)]).as_deref(),
+        Some("test_file"),
+        "the test-suffixed file form (`*_test.py`) classifies"
+    );
+    assert_eq!(
+        rule_of(&store, "p", &[("fixture_client", SegmentKind::Method)]).as_deref(),
+        Some("test_file"),
+        "conftest.py is test infrastructure wherever it sits"
+    );
+    assert_eq!(
+        rule_of(&store, "p", &[("check", SegmentKind::Method)]).as_deref(),
+        Some("test_file"),
+        "the conventional single-file module tests.py classifies"
+    );
+    assert_eq!(
+        rule_of(&store, "p", &[("witness", SegmentKind::Method)]),
+        None,
+        "a file name merely beginning with the word test matches no form"
+    );
+}
+
+// _(Per-symbol test classification — Python test-directory rule)_ — a fixture module under `tests/`
+// whose file name matches no test-file pattern classifies under the test-directory rule.
+#[test]
+fn python_tests_directory_classifies_fixture_modules() {
+    let source = "def shared_fixture():\n    pass\n";
+    let symbols = vec![fn_def_at(
+        "p",
+        "shared_fixture",
+        "pkg/tests/fixtures.py",
+        source,
+        "shared_fixture",
+        1,
+    )];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("pkg/tests/fixtures.py".to_string(), source.to_string())];
+    ingest(
+        &mut store,
+        &ws(),
+        &py_docs_index(&["pkg/tests/fixtures.py"], symbols),
+        &src,
+    )
+    .unwrap();
+
+    assert_eq!(
+        rule_of(&store, "p", &[("shared_fixture", SegmentKind::Method)]).as_deref(),
+        Some("test_directory")
+    );
+}
+
+// _(Per-symbol test classification — unaligned definitions still classify by document)_ — a symbol
+// whose definition occurrence the join refused (text mismatch) still classifies under the
+// document-scoped rules: the extracted definition's document is trustworthy even when its span is
+// not, so file and directory rules apply while the span-dependent attribute rule stays out.
+#[test]
+fn unaligned_rust_definition_still_classifies_by_document() {
+    // The extracted definition names `renamed_helper` but the source token spells `helper`, so the
+    // join refuses the definition; the tests/ directory rule must still classify the symbol.
+    let source = "pub fn helper() {}\n";
+    let symbols = vec![fn_def_at("c", "renamed_helper", "tests/api.rs", source, "helper", 1)];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("tests/api.rs".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &one_doc_index("tests/api.rs", symbols), &src).unwrap();
+    assert_eq!(acc.text_mismatch, 1, "the drifted definition is refused by the join");
+
+    assert_eq!(
+        rule_of(&store, "c", &[("renamed_helper", SegmentKind::Method)]).as_deref(),
+        Some("test_directory"),
+        "the refused definition's document still classifies the symbol"
+    );
+}
+
+// _(Per-symbol test classification — unaligned definitions still classify by document, Python)_ —
+// the same guarantee for a Python symbol whose definition the join refused inside a test file.
+#[test]
+fn unaligned_python_definition_still_classifies_by_document() {
+    let source = "def make_thing():\n    pass\n";
+    let symbols = vec![fn_def_at("p", "renamed_fn", "pkg/test_api.py", source, "make_thing", 1)];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("pkg/test_api.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), &py_docs_index(&["pkg/test_api.py"], symbols), &src).unwrap();
+    assert_eq!(acc.text_mismatch, 1, "the drifted definition is refused by the join");
+
+    assert_eq!(
+        rule_of(&store, "p", &[("renamed_fn", SegmentKind::Method)]).as_deref(),
+        Some("test_file"),
+        "the refused definition's document still classifies the symbol"
+    );
+}
+
+// _(Per-symbol test classification — rule precedence)_ — when several rules accept one symbol, the
+// recorded rule is the first in the fixed order attribute > configuration > file > directory: a
+// `#[test]` function inside a `#[cfg(test)]` module records test-attribute, not test-configuration.
+#[test]
+fn test_attribute_takes_precedence_over_test_configuration() {
+    let source = "\
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn attributed_case() {}
+}
+";
+    let tests_pos = source.find("tests {").unwrap();
+    let symbols = vec![
+        sym_multi(
+            "c",
+            &[("tests", SegmentKind::Module)],
+            SymbolKind::Module,
+            SymbolClass::InWorkspace,
+            "src/lib.rs",
+            &[(tests_pos, 5, OccurrenceRole::Definition)],
+            source,
+        ),
+        fn_def_at("c", "attributed_case", "src/lib.rs", source, "attributed_case", 1),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("src/lib.rs".to_string(), source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+
+    assert_eq!(
+        rule_of(&store, "c", &[("attributed_case", SegmentKind::Method)]).as_deref(),
+        Some("test_attribute"),
+        "the strongest evidence wins over the enclosing gate"
+    );
+    assert_eq!(
+        rule_of(&store, "c", &[("tests", SegmentKind::Module)]).as_deref(),
+        Some("test_configuration"),
+        "the module itself still records its own rule"
+    );
+}
+
+// _(Per-symbol test classification — negatives)_ — a production Rust function with no signal, and a
+// `test_`-prefixed Python function in a document no rule accepts, both persist no classification: a
+// declaration-name convention alone never classifies.
+#[test]
+fn no_signal_and_name_only_convention_stay_non_test() {
+    let rust_source = "pub fn plain() {}\n";
+    let rust_symbols = vec![fn_def_at("c", "plain", "src/lib.rs", rust_source, "plain", 1)];
+    let mut rust_store = GraphStore::open_in_memory().unwrap();
+    let rust_src = vec![("src/lib.rs".to_string(), rust_source.to_string())];
+    ingest(
+        &mut rust_store,
+        &ws(),
+        &one_doc_index("src/lib.rs", rust_symbols),
+        &rust_src,
+    )
+    .unwrap();
+    assert_eq!(rule_of(&rust_store, "c", &[("plain", SegmentKind::Method)]), None);
+
+    let py_source = "def test_connection():\n    pass\n";
+    let py_symbols = vec![fn_def_at(
+        "p",
+        "test_connection",
+        "pkg/health.py",
+        py_source,
+        "test_connection",
+        1,
+    )];
+    let mut py_store = GraphStore::open_in_memory().unwrap();
+    let py_src = vec![("pkg/health.py".to_string(), py_source.to_string())];
+    ingest(
+        &mut py_store,
+        &ws(),
+        &py_docs_index(&["pkg/health.py"], py_symbols),
+        &py_src,
+    )
+    .unwrap();
+    assert_eq!(
+        rule_of(&py_store, "p", &[("test_connection", SegmentKind::Method)]),
+        None,
+        "a test-prefixed name in a production document is not classified"
+    );
+}
+
+// _(Per-symbol test classification — every classification carries its rule)_ — a mixed build firing
+// several rules stamps each classified symbol with exactly the rule that accepted it, and no
+// classified symbol lacks provenance.
+#[test]
+fn mixed_build_carries_a_rule_on_every_classification() {
+    let lib_source = "\
+#[test]
+fn attributed_case() {}
+
+#[cfg(test)]
+mod tests {
+    fn config_helper() {}
+}
+
+fn production() {}
+";
+    let integration_source = "pub fn dir_helper() {}\n";
+    let tests_pos = lib_source.find("tests {").unwrap();
+    let symbols = vec![
+        fn_def_at("c", "attributed_case", "src/lib.rs", lib_source, "attributed_case", 1),
+        sym_multi(
+            "c",
+            &[("tests", SegmentKind::Module)],
+            SymbolKind::Module,
+            SymbolClass::InWorkspace,
+            "src/lib.rs",
+            &[(tests_pos, 5, OccurrenceRole::Definition)],
+            lib_source,
+        ),
+        fn_def_at("c", "config_helper", "src/lib.rs", lib_source, "config_helper", 1),
+        fn_def_at("c", "production", "src/lib.rs", lib_source, "production", 1),
+        fn_def_at("c", "dir_helper", "tests/api.rs", integration_source, "dir_helper", 1),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![
+        ("src/lib.rs".to_string(), lib_source.to_string()),
+        ("tests/api.rs".to_string(), integration_source.to_string()),
+    ];
+    ingest(
+        &mut store,
+        &ws(),
+        &docs_index(&["src/lib.rs", "tests/api.rs"], symbols),
+        &src,
+    )
+    .unwrap();
+
+    let expected = [
+        (&[("attributed_case", SegmentKind::Method)][..], Some("test_attribute")),
+        (
+            &[("config_helper", SegmentKind::Method)][..],
+            Some("test_configuration"),
+        ),
+        (&[("dir_helper", SegmentKind::Method)][..], Some("test_directory")),
+        (&[("production", SegmentKind::Method)][..], None),
+    ];
+    for (segments, rule) in expected {
+        assert_eq!(
+            rule_of(&store, "c", segments).as_deref(),
+            rule,
+            "each classification carries exactly its accepting rule: {segments:?}"
+        );
+    }
+}
+
+// _(Per-symbol test classification — builds wholly supersede)_ — a symbol classified in one build
+// whose source moves out of test territory reads back non-test after the rebuild.
+#[test]
+fn reclassification_is_wholly_superseded_by_rebuild() {
+    let test_source = "\
+#[test]
+fn mover() {}
+";
+    let symbols = vec![fn_def_at("c", "mover", "src/lib.rs", test_source, "mover", 1)];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("src/lib.rs".to_string(), test_source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+    assert_eq!(
+        rule_of(&store, "c", &[("mover", SegmentKind::Method)]).as_deref(),
+        Some("test_attribute")
+    );
+
+    // The attribute is gone in the next build's sources: the classification must not survive.
+    let plain_source = "fn mover() {}\n";
+    let symbols = vec![fn_def_at("c", "mover", "src/lib.rs", plain_source, "mover", 1)];
+    let src = vec![("src/lib.rs".to_string(), plain_source.to_string())];
+    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+    assert_eq!(
+        rule_of(&store, "c", &[("mover", SegmentKind::Method)]),
+        None,
+        "the rebuild wholly supersedes the prior classification"
+    );
+}
+
+// _(Per-symbol test classification — classification does not alter the graph)_ — a test-classified
+// function referencing a production symbol yields the same attribution and `uses` edge as an
+// identical non-test function.
+#[test]
+fn classification_does_not_alter_attribution_or_edges() {
+    let make_source = |attr: &str| format!("{attr}fn caller() {{ helper(); }}\n\nfn helper() {{}}\n");
+    let build = |source: &str| {
+        let helper_def_pos = source.rfind("helper").unwrap();
+        let helper_ref_pos = source.find("helper()").unwrap();
+        let symbols = vec![
+            fn_def_at("c", "caller", "src/lib.rs", source, "caller", 1),
+            sym_multi(
+                "c",
+                &[("helper", SegmentKind::Method)],
+                SymbolKind::Function,
+                SymbolClass::InWorkspace,
+                "src/lib.rs",
+                &[
+                    (helper_def_pos, 6, OccurrenceRole::Definition),
+                    (helper_ref_pos, 6, OccurrenceRole::Reference),
+                ],
+                source,
+            ),
+        ];
+        let mut store = GraphStore::open_in_memory().unwrap();
+        let src = vec![("src/lib.rs".to_string(), source.to_string())];
+        ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+        store
+    };
+
+    let test_store = build(&make_source("#[test]\n"));
+    let plain_store = build(&make_source(""));
+
+    // Same reference attribution: the helper's reference site attributes to the caller in both.
+    let helper = id_of_pkg("c", &[("helper", SegmentKind::Method)]);
+    let caller = id_of_pkg("c", &[("caller", SegmentKind::Method)]);
+    for store in [&test_store, &plain_store] {
+        let refs = store.references_of(&helper).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].enclosing_id.as_ref(), Some(&caller), "attribution unchanged");
+        assert!(
+            store
+                .edges(EdgeKind::Uses)
+                .unwrap()
+                .contains(&(caller.clone(), helper.clone())),
+            "the uses edge derives identically"
+        );
+    }
+    // The only difference is the classification itself.
+    assert_eq!(
+        rule_of(&test_store, "c", &[("caller", SegmentKind::Method)]).as_deref(),
+        Some("test_attribute")
+    );
+    assert_eq!(rule_of(&plain_store, "c", &[("caller", SegmentKind::Method)]), None);
 }

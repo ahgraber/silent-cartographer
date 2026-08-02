@@ -615,6 +615,7 @@ mod tests {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         }
     }
 

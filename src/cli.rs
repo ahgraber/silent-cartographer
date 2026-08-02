@@ -128,6 +128,10 @@ pub enum RelationArg {
     /// The types that declare the subject as a supertype — a trait's implementors or a base type's
     /// subtypes.
     Implementers,
+    /// The reference sites whose enclosing declaration is classified test code — "what test code
+    /// exercises this symbol." Convention-based classification (file names, test attributes, test
+    /// directories), not resolved semantic fact; every answer is labeled heuristic-grade.
+    Tests,
 }
 
 impl From<RelationArg> for Relation {
@@ -139,6 +143,7 @@ impl From<RelationArg> for Relation {
             RelationArg::Dependents => Relation::Dependents,
             RelationArg::Importers => Relation::Importers,
             RelationArg::Implementers => Relation::Implementers,
+            RelationArg::Tests => Relation::Tests,
         }
     }
 }

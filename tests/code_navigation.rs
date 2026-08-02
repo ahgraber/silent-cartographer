@@ -620,6 +620,7 @@ fn trace_contains_symbol_rows_carry_definition_location() {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
     store
@@ -634,6 +635,7 @@ fn trace_contains_symbol_rows_carry_definition_location() {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
     store
@@ -910,6 +912,7 @@ fn module_scope_site_projects_the_file_module_over_a_reexport_twin() {
                 signature_text: Some(signature.to_string()),
                 interface_text: Some(signature.to_string()),
                 duplicated: false,
+                test_rule: None,
             })
             .unwrap();
     };
@@ -979,6 +982,7 @@ fn trace_containers_at_body_detail_carries_the_container_body() {
             signature_text: Some("struct Holder".to_string()),
             interface_text: Some("struct Holder".to_string()),
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
     put_dep_symbol(&store, "member");
@@ -1306,6 +1310,7 @@ fn put_dep_symbol(store: &GraphStore, name: &str) {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
 }
@@ -1324,6 +1329,7 @@ fn put_dep_symbol_with_tiers(store: &GraphStore, name: &str, signature: Option<&
             signature_text: signature.map(str::to_string),
             interface_text: interface.map(str::to_string),
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
 }
@@ -2037,5 +2043,575 @@ fn python_dotted_qualified_name_resolves() {
     match engine.resolve("pkg.shapes.Widget").unwrap() {
         Resolution::Unique(row) => assert_eq!(row.canonical_id, py_widget_id()),
         other => panic!("expected a unique resolution, got {other:?}"),
+    }
+}
+
+// ---- The `tests` relation ----
+
+const TR_LIB_DOC: &str = "src/lib.rs";
+const TR_API_DOC: &str = "tests/api.rs";
+
+const TR_LIB_SOURCE: &str = "\
+pub fn subject_a() {}
+pub fn subject_b() {}
+pub fn subject_c() {}
+pub fn subject_d() {}
+pub fn subject_e() {}
+
+pub fn production_caller() {
+    subject_a();
+    subject_d();
+}
+
+#[test]
+fn test_caller() {
+    subject_a();
+    subject_e();
+}
+
+#[test]
+fn test_caller_two() {
+    subject_a();
+}
+";
+
+const TR_API_SOURCE: &str = "\
+use crate::subject_c;
+
+pub fn helper() {
+    subject_b();
+    subject_e();
+}
+";
+
+fn tr_source(doc: &str) -> &'static str {
+    match doc {
+        TR_LIB_DOC => TR_LIB_SOURCE,
+        TR_API_DOC => TR_API_SOURCE,
+        other => panic!("unknown fixture doc {other}"),
+    }
+}
+
+/// A fixture symbol whose occurrences are `(doc, occurrence-of-token, role)` sites, each locating
+/// the n-th (1-based) appearance of the symbol's own name in that document.
+fn tr_symbol(name: &str, kind: SymbolKind, occs: &[(&str, usize, OccurrenceRole)]) -> ExtractedSymbol {
+    let occurrences = occs
+        .iter()
+        .map(|(doc, nth, role)| {
+            let source = tr_source(doc);
+            let pos = source.match_indices(name).nth(nth - 1).expect("token present").0;
+            let (l, c) = line_col(source, pos);
+            ExtractedOccurrence {
+                document_path: doc.to_string(),
+                range: SourceRange::new(l, c, l, c + name.len() as u32),
+                role: *role,
+            }
+        })
+        .collect();
+    ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "t",
+            vec![DescriptorSegment::new(name, SegmentKind::Method)],
+        )),
+        kind,
+        class: SymbolClass::InWorkspace,
+        occurrences,
+    }
+}
+
+fn tr_id(name: &str) -> CanonicalId {
+    id_of_pkg("t", &[(name, SegmentKind::Method)])
+}
+
+fn tr_sources() -> Vec<(String, String)> {
+    vec![
+        (TR_LIB_DOC.to_string(), TR_LIB_SOURCE.to_string()),
+        (TR_API_DOC.to_string(), TR_API_SOURCE.to_string()),
+    ]
+}
+
+/// The `tests`-relation fixture store: subjects with mixed callers, a test-only helper caller, a
+/// module-scope test reference, and a production-only subject, across a production document and an
+/// integration-test document.
+fn tr_store() -> GraphStore {
+    use OccurrenceRole::{Definition, Reference};
+    let mut symbols = vec![
+        tr_symbol(
+            "subject_a",
+            SymbolKind::Function,
+            &[
+                (TR_LIB_DOC, 1, Definition),
+                (TR_LIB_DOC, 2, Reference),
+                (TR_LIB_DOC, 3, Reference),
+                (TR_LIB_DOC, 4, Reference),
+            ],
+        ),
+        tr_symbol(
+            "subject_b",
+            SymbolKind::Function,
+            &[(TR_LIB_DOC, 1, Definition), (TR_API_DOC, 1, Reference)],
+        ),
+        tr_symbol(
+            "subject_c",
+            SymbolKind::Function,
+            &[(TR_LIB_DOC, 1, Definition), (TR_API_DOC, 1, Reference)],
+        ),
+        tr_symbol(
+            "subject_d",
+            SymbolKind::Function,
+            &[(TR_LIB_DOC, 1, Definition), (TR_LIB_DOC, 2, Reference)],
+        ),
+        tr_symbol(
+            "subject_e",
+            SymbolKind::Function,
+            &[
+                (TR_LIB_DOC, 1, Definition),
+                (TR_LIB_DOC, 2, Reference),
+                (TR_API_DOC, 1, Reference),
+            ],
+        ),
+        tr_symbol(
+            "production_caller",
+            SymbolKind::Function,
+            &[(TR_LIB_DOC, 1, Definition)],
+        ),
+        tr_symbol("test_caller", SymbolKind::Function, &[(TR_LIB_DOC, 1, Definition)]),
+        tr_symbol("test_caller_two", SymbolKind::Function, &[(TR_LIB_DOC, 1, Definition)]),
+        tr_symbol("helper", SymbolKind::Function, &[(TR_API_DOC, 1, Definition)]),
+    ];
+    // The integration-test document's file module, the attribution target of its module-scope
+    // reference sites: a whole-document definition occurrence (line one past the final newline).
+    let api_lines = TR_API_SOURCE.matches('\n').count() as u32;
+    symbols.push(ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "t",
+            vec![DescriptorSegment::new("api", SegmentKind::Module)],
+        )),
+        kind: SymbolKind::Module,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: TR_API_DOC.to_string(),
+            range: SourceRange::new(0, 0, api_lines, 0),
+            role: OccurrenceRole::Definition,
+        }],
+    });
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: vec![
+            SourceDocument {
+                path: TR_LIB_DOC.to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+            SourceDocument {
+                path: TR_API_DOC.to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+        ],
+        symbols,
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    };
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), &index, &tr_sources()).unwrap();
+    store
+}
+
+fn tr_engine(store: &GraphStore) -> QueryEngine<'_> {
+    let hash = silent_cartographer::graph::content_hash(&tr_sources());
+    QueryEngine::new(store, support::provenance(), hash, None)
+}
+
+/// The reference locations of a found trace answer, in answer order.
+fn tr_locations(
+    answer: &silent_cartographer::query::output::Answer<silent_cartographer::query::TraceItem>,
+) -> Vec<(String, usize)> {
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    results
+        .iter()
+        .map(|item| match item {
+            silent_cartographer::query::TraceItem::Reference { location, .. } => {
+                (location.document_path.clone(), location.span_start)
+            }
+            other => panic!("expected a reference, got {other:?}"),
+        })
+        .collect()
+}
+
+// _(Scenario: Trace tests of a Rust symbol)_ — a subject referenced from test-classified functions
+// and a production function returns exactly the test-classified sites, and the production site is
+// not among them.
+#[test]
+fn trace_tests_returns_exactly_test_classified_sites() {
+    let store = tr_store();
+    let engine = tr_engine(&store);
+    let answer = engine.trace("subject_a", Relation::Tests, None, None).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    assert_eq!(results.len(), 2, "both test callers, never the production caller");
+    for item in results {
+        match item {
+            silent_cartographer::query::TraceItem::Reference { enclosing, .. } => {
+                let enclosing = enclosing.as_ref().expect("attributed to a declaration");
+                assert!(
+                    [tr_id("test_caller"), tr_id("test_caller_two")].contains(enclosing),
+                    "the site is attributed to a test-classified declaration: {enclosing}"
+                );
+            }
+            other => panic!("expected a reference, got {other:?}"),
+        }
+    }
+}
+
+// _(Scenario: Tests reach through a shared helper)_ — a subject referenced only from a
+// test-classified helper returns the helper's site rather than an empty answer.
+#[test]
+fn trace_tests_reaches_through_a_shared_helper() {
+    let store = tr_store();
+    let engine = tr_engine(&store);
+    let answer = engine.trace("subject_b", Relation::Tests, None, None).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    assert_eq!(results.len(), 1);
+    match &results[0] {
+        silent_cartographer::query::TraceItem::Reference { enclosing, .. } => {
+            assert_eq!(
+                enclosing.as_ref(),
+                Some(&tr_id("helper")),
+                "the helper's site is returned"
+            );
+        }
+        other => panic!("expected a reference, got {other:?}"),
+    }
+}
+
+// _(Scenario: Module-scope test references count)_ — a subject named by an import statement at
+// module scope in a test-classified document returns that site, attributed to the document's module.
+#[test]
+fn trace_tests_module_scope_reference_counts() {
+    let store = tr_store();
+    let engine = tr_engine(&store);
+    let answer = engine.trace("subject_c", Relation::Tests, None, None).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    assert_eq!(results.len(), 1);
+    match &results[0] {
+        silent_cartographer::query::TraceItem::Reference {
+            enclosing, location, ..
+        } => {
+            assert_eq!(*enclosing, None, "the site attributes to the module itself");
+            assert_eq!(location.document_path, TR_API_DOC);
+        }
+        other => panic!("expected a reference, got {other:?}"),
+    }
+}
+
+// _(Scenario: Empty relation is typed absence — tests)_ — a subject with only production references
+// returns a definite empty set, distinct from an unavailable or failed answer.
+#[test]
+fn trace_tests_only_production_references_is_typed_absence() {
+    let store = tr_store();
+    let engine = tr_engine(&store);
+    let answer = engine.trace("subject_d", Relation::Tests, None, None).unwrap();
+    assert!(
+        matches!(answer.outcome, Outcome::Empty),
+        "a definite empty set: {:?}",
+        answer.outcome
+    );
+}
+
+// _(Scenario: Trace tests of a Python symbol)_ — a Python function referenced from a declaration in
+// a test-classified document returns that reference site with its location.
+#[test]
+fn trace_tests_python_site_returned() {
+    let api_source = "def subject():\n    pass\n";
+    let test_source = "def test_subject():\n    subject()\n";
+    let subject_def = api_source.find("subject").unwrap();
+    let subject_ref = test_source.rfind("subject()").unwrap();
+    let test_fn_def = test_source.find("test_subject").unwrap();
+    let occ = |doc: &str, source: &str, pos: usize, len: usize, role: OccurrenceRole| {
+        let (l, c) = line_col(source, pos);
+        ExtractedOccurrence {
+            document_path: doc.to_string(),
+            range: SourceRange::new(l, c, l, c + len as u32),
+            role,
+        }
+    };
+    let symbols = vec![
+        ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "p",
+                vec![DescriptorSegment::new("subject", SegmentKind::Method)],
+            )),
+            kind: SymbolKind::Function,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![
+                occ("pkg/api.py", api_source, subject_def, 7, OccurrenceRole::Definition),
+                occ(
+                    "pkg/test_api.py",
+                    test_source,
+                    subject_ref,
+                    7,
+                    OccurrenceRole::Reference,
+                ),
+            ],
+        },
+        ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "p",
+                vec![DescriptorSegment::new("test_subject", SegmentKind::Method)],
+            )),
+            kind: SymbolKind::Function,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![occ(
+                "pkg/test_api.py",
+                test_source,
+                test_fn_def,
+                12,
+                OccurrenceRole::Definition,
+            )],
+        },
+    ];
+    let index = ExtractedIndex {
+        provenance: support::python_fixture_index().provenance,
+        documents: vec![
+            SourceDocument {
+                path: "pkg/api.py".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+            SourceDocument {
+                path: "pkg/test_api.py".to_string(),
+                encoding: PositionEncoding::Utf8,
+            },
+        ],
+        symbols,
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    };
+    let sources = vec![
+        ("pkg/api.py".to_string(), api_source.to_string()),
+        ("pkg/test_api.py".to_string(), test_source.to_string()),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &py_ws(), &index, &sources).unwrap();
+    let provenance = support::python_fixture_index().provenance;
+    let hash = silent_cartographer::graph::content_hash(&sources);
+    let engine = QueryEngine::new(&store, provenance, hash, None);
+
+    let answer = engine.trace("subject", Relation::Tests, None, None).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    assert_eq!(results.len(), 1);
+    match &results[0] {
+        silent_cartographer::query::TraceItem::Reference { location, .. } => {
+            assert_eq!(location.document_path, "pkg/test_api.py");
+            assert!(location.span_end > location.span_start);
+        }
+        other => panic!("expected a reference, got {other:?}"),
+    }
+}
+
+// _(Scenario: Machine answer carries the marker / Each site carries its classification rule /
+// Resolved relations carry no heuristic marker)_ — a `tests` answer carries the answer-level
+// convention marker and a per-site rule on every returned site (each site its own accepting rule,
+// under more than one rule in one answer); a `references` answer over the same subject carries
+// neither.
+#[test]
+fn tests_json_carries_marker_and_per_site_rules_references_carries_neither() {
+    let store = tr_store();
+    let engine = tr_engine(&store);
+    let tests_json = engine
+        .trace("subject_e", Relation::Tests, None, None)
+        .unwrap()
+        .to_json();
+    assert!(
+        tests_json.contains("\"classification\": \"convention\""),
+        "the answer-level marker is structural: {tests_json}"
+    );
+    assert!(
+        tests_json.contains("\"test_rule\": \"test_attribute\""),
+        "the attribute-classified site carries its rule: {tests_json}"
+    );
+    assert!(
+        tests_json.contains("\"test_rule\": \"test_directory\""),
+        "the directory-classified site carries its rule: {tests_json}"
+    );
+
+    let refs_json = engine
+        .trace("subject_e", Relation::References, None, None)
+        .unwrap()
+        .to_json();
+    assert!(
+        !refs_json.contains("classification"),
+        "a resolved relation carries no heuristic marker: {refs_json}"
+    );
+    assert!(
+        !refs_json.contains("test_rule"),
+        "a resolved relation's sites carry no rule field: {refs_json}"
+    );
+}
+
+// _(Scenario: Empty answer keeps the marker)_ — an empty `tests` answer asserts only that no
+// convention-classified reference site was found, and carries the marker like any other `tests`
+// answer.
+#[test]
+fn empty_tests_json_keeps_the_marker() {
+    let store = tr_store();
+    let engine = tr_engine(&store);
+    let answer = engine.trace("subject_d", Relation::Tests, None, None).unwrap();
+    assert!(matches!(answer.outcome, Outcome::Empty), "{:?}", answer.outcome);
+    let json = answer.to_json();
+    assert!(
+        json.contains("\"classification\": \"convention\""),
+        "the empty answer still carries the convention marker: {json}"
+    );
+}
+
+// _(Scenario: Unresolved subject carries no marker)_ — an absent answer terminates before
+// classification is consulted and contains no classification-derived content, so the marker — which
+// asserts a derivation, never merely the relation requested — stays off.
+#[test]
+fn unresolved_tests_subject_carries_no_marker() {
+    let store = tr_store();
+    let engine = tr_engine(&store);
+    let answer = engine.trace("no_such_symbol", Relation::Tests, None, None).unwrap();
+    assert!(matches!(answer.outcome, Outcome::Absent), "{:?}", answer.outcome);
+    assert!(
+        !answer.to_json().contains("classification"),
+        "a typed absence asserts no classification derivation"
+    );
+}
+
+// _(Scenario: Ambiguous subject carries no marker)_ — an ambiguous-reference answer terminates
+// before classification is consulted and contains no classification-derived content, so — like the
+// unresolved arm — the marker stays off.
+#[test]
+fn ambiguous_tests_subject_carries_no_marker() {
+    // Two symbols named `connect` in different types → ambiguous shortname (the same setup the
+    // ambiguous `get` test uses).
+    let mut index = support::fixture_index();
+    index
+        .symbols
+        .push(silent_cartographer::semantic::model::ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "mycrate",
+                vec![
+                    DescriptorSegment::new("net", SegmentKind::Module),
+                    DescriptorSegment::new("Server", SegmentKind::Type),
+                    DescriptorSegment::new("connect", SegmentKind::Method),
+                ],
+            )),
+            kind: silent_cartographer::semantic::model::SymbolKind::Method,
+            class: silent_cartographer::semantic::model::SymbolClass::InWorkspace,
+            occurrences: vec![silent_cartographer::semantic::model::ExtractedOccurrence {
+                document_path: support::DOC.to_string(),
+                range: silent_cartographer::semantic::model::SourceRange::new(3, 15, 3, 22),
+                role: silent_cartographer::semantic::model::OccurrenceRole::Definition,
+            }],
+        });
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), &index, &sources()).unwrap();
+    let engine = engine_over(&store, support::provenance());
+
+    let answer = engine.trace("connect", Relation::Tests, None, None).unwrap();
+    assert!(
+        matches!(answer.outcome, Outcome::Ambiguous { .. }),
+        "{:?}",
+        answer.outcome
+    );
+    assert!(
+        !answer.to_json().contains("classification"),
+        "an ambiguous answer asserts no classification derivation"
+    );
+}
+
+// _(Scenario: Heuristic marker composes with staleness)_ — a `tests` answer against an index whose
+// sources changed carries both the staleness flag and the heuristic-grade marker, each
+// independently.
+#[test]
+fn tests_marker_composes_with_staleness() {
+    let store = tr_store();
+    let engine = QueryEngine::new(&store, support::provenance(), "drifted-hash".to_string(), None);
+    let answer = engine.trace("subject_a", Relation::Tests, None, None).unwrap();
+    assert!(answer.stale, "the changed sources flag the answer stale");
+    let json = answer.to_json();
+    assert!(json.contains("\"stale\": true"), "{json}");
+    assert!(
+        json.contains("\"classification\": \"convention\""),
+        "the marker rides independently of freshness: {json}"
+    );
+}
+
+// _(Relationship trace — self-description, tests)_ — the command's self-description presents `tests`
+// as convention-based classification rather than resolved semantic fact, mirroring the
+// dependents-as-impact framing.
+#[test]
+fn trace_self_description_frames_tests_as_convention_based() {
+    use clap::CommandFactory;
+    let mut cmd = silent_cartographer::cli::Cli::command();
+    let mut trace = cmd
+        .find_subcommand_mut("trace")
+        .expect("trace subcommand present")
+        .clone();
+    let help = trace.render_long_help().to_string();
+    assert!(
+        help.contains("what test code exercises this symbol"),
+        "the self-description carries the tests question: {help}"
+    );
+    assert!(
+        help.contains("not resolved semantic fact"),
+        "the self-description names the convention-based grade: {help}"
+    );
+}
+
+// _(Scenario: Deterministic ordering — tests)_ — repeated identical `tests` queries return identical
+// ordering, matching the order the same sites carry in a `references` answer.
+#[test]
+fn trace_tests_ordering_is_deterministic_and_matches_references() {
+    let store = tr_store();
+    let engine = tr_engine(&store);
+    let first = tr_locations(&engine.trace("subject_a", Relation::Tests, None, None).unwrap());
+    let second = tr_locations(&engine.trace("subject_a", Relation::Tests, None, None).unwrap());
+    assert_eq!(first, second, "repeated queries return identical ordering");
+
+    let references = tr_locations(&engine.trace("subject_a", Relation::References, None, None).unwrap());
+    let filtered: Vec<_> = references.into_iter().filter(|loc| first.contains(loc)).collect();
+    assert_eq!(first, filtered, "the tests answer preserves the references ordering");
+}
+
+// _(Scenario: Trace at signature detail — tests)_ — a `tests` query at signature detail carries the
+// attributed declaration's signature tier without changing the result set.
+#[test]
+fn trace_tests_signature_detail_projects_without_changing_results() {
+    let store = tr_store();
+    let engine = tr_engine(&store);
+    let plain = tr_locations(&engine.trace("subject_b", Relation::Tests, None, None).unwrap());
+    let answer = engine
+        .trace("subject_b", Relation::Tests, Some(Detail::Signature), None)
+        .unwrap();
+    assert_eq!(tr_locations(&answer), plain, "detail never changes the result set");
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    match &results[0] {
+        silent_cartographer::query::TraceItem::Reference { content, .. } => {
+            let expected = store
+                .symbol(&tr_id("helper"))
+                .unwrap()
+                .expect("helper persisted")
+                .signature_text;
+            assert_eq!(
+                *content, expected,
+                "the row carries the attributed declaration's signature"
+            );
+        }
+        other => panic!("expected a reference, got {other:?}"),
     }
 }

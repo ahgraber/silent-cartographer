@@ -45,6 +45,10 @@ pub enum Relation {
     /// The types that declare the subject as a supertype — a trait's implementors or a base type's
     /// subtypes.
     Implementers,
+    /// The reference sites of the subject whose enclosing declaration is classified test code — the
+    /// answer to "what test code exercises this symbol". Convention-based classification, not
+    /// resolved semantic fact; every answer carries the heuristic-grade marker.
+    Tests,
 }
 
 /// A query error distinct from a typed-absence answer (which is a successful "none").
@@ -225,7 +229,24 @@ impl<'a> QueryEngine<'a> {
                 for occ in occs {
                     let (content, truncated) =
                         self.reference_content(&occ.document_path, occ.enclosing_id.as_ref(), detail, max_lines)?;
-                    items.push(TraceItem::reference(&subject, occ, content, truncated));
+                    items.push(TraceItem::reference(&subject, occ, None, content, truncated));
+                }
+                items
+            }
+            // The `tests` relation is the reverse-reference traversal filtered at the
+            // enclosing-declaration grain, preserving the `references` ordering: a site counts
+            // exactly when the declaration it is attributed to is classified test code, and each
+            // kept site carries that classification's rule as provenance.
+            Relation::Tests => {
+                let occs = self.store.references_of(&subject.canonical_id)?;
+                let mut items = Vec::with_capacity(occs.len());
+                for occ in occs {
+                    let Some(rule) = self.attributed_test_rule(&occ)? else {
+                        continue;
+                    };
+                    let (content, truncated) =
+                        self.reference_content(&occ.document_path, occ.enclosing_id.as_ref(), detail, max_lines)?;
+                    items.push(TraceItem::reference(&subject, occ, Some(rule), content, truncated));
                 }
                 items
             }
@@ -252,10 +273,18 @@ impl<'a> QueryEngine<'a> {
             Relation::Dependents => unreachable!("returned above"),
         };
 
-        if items.is_empty() {
-            Ok(Answer::empty(provenance, freshness))
+        let answer = if items.is_empty() {
+            Answer::empty(provenance, freshness)
         } else {
-            Ok(Answer::found(items, provenance, freshness))
+            Answer::found(items, provenance, freshness)
+        };
+        // Every `tests` answer — found and empty alike — carries the structural heuristic-grade
+        // marker: an empty answer asserts only that no convention-classified site was found, never
+        // that nothing tests the subject.
+        if relation == Relation::Tests {
+            Ok(answer.convention_classified())
+        } else {
+            Ok(answer)
         }
     }
 
@@ -402,6 +431,18 @@ impl<'a> QueryEngine<'a> {
         }
     }
 
+    /// The `test_rule` of the declaration a reference site is attributed to: its enclosing
+    /// declaration (`enclosing_id`), or the document's module when the site attributes to the
+    /// module itself — the same fallback the detail projection uses. `None` means the attributed
+    /// declaration is not classified test code.
+    fn attributed_test_rule(&self, occ: &OccurrenceRow) -> Result<Option<String>, QueryError> {
+        let row = match occ.enclosing_id.as_ref() {
+            Some(id) => self.store.symbol(id)?,
+            None => self.store.module_of_document(&occ.document_path)?,
+        };
+        Ok(row.and_then(|r| r.test_rule))
+    }
+
     /// The tier content for a `references` row at `detail`, capped at `max_lines`: the tiers of the
     /// declaration the reference site is attributed to (`enclosing_id`), or, when the site attributes
     /// to the module/file itself (`enclosing_id` is `None`), the tiers of that document's module
@@ -504,6 +545,11 @@ pub enum TraceItem {
         location: Location,
         /// The enclosing declaration the reference is attributed to, if any.
         enclosing: Option<CanonicalId>,
+        /// The convention rule that classified the attributed declaration as test code — per-site
+        /// provenance on a `tests` answer. Absent on a `references` answer, so its shape is
+        /// unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_rule: Option<String>,
         /// The tier content of the declaration the site is attributed to, at the requested detail.
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
@@ -523,7 +569,13 @@ impl TraceItem {
         }
     }
 
-    fn reference(subject: &SymbolRow, occ: OccurrenceRow, content: Option<String>, content_truncated: bool) -> Self {
+    fn reference(
+        subject: &SymbolRow,
+        occ: OccurrenceRow,
+        test_rule: Option<String>,
+        content: Option<String>,
+        content_truncated: bool,
+    ) -> Self {
         TraceItem::Reference {
             subject: symbol_view(subject),
             location: Location {
@@ -532,6 +584,7 @@ impl TraceItem {
                 span_end: occ.span.1,
             },
             enclosing: occ.enclosing_id,
+            test_rule,
             content,
             content_truncated,
         }

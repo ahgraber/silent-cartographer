@@ -13,7 +13,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use silent_cartographer::graph::store::{EdgeKind, GraphStore, PersistedClass, SymbolRow};
+use silent_cartographer::graph::store::{EdgeKind, GraphStore, OccurrenceRow, PersistedClass, SymbolRow};
 use silent_cartographer::identity::CanonicalId;
 
 /// The single fixture source, paired with its workspace-relative path.
@@ -501,6 +501,7 @@ fn put_symbol(store: &GraphStore, id: &str, display: &str, body: Option<&str>) {
             signature_text: body.map(str::to_string),
             interface_text: body.map(str::to_string),
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
 }
@@ -520,6 +521,99 @@ fn build_widget_db(dir: &Path, count: usize) -> PathBuf {
     }
     support::stamp_metadata(&store, "bound-ws");
     db
+}
+
+/// A store at `dir/index.db` where `subject` is referenced from `count` test-classified callers,
+/// for bounding the `tests` relation.
+fn build_tests_relation_db(dir: &Path, count: usize) -> PathBuf {
+    let db = dir.join("index.db");
+    let store = GraphStore::open(&db).unwrap();
+    put_symbol(&store, "subject", "subject", None);
+    for i in 0..count {
+        let name = format!("tcase{i:02}");
+        store
+            .insert_symbol(&SymbolRow {
+                canonical_id: ws_id(&name),
+                display_name: name.clone(),
+                kind: "function".to_string(),
+                class: PersistedClass::InWorkspace,
+                document_path: Some("m.rs".to_string()),
+                span: Some((1000 + i * 20, 1010 + i * 20)),
+                span_text: None,
+                signature_text: None,
+                interface_text: None,
+                duplicated: false,
+                test_rule: Some("test_attribute".to_string()),
+            })
+            .unwrap();
+        store
+            .insert_occurrence(&OccurrenceRow {
+                symbol_id: ws_id("subject"),
+                document_path: "m.rs".to_string(),
+                span: (1002 + i * 20, 1009 + i * 20),
+                role: "reference".to_string(),
+                rule: "exact".to_string(),
+                enclosing_id: Some(ws_id(&name)),
+                locality: None,
+            })
+            .unwrap();
+    }
+    support::stamp_metadata(&store, "bound-ws");
+    db
+}
+
+// _(Scenario: Answer bounded past the result limit — tests relation)_ — a `tests` answer larger than
+// the limit is truncated with disclosure, and its continuation token resumes the remainder
+// deterministically.
+#[test]
+fn tests_relation_bounds_and_resumes_deterministically() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_tests_relation_db(dir.path(), 30);
+    let query = ["--json", "trace", "subject", "--relation", "tests"];
+
+    let first = json_answer(&c10r(dir.path()).arg("--db").arg(&db).args(query).output().unwrap());
+    assert_eq!(
+        first["outcome"]["results"].as_array().unwrap().len(),
+        25,
+        "the default limit caps the set: {first}"
+    );
+    assert_eq!(first["page"]["truncated"], true, "truncation is disclosed: {first}");
+    assert_eq!(first["page"]["total"], 30, "the total is disclosed: {first}");
+    assert_eq!(
+        first["classification"], "convention",
+        "the truncated page keeps the heuristic-grade marker: {first}"
+    );
+    let token = first["page"]["cursor"]
+        .as_str()
+        .expect("a truncated answer carries a cursor")
+        .to_string();
+
+    // The same query returns the identical first page: the ordering is deterministic.
+    let again = json_answer(&c10r(dir.path()).arg("--db").arg(&db).args(query).output().unwrap());
+    assert_eq!(
+        first["outcome"]["results"], again["outcome"]["results"],
+        "repeated identical queries return the identical page"
+    );
+
+    // The token resumes exactly the remaining five.
+    let next = json_answer(
+        &c10r(dir.path())
+            .arg("--db")
+            .arg(&db)
+            .args(query)
+            .args(["--cursor", &token])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        next["outcome"]["results"].as_array().unwrap().len(),
+        5,
+        "the second page holds the remainder: {next}"
+    );
+    assert_eq!(
+        next["classification"], "convention",
+        "the resumed page keeps the heuristic-grade marker: {next}"
+    );
 }
 
 // _(Default bounding: a documented default bound applies with no limit requested)_ — a result set

@@ -120,6 +120,17 @@ pub struct ConstructAt {
     pub operator: Option<String>,
 }
 
+/// A Rust module gated to the test configuration (`#[cfg(test)]`): its name-token span, and its
+/// whole item span when its body is inline (`None` for an out-of-line `mod name;` declaration whose
+/// body lives in its own document).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CfgTestModule {
+    /// The byte span of the module's name identifier.
+    pub name_span: ByteSpan,
+    /// The whole `mod` item's span when the body is inline; `None` for `mod name;`.
+    pub inline_span: Option<ByteSpan>,
+}
+
 /// The shape of a Rust range construct (`range_expression` or `range_pattern`) at its operator
 /// token: which ends are present, and whether the operator is inclusive.
 ///
@@ -691,6 +702,116 @@ impl SyntaxTree {
         out
     }
 
+    /// The name spans of every declaration bearing an attribute whose path's terminal segment is
+    /// `test` (`#[test]`, `#[tokio::test]`, `#[sqlx::test]`) — the test-attribute classification
+    /// signal. Rust only; empty for other languages.
+    pub fn test_attributed_declaration_names(&self) -> Vec<ByteSpan> {
+        if self.language != Language::Rust {
+            return Vec::new();
+        }
+        let root = self.tree.root_node();
+        let kinds = declaration_kinds(self.language);
+        let mut out = Vec::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if kinds.contains(&node.kind())
+                && let Some(name_span) = declaration_name_span(node)
+                && preceding_attributes(node)
+                    .into_iter()
+                    .any(|attr| self.attribute_path_terminal(attr) == Some("test"))
+            {
+                out.push(name_span);
+            }
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// Every module gated to the test configuration (`#[cfg(test)] mod …`), inline bodies and
+    /// out-of-line `mod name;` declarations alike. Rust only; empty for other languages.
+    pub fn cfg_test_modules(&self) -> Vec<CfgTestModule> {
+        if self.language != Language::Rust {
+            return Vec::new();
+        }
+        let root = self.tree.root_node();
+        let mut out = Vec::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "mod_item"
+                && let Some(name) = node.child_by_field_name("name")
+                && preceding_attributes(node)
+                    .into_iter()
+                    .any(|attr| self.is_cfg_test(attr))
+            {
+                out.push(CfgTestModule {
+                    name_span: span_of(name),
+                    inline_span: node.child_by_field_name("body").map(|_| span_of(node)),
+                });
+            }
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// The name spans of every out-of-line module declaration (`mod name;` with no inline body) —
+    /// the sites through which test-configuration gating reaches a module body living in its own
+    /// document. Rust only; empty for other languages.
+    pub fn out_of_line_module_names(&self) -> Vec<ByteSpan> {
+        if self.language != Language::Rust {
+            return Vec::new();
+        }
+        let root = self.tree.root_node();
+        let mut out = Vec::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "mod_item"
+                && node.child_by_field_name("body").is_none()
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                out.push(span_of(name));
+            }
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// The terminal segment text of an attribute's path (`tokio::test` → `test`; `test` → `test`),
+    /// or `None` for a path shape with no resolvable terminal segment.
+    fn attribute_path_terminal(&self, attr: Node) -> Option<&str> {
+        let path = attr.named_child(0)?;
+        let terminal = match path.kind() {
+            "identifier" => path,
+            "scoped_identifier" => path.child_by_field_name("name")?,
+            _ => return None,
+        };
+        self.text_at(span_of(terminal))
+    }
+
+    /// Whether an attribute is the test-configuration gate `#[cfg(test)]` — the `cfg` path with
+    /// exactly the `test` argument.
+    fn is_cfg_test(&self, attr: Node) -> bool {
+        if self.attribute_path_terminal(attr) != Some("cfg") {
+            return false;
+        }
+        let Some(args) = attr.child_by_field_name("arguments") else {
+            return false;
+        };
+        let Some(text) = self.text_at(span_of(args)) else {
+            return false;
+        };
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        compact == "(test)"
+    }
+
     /// The signature and interface tier content for `decl`.
     ///
     /// Total: a declaration whose node can no longer be located in this tree (a stale or fabricated
@@ -936,6 +1057,26 @@ fn declaration_full_span(node: Node) -> ByteSpan {
         Some(parent) if parent.kind() == "decorated_definition" => span_of(parent),
         _ => span_of(node),
     }
+}
+
+/// The attribute nodes preceding a declaration: the `attribute` child of each `attribute_item`
+/// sibling above it, tolerating interleaved comments, stopping at the first other sibling.
+fn preceding_attributes(node: Node) -> Vec<Node> {
+    let mut attrs = Vec::new();
+    let mut sibling = node.prev_sibling();
+    while let Some(s) = sibling {
+        match s.kind() {
+            "attribute_item" => {
+                if let Some(attr) = s.named_child(0) {
+                    attrs.push(attr);
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        sibling = s.prev_sibling();
+    }
+    attrs
 }
 
 /// The byte offset of a Rust item's declaration start, extended backward over a contiguous run of

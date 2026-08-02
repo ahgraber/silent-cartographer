@@ -204,6 +204,19 @@ pub fn ingest(
         }
     }
 
+    // The per-symbol test classification, computed from the same syntax pass and identity maps the
+    // build already holds. Read-only over the join's outputs: it alters no alignment, attribution,
+    // or edge derivation.
+    let test_rules = classify_test_symbols(
+        index,
+        &identities,
+        language,
+        &source_map,
+        &def_name_span,
+        &module_by_doc,
+        &join_result.aligned,
+    );
+
     // True same-descriptor twins: descriptors shared by two or more persisted, definition-bearing
     // symbols (the two-definition quorum). This marks real duplicates only — two DISTINCT descriptors
     // whose canonical projections collide are disambiguated by identity projection but are not
@@ -252,6 +265,7 @@ pub fn ingest(
             signature_text: content.signature_text,
             interface_text: content.interface_text,
             duplicated,
+            test_rule: test_rules.get(id).map(|rule| (*rule).to_string()),
         })?;
     }
 
@@ -586,6 +600,182 @@ fn parent_of_definition(
         def_name_span,
         type_by_name,
     )
+}
+
+/// Classify every persisted in-workspace symbol as test code or not, from statically observable
+/// language-convention signals, returning the accepting rule tag per classified identity (a symbol
+/// absent from the map is non-test).
+///
+/// When several rules accept one symbol, the recorded rule is the first in the fixed order
+/// attribute > configuration > file > directory — the strongest evidence wins, so provenance is
+/// deterministic. The classification reads the join's outputs and the syntax trees only; it never
+/// alters alignment, attribution, or edge derivation.
+fn classify_test_symbols(
+    index: &ExtractedIndex,
+    identities: &[Option<CanonicalId>],
+    language: Language,
+    source_map: &HashMap<&str, &str>,
+    def_name_span: &HashMap<CanonicalId, (String, ByteSpan)>,
+    module_by_doc: &HashMap<String, CanonicalId>,
+    aligned: &[AlignedOccurrence],
+) -> HashMap<CanonicalId, &'static str> {
+    // Per-document convention signals, read once per document from its syntax tree: the name spans
+    // of test-attributed declarations, the spans of inline `#[cfg(test)]` module bodies, the gated
+    // out-of-line module declarations, and every out-of-line module declaration (through which
+    // gating propagates into other documents).
+    let mut attr_names: HashMap<String, std::collections::HashSet<ByteSpan>> = HashMap::new();
+    let mut inline_gated: HashMap<String, Vec<ByteSpan>> = HashMap::new();
+    let mut gated_mod_decls: Vec<(String, ByteSpan)> = Vec::new();
+    let mut out_of_line_mods: HashMap<String, Vec<ByteSpan>> = HashMap::new();
+    if language == Language::Rust {
+        for (path, source) in source_map {
+            let Some(tree) = syntax::SyntaxTree::parse(source, language) else {
+                continue;
+            };
+            attr_names.insert(
+                (*path).to_string(),
+                tree.test_attributed_declaration_names().into_iter().collect(),
+            );
+            for gated in tree.cfg_test_modules() {
+                match gated.inline_span {
+                    Some(span) => inline_gated.entry((*path).to_string()).or_default().push(span),
+                    None => gated_mod_decls.push(((*path).to_string(), gated.name_span)),
+                }
+            }
+            out_of_line_mods.insert((*path).to_string(), tree.out_of_line_module_names());
+        }
+    }
+
+    // The identity aligned at a location, resolving a gated `mod name;` declaration to its module
+    // symbol — never by name matching.
+    let mut occ_at: HashMap<(&str, ByteSpan), &CanonicalId> = HashMap::new();
+    for occ in aligned {
+        occ_at
+            .entry((occ.document_path.as_str(), occ.name_span))
+            .or_insert(&occ.symbol);
+    }
+    // A module's defining document, for carrying gating into an out-of-line body's document and for
+    // classifying a module symbol that carries no aligned definition of its own.
+    let mut doc_of_module: HashMap<&CanonicalId, &str> = HashMap::new();
+    for (doc, id) in module_by_doc {
+        doc_of_module.entry(id).or_insert(doc.as_str());
+    }
+    let resolve_mod_doc = |doc: &str, name_span: ByteSpan| -> Option<&str> {
+        let id = occ_at.get(&(doc, name_span))?;
+        doc_of_module.get(id).copied()
+    };
+
+    // The documents whose symbols are test-configured: seeded by gated out-of-line declarations (and
+    // out-of-line declarations inside an inline-gated body), then closed over the out-of-line module
+    // declarations each gated document itself contains — containment taken from the persisted
+    // module identities after all documents are parsed.
+    let mut gated_docs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut pending: Vec<&str> = Vec::new();
+    for (doc, name_span) in &gated_mod_decls {
+        if let Some(target) = resolve_mod_doc(doc, *name_span) {
+            pending.push(target);
+        }
+    }
+    for (doc, spans) in &inline_gated {
+        for name_span in out_of_line_mods.get(doc).into_iter().flatten() {
+            if spans.iter().any(|s| s.contains(name_span))
+                && let Some(target) = resolve_mod_doc(doc, *name_span)
+            {
+                pending.push(target);
+            }
+        }
+    }
+    while let Some(doc) = pending.pop() {
+        if !gated_docs.insert(doc) {
+            continue;
+        }
+        for name_span in out_of_line_mods.get(doc).into_iter().flatten() {
+            if let Some(target) = resolve_mod_doc(doc, *name_span) {
+                pending.push(target);
+            }
+        }
+    }
+
+    let mut rules: HashMap<CanonicalId, &'static str> = HashMap::new();
+    for (idx, sym) in index.symbols.iter().enumerate() {
+        let Some(Some(id)) = identities.get(idx) else {
+            continue;
+        };
+        if sym.class == SymbolClass::External {
+            continue;
+        }
+        // The symbol's defining document and name span. A symbol with no aligned definition still
+        // classifies through its document alone: a module through the document→module derivation (a
+        // refused Python origin marker), any other symbol through its extracted definition
+        // occurrence — the occurrence's document path is trustworthy even when the join refused its
+        // span, so the document-scoped rules apply while the span-dependent ones stay out.
+        let (doc, name_span) = match def_name_span.get(id) {
+            Some((doc, span)) => (doc.as_str(), Some(*span)),
+            None => {
+                let module_doc = (sym.kind == SymbolKind::Module)
+                    .then(|| doc_of_module.get(id).copied())
+                    .flatten();
+                match module_doc.or_else(|| sym.definition().map(|occ| occ.document_path.as_str())) {
+                    Some(doc) => (doc, None),
+                    None => continue,
+                }
+            }
+        };
+        let rule = match language {
+            Language::Rust => {
+                let attributed =
+                    name_span.is_some_and(|span| attr_names.get(doc).is_some_and(|names| names.contains(&span)));
+                let configured = gated_docs.contains(doc)
+                    || name_span
+                        .is_some_and(|span| inline_gated.get(doc).into_iter().flatten().any(|s| s.contains(&span)));
+                if attributed {
+                    Some("test_attribute")
+                } else if configured {
+                    Some("test_configuration")
+                } else if has_tests_directory_component(doc) {
+                    Some("test_directory")
+                } else {
+                    None
+                }
+            }
+            Language::Python => {
+                if is_python_test_file_name(doc) {
+                    Some("test_file")
+                } else if has_tests_directory_component(doc) {
+                    Some("test_directory")
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(rule) = rule {
+            rules.insert(id.clone(), rule);
+        }
+    }
+    rules
+}
+
+/// Whether a workspace-relative document path lies under a directory named `tests` — the
+/// test-directory classification signal (the file name itself is not a directory component).
+fn has_tests_directory_component(path: &str) -> bool {
+    let mut components: Vec<&str> = path.split('/').collect();
+    components.pop();
+    components.contains(&"tests")
+}
+
+/// Whether a Python document's file name follows the test runners' file-collection conventions:
+/// pytest's `test_*.py` / `*_test.py` discovery defaults, the conventional single-file module
+/// `tests.py`, or the reserved fixture file `conftest.py`. A file name that merely begins with the
+/// word test (`testimony.py`) matches no form and stays non-test.
+fn is_python_test_file_name(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name == "tests.py" || name == "conftest.py" {
+        return true;
+    }
+    let Some(stem) = name.strip_suffix(".py") else {
+        return false;
+    };
+    stem.starts_with("test_") || stem.ends_with("_test")
 }
 
 /// Evaluate freshness of the store against the current sources, analyzer, and declared environment

@@ -8,7 +8,11 @@
 /// The current schema version. Bumped on any schema-affecting change under the reproducibility
 /// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
 /// before any table access; the `index_metadata.schema_version` column carries it as provenance.
-pub const SCHEMA_VERSION: i64 = 11;
+///
+/// Migration: version 12 added `symbols.test_rule`. The index is derived, replayable data, so
+/// rebuild is the migration — a build replaces an older store wholesale and a query refuses it with
+/// recovery guidance (the replace-or-refuse contract).
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -53,6 +57,10 @@ CREATE TABLE IF NOT EXISTS index_metadata (
 -- `signature_text` and `interface_text` are the signature and interface tiers: the declaration form
 -- without its body, and the signature together with the symbol's own documentation. Both are NULL
 -- for externals and for in-workspace symbols carrying no definition span.
+-- `test_rule` is the per-symbol test classification: NULL means non-test; a rule name means the
+-- symbol is test code, with the convention rule that stamped it as provenance ('test_attribute',
+-- 'test_configuration', 'test_file', 'test_directory' — an open set a consumer must not treat as
+-- closed). The predicate and its provenance are one column so they cannot disagree.
 -- The reserved `embedding` column holds the deferred semantic-pillar vector; its shape is not yet
 -- committed, so it is a nullable BLOB placeholder that a future additive migration reshapes.
 CREATE TABLE IF NOT EXISTS symbols (
@@ -67,6 +75,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     signature_text   TEXT,
     interface_text   TEXT,
     duplicated       INTEGER NOT NULL DEFAULT 0,
+    test_rule        TEXT,
     embedding        BLOB
 );
 

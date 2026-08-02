@@ -113,6 +113,7 @@ pub fn apply_pagination<T>(
         provenance,
         freshness,
         stale,
+        classification,
         outcome,
         page: _,
     } = answer;
@@ -136,6 +137,7 @@ pub fn apply_pagination<T>(
             provenance,
             freshness,
             stale,
+            classification,
             outcome: Outcome::Ambiguous {
                 candidates,
                 candidates_total,
@@ -154,6 +156,7 @@ pub fn apply_pagination<T>(
             provenance,
             freshness,
             stale,
+            classification,
             outcome,
             page: None,
         });
@@ -165,6 +168,7 @@ pub fn apply_pagination<T>(
             provenance,
             freshness,
             stale,
+            classification,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -197,6 +201,7 @@ pub fn apply_pagination<T>(
         provenance,
         freshness,
         stale,
+        classification,
         outcome: Outcome::Found { results: page_results },
         page,
     })
@@ -230,6 +235,7 @@ pub fn apply_report_pagination<T>(
         provenance,
         freshness,
         stale,
+        classification,
         outcome,
         page: _,
     } = answer;
@@ -243,6 +249,7 @@ pub fn apply_report_pagination<T>(
             provenance,
             freshness,
             stale,
+            classification,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -281,6 +288,7 @@ pub fn apply_report_pagination<T>(
         provenance,
         freshness,
         stale,
+        classification,
         outcome: Outcome::Found { results: vec![report] },
         page,
     })

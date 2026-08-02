@@ -249,6 +249,7 @@ fn build_hostile_db(dir: &Path) -> PathBuf {
             signature_text: Some(HOSTILE_BODY.to_string()),
             interface_text: Some(HOSTILE_BODY.to_string()),
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
     store
@@ -263,6 +264,7 @@ fn build_hostile_db(dir: &Path) -> PathBuf {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
     store
@@ -489,6 +491,7 @@ fn build_crlf_db(dir: &Path) -> PathBuf {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
     support::stamp_metadata(&store, "crlf-ws");
@@ -629,6 +632,7 @@ fn build_ambiguous_hostile_db(dir: &Path) -> PathBuf {
                 signature_text: None,
                 interface_text: None,
                 duplicated: false,
+                test_rule: None,
             })
             .unwrap();
     }
@@ -671,6 +675,110 @@ fn ambiguous_candidate_lines_sanitize_hostile_names() {
     );
 }
 
+/// A store at `dir/index.db` where `covered` is referenced from a test-classified case and
+/// `uncovered` only from a production caller, for the `tests`-relation render scenarios.
+fn build_tests_render_db(dir: &Path) -> PathBuf {
+    let db = dir.join("index.db");
+    let store = GraphStore::open(&db).unwrap();
+    let symbol = |name: &str, span: (usize, usize), test_rule: Option<&str>| SymbolRow {
+        canonical_id: CanonicalId::from_raw(format!("tests-ws::{name}")),
+        display_name: name.to_string(),
+        kind: "function".to_string(),
+        class: PersistedClass::InWorkspace,
+        document_path: Some("m.rs".to_string()),
+        span: Some(span),
+        span_text: None,
+        signature_text: None,
+        interface_text: None,
+        duplicated: false,
+        test_rule: test_rule.map(str::to_string),
+    };
+    store.insert_symbol(&symbol("covered", (0, 10), None)).unwrap();
+    store.insert_symbol(&symbol("uncovered", (20, 30), None)).unwrap();
+    store
+        .insert_symbol(&symbol("tcase", (40, 60), Some("test_attribute")))
+        .unwrap();
+    store.insert_symbol(&symbol("prod", (80, 100), None)).unwrap();
+    let reference = |subject: &str, span: (usize, usize), enclosing: &str| OccurrenceRow {
+        symbol_id: CanonicalId::from_raw(format!("tests-ws::{subject}")),
+        document_path: "m.rs".to_string(),
+        span,
+        role: "reference".to_string(),
+        rule: "exact".to_string(),
+        enclosing_id: Some(CanonicalId::from_raw(format!("tests-ws::{enclosing}"))),
+        locality: None,
+    };
+    store
+        .insert_occurrence(&reference("covered", (45, 52), "tcase"))
+        .unwrap();
+    store
+        .insert_occurrence(&reference("uncovered", (85, 94), "prod"))
+        .unwrap();
+    support::stamp_metadata(&store, "tests-ws");
+    db
+}
+
+// _(Scenario: Human render carries the marker)_ — the rendered `tests` answer states that the
+// results are convention-classified test code, not resolved semantic fact.
+#[test]
+fn tests_render_states_convention_classification() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_tests_render_db(dir.path());
+
+    let out = c10r(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .args(["trace", "covered", "--relation", "tests"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("convention-classified test code, not resolved semantic fact"),
+        "the rendering names the heuristic grade: {stdout}"
+    );
+    assert!(
+        stdout.contains("tests-ws::tcase"),
+        "the test-classified site renders: {stdout}"
+    );
+}
+
+// _(Scenario: Empty human render states scoped absence)_ — the rendered empty `tests` answer
+// presents the result as no convention-classified test reference found, never as proof that nothing
+// tests the subject.
+#[test]
+fn empty_tests_render_states_scoped_absence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_tests_render_db(dir.path());
+
+    let out = c10r(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .args(["trace", "uncovered", "--relation", "tests"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a typed absence is a success, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no convention-classified test reference found"),
+        "the absence is scoped to the classification: {stdout}"
+    );
+    assert!(
+        stdout.contains("not proof that nothing tests the subject"),
+        "the absence never overclaims: {stdout}"
+    );
+}
+
 /// A store at `dir/index.db` holding a subject and one dependent whose `display_name` and
 /// `document_path` carry terminal-control bytes, connected by a `uses` edge, so a `dependents`
 /// impact answer's detail row and summary project the hostile fields.
@@ -689,6 +797,7 @@ fn build_hostile_dependents_db(dir: &Path) -> PathBuf {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
     store
@@ -703,6 +812,7 @@ fn build_hostile_dependents_db(dir: &Path) -> PathBuf {
             signature_text: Some(HOSTILE_BODY.to_string()),
             interface_text: Some(HOSTILE_BODY.to_string()),
             duplicated: false,
+            test_rule: None,
         })
         .unwrap();
     store

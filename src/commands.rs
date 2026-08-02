@@ -1438,6 +1438,7 @@ fn relation_label(relation: Relation) -> &'static str {
         Relation::Dependents => "dependents",
         Relation::Importers => "importers",
         Relation::Implementers => "implementers",
+        Relation::Tests => "tests",
     }
 }
 

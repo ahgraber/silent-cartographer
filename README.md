@@ -72,6 +72,19 @@ Every answer carries an `exactness` grade.
 `exact` means the index matches the change's pre-change state, so the reach shown is the real reach.
 `approximate` means something has drifted since the build (an unrelated edit, a change made before the index was refreshed), so the dependents shown may be incomplete; treat it as directional, not a ship/no-ship verdict.
 
+### Finding a symbol's tests
+
+Before changing a symbol, ask what test code exercises it:
+
+```sh
+c10r trace some_symbol --relation tests
+```
+
+The answer is the symbol's reference sites filtered to the ones sitting inside test code, so it includes shared test helpers, not only runnable test cases.
+Test code is recognized by language convention — Rust `#[test]`-style attributes, `#[cfg(test)]` modules, and `tests/` directories; Python `test_*.py` / `*_test.py` / `tests.py` / `conftest.py` files and `tests/` directories — and every site carries the rule that classified it.
+Because that classification is heuristic, every `tests` answer is structurally labeled `"classification": "convention"` (with a matching notice in the human rendering) rather than presented with the confidence of the resolved relations.
+An empty answer means no convention-classified reference site was found — not proof that nothing tests the symbol.
+
 ### Recovering an exact answer
 
 An approximate answer carries a runnable recovery recipe: shell commands that rebuild the index at the change's exact base revision, in a throwaway worktree, and re-run the same `impact` query against it — with the base revision, the `--db` path, and the `--workspace` identity already filled in.

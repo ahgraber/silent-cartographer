@@ -91,6 +91,10 @@ pub struct SymbolRow {
     /// identical resolved descriptor is shared by at least one other definition. Distinct
     /// descriptors whose canonical projections merely collide are not duplicated.
     pub duplicated: bool,
+    /// The per-symbol test classification: `None` means non-test; a rule name means the symbol is
+    /// test code, carrying the convention rule that stamped it as provenance. The rule vocabulary is
+    /// open — an unrecognized name is a valid classification, never an error.
+    pub test_rule: Option<String>,
 }
 
 /// A persisted occurrence row.
@@ -472,8 +476,8 @@ impl GraphStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO symbols
                 (canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                 signature_text, interface_text, duplicated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 signature_text, interface_text, duplicated, test_rule)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 row.canonical_id.as_str(),
                 row.display_name,
@@ -486,6 +490,7 @@ impl GraphStore {
                 row.signature_text,
                 row.interface_text,
                 row.duplicated as i64,
+                row.test_rule,
             ],
         )?;
         Ok(())
@@ -641,7 +646,7 @@ impl GraphStore {
         self.conn
             .query_row(
                 "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                        signature_text, interface_text, duplicated
+                        signature_text, interface_text, duplicated, test_rule
                  FROM symbols WHERE canonical_id = ?1",
                 params![id.as_str()],
                 Self::map_symbol,
@@ -667,6 +672,7 @@ impl GraphStore {
             signature_text: r.get(8)?,
             interface_text: r.get(9)?,
             duplicated: r.get::<_, i64>(10)? != 0,
+            test_rule: r.get(11)?,
         })
     }
 
@@ -674,7 +680,7 @@ impl GraphStore {
     pub fn symbols_by_shortname(&self, shortname: &str) -> rusqlite::Result<Vec<SymbolRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated
+                    signature_text, interface_text, duplicated, test_rule
              FROM symbols WHERE display_name = ?1 ORDER BY canonical_id",
         )?;
         let rows = stmt.query_map(params![shortname], Self::map_symbol)?;
@@ -688,7 +694,7 @@ impl GraphStore {
     pub fn symbols_by_fragment(&self, fragment: &str) -> rusqlite::Result<Vec<SymbolRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated
+                    signature_text, interface_text, duplicated, test_rule
              FROM symbols WHERE display_name LIKE ?1 ESCAPE '\\'
              ORDER BY canonical_id",
         )?;
@@ -703,7 +709,7 @@ impl GraphStore {
         let suffix = format!("::{qualified}");
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated
+                    signature_text, interface_text, duplicated, test_rule
              FROM symbols
              WHERE canonical_id = ?1 OR canonical_id LIKE ?2 ESCAPE '\\'
              ORDER BY canonical_id",
@@ -727,7 +733,7 @@ impl GraphStore {
     pub fn duplicated_groups(&self) -> rusqlite::Result<Vec<DuplicatedGroup>> {
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated
+                    signature_text, interface_text, duplicated, test_rule
              FROM symbols WHERE class = 'in_workspace' AND duplicated = 1 ORDER BY canonical_id",
         )?;
         let rows: Vec<SymbolRow> = stmt.query_map([], Self::map_symbol)?.collect::<rusqlite::Result<_>>()?;
@@ -784,7 +790,7 @@ impl GraphStore {
         self.conn
             .query_row(
                 "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                        signature_text, interface_text, duplicated
+                        signature_text, interface_text, duplicated, test_rule
                  FROM symbols
                  WHERE document_path = ?1 AND span_start IS NOT NULL
                    AND span_start <= ?2 AND ?2 < span_end
@@ -812,7 +818,7 @@ impl GraphStore {
     ) -> rusqlite::Result<Vec<SymbolRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated
+                    signature_text, interface_text, duplicated, test_rule
              FROM symbols
              WHERE document_path = ?1 AND span_start IS NOT NULL AND span_start < ?3 AND ?2 < span_end
              ORDER BY span_start, span_end, canonical_id",
@@ -844,7 +850,7 @@ impl GraphStore {
         self.conn
             .query_row(
                 "SELECT s.canonical_id, s.display_name, s.kind, s.class, s.document_path, s.span_start, s.span_end,
-                        s.span_text, s.signature_text, s.interface_text, s.duplicated
+                        s.span_text, s.signature_text, s.interface_text, s.duplicated, s.test_rule
                  FROM symbols s
                  LEFT JOIN occurrences o
                    ON o.symbol_id = s.canonical_id AND o.document_path = ?1 AND o.role = 'definition'
@@ -1245,6 +1251,7 @@ mod tests {
             signature_text: None,
             interface_text: None,
             duplicated: false,
+            test_rule: None,
         }
     }
 

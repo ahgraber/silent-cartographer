@@ -136,6 +136,12 @@ pub struct Answer<T> {
     pub freshness: FreshnessLabel,
     /// Whether the answer is stale (either reason).
     pub stale: bool,
+    /// The heuristic-grade marker: `Some("convention")` when the answer derives from
+    /// convention-based classification rather than resolved semantic fact (the `tests` relation).
+    /// Absent for relations derived only from resolved reference evidence, so their shape is
+    /// unchanged. Rides independently of provenance and freshness, never replacing either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<&'static str>,
     /// The outcome.
     pub outcome: Outcome<T>,
     /// The result-set paging disclosure, present only when a result limit was applied.
@@ -177,9 +183,17 @@ impl<T> Answer<T> {
             provenance,
             freshness: freshness.into(),
             stale: freshness.is_stale(),
+            classification: None,
             outcome,
             page: None,
         }
+    }
+
+    /// Mark the answer as derived from convention-based classification — the structural
+    /// heuristic-grade marker every `tests` answer carries, found and empty alike.
+    pub fn convention_classified(mut self) -> Self {
+        self.classification = Some("convention");
+        self
     }
 }
 

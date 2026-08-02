@@ -86,7 +86,8 @@ fn derived_structure_enumerates_commands_args_flags_and_carries_a_surface_versio
             "references",
             "dependents",
             "importers",
-            "implementers"
+            "implementers",
+            "tests"
         ],
         "a ValueEnum-backed flag lists its valid values"
     );
@@ -237,9 +238,10 @@ fn manifest_enumerates_the_surface_through_the_binary_with_and_without_an_index(
             "references",
             "dependents",
             "importers",
-            "implementers"
+            "implementers",
+            "tests"
         ],
-        "the relation flag enumerates its six valid values"
+        "the relation flag enumerates its seven valid values"
     );
 
     let color = trace["flags"]

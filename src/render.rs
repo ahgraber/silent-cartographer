@@ -96,7 +96,15 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(header_line(answer, styled));
     match &answer.outcome {
-        Outcome::Found { results } => T::render_found(results, &mut lines, styled),
+        Outcome::Found { results } => {
+            // The heuristic-grade marker renders above the results, so a human consumer cannot
+            // miss what the structural field tells a machine consumer.
+            if answer.classification.is_some() {
+                lines
+                    .push("note: results are convention-classified test code, not resolved semantic fact".to_string());
+            }
+            T::render_found(results, &mut lines, styled)
+        }
         Outcome::Ambiguous {
             candidates,
             candidates_total,
@@ -113,8 +121,16 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
             }
         }
         // The two typed-none outcomes read as definite, distinct from a failure and from each other.
+        // A convention-classified empty answer scopes its absence to the classification: no
+        // convention-classified site was found — never proof that nothing tests the subject.
         Outcome::Absent => lines.push("absent: nothing resolved (a definite none, not a failure)".to_string()),
-        Outcome::Empty => lines.push("empty: the relation holds no instances (a definite empty set)".to_string()),
+        Outcome::Empty => lines.push(match answer.classification {
+            Some(_) => {
+                "empty: no convention-classified test reference found (not proof that nothing tests the subject)"
+                    .to_string()
+            }
+            None => "empty: the relation holds no instances (a definite empty set)".to_string(),
+        }),
     }
     if let Some(page) = &answer.page {
         push_page(&mut lines, page, styled);
@@ -198,6 +214,7 @@ impl HumanRender for TraceItem {
                     subject,
                     location,
                     enclosing,
+                    test_rule: _,
                     content,
                     content_truncated,
                 } => {

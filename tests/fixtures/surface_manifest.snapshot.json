@@ -1,5 +1,5 @@
 {
-  "surface_version": 4,
+  "surface_version": 5,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -100,7 +100,8 @@
             "references",
             "dependents",
             "importers",
-            "implementers"
+            "implementers",
+            "tests"
           ],
           "global": false
         },
