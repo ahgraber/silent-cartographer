@@ -623,6 +623,7 @@ mod tests {
         store
             .write_metadata(&IndexMetadata {
                 workspace_id: WorkspaceId::new("ws"),
+                workspace_root: Some("/ws".to_string()),
                 provenance: AnalyzerProvenance {
                     analyzer_name: "test".to_string(),
                     analyzer_version: "0".to_string(),

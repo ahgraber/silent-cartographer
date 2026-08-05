@@ -35,7 +35,7 @@ fn build_produces_a_queryable_index() {
 
     // Build the index from the exemplar fixture (a live analyzer is not available in this
     // environment; the ingest path is identical to `run_build`'s once an index is produced).
-    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
     assert!(db.exists(), "build wrote the index database");
 
     // The index is queryable: resolve and retrieve a symbol from the freshly built store.
@@ -70,7 +70,7 @@ fn build_produces_a_queryable_index() {
 fn status_reports_provenance_freshness_and_alignment() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
 
     // `status` in JSON, with no live analyzer, echoes the recorded provenance and reports counts.
     // The workspace root has no `.rs` files, so the current hash differs from the built hash and the
@@ -115,7 +115,7 @@ fn default_workspace_derived_from_root_name() {
 
     // The derived identity namespaces every persisted symbol.
     let db = parent.path().join("index.db");
-    build_from_index(&db, derived.as_str(), &support::fixture_index(), &sources()).unwrap();
+    build_from_index(&db, derived.as_str(), &root, &support::fixture_index(), &sources()).unwrap();
     let store = GraphStore::open(&db).unwrap();
     let connect = project_one(
         &derived,
@@ -197,7 +197,14 @@ fn build_n_discrepancy_groups(n: usize) -> (tempfile::TempDir, std::path::PathBu
     };
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    build_from_index(&db, "op-ws", &index, &[("m.rs".to_string(), source.to_string())]).unwrap();
+    build_from_index(
+        &db,
+        "op-ws",
+        dir.path(),
+        &index,
+        &[("m.rs".to_string(), source.to_string())],
+    )
+    .unwrap();
     (dir, db)
 }
 
@@ -300,16 +307,31 @@ fn write_pre_guard_store(db: &Path) {
     .unwrap();
 }
 
-// _(Incompatible index stores are replaced or refused — build branch)_ — a build over a store
-// stamped with a different schema version succeeds and leaves a store carrying the current version.
+/// Lay down a store c10r recognizes as its own — carrying the ownership marker — at a schema version
+/// this binary does not write. This is the shape the replace-or-refuse contract governs: replacement
+/// reaches c10r's own stores at any version, and nothing else.
+fn write_marked_old_store(db: &Path) {
+    write_pre_guard_store(db);
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.pragma_update(
+        None,
+        "application_id",
+        silent_cartographer::graph::store::APPLICATION_ID,
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 1i64).unwrap();
+}
+
+// _(Incompatible index stores are replaced or refused — build branch)_ — a build over a store c10r
+// created under a different schema version succeeds and leaves a store carrying the current version.
 #[test]
 fn build_replaces_an_incompatible_store() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    write_pre_guard_store(&db);
+    write_marked_old_store(&db);
 
     // The build succeeds despite the incompatible store — replace, not a raw storage failure.
-    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
 
     // The resulting store carries the current schema version and answers queries.
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -334,7 +356,7 @@ fn build_replaces_an_incompatible_store() {
 fn query_refuses_an_incompatible_store_with_guidance() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    write_pre_guard_store(&db);
+    write_marked_old_store(&db);
 
     let err = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false)
         .expect_err("status against an incompatible store must refuse");
@@ -347,7 +369,7 @@ fn query_refuses_an_incompatible_store_with_guidance() {
             .is_some()),
         "the error is the typed store-open refusal: {chain}"
     );
-    assert!(chain.contains("version 0"), "names the store's version: {chain}");
+    assert!(chain.contains("version 1"), "names the store's version: {chain}");
     assert!(
         chain.contains(&format!(
             "version {}",
@@ -368,10 +390,10 @@ fn query_refuses_an_incompatible_store_with_guidance() {
 fn matching_version_store_operates_normally() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
 
     // A rebuild over the matching store succeeds (write path, no version error).
-    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
 
     // Read paths operate normally.
     let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false).unwrap();
@@ -407,7 +429,7 @@ fn reindex_doorbell_hook_is_present_and_invokes_build() {
 fn status_reports_per_rule_acceptance_buckets() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
 
     let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false).unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -648,6 +670,7 @@ fn duplicated_groups_are_retrievable_with_descriptor_and_definitions() {
     build_from_index(
         &db,
         "op-ws",
+        dir.path(),
         &duplicated_group_index(),
         &[
             ("a.rs".to_string(), a_source.to_string()),
@@ -687,7 +710,7 @@ fn duplicated_groups_are_retrievable_with_descriptor_and_definitions() {
 fn no_duplicates_is_a_definite_zero_group_count() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
 
     let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, true).unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -715,6 +738,7 @@ fn status_json_always_carries_the_duplicated_group_count() {
     build_from_index(
         &db,
         "op-ws",
+        dir.path(),
         &duplicated_group_index(),
         &[
             ("a.rs".to_string(), a_source.to_string()),
@@ -845,7 +869,7 @@ fn explicit_selection_overrides_detection() {
 fn failed_build_leaves_existing_store_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
     let before = std::fs::read(&db).unwrap();
 
     // The Rust path, refused on an unavailable rust-analyzer.
@@ -922,4 +946,317 @@ fn explicit_environment_refusal_precedes_tool_lookup() {
         "the refusal precedes any tool lookup: {message}"
     );
     assert!(!db.exists(), "no store is touched by the refused attempt");
+}
+
+/// A workspace directory holding the fixture's single source file at its real path, so a query from
+/// it recomputes exactly the content hash the fixture build recorded — which keeps freshness out of
+/// the way when a test is about workspace identity rather than drift.
+fn workspace_with_fixture_source() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(support::DOC);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, support::SOURCE).unwrap();
+    dir
+}
+
+/// Retrieve a symbol through the `get` handler, in machine or human form.
+fn get_answer(db: &Path, root: &Path, json: bool) -> String {
+    silent_cartographer::commands::run_get(
+        db,
+        root,
+        "not-a-real-analyzer",
+        Some("net::Client::connect"),
+        /* at */ None,
+        Detail::Location,
+        /* max_lines */ 0,
+        /* from */ 1,
+        /* max_lines_explicit */ false,
+        /* from_explicit */ false,
+        /* limit */ 25,
+        /* cursor */ None,
+        json,
+        /* styled */ false,
+    )
+    .expect("the query answers")
+}
+
+// _(Read operations create no store)_ — a query and a status request against a path where no file
+// exists both refuse, name the build that would fix it, and leave the path empty. A read that
+// silently conjured an empty store would answer later queries from a graph nobody built.
+#[test]
+fn a_query_or_status_against_a_missing_store_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+
+    let query_err = silent_cartographer::commands::run_get(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        Some("net::Client"),
+        None,
+        Detail::Location,
+        0,
+        1,
+        false,
+        false,
+        25,
+        None,
+        true,
+        false,
+    )
+    .expect_err("a query against nothing refuses");
+    let status_err = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false)
+        .expect_err("a status request against nothing refuses");
+
+    for (what, err) in [("query", query_err), ("status", status_err)] {
+        let message = format!("{err:#}");
+        assert!(message.contains("c10r build"), "{what} names the remedy: {message}");
+        assert_eq!(
+            silent_cartographer::exit::classify(&err),
+            silent_cartographer::exit::ExitCode::NoIndex,
+            "{what} refuses as an absent index: {message}"
+        );
+    }
+    assert!(!db.exists(), "neither read brought a store into being");
+}
+
+// _(Stores record and disclose their workspace: matching workspace carries no marker)_ — an answer
+// from the workspace its store was built for carries no workspace disclosure at all, in the machine
+// answer or the human render.
+#[test]
+fn a_matching_workspace_carries_no_marker() {
+    let dir = workspace_with_fixture_source();
+    let db = dir.path().join("index.db");
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
+
+    let machine: serde_json::Value = serde_json::from_str(&get_answer(&db, dir.path(), true)).unwrap();
+    assert!(
+        machine.get("workspace_relation").is_none(),
+        "a matched workspace carries no marker: {machine}"
+    );
+    assert_eq!(
+        machine["stale"], false,
+        "the fixture source is on disk, so nothing drifted"
+    );
+
+    let human = get_answer(&db, dir.path(), false);
+    assert!(
+        !human.contains("workspace"),
+        "the human render carries no workspace line: {human}"
+    );
+}
+
+// _(Stores record and disclose their workspace: different workspace carries the marker)_ — an answer
+// from a store built for somewhere else carries the mismatch marker, naming the root it was built
+// for, in the machine answer and the human render alike. The graph is confidently about another
+// project, which is the one thing an unmarked answer would hide.
+#[test]
+fn a_different_workspace_carries_the_marker_in_both_renderings() {
+    let built_in = workspace_with_fixture_source();
+    let queried_from = workspace_with_fixture_source();
+    let db = built_in.path().join("index.db");
+    build_from_index(&db, "op-ws", built_in.path(), &support::fixture_index(), &sources()).unwrap();
+
+    let recorded = std::fs::canonicalize(built_in.path()).unwrap().display().to_string();
+
+    let machine: serde_json::Value = serde_json::from_str(&get_answer(&db, queried_from.path(), true)).unwrap();
+    assert_eq!(
+        machine["workspace_relation"]["state"], "mismatched",
+        "the answer discloses the mismatch: {machine}"
+    );
+    assert_eq!(
+        machine["workspace_relation"]["recorded_root"], recorded,
+        "the disclosure names the workspace the store describes: {machine}"
+    );
+
+    let human = get_answer(&db, queried_from.path(), false);
+    assert!(
+        human.contains("different workspace") && human.contains(&recorded),
+        "the human render names the mismatch and the recorded root: {human}"
+    );
+}
+
+// _(Stores record and disclose their workspace: the marker composes with staleness)_ — a store built
+// elsewhere whose sources have also drifted carries both the mismatch marker and the staleness flag,
+// each independently. Staleness says the graph is behind; the marker says it is about somewhere else,
+// and reporting only the first would explain the wrong problem.
+#[test]
+fn the_mismatch_marker_composes_with_staleness() {
+    let built_in = workspace_with_fixture_source();
+    let queried_from = workspace_with_fixture_source();
+    let db = built_in.path().join("index.db");
+    build_from_index(&db, "op-ws", built_in.path(), &support::fixture_index(), &sources()).unwrap();
+
+    // Drift the queried workspace's source away from what the store recorded.
+    std::fs::write(
+        queried_from.path().join(support::DOC),
+        format!("{}\n// drifted\n", support::SOURCE),
+    )
+    .unwrap();
+
+    let machine: serde_json::Value = serde_json::from_str(&get_answer(&db, queried_from.path(), true)).unwrap();
+    assert_eq!(
+        machine["workspace_relation"]["state"], "mismatched",
+        "the mismatch is disclosed: {machine}"
+    );
+    assert_eq!(
+        machine["stale"], true,
+        "the staleness flag stands on its own: {machine}"
+    );
+    assert_eq!(machine["freshness"], "stale_content", "with its own reason: {machine}");
+}
+
+// _(Stores record and disclose their workspace: an unevaluable comparison is disclosed as unknown)_
+// — a store that records no workspace root cannot be compared against anything, so its answers say
+// the relationship is unknown rather than carrying no marker. Silence is what a match looks like, and
+// "I could not tell" must never be served as "they match".
+#[test]
+fn a_store_recording_no_workspace_is_disclosed_as_unknown() {
+    let dir = workspace_with_fixture_source();
+    let db = dir.path().join("index.db");
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
+
+    // A root that could not be recorded exactly — what a build over a workspace path that will not
+    // convert to text leaves behind.
+    {
+        let store = GraphStore::open_or_replace(&db).unwrap();
+        let mut meta = store.read_metadata().unwrap().expect("the fixture recorded metadata");
+        meta.workspace_root = None;
+        store.write_metadata(&meta).unwrap();
+    }
+
+    let machine: serde_json::Value = serde_json::from_str(&get_answer(&db, dir.path(), true)).unwrap();
+    assert_eq!(
+        machine["workspace_relation"]["state"], "unknown",
+        "the answer discloses that the comparison could not be made: {machine}"
+    );
+    assert!(
+        machine["workspace_relation"].get("recorded_root").is_none(),
+        "there is no root to name: {machine}"
+    );
+
+    let human = get_answer(&db, dir.path(), false);
+    assert!(
+        human.contains("could not be determined"),
+        "the human render says so too: {human}"
+    );
+}
+
+// _(Stores record and disclose their workspace: every query family discloses)_ — the disclosure is a
+// property of the answer envelope, not of one command, so `trace` (both its plain-relation and its
+// `dependents` answer), `find`, and `status` carry it too.
+#[test]
+fn every_query_family_carries_the_workspace_disclosure() {
+    let built_in = workspace_with_fixture_source();
+    let queried_from = workspace_with_fixture_source();
+    let db = built_in.path().join("index.db");
+    build_from_index(&db, "op-ws", built_in.path(), &support::fixture_index(), &sources()).unwrap();
+    let root = queried_from.path();
+
+    let trace = silent_cartographer::commands::run_trace(
+        &db,
+        root,
+        "not-a-real-analyzer",
+        "net::Client",
+        silent_cartographer::query::Relation::Contains,
+        None,
+        None,
+        0,
+        false,
+        25,
+        None,
+        true,
+        false,
+    )
+    .expect("trace answers");
+    // `dependents` assembles its own answer shape, so it is a separate site the disclosure has to
+    // reach — a relation-by-relation check, not a single wiring point.
+    let dependents = silent_cartographer::commands::run_trace(
+        &db,
+        root,
+        "not-a-real-analyzer",
+        "net::Client::connect",
+        silent_cartographer::query::Relation::Dependents,
+        Some(1),
+        None,
+        0,
+        false,
+        25,
+        None,
+        true,
+        false,
+    )
+    .expect("dependents answers");
+    let find =
+        silent_cartographer::commands::run_find(&db, root, "not-a-real-analyzer", "connect", 25, None, true, false)
+            .expect("find answers");
+    let status = run_status(&db, root, "not-a-real-analyzer", true, false, false, false).expect("status answers");
+
+    for (command, answer) in [
+        ("trace", trace),
+        ("dependents", dependents),
+        ("find", find),
+        ("status", status),
+    ] {
+        let value: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(
+            value["workspace_relation"]["state"], "mismatched",
+            "{command} discloses the mismatch: {value}"
+        );
+    }
+}
+
+// _(Stores record and disclose their workspace: a build hands a store between workspaces)_ — building
+// over a store recorded for a different workspace succeeds and re-records the workspace the store now
+// describes, which clears the marker for later queries from there.
+#[test]
+fn a_build_over_another_workspaces_store_re_records_the_workspace() {
+    let first = workspace_with_fixture_source();
+    let second = workspace_with_fixture_source();
+    let db = second.path().join("index.db");
+    build_from_index(&db, "op-ws", first.path(), &support::fixture_index(), &sources()).unwrap();
+
+    build_from_index(&db, "op-ws", second.path(), &support::fixture_index(), &sources()).unwrap();
+
+    let machine: serde_json::Value = serde_json::from_str(&get_answer(&db, second.path(), true)).unwrap();
+    assert!(
+        machine.get("workspace_relation").is_none(),
+        "the rebuild re-recorded the workspace, clearing the marker: {machine}"
+    );
+}
+
+// _(Store ownership recognition: a redirected path is refused)_ — a `--db` path that resolves through
+// a symlink to a database c10r did not create is refused, and the link's target is left
+// byte-identical. A symlinked `.c10r` directory is exactly how a mis-pointed path stops looking
+// mis-pointed.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_path_to_a_foreign_database_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("someone-elses.db");
+    {
+        let conn = rusqlite::Connection::open(&target).unwrap();
+        conn.execute_batch("CREATE TABLE payroll (x); INSERT INTO payroll VALUES (1);")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 4i64).unwrap();
+    }
+    let before = std::fs::read(&target).unwrap();
+
+    let link = dir.path().join("index.db");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = build_from_index(&link, "op-ws", dir.path(), &support::fixture_index(), &sources())
+        .expect_err("a build through the link refuses");
+    assert!(
+        err.chain().any(|e| matches!(
+            e.downcast_ref::<silent_cartographer::graph::store::StoreOpenError>(),
+            Some(silent_cartographer::graph::store::StoreOpenError::UnrecognizedStore { .. })
+        )),
+        "the refusal is the typed ownership error: {err:#}"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        before,
+        "the link's target is untouched"
+    );
 }

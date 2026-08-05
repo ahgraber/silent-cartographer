@@ -19,10 +19,13 @@ use silent_cartographer::semantic::model::{
 /// path — with minimal index metadata, so it reads as a completed build. The read-only query path
 /// refuses a schema-stamped store that carries no build metadata (a never-completed build), so a
 /// fixture that queries through the CLI must record metadata even when the join accounting is empty.
-pub fn stamp_metadata(store: &GraphStore, workspace: &str) {
+pub fn stamp_metadata(store: &GraphStore, workspace: &str, root: &std::path::Path) {
+    let workspace_root = std::fs::canonicalize(root)
+        .unwrap_or_else(|e| panic!("canonicalizing the fixture workspace root {}: {e}", root.display()));
     store
         .write_metadata(&IndexMetadata {
             workspace_id: WorkspaceId::new(workspace),
+            workspace_root: workspace_root.to_str().map(str::to_string),
             provenance: provenance(),
             content_hash: String::new(),
             accounting: JoinAccounting::default(),

@@ -199,7 +199,7 @@ fn setup_repo_with_index() -> (TestRepo, PathBuf, String) {
 
     let db = repo.path().join(".c10r/index.db");
     let ws = workspace_id(&repo);
-    build_from_index(&db, &ws, &extended_fixture_index(), &base_sources()).unwrap();
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &base_sources()).unwrap();
     (repo, db, ws)
 }
 
@@ -362,7 +362,7 @@ fn revision_range_seeds_the_symbol_changed_across_the_range() {
 
     let db = repo.path().join(".c10r/index.db");
     let ws = workspace_id(&repo);
-    build_from_index(&db, &ws, &extended_fixture_index(), &base_sources()).unwrap();
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &base_sources()).unwrap();
 
     let range = format!("{sha1}..HEAD");
     let answer = run_impact_json(&repo, &db, &[&range]);
@@ -670,7 +670,7 @@ fn untracked_source_present_at_build_unedited_stays_exact() {
     let ws = workspace_id(&repo);
     let mut sources = base_sources();
     sources.push(("src/scratch.rs".to_string(), scratch_content.to_string()));
-    build_from_index(&db, &ws, &extended_fixture_index(), &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &sources).unwrap();
 
     let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
     repo.write(support::DOC, &edited);
@@ -701,7 +701,7 @@ fn untracked_source_edited_after_the_build_is_approximate_with_the_copy_step() {
     let ws = workspace_id(&repo);
     let mut sources = base_sources();
     sources.push(("src/scratch.rs".to_string(), scratch_content.to_string()));
-    build_from_index(&db, &ws, &extended_fixture_index(), &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &sources).unwrap();
 
     // Edit connect (the seed) and the untracked scratch file (drift the untracked-source hash).
     let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
@@ -826,7 +826,7 @@ fn unmappable_regions_are_disclosed_on_an_approximate_answer() {
     let mut sources = base_sources();
     sources.push(("src/untouched.rs".to_string(), "pub fn untouched() {}\n".to_string()));
     sources.push(("src/scratch.rs".to_string(), scratch_content.to_string()));
-    build_from_index(&db, &ws, &extended_fixture_index(), &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &sources).unwrap();
 
     let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
     repo.write(support::DOC, &edited);
@@ -919,7 +919,7 @@ fn over_limit_answer_is_capped_and_the_cursor_resumes_exactly() {
     let ws = workspace_id(&repo);
     let mut sources = base_sources();
     sources.push(("src/callers.rs".to_string(), callers_source));
-    build_from_index(&db, &ws, &index, &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &index, &sources).unwrap();
 
     let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
     repo.write(support::DOC, &edited);
@@ -1056,7 +1056,14 @@ fn diff_larger_than_64kib_seeds_every_touched_symbol() {
 
     let db = repo.path().join(".c10r/index.db");
     let ws = workspace_id(&repo);
-    build_from_index(&db, &ws, &index, &[("src/giant.rs".to_string(), committed.to_string())]).unwrap();
+    build_from_index(
+        &db,
+        &ws,
+        repo.path(),
+        &index,
+        &[("src/giant.rs".to_string(), committed.to_string())],
+    )
+    .unwrap();
 
     let filler = format!("    // filler: {}", "x".repeat(70_000));
     let edited = format!(
@@ -1175,7 +1182,7 @@ fn a_cursor_is_refused_after_the_seeding_change_moves() {
     let ws = workspace_id(&repo);
     let mut sources = base_sources();
     sources.push(("src/callers.rs".to_string(), callers_source));
-    build_from_index(&db, &ws, &index, &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &index, &sources).unwrap();
 
     let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
     repo.write(support::DOC, &edited);
@@ -1260,7 +1267,7 @@ fn following_the_recipe_leaves_the_queried_index_byte_for_byte_unchanged() {
     let ws = workspace_id(&repo);
     let mut sources = base_sources();
     sources.push(("src/scratch.rs".to_string(), scratch_content.to_string()));
-    build_from_index(&db, &ws, &extended_fixture_index(), &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &sources).unwrap();
 
     // Edit connect (the seed) and the untracked scratch file (drift the untracked-source hash), so
     // the answer is approximate and its recipe carries the untracked-copy step.
@@ -1591,7 +1598,7 @@ fn follow_recipe(
         "the recipe's build root {} holds the workspace's sources",
         build.root.display()
     );
-    build_from_index(&build.db, &build.workspace, index, &sources).unwrap();
+    build_from_index(&build.db, &build.workspace, &build.root, index, &sources).unwrap();
 
     // The re-run, verbatim apart from `--json`: the answer has to be machine-readable to be asserted
     // on, and `--json` is a global flag, so it goes in front of the subcommand without disturbing
@@ -1630,7 +1637,7 @@ fn following_the_recipe_converges_to_an_exact_working_tree_answer() {
     let ws = workspace_id(&repo);
     let mut sources = base_sources();
     sources.push(("src/scratch.rs".to_string(), scratch_content.to_string()));
-    build_from_index(&db, &ws, &extended_fixture_index(), &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &sources).unwrap();
 
     let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
     repo.write(support::DOC, &edited);
@@ -1685,7 +1692,7 @@ fn following_the_recipe_converges_to_an_exact_range_answer() {
         (support::DOC.to_string(), edited.clone()),
         ("other/extra.rs".to_string(), extra_source().to_string()),
     ];
-    build_from_index(&db, &ws, &extended_fixture_index(), &head_sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &head_sources).unwrap();
 
     let range = format!("{sha1}..{sha2}");
     let answer = run_impact_json(&repo, &db, &[&range]);
@@ -1734,7 +1741,7 @@ fn a_range_recipe_converges_for_a_workspace_below_the_repository_root() {
         (support::DOC.to_string(), edited.clone()),
         ("other/extra.rs".to_string(), extra_source().to_string()),
     ];
-    build_from_index(&db, &ws, &extended_fixture_index(), &head_sources).unwrap();
+    build_from_index(&db, &ws, &workspace_dir, &extended_fixture_index(), &head_sources).unwrap();
 
     let range = format!("{sha1}..{sha2}");
     let out = Command::new(env!("CARGO_BIN_EXE_c10r"))
@@ -1844,7 +1851,7 @@ fn a_range_at_the_checkout_with_an_uncommitted_source_edit_is_approximate() {
     // Built at the range's pre-change side, so the reverted hash matches.
     let db = repo.path().join(".c10r/index.db");
     let ws = workspace_id(&repo);
-    build_from_index(&db, &ws, &extended_fixture_index(), &base_sources()).unwrap();
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &base_sources()).unwrap();
 
     let range = format!("{sha1}..{sha2}");
     let clean = run_impact_json(&repo, &db, &[&range]);
@@ -1939,7 +1946,7 @@ fn a_cursor_is_refused_across_two_ranges_sharing_a_base() {
     let ws = workspace_id(&repo);
     let mut sources = base_sources();
     sources.push(("src/callers.rs".to_string(), callers_source));
-    build_from_index(&db, &ws, &index, &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &index, &sources).unwrap();
 
     let range_ab = format!("{sha_a}..{sha_b}");
     let range_ac = format!("{sha_a}..{sha_c}");
@@ -2034,7 +2041,7 @@ fn the_impact_set_carries_no_callee_direction_reach() {
     let ws = workspace_id(&repo);
     let mut sources = base_sources();
     sources.push(("src/user.rs".to_string(), user_source.to_string()));
-    build_from_index(&db, &ws, &index, &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &index, &sources).unwrap();
 
     // Guard the premise: the seed really does have outgoing dependency edges, so a forward-reach
     // regression would have something to find. Seeding `Client` and `connect` each reports `open` as
@@ -2101,7 +2108,7 @@ fn every_page_of_a_capped_answer_repeats_its_disclosures() {
     sources.push(("src/callers.rs".to_string(), callers_source));
     sources.push(("src/untouched.rs".to_string(), "pub fn untouched() {}\n".to_string()));
     sources.push(("src/scratch.rs".to_string(), scratch_content.to_string()));
-    build_from_index(&db, &ws, &index, &sources).unwrap();
+    build_from_index(&db, &ws, repo.path(), &index, &sources).unwrap();
 
     let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
     repo.write(support::DOC, &edited);
@@ -2153,4 +2160,42 @@ fn every_page_of_a_capped_answer_repeats_its_disclosures() {
             "the {label} page discloses the region in the unindexed tracked file: {report}"
         );
     }
+}
+
+// _(Stores record and disclose their workspace: an impact answer discloses too)_ — `impact` assembles
+// its own answer, so the workspace disclosure has to reach it as well: an assessment read from a
+// store recorded for another workspace carries the mismatch marker, and one read from the workspace
+// its store describes carries none.
+#[test]
+fn an_impact_answer_discloses_a_workspace_mismatch() {
+    let repo = TestRepo::new();
+    repo.write(support::DOC, support::SOURCE);
+    repo.write("other/extra.rs", extra_source());
+    repo.commit_all("add fixture sources");
+    let db = repo.path().join(".c10r/index.db");
+    let ws = workspace_id(&repo);
+
+    // The index records a workspace that is not the one the assessment is run from.
+    let elsewhere = tempfile::tempdir().unwrap();
+    build_from_index(&db, &ws, elsewhere.path(), &extended_fixture_index(), &base_sources()).unwrap();
+
+    repo.write(
+        support::DOC,
+        &edit_line(support::SOURCE, 4, "        pub fn connect(&self, x: u8) {}"),
+    );
+    let out = run_impact(&repo, &db, &[]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("impact emits JSON");
+    assert_eq!(
+        report["workspace_relation"]["state"], "mismatched",
+        "the impact answer discloses the mismatch: {report}"
+    );
+
+    // Rebuilt for this workspace, the same assessment carries no marker.
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &base_sources()).unwrap();
+    let out = run_impact(&repo, &db, &[]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("impact emits JSON");
+    assert!(
+        report.get("workspace_relation").is_none(),
+        "a matched workspace carries no marker: {report}"
+    );
 }

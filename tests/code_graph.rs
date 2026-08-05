@@ -13,6 +13,11 @@ use silent_cartographer::semantic::model::{
     OccurrenceRole, PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind, normalize,
 };
 
+/// The canonicalized workspace root a directly-ingested fixture store records. These stores are never
+/// queried against a real filesystem root, so a stable stand-in keeps the recorded identity out of the
+/// way of what each test is asserting.
+const WS_ROOT: &str = "/test-ws";
+
 fn ws() -> WorkspaceId {
     WorkspaceId::new("test-ws")
 }
@@ -26,7 +31,7 @@ fn ingest_fixture() -> GraphStore {
     let mut store = GraphStore::open_in_memory().unwrap();
     let index = support::fixture_index();
     let src = sources();
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     store
 }
 
@@ -66,7 +71,7 @@ fn edges_are_deduplicated_and_rebuild_is_idempotent() {
     let index = support::fixture_index();
     let src = sources();
 
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     let uses_first = store.edges(EdgeKind::Uses).unwrap();
 
     // `open` references `Client` twice (return type and `let c = Client`), yet exactly one `uses`
@@ -89,7 +94,7 @@ fn edges_are_deduplicated_and_rebuild_is_idempotent() {
     );
 
     // Rebuilding the identical fixture into the same store yields the identical edge set.
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     let uses_second = store.edges(EdgeKind::Uses).unwrap();
     assert_eq!(uses_first, uses_second, "rebuild is idempotent over the edge set");
 }
@@ -126,7 +131,7 @@ fn rebuilding_over_the_same_store_supersedes_all_derived_rows() {
     let mut store = GraphStore::open_in_memory().unwrap();
     let index = support::fixture_index();
     let src = sources();
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     let first = snapshot(&store);
     assert!(
         !first.0.is_empty() && !first.1.is_empty() && !first.2.is_empty(),
@@ -135,7 +140,7 @@ fn rebuilding_over_the_same_store_supersedes_all_derived_rows() {
 
     // Second build of the identical index over the same store: every derived row set is superseded,
     // not accumulated — equal counts AND equal content.
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     let second = snapshot(&store);
     assert_eq!(first.0, second.0, "symbol rows are identical after a rebuild");
     assert_eq!(first.1, second.1, "occurrence rows are identical after a rebuild");
@@ -162,7 +167,7 @@ fn rebuilding_over_the_same_store_supersedes_all_derived_rows() {
     // a build of an index without it.
     let mut smaller = support::fixture_index();
     smaller.symbols.retain(|s| s.terminal_name() != Some("disconnect"));
-    ingest(&mut store, &ws(), &smaller, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &smaller, &src).unwrap();
     assert!(
         store.symbols_by_shortname("disconnect").unwrap().is_empty(),
         "the vanished symbol's row is superseded away, not left stale"
@@ -227,7 +232,14 @@ fn refused_occurrence_contributes_no_dependency_edge() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![caller, beta]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![caller, beta]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.text_mismatch, 1, "the drifted reference is refused");
     assert!(
         store.edges(EdgeKind::Uses).unwrap().is_empty(),
@@ -296,7 +308,7 @@ use thing::Thing;
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let module = silent_cartographer::identity::project_one(
         &ws(),
@@ -397,7 +409,7 @@ fn shared_module_symbol_maps_to_every_document_it_defines() {
         ("a.rs".to_string(), source_a.to_string()),
         ("b.rs".to_string(), source_b.to_string()),
     ];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let root = silent_cartographer::identity::project_one(
         &ws(),
@@ -510,7 +522,14 @@ impl Greet for Person {}
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![greet, person]), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![greet, person]),
+        &src,
+    )
+    .unwrap();
 
     let greet_id = silent_cartographer::identity::project_one(
         &ws(),
@@ -561,7 +580,14 @@ impl From<Detail> for Wrapper {}
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![from, wrapper]), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![from, wrapper]),
+        &src,
+    )
+    .unwrap();
 
     let from_id = silent_cartographer::identity::project_one(
         &ws(),
@@ -615,7 +641,14 @@ impl Default for Widget {}
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![default, widget]), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![default, widget]),
+        &src,
+    )
+    .unwrap();
 
     let default_id = silent_cartographer::identity::project_one(
         &ws(),
@@ -663,7 +696,14 @@ impl Gone for Thing {}
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![thing]), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![thing]),
+        &src,
+    )
+    .unwrap();
 
     assert!(
         store.edges(EdgeKind::TypeHierarchy).unwrap().is_empty(),
@@ -1126,7 +1166,7 @@ fn text_mismatch_is_refused_and_surfaced() {
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let accounting = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let accounting = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     assert_eq!(accounting.text_mismatch, 1, "mismatch should be counted");
     assert_eq!(accounting.aligned_total(), 0, "mismatched occurrence must not align");
 
@@ -1158,7 +1198,7 @@ fn text_mismatch_is_refused_and_surfaced() {
     };
     let mut store2 = GraphStore::open_in_memory().unwrap();
     let src2 = vec![("n.rs".to_string(), nonascii.to_string())];
-    let acc2 = ingest(&mut store2, &ws(), &index2, &src2).unwrap();
+    let acc2 = ingest(&mut store2, &ws(), Some(WS_ROOT), &index2, &src2).unwrap();
     assert_eq!(
         acc2.text_mismatch, 1,
         "non-ASCII drift is a surfaced mismatch, not aligned"
@@ -1197,7 +1237,7 @@ fn semantic_only_occurrence_is_unaligned() {
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     assert_eq!(acc.semantic_only, 1, "occurrence with no syntax is semantic-only");
     assert_eq!(acc.aligned_total(), 0);
     // Not misattributed: the ghost symbol has no aligned occurrence persisted.
@@ -1219,7 +1259,7 @@ fn syntax_only_construct_is_counted_without_fabricated_identity() {
     index.symbols.retain(|s| s.terminal_name() != Some("disconnect"));
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = sources();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     assert!(acc.syntax_only >= 1, "unresolved declaration counted as syntax-only");
     // No fabricated identity: nothing named disconnect is persisted.
     assert!(store.symbols_by_shortname("disconnect").unwrap().is_empty());
@@ -1371,7 +1411,7 @@ fn unchanged_sources_and_analyzer_are_fresh() {
     let mut store = GraphStore::open_in_memory().unwrap();
     let mut index = support::fixture_index();
     index.environment = Some(env_facts("fp-a"));
-    ingest(&mut store, &ws(), &index, &sources()).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources()).unwrap();
     let f = freshness(&store, &sources(), &support::provenance(), Some(&env_facts("fp-a"))).unwrap();
     assert_eq!(f, Some(Freshness::Fresh), "an unchanged environment stays fresh");
 }
@@ -1406,7 +1446,7 @@ fn changed_environment_marks_stale() {
     let mut store = GraphStore::open_in_memory().unwrap();
     let mut index = support::fixture_index();
     index.environment = Some(env_facts("fp-a"));
-    ingest(&mut store, &ws(), &index, &sources()).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources()).unwrap();
 
     let drifted = env_facts("fp-b");
     let f = freshness(&store, &sources(), &support::provenance(), Some(&drifted)).unwrap();
@@ -1432,6 +1472,7 @@ fn environment_provenance_round_trips_through_metadata() {
     let store = GraphStore::open_in_memory().unwrap();
     let meta = IndexMetadata {
         workspace_id: ws(),
+        workspace_root: Some(WS_ROOT.to_string()),
         provenance: support::provenance(),
         content_hash: "hash".to_string(),
         accounting: Default::default(),
@@ -1481,6 +1522,7 @@ fn module_name_count_rides_metadata() {
     };
     let meta = IndexMetadata {
         workspace_id: ws(),
+        workspace_root: Some(WS_ROOT.to_string()),
         provenance: support::provenance(),
         content_hash: "hash".to_string(),
         accounting,
@@ -1524,6 +1566,7 @@ fn new_rule_counts_ride_metadata() {
     };
     let meta = IndexMetadata {
         workspace_id: ws(),
+        workspace_root: Some(WS_ROOT.to_string()),
         provenance: support::provenance(),
         content_hash: "hash".to_string(),
         accounting,
@@ -1599,7 +1642,7 @@ impl Client {
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let connect = silent_cartographer::identity::project_one(
         &ws(),
@@ -1700,7 +1743,7 @@ use thing::Thing;
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let thing = silent_cartographer::identity::project_one(
         &ws(),
@@ -1739,7 +1782,7 @@ fn local_symbols_are_excluded() {
     });
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = sources();
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     // The local binding `c` is not a persisted symbol.
     assert!(
         store.symbols_by_shortname("c").unwrap().is_empty(),
@@ -1794,7 +1837,7 @@ fn external_symbol_persists_without_definition_span() {
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let g = silent_cartographer::identity::project_one(
         &ws(),
@@ -1853,7 +1896,7 @@ fn external_symbol_persists_null_tiers() {
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let g = silent_cartographer::identity::project_one(
         &ws(),
@@ -1923,7 +1966,7 @@ fn accounting_conserves_occurrence_total() {
     let total_occurrences: u64 = index.symbols.iter().map(|s| s.occurrences.len() as u64).sum();
 
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &ws(), &index, &sources()).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources()).unwrap();
     let meta = store.read_metadata().unwrap().unwrap();
 
     // Every semantic-side term is non-zero, so the conservation claim is exercised across a real mix.
@@ -2010,7 +2053,7 @@ fn accounting_conserves_occurrence_total() {
     let py_total: u64 = py_index.symbols.iter().map(|s| s.occurrences.len() as u64).sum();
     let mut py_store = GraphStore::open_in_memory().unwrap();
     let py_src = vec![("m.py".to_string(), py_source.to_string())];
-    ingest(&mut py_store, &ws(), &py_index, &py_src).unwrap();
+    ingest(&mut py_store, &ws(), Some(WS_ROOT), &py_index, &py_src).unwrap();
     let py_acc = py_store.read_metadata().unwrap().unwrap().accounting;
     for (bucket, count) in [
         ("aligned_module_name", py_acc.aligned_module_name),
@@ -2043,8 +2086,8 @@ fn two_workspace_ingest_persists_distinct_symbols() {
     let ws_b = WorkspaceId::new("workspace-b");
     let mut store_a = GraphStore::open_in_memory().unwrap();
     let mut store_b = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store_a, &ws_a, &index, &src).unwrap();
-    ingest(&mut store_b, &ws_b, &index, &src).unwrap();
+    ingest(&mut store_a, &ws_a, Some(WS_ROOT), &index, &src).unwrap();
+    ingest(&mut store_b, &ws_b, Some(WS_ROOT), &index, &src).unwrap();
 
     let descriptor = Descriptor::new(
         "mycrate",
@@ -2156,7 +2199,7 @@ fn duplicate_definitions_attach_by_co_location() {
     let mut store = GraphStore::open_in_memory().unwrap();
     let index = duplicate_index();
     let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     // Two definitions aligned (each at its own location); the lone reference did not.
     assert_eq!(
@@ -2190,7 +2233,7 @@ fn duplicate_reference_is_ambiguous_and_unattributed() {
     let mut store = GraphStore::open_in_memory().unwrap();
     let index = duplicate_index();
     let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(acc.duplicate_ambiguous, 1, "the reference is typed duplicate-ambiguous");
 
@@ -2240,7 +2283,7 @@ fn build_records_duplicate_ambiguous_count() {
     let mut store = GraphStore::open_in_memory().unwrap();
     let index = duplicate_index();
     let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     let acc = store.read_metadata().unwrap().unwrap().accounting;
     // All four semantic-side buckets plus syntax-only are recorded and retrievable.
     assert_eq!(acc.aligned_total(), 2);
@@ -2289,7 +2332,7 @@ fn accounting_conserves_with_four_buckets() {
 
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     let acc = store.read_metadata().unwrap().unwrap().accounting;
 
     assert!(acc.aligned_total() > 0, "aligned term non-zero");
@@ -2334,7 +2377,7 @@ fn text_mismatch_detail_is_persisted() {
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let rows = store.all_discrepancies().unwrap();
     let row = rows
@@ -2381,7 +2424,14 @@ fn discrepancies_are_superseded_per_build() {
         library_roots: Default::default(),
         environment: None,
     };
-    ingest(&mut store, &ws(), &index1, &[("m.rs".to_string(), source1.to_string())]).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &index1,
+        &[("m.rs".to_string(), source1.to_string())],
+    )
+    .unwrap();
     assert!(
         store
             .all_discrepancies()
@@ -2394,7 +2444,7 @@ fn discrepancies_are_superseded_per_build() {
     // Second build over an all-aligned source: the prior discrepancy must not survive.
     let index2 = support::fixture_index();
     let src2 = vec![(support::DOC.to_string(), support::SOURCE.to_string())];
-    ingest(&mut store, &ws(), &index2, &src2).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index2, &src2).unwrap();
     let rows = store.all_discrepancies().unwrap();
     assert!(
         !rows.iter().any(|r| r.expected_name == "alpha"),
@@ -2426,7 +2476,7 @@ fn unnormalizable_span_is_typed_absence_and_ambiguous_span_is_real() {
     });
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let rows = store.all_discrepancies().unwrap();
 
@@ -2497,7 +2547,7 @@ fn oversized_found_text_is_classified_on_full_bytes_and_truncated_on_a_boundary(
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source)];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     // Classified on the full bytes: a mismatch, not a silent alignment against the truncated text.
     assert_eq!(
@@ -2534,10 +2584,10 @@ fn content_hash_gate_refuses_non_matching_sources() {
     let expected = content_hash(&src);
     let mut store = GraphStore::open_in_memory().unwrap();
     // Matching sources: accepted.
-    assert!(join_guarded(&mut store, &ws(), &index, &src, &expected).is_ok());
+    assert!(join_guarded(&mut store, &ws(), Some(WS_ROOT), &index, &src, &expected).is_ok());
     // Non-matching sources against the same expected hash: refused.
     let drifted = vec![(support::DOC.to_string(), format!("{}// drift\n", support::SOURCE))];
-    let err = join_guarded(&mut store, &ws(), &index, &drifted, &expected);
+    let err = join_guarded(&mut store, &ws(), Some(WS_ROOT), &index, &drifted, &expected);
     assert!(err.is_err(), "content-hash gate must refuse a non-matching tree");
 }
 
@@ -2609,7 +2659,14 @@ fn crate_root_reference_aligns_on_package_name() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![root]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![root]),
+        &src,
+    )
+    .unwrap();
 
     assert_eq!(acc.aligned_crate_root, 1, "package-name token accepted by crate-root");
     assert_eq!(acc.text_mismatch, 0, "not refused as a mismatch");
@@ -2646,7 +2703,14 @@ fn crate_keyword_reference_aligns_under_crate_root() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![root]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![root]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         acc.aligned_crate_root, 1,
         "the `crate` keyword is accepted by crate-root"
@@ -2676,7 +2740,14 @@ fn try_expression_aligns_for_branch() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![branch]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![branch]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.aligned_operator_desugar, 1, "`?` accepted for `branch`");
     assert_eq!(acc.text_mismatch, 0);
 }
@@ -2704,7 +2775,14 @@ fn operator_span_adjacent_to_sigil_aligns() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![add]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![add]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.aligned_operator_desugar, 1, "adjacent span matched by construct");
     assert_eq!(
         acc.text_mismatch, 0,
@@ -2730,7 +2808,14 @@ fn method_outside_correspondence_stays_refused() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![compute]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![compute]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.text_mismatch, 1, "no rule accepts a name-shaped drift");
     assert_eq!(acc.aligned_total(), 0);
     assert_eq!(
@@ -2756,7 +2841,14 @@ fn module_definition_spanning_whole_document_aligns() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("mymod.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("mymod.rs", vec![module]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("mymod.rs", vec![module]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.aligned_module_span, 1, "whole-document module definition accepted");
     assert_eq!(acc.text_mismatch, 0);
 }
@@ -2777,7 +2869,14 @@ fn whole_document_span_on_non_module_stays_refused() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![not_a_module]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![not_a_module]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.aligned_module_span, 0, "module-span is gated on the module kind");
     assert_eq!(acc.aligned_total(), 0);
     assert_eq!(acc.text_mismatch, 1, "the non-module whole-document span is refused");
@@ -2899,7 +2998,7 @@ pub const LIMIT: u8 = 10;
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
     let index = one_doc_index("m.rs", vec![double, triple, limit]);
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let id = |name: &str, kind: SegmentKind| {
         silent_cartographer::identity::project_one(
@@ -2978,7 +3077,14 @@ fn rust_file_module_persists_whole_document_qualified_name_and_module_doc() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("mymod.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("mymod.rs", vec![module]), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("mymod.rs", vec![module]),
+        &src,
+    )
+    .unwrap();
 
     let id = silent_cartographer::identity::project_one(
         &ws(),
@@ -3034,7 +3140,14 @@ fn declaration_less_symbol_persists_name_token_tiers() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![field]), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![field]),
+        &src,
+    )
+    .unwrap();
 
     let id = silent_cartographer::identity::project_one(
         &ws(),
@@ -3084,7 +3197,14 @@ fn inline_module_declaration_keeps_its_declaration_span() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("lib.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("lib.rs", vec![module]), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("lib.rs", vec![module]),
+        &src,
+    )
+    .unwrap();
 
     let id = silent_cartographer::identity::project_one(
         &ws(),
@@ -3143,7 +3263,14 @@ fn attributions_carry_their_accepting_rule() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![add2, add]), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![add2, add]),
+        &src,
+    )
+    .unwrap();
 
     let exact_id = silent_cartographer::identity::project_one(
         &ws(),
@@ -3197,7 +3324,14 @@ fn trace_references_includes_operator_aligned_site() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![add]), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![add]),
+        &src,
+    )
+    .unwrap();
 
     let engine = QueryEngine::new(&store, support::provenance(), content_hash(&src), None);
     let answer = engine.trace("ops::Add::add", Relation::References, None, None).unwrap();
@@ -3410,7 +3544,7 @@ fn r(a: u8, b: u8) -> u8 { for _i in a..b {} a }
     let total: u64 = index.symbols.iter().map(|s| s.occurrences.len() as u64).sum();
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![(doc.to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let acc = store.read_metadata().unwrap().unwrap().accounting;
     assert!(acc.aligned_exact > 0, "exact bucket non-zero");
@@ -3454,7 +3588,14 @@ impl GraphStore {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![store_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![store_ref]),
+        &src,
+    )
+    .unwrap();
 
     assert_eq!(acc.aligned_self_keyword, 1, "`Self` in its own impl accepted");
     assert_eq!(acc.text_mismatch, 0);
@@ -3491,7 +3632,14 @@ impl Widget2 {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![widget_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![widget_ref]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.aligned_self_keyword, 1, "`Self::` path segment accepted");
     assert_eq!(acc.text_mismatch, 0);
 }
@@ -3525,7 +3673,14 @@ impl<T> Answer<T> {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![answer_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![answer_ref]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.aligned_self_keyword, 1, "generic self type accepted by base name");
     assert_eq!(acc.text_mismatch, 0);
 }
@@ -3557,7 +3712,14 @@ impl Tr for A {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![b_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![b_ref]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.aligned_self_keyword, 0, "a foreign impl's Self is never accepted");
     assert_eq!(acc.aligned_total(), 0);
     assert_eq!(acc.text_mismatch, 1, "the drifted occurrence is refused and surfaced");
@@ -3598,7 +3760,14 @@ impl<T> Answer<T> {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![impl_symbol]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![impl_symbol]),
+        &src,
+    )
+    .unwrap();
 
     assert_eq!(
         acc.aligned_self_keyword, 1,
@@ -3651,7 +3820,14 @@ impl From<X> for Y {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![trait_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![trait_ref]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         acc.aligned_self_keyword, 1,
         "the trait reference at `Self` accepted by the self-keyword rule"
@@ -3694,6 +3870,7 @@ fn range_literal_accepted_under_shape_correspondence() {
     let acc = ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &one_doc_index("m.rs", vec![range_ref, range_from_ref]),
         &src,
     )
@@ -3723,7 +3900,14 @@ fn range_occurrence_with_mismatched_shape_stays_refused() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![mismatched_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![mismatched_ref]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         acc.aligned_range_literal, 0,
         "`RangeInclusive` does not match the exclusive `a..b` shape"
@@ -3756,7 +3940,14 @@ fn use_list_self_token_accepted_for_path_module() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![walk_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![walk_ref]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         acc.aligned_use_list_self, 1,
         "the use-list `self` token accepted for the path module `walk`"
@@ -3782,7 +3973,14 @@ fn use_list_self_for_different_module_stays_refused() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![other_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![other_ref]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         acc.aligned_use_list_self, 0,
         "a module occurrence naming a different module is not accepted"
@@ -3826,7 +4024,14 @@ fn f() { w::go(); }
     });
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![walk_module]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![walk_module]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         acc.aligned_use_list_self, 1,
         "the `self` target token aligns under the use-list-self rule"
@@ -3889,6 +4094,7 @@ mod m {
     let acc = ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &one_doc_index("m.rs", vec![doc_module, inline_ref]),
         &src,
     )
@@ -3931,6 +4137,7 @@ fn path_start_self_for_foreign_module_stays_refused() {
     let acc = ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &one_doc_index("m.rs", vec![doc_module, foreign_ref]),
         &src,
     )
@@ -4004,6 +4211,7 @@ use super::super::y;
     let acc = ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &one_doc_index("m.rs", vec![doc_module, parent_ref, grandparent_ref]),
         &src,
     )
@@ -4050,6 +4258,7 @@ fn super_token_for_non_parent_module_stays_refused() {
     let acc = ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &one_doc_index("m.rs", vec![doc_module, sibling_ref]),
         &src,
     )
@@ -4112,6 +4321,7 @@ mod tests {
     let acc = ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &one_doc_index("m.rs", vec![doc_module, grandparent_ref]),
         &src,
     )
@@ -4146,7 +4356,14 @@ fn desugar_case(source: &str, token: &str, method: &str) -> silent_cartographer:
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![sym]), &src).unwrap()
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![sym]),
+        &src,
+    )
+    .unwrap()
 }
 
 // _(Guarded positional join — operator branch, equality family)_
@@ -4276,6 +4493,7 @@ fn indexing_occurrences_accepted_at_both_brackets() {
     let acc = ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &one_doc_index("m.rs", vec![at_open, at_close, elsewhere_occ]),
         &src,
     )
@@ -4327,7 +4545,14 @@ fn tuple_field_index_accepted_under_default_rule() {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![field_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![field_ref]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         acc.aligned_exact, 1,
         "the tuple-field index accepted under the default rule"
@@ -4362,7 +4587,14 @@ impl output::Answer {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("m.rs", vec![answer_ref]), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![answer_ref]),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         acc.aligned_self_keyword, 1,
         "the qualified impl header compares by base name"
@@ -4463,7 +4695,7 @@ fn reference_in_twins_defining_document_attributes_via_defining_document_localit
         ("b.rs".to_string(), b_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(acc.duplicate_ambiguous, 0, "the reference is settled, not ambiguous");
     assert_eq!(
@@ -4531,7 +4763,7 @@ fn locality_provenance_round_trips_through_the_store() {
         ("b.rs".to_string(), b_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let twins = store.symbols_by_shortname("Widget").unwrap();
     let a_twin = twins
@@ -4633,7 +4865,7 @@ fn reference_reachable_only_through_one_twins_module_chain_attributes_via_module
         ("sub_a.rs".to_string(), sub_a_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.duplicate_ambiguous, 0,
@@ -4756,7 +4988,7 @@ fn use_style_module_references_derive_no_parent_and_group_reference_stays_ambigu
         ("sub.rs".to_string(), sub_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.duplicate_ambiguous, 1,
@@ -4822,7 +5054,7 @@ fn package_name_reference_among_duplicated_crate_roots_is_ambiguous_while_crate_
         ("root_b.rs".to_string(), root_b_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.duplicate_ambiguous, 1,
@@ -4924,7 +5156,7 @@ fn package_name_reference_resolves_to_the_library_twin_via_target_metadata() {
         ("root_b.rs".to_string(), root_b_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.duplicate_ambiguous, 0,
@@ -5011,7 +5243,7 @@ fn locality_selected_occurrence_with_mismatched_text_is_refused_not_attributed()
         ("b.rs".to_string(), b_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.text_mismatch, 1,
@@ -5055,7 +5287,7 @@ fn same_document_reference_inside_one_twin_scope_attributes() {
     let mut store = GraphStore::open_in_memory().unwrap();
     let index = support::python_fixture_index();
     let sources = support::python_fixture_sources();
-    let acc = ingest(&mut store, &py_ws(), &index, &sources).unwrap();
+    let acc = ingest(&mut store, &py_ws(), Some(WS_ROOT), &index, &sources).unwrap();
 
     // Both twin-group references resolve by declaration scope: the ambiguous bucket is empty, and
     // the duplicated-group disclosure still reports the twin group itself (attribution settles
@@ -5139,7 +5371,7 @@ mod holder {
     let index = duplicate_group_index(&["dup.rs"], vec![twin_a, twin_b], widget_descriptor(), vec![group_occ]);
     let src = vec![("dup.rs".to_string(), source.to_string())];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.duplicate_ambiguous, 1,
@@ -5183,7 +5415,7 @@ fn use_widget() { let _w: Widget = Widget; }
     let index = duplicate_group_index(&["dup.rs"], vec![twin_a, twin_b], widget_descriptor(), vec![group_occ]);
     let src = vec![("dup.rs".to_string(), source.to_string())];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.duplicate_ambiguous, 1,
@@ -5231,7 +5463,7 @@ fn b() {
     let index = duplicate_group_index(&["dup.rs"], vec![twin_a, twin_b], widget_descriptor(), vec![group_occ]);
     let src = vec![("dup.rs".to_string(), source.to_string())];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.text_mismatch, 1,
@@ -5288,7 +5520,7 @@ fn reference_outside_every_twins_territory_is_ambiguous() {
         ("c.rs".to_string(), c_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.duplicate_ambiguous, 1,
@@ -5416,7 +5648,7 @@ fn reference_in_shared_territory_is_ambiguous() {
     );
     let src = vec![("shared.rs".to_string(), source.to_string())];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.duplicate_ambiguous, 1,
@@ -5479,7 +5711,7 @@ fn conservation_holds_with_locality_attributed_and_ambiguous_group_references() 
         ("c.rs".to_string(), c_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(acc.duplicate_ambiguous, 1, "the unsettled reference is ambiguous");
     assert_eq!(
@@ -5578,7 +5810,7 @@ fn twin_crate_roots_produce_per_target_imports_edges_after_normalization() {
         ("a.rs".to_string(), source_a.to_string()),
         ("b.rs".to_string(), source_b.to_string()),
     ];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let roots = store.symbols_by_shortname("crate").unwrap();
     assert_eq!(roots.len(), 2, "two distinct crate-root symbols persisted: {roots:?}");
@@ -5629,7 +5861,7 @@ fn store_duplicated_groups_returns_the_shared_descriptor_and_its_definitions() {
     let mut store = GraphStore::open_in_memory().unwrap();
     let index = duplicate_index();
     let src = vec![("dup.rs".to_string(), DUP_SOURCE.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let groups = store.duplicated_groups().unwrap();
     assert_eq!(groups.len(), 1, "one duplicated-descriptor group: {groups:?}");
@@ -5710,6 +5942,7 @@ fn canonical_collision_groups_are_not_reported_as_duplicated_descriptors() {
     ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &one_doc_index("m.rs", vec![as_term, as_method]),
         &src,
     )
@@ -5774,7 +6007,7 @@ fn ingest_python_fixture() -> GraphStore {
     let mut store = GraphStore::open_in_memory().unwrap();
     let index = support::python_fixture_index();
     let sources = support::python_fixture_sources();
-    ingest(&mut store, &py_ws(), &index, &sources).unwrap();
+    ingest(&mut store, &py_ws(), Some(WS_ROOT), &index, &sources).unwrap();
     store
 }
 
@@ -5836,7 +6069,7 @@ fn python_occurrence_outside_every_rule_stays_refused() {
     let index = py_synthetic_index(vec![alpha]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     // Zero aligned rows: no rule accepts the misattributed token.
     assert_eq!(acc.aligned_total(), 0, "no rule accepts the misattributed token");
@@ -5972,7 +6205,7 @@ fn python_build_persists_docstring_bearing_function_tiers() {
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
     let index = py_synthetic_index(vec![greet]);
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let id = silent_cartographer::identity::project_one(
         &ws(),
@@ -6053,7 +6286,7 @@ fn nested_module_bare_terminal_aligns_and_prefix_refused() {
     let index = py_synthetic_index(vec![module]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_module_name, 1,
@@ -6087,7 +6320,7 @@ fn module_kind_without_init_terminal_is_outside_module_name_rule() {
     let index = py_synthetic_index(vec![module]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_module_name, 0,
@@ -6116,7 +6349,7 @@ fn non_module_occurrence_is_outside_module_name_rule() {
     let index = py_synthetic_index(vec![class_symbol]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_module_name, 0,
@@ -6151,7 +6384,7 @@ fn rust_kind_scoped_rules_do_not_fire_for_python() {
     index.documents[0].path = "pkg/__init__.py".to_string();
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("pkg/__init__.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_module_span, 0,
@@ -6187,7 +6420,7 @@ fn python_module_relative_import_aligns_under_module_name_rule() {
     let index = py_synthetic_index(vec![module]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_module_name, 1,
@@ -6236,7 +6469,7 @@ fn python_module_prefix_token_stays_refused() {
     let index = py_synthetic_index(vec![module]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_module_name, 0,
@@ -6274,7 +6507,7 @@ fn module_reference_accepted_through_enclosing_dotted_construct() {
     let index = py_synthetic_index(vec![module]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_module_name, 1,
@@ -6343,7 +6576,7 @@ fn self_name_token_for_foreign_module_stays_refused() {
     let index = py_synthetic_index(vec![own_module, foreign_module]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_self_name, 0,
@@ -6409,7 +6642,7 @@ fn zero_width_non_module_stays_refused() {
     let index = py_synthetic_index(vec![class_symbol]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_module_marker, 0,
@@ -6486,7 +6719,7 @@ fn python_module_marker_persists_whole_document_and_docstring() {
     let index = py_synthetic_index(vec![module]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let id = silent_cartographer::identity::project_one(
         &ws(),
@@ -6574,7 +6807,7 @@ fn binding_site_with_foreign_target_stays_refused() {
     let index = py_synthetic_index(vec![other]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_total(),
@@ -6648,7 +6881,7 @@ fn alias_bound_to_different_symbol_stays_refused() {
     let index = py_synthetic_index(vec![n_symbol, other_symbol]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_import_alias, 0,
@@ -6706,7 +6939,7 @@ fn alias_binding_outside_document_is_not_evidence() {
         ("a.py".to_string(), a_source.to_string()),
         ("b.py".to_string(), b_source.to_string()),
     ];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_import_alias, 0,
@@ -6744,7 +6977,7 @@ fn alias_of_alias_stays_refused() {
     let index = py_synthetic_index(vec![n_symbol]);
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
         acc.aligned_import_alias, 0,
@@ -6796,7 +7029,7 @@ fn rust_use_alias_accepted_under_document_binding() {
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &index, &src).unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(acc.aligned_exact, 1, "the binding target token aligns exact");
     assert_eq!(
@@ -6895,7 +7128,14 @@ fn production() {}
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("src/lib.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("src/lib.rs", symbols),
+        &src,
+    )
+    .unwrap();
 
     assert_eq!(
         rule_of(&store, "c", &[("plain_case", SegmentKind::Method)]).as_deref(),
@@ -6951,7 +7191,14 @@ fn production() {}
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("src/lib.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("src/lib.rs", symbols),
+        &src,
+    )
+    .unwrap();
 
     assert_eq!(
         rule_of(&store, "c", &[("helper", SegmentKind::Method)]).as_deref(),
@@ -7019,6 +7266,7 @@ pub fn helper() {}
     ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &docs_index(&["src/lib.rs", "src/tests_mod.rs"], symbols),
         &src,
     )
@@ -7069,6 +7317,7 @@ pub fn shared_helper() {}
     ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &docs_index(&["tests/api.rs", "tests/common/mod.rs"], symbols),
         &src,
     )
@@ -7145,7 +7394,7 @@ fn python_test_file_forms_classify_and_near_miss_stays_non_test() {
         "pkg/tests.py",
         "pkg/testimony.py",
     ];
-    ingest(&mut store, &ws(), &py_docs_index(&paths, symbols), &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &py_docs_index(&paths, symbols), &src).unwrap();
 
     assert_eq!(
         rule_of(&store, "p", &[("make_client", SegmentKind::Method)]).as_deref(),
@@ -7192,6 +7441,7 @@ fn python_tests_directory_classifies_fixture_modules() {
     ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &py_docs_index(&["pkg/tests/fixtures.py"], symbols),
         &src,
     )
@@ -7215,7 +7465,14 @@ fn unaligned_rust_definition_still_classifies_by_document() {
     let symbols = vec![fn_def_at("c", "renamed_helper", "tests/api.rs", source, "helper", 1)];
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("tests/api.rs".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &one_doc_index("tests/api.rs", symbols), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("tests/api.rs", symbols),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.text_mismatch, 1, "the drifted definition is refused by the join");
 
     assert_eq!(
@@ -7233,7 +7490,14 @@ fn unaligned_python_definition_still_classifies_by_document() {
     let symbols = vec![fn_def_at("p", "renamed_fn", "pkg/test_api.py", source, "make_thing", 1)];
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("pkg/test_api.py".to_string(), source.to_string())];
-    let acc = ingest(&mut store, &ws(), &py_docs_index(&["pkg/test_api.py"], symbols), &src).unwrap();
+    let acc = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &py_docs_index(&["pkg/test_api.py"], symbols),
+        &src,
+    )
+    .unwrap();
     assert_eq!(acc.text_mismatch, 1, "the drifted definition is refused by the join");
 
     assert_eq!(
@@ -7270,7 +7534,14 @@ mod tests {
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("src/lib.rs".to_string(), source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("src/lib.rs", symbols),
+        &src,
+    )
+    .unwrap();
 
     assert_eq!(
         rule_of(&store, "c", &[("attributed_case", SegmentKind::Method)]).as_deref(),
@@ -7296,6 +7567,7 @@ fn no_signal_and_name_only_convention_stay_non_test() {
     ingest(
         &mut rust_store,
         &ws(),
+        Some(WS_ROOT),
         &one_doc_index("src/lib.rs", rust_symbols),
         &rust_src,
     )
@@ -7316,6 +7588,7 @@ fn no_signal_and_name_only_convention_stay_non_test() {
     ingest(
         &mut py_store,
         &ws(),
+        Some(WS_ROOT),
         &py_docs_index(&["pkg/health.py"], py_symbols),
         &py_src,
     )
@@ -7368,6 +7641,7 @@ fn production() {}
     ingest(
         &mut store,
         &ws(),
+        Some(WS_ROOT),
         &docs_index(&["src/lib.rs", "tests/api.rs"], symbols),
         &src,
     )
@@ -7402,7 +7676,14 @@ fn mover() {}
     let symbols = vec![fn_def_at("c", "mover", "src/lib.rs", test_source, "mover", 1)];
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("src/lib.rs".to_string(), test_source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("src/lib.rs", symbols),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         rule_of(&store, "c", &[("mover", SegmentKind::Method)]).as_deref(),
         Some("test_attribute")
@@ -7412,7 +7693,14 @@ fn mover() {}
     let plain_source = "fn mover() {}\n";
     let symbols = vec![fn_def_at("c", "mover", "src/lib.rs", plain_source, "mover", 1)];
     let src = vec![("src/lib.rs".to_string(), plain_source.to_string())];
-    ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("src/lib.rs", symbols),
+        &src,
+    )
+    .unwrap();
     assert_eq!(
         rule_of(&store, "c", &[("mover", SegmentKind::Method)]),
         None,
@@ -7446,7 +7734,14 @@ fn classification_does_not_alter_attribution_or_edges() {
         ];
         let mut store = GraphStore::open_in_memory().unwrap();
         let src = vec![("src/lib.rs".to_string(), source.to_string())];
-        ingest(&mut store, &ws(), &one_doc_index("src/lib.rs", symbols), &src).unwrap();
+        ingest(
+            &mut store,
+            &ws(),
+            Some(WS_ROOT),
+            &one_doc_index("src/lib.rs", symbols),
+            &src,
+        )
+        .unwrap();
         store
     };
 

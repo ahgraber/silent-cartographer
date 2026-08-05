@@ -9,10 +9,13 @@
 /// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
 /// before any table access; the `index_metadata.schema_version` column carries it as provenance.
 ///
-/// Migration: version 12 added `symbols.test_rule`. The index is derived, replayable data, so
-/// rebuild is the migration — a build replaces an older store wholesale and a query refuses it with
-/// recovery guidance (the replace-or-refuse contract).
-pub const SCHEMA_VERSION: i64 = 12;
+/// Version is not ownership: whose file this is lives in `PRAGMA application_id`
+/// ([`crate::graph::store::APPLICATION_ID`]), which no migration disturbs.
+///
+/// Migration: version 13 added `index_metadata.workspace_root`. The index is derived, replayable
+/// data, so rebuild is the migration — a build replaces an older store of its own wholesale and a
+/// query refuses it with recovery guidance (the replace-or-refuse contract).
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -23,10 +26,16 @@ PRAGMA foreign_keys = ON;
 -- `environment` is the backend's declared interpreter-environment facts as JSON (nullable — absent
 -- for backends, like Rust's, that declare none); staleness compares it against the environment in
 -- effect.
+-- `workspace_root` is the canonicalized filesystem root the build indexed — the durable link from a
+-- store to the workspace it describes, which a query compares against the root it is invoked with.
+-- It is nullable: a root that is not valid UTF-8 cannot be recorded exactly, and a lossy rendering
+-- would let a different workspace compare equal, so it is recorded as absent instead.
+-- `workspace_id` stays a display name and is never compared.
 CREATE TABLE IF NOT EXISTS index_metadata (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version      INTEGER NOT NULL,
     workspace_id        TEXT    NOT NULL,
+    workspace_root      TEXT,
     analyzer_name       TEXT    NOT NULL,
     analyzer_version    TEXT    NOT NULL,
     environment         TEXT,

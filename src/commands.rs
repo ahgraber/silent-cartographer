@@ -13,13 +13,13 @@ use sha2::{Digest, Sha256};
 use crate::exit::Failure;
 use crate::git::{GitError, GitRepo, SeedMode};
 use crate::graph::join::JoinAccounting;
-use crate::graph::store::GraphStore;
+use crate::graph::store::{GraphStore, StoreOpenError};
 use crate::graph::syntax::Language;
 use crate::graph::{content_hash, ingest};
 use crate::identity::WorkspaceId;
 use crate::query::diff::{self, FileChange};
 use crate::query::impact::{ImpactRequest, shell_quote};
-use crate::query::output::Answer;
+use crate::query::output::{Answer, WorkspaceRelation};
 use crate::query::page::{
     PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination, precheck_cursor,
 };
@@ -176,11 +176,12 @@ pub fn render<T: serde::Serialize + crate::render::HumanRender>(
 /// Open an existing index store for a read-only query, refusing to create one as a side effect.
 ///
 /// A query must never bring an empty store into being merely by being asked, so a missing database
-/// file is reported as an absent index before the connection is opened (the connection would
-/// otherwise create the file). A store present but written under a different schema version surfaces
-/// through [`GraphStore::open`]'s typed guard. A schema-stamped store that carries no build metadata —
-/// a never-completed build, its tables created but never populated — is likewise reported as an absent
-/// index rather than answered as an empty one, since no build has actually run against it.
+/// file is reported as an absent index naming the build that would fix it, and nothing is written at
+/// the path. A file present that c10r did not create, and a store present but written under a
+/// different schema version, both surface through [`GraphStore::open`]'s typed guards. A
+/// schema-stamped store that carries no build metadata — a never-completed build, its tables created
+/// but never populated — is reported as an absent index rather than answered as an empty one, since
+/// no build has actually run against it.
 fn open_query_store(db: &Path) -> Result<GraphStore> {
     if !db.exists() {
         return Err(Failure::NoIndex(format!("no index found at {}; run `c10r build` first", db.display())).into());
@@ -194,6 +195,33 @@ fn open_query_store(db: &Path) -> Result<GraphStore> {
         .into());
     }
     Ok(store)
+}
+
+/// How the store's recorded workspace relates to the root the query was invoked against: `None` when
+/// they match (a match carries no marker), a disclosure otherwise.
+///
+/// The comparison is between canonicalized roots, so a relative invocation path or a symlinked parent
+/// still reads as the same workspace. It never refuses: the store is c10r's own replayable artifact,
+/// and a repo that moved or a container that remounts the same checkout elsewhere is a legitimate
+/// state — one the marker labels and a rebuild clears. A root that cannot be canonicalized leaves the
+/// comparison unevaluable, which is disclosed as unknown rather than passed off as a match.
+fn workspace_relation(store: &GraphStore, root: &Path) -> Result<Option<WorkspaceRelation>> {
+    // Every arm that cannot produce an exact comparison lands on `Unknown`: no recorded build, no
+    // recorded root, a root that will not resolve, or either side unrepresentable as text. Only an
+    // exact match returns "no marker", so nothing is ever passed off as matched by default.
+    let Some(recorded_root) = store.read_metadata()?.and_then(|meta| meta.workspace_root) else {
+        return Ok(Some(WorkspaceRelation::Unknown));
+    };
+    let Ok(current) = std::fs::canonicalize(root) else {
+        return Ok(Some(WorkspaceRelation::Unknown));
+    };
+    let Some(current) = current.to_str() else {
+        return Ok(Some(WorkspaceRelation::Unknown));
+    };
+    if current == recorded_root {
+        return Ok(None);
+    }
+    Ok(Some(WorkspaceRelation::Mismatched { recorded_root }))
 }
 
 /// The provenance, source hash, and declared environment currently in effect for a workspace root,
@@ -367,11 +395,53 @@ pub fn run_build(
         }
     };
     ensure_parent_dir(db)?;
-    // The write path replaces an incompatible store outright: the index is derived, replayable
-    // data, so rebuild is the migration.
+    let workspace_root = canonical_root(root)?;
+    // The write path replaces an incompatible store of its own outright: the index is derived,
+    // replayable data, so rebuild is the migration. A file c10r did not create is refused instead.
     let mut store = GraphStore::open_or_replace(db).context("opening index database")?;
-    let accounting = ingest(&mut store, &workspace_id, &index, &sources).map_err(|e| anyhow!("ingest failed: {e}"))?;
+    disclose_workspace_handoff(&store, workspace_root.as_deref());
+    let accounting = ingest(&mut store, &workspace_id, workspace_root.as_deref(), &index, &sources)
+        .map_err(|e| anyhow!("ingest failed: {e}"))?;
     Ok(accounting)
+}
+
+/// The canonicalized workspace root a build records and a query compares against, or `None` when the
+/// path cannot be represented exactly.
+///
+/// Canonicalization is what makes the comparison meaningful: two spellings of the same directory —
+/// a relative path, a symlinked parent — must read as the same workspace. The conversion to text is
+/// strict rather than lossy: a lossy rendering maps distinct paths onto the same string, and two
+/// workspaces that collided there would compare equal, which is the one answer the comparison must
+/// never give wrongly. A path that will not convert is recorded as absent instead.
+fn canonical_root(root: &Path) -> Result<Option<String>> {
+    let canonical =
+        std::fs::canonicalize(root).with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
+    Ok(canonical.to_str().map(str::to_string))
+}
+
+/// The handoff notice for a build over a store recorded for a different workspace: both roots named,
+/// or `None` when the store already describes this workspace.
+///
+/// The build re-records the root, so the handoff is a one-time announcement rather than a refusal: a
+/// store is replayable data, and a moved or re-pointed workspace is a legitimate thing to do. A store
+/// carrying no readable metadata — freshly created, or just replaced at a new schema version — has no
+/// prior identity to disclose, which is why the guarantee reaches only current-version stores.
+fn workspace_handoff_notice(store: &GraphStore, workspace_root: Option<&str>) -> Option<String> {
+    let recorded = store.read_metadata().ok().flatten()?.workspace_root?;
+    let rebuilding_for = workspace_root?;
+    if recorded == rebuilding_for {
+        return None;
+    }
+    Some(format!(
+        "warning: the index at this path was built for workspace root {recorded}; rebuilding it for {rebuilding_for}"
+    ))
+}
+
+/// Emit the workspace-handoff notice, if the build is taking a store over from another workspace.
+fn disclose_workspace_handoff(store: &GraphStore, workspace_root: Option<&str>) {
+    if let Some(notice) = workspace_handoff_notice(store, workspace_root) {
+        eprintln!("{}", crate::render::sanitize(&notice));
+    }
 }
 
 /// The one-line `build` accounting summary: every per-rule acceptance bucket inside the
@@ -437,16 +507,30 @@ pub fn build_accounting_json(accounting: &JoinAccounting) -> serde_json::Value {
 
 /// Build directly from a pre-produced index (used where a live analyzer is unavailable, e.g. tests
 /// and the exemplar fixtures).
+///
+/// `root` is the workspace the index describes: it is recorded canonicalized, exactly as `run_build`
+/// records it, so a store built this way carries the same workspace identity a query compares
+/// against.
 pub fn build_from_index(
     db: &Path,
     workspace: &str,
+    root: &Path,
     index: &ExtractedIndex,
     sources: &[(String, String)],
 ) -> Result<()> {
     ensure_parent_dir(db)?;
+    let workspace_root = canonical_root(root)?;
     // Same write-path replacement policy as `run_build`.
     let mut store = GraphStore::open_or_replace(db).context("opening index database")?;
-    ingest(&mut store, &WorkspaceId::new(workspace), index, sources).map_err(|e| anyhow!("ingest failed: {e}"))?;
+    disclose_workspace_handoff(&store, workspace_root.as_deref());
+    ingest(
+        &mut store,
+        &WorkspaceId::new(workspace),
+        workspace_root.as_deref(),
+        index,
+        sources,
+    )
+    .map_err(|e| anyhow!("ingest failed: {e}"))?;
     Ok(())
 }
 
@@ -511,6 +595,13 @@ pub fn run_status(
             "group_count": duplicated_groups.len(),
         },
     });
+
+    // The workspace-relationship disclosure rides beside freshness, exactly as it does on a query
+    // answer: absent on a match, present otherwise. `workspace` above is the store's display
+    // identity, which is never what the comparison turns on.
+    if let Some(relation) = workspace_relation(&store, root)? {
+        report["workspace_relation"] = serde_json::to_value(&relation)?;
+    }
 
     if duplicates {
         report["duplicated_descriptors"]["groups"] = serde_json::json!(
@@ -594,14 +685,41 @@ pub fn run_status(
 /// — when one has — its workspace identity and freshness. Reuses the same metadata/freshness read
 /// `status` performs, kept small (no join-accounting detail; that is `status`'s job).
 ///
-/// An agent orienting on arrival may not have built an index yet, so a missing or unreadable index
-/// answers `{"built": false}` rather than failing `manifest` itself: unlike a query, `manifest` does
-/// not need an index to answer.
+/// An agent orienting on arrival may not have built an index yet, so no usable index answers
+/// `built: false` rather than failing `manifest` itself: unlike a query, `manifest` does not need an
+/// index to answer. Why it is unusable still travels with that answer — a file c10r did not create and
+/// a path whose contents cannot be examined each carry their own reading, distinct from an absent
+/// index and from each other, because their remedies are opposite (build here, versus point `--db`
+/// somewhere else) and collapsing them would invite an agent to build over data that is not c10r's.
 pub fn index_state(db: &Path, root: &Path, rust_analyzer: &str) -> serde_json::Value {
-    if !db.exists() {
-        return serde_json::json!({ "built": false });
+    match crate::graph::store::recognize_store(db) {
+        Ok(crate::graph::store::StoreRecognition::Absent) => return serde_json::json!({ "built": false }),
+        Ok(crate::graph::store::StoreRecognition::Unrecognized) => {
+            return serde_json::json!({ "built": false, "store": "unrecognized" });
+        }
+        Ok(crate::graph::store::StoreRecognition::Recognized) => {}
+        // A path that cannot be examined is its own reading: neither absent nor refused by marker.
+        // Collapsing it onto absent would answer with the one remedy the guard exists to withhold —
+        // build here — against something orientation never established the nature of.
+        Err(_) => return serde_json::json!({ "built": false, "store": "unreadable" }),
     }
-    read_index_state(db, root, rust_analyzer).unwrap_or_else(|_| serde_json::json!({ "built": false }))
+    match read_index_state(db, root, rust_analyzer) {
+        Ok(state) => state,
+        // A store that cleared recognition but carries a schema version this binary does not read is
+        // its own reading too. An index does exist at the path, which "absent" denies: every query
+        // against it names the version mismatch and refuses, so orientation reporting nothing there
+        // would disagree with the rest of the surface about the same file.
+        Err(error) if version_mismatched(&error) => serde_json::json!({ "built": false, "store": "incompatible" }),
+        Err(_) => serde_json::json!({ "built": false }),
+    }
+}
+
+/// Whether `error` carries a store-open refusal over a recognized store's schema version.
+fn version_mismatched(error: &anyhow::Error) -> bool {
+    matches!(
+        error.chain().find_map(|e| e.downcast_ref::<StoreOpenError>()),
+        Some(StoreOpenError::SchemaVersionMismatch { .. })
+    )
 }
 
 fn read_index_state(db: &Path, root: &Path, rust_analyzer: &str) -> Result<serde_json::Value> {
@@ -684,6 +802,7 @@ pub fn run_get(
 
     let store = open_query_store(db)?;
     let index_hash = recorded_index_hash(&store)?;
+    let relation = workspace_relation(&store, root)?;
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment);
 
@@ -707,7 +826,7 @@ pub fn run_get(
         from: Some(from),
         index_hash,
     };
-    let answer = apply_pagination(answer, effective_limit, cursor, &identity)?;
+    let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
     Ok(render(&answer, json, styled))
 }
 
@@ -757,6 +876,7 @@ pub fn run_trace(
     precheck_cursor(cursor, effective_limit)?;
     let store = open_query_store(db)?;
     let index_hash = recorded_index_hash(&store)?;
+    let relation_disclosure = workspace_relation(&store, root)?;
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment);
     let identity = PageIdentity {
@@ -776,11 +896,13 @@ pub fn run_trace(
         let answer = engine.dependents(reference, depth.unwrap_or(1), detail, effective_max_lines)?;
         // Dependents pages its detailed rows under the limit; the depth/horizon/disclosure/beyond-bound
         // summary is repeated on every page as context.
-        let answer = apply_dependents_pagination(answer, effective_limit, cursor, &identity)?;
+        let answer = apply_dependents_pagination(answer, effective_limit, cursor, &identity)?
+            .with_workspace_relation(relation_disclosure);
         return Ok(render(&answer, json, styled));
     }
     let answer = engine.trace(reference, relation, detail, effective_max_lines)?;
-    let answer = apply_pagination(answer, effective_limit, cursor, &identity)?;
+    let answer =
+        apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation_disclosure);
     Ok(render(&answer, json, styled))
 }
 
@@ -805,6 +927,7 @@ pub fn run_find(
     precheck_cursor(cursor, effective_limit)?;
     let store = open_query_store(db)?;
     let index_hash = recorded_index_hash(&store)?;
+    let relation = workspace_relation(&store, root)?;
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment);
     let answer = engine.find(fragment)?;
@@ -819,7 +942,7 @@ pub fn run_find(
         from: None,
         index_hash,
     };
-    let answer = apply_pagination(answer, effective_limit, cursor, &identity)?;
+    let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
     Ok(render(&answer, json, styled))
 }
 
@@ -892,6 +1015,7 @@ pub fn run_impact(
 
     let store = open_query_store(db)?;
     let page_index_hash = recorded_index_hash(&store)?;
+    let relation = workspace_relation(&store, root)?;
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
     let meta = store
         .read_metadata()?
@@ -1053,7 +1177,8 @@ pub fn run_impact(
         from: None,
         index_hash: page_index_hash,
     };
-    let answer = apply_impact_pagination(answer, effective_limit, cursor, &identity)?;
+    let answer =
+        apply_impact_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
     Ok(render(&answer, json, styled))
 }
 
@@ -1198,14 +1323,14 @@ pub struct CacheOutcome {
 }
 
 /// `cache`: remove the stored index at `db`. An already-absent index is success with `removed:
-/// false`. Removal applies only to a recognizable index store: the target must be a SQLite database
-/// carrying a nonzero `user_version` stamp (the schema-version stamp every `c10r build` writes), so a
-/// mis-pointed `--db` cannot unlink an unrelated file — that target is refused with a teaching message
-/// naming the manual alternative. An empty (0-byte) file is a failed-create artifact and stays
-/// removable. When an index is removed, its SQLite WAL/SHM sidecar files (present under concurrent
-/// access) are removed alongside it on a best-effort basis — their absence or removal failure never
-/// fails the command, since the primary database file is the index's identity. An OS error removing
-/// the primary file is surfaced to the caller, naming the path.
+/// false`. Removal applies only to a store c10r created — recognized by the ownership marker in the
+/// file header, the same test every other store-touching path consults — so a mis-pointed `--db`
+/// cannot unlink an unrelated file, not even another application's versioned database; that target is
+/// refused with a teaching message naming the manual alternative. When an index is removed, its
+/// SQLite WAL/SHM sidecar files (present under concurrent access) are removed alongside it on a
+/// best-effort basis — their absence or removal failure never fails the command, since the primary
+/// database file is the index's identity. An OS error removing the primary file is surfaced to the
+/// caller, naming the path.
 pub fn run_cache(db: &Path) -> Result<CacheOutcome> {
     if !db.exists() {
         return Ok(CacheOutcome {
@@ -1214,11 +1339,16 @@ pub fn run_cache(db: &Path) -> Result<CacheOutcome> {
         });
     }
     if !is_removable_index(db)? {
-        return Err(anyhow!(
-            "{path} is not a c10r index (missing SQLite header or version stamp); refusing to remove it \
+        // The ownership category, the same one a build or a query reaches over this file: what the
+        // caller must do next is decided by the target, not by which command met it. The message
+        // keeps reset's own shape — naming the manual `rm` — because this caller already asked for a
+        // deletion, so naming the manual step is informed consent rather than a footgun.
+        return Err(Failure::UnrecognizedStore(format!(
+            "{path} is not a c10r index store, so c10r will not remove it \
              — if you mean to delete it: rm {path}",
             path = db.display()
-        ));
+        ))
+        .into());
     }
     std::fs::remove_file(db).with_context(|| format!("failed to remove index at {}", db.display()))?;
     // Build the WAL/SHM sidecar paths by pushing the suffix onto the primary path's os-string, so a
@@ -1235,48 +1365,19 @@ pub fn run_cache(db: &Path) -> Result<CacheOutcome> {
     })
 }
 
-/// Whether the file at `db` is a recognizable c10r index store safe to remove.
+/// Whether the file at `db` is a store c10r created, and so safe for `cache` to remove.
 ///
-/// A c10r index is a SQLite database — identified by the 16-byte magic header `SQLite format 3\0` —
-/// carrying a nonzero `user_version` (the big-endian `u32` at header offset 60, which every
-/// `c10r build` stamps with the schema version). A store written under an older schema version still
-/// carries a nonzero stamp, so it remains removable — resetting it is the recovery path. An empty
-/// (0-byte) file is a failed-create artifact and is removable; any other non-index file — a text file,
-/// a SQLite database with a zero `user_version` — is refused so `cache` never unlinks an unrelated
-/// file at a mis-pointed `--db` path.
+/// The decision is the shared ownership recognizer's: a SQLite database carrying c10r's own
+/// application marker. A store written under an older schema version still carries the marker, so it
+/// remains removable — resetting it is the recovery path. Anything else — a text file, an empty file,
+/// another application's database however it is versioned — is refused, so `cache` never unlinks an
+/// unrelated file at a mis-pointed `--db` path.
 fn is_removable_index(db: &Path) -> Result<bool> {
-    // Any I/O error (including a directory at the path) is surfaced naming the path, so a failed
-    // inspection reads as a path-named operational failure rather than a bare OS error.
-    index_header_decision(db).with_context(|| format!("inspecting index store at {}", db.display()))
-}
-
-/// The header-guard decision for [`is_removable_index`], returning the raw I/O result so the caller
-/// can attach path context once.
-fn index_header_decision(db: &Path) -> std::io::Result<bool> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(db)?;
-    let mut header = [0u8; 64];
-    let mut filled = 0;
-    loop {
-        let n = file.read(&mut header[filled..])?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-        if filled == header.len() {
-            break;
-        }
-    }
-    if filled == 0 {
-        // An empty file is a failed-create artifact, not a foreign file: removable.
-        return Ok(true);
-    }
-    if filled < header.len() || &header[0..16] != b"SQLite format 3\0" {
-        return Ok(false);
-    }
-    let user_version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
-    Ok(user_version != 0)
+    // A path that cannot be examined refuses through the same typed error every other store-touching
+    // path raises, so a failed inspection reads as an ownership refusal naming the cause rather than a
+    // bare OS error — and it never becomes a verdict that the target is somebody else's.
+    let recognition = crate::graph::store::recognize_or_refuse(db)?;
+    Ok(matches!(recognition, crate::graph::store::StoreRecognition::Recognized))
 }
 
 /// The rendering of a `cache` report: the JSON structured answer under `--json`, or a one-line human
@@ -1466,7 +1567,71 @@ fn ensure_parent_dir(db: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::graph::content_hash;
+    use crate::graph::join::JoinAccounting;
+    use crate::graph::store::IndexMetadata;
     use crate::query::diff::ChangeKind;
+
+    /// A store recording `workspace_root` as the workspace it describes.
+    fn store_recorded_for(workspace_root: &str) -> GraphStore {
+        let store = GraphStore::open_in_memory().unwrap();
+        store
+            .write_metadata(&IndexMetadata {
+                workspace_id: WorkspaceId::new("ws"),
+                workspace_root: Some(workspace_root.to_string()),
+                provenance: AnalyzerProvenance {
+                    analyzer_name: "test".to_string(),
+                    analyzer_version: "0".to_string(),
+                },
+                content_hash: "hash".to_string(),
+                accounting: JoinAccounting::default(),
+                environment: None,
+            })
+            .unwrap();
+        store
+    }
+
+    // A comparison that cannot be evaluated — here, a query root that does not resolve — is disclosed
+    // as unknown. Reporting nothing would be indistinguishable from a match, which is the one thing
+    // an unevaluable comparison must never look like.
+    #[test]
+    fn an_unevaluable_workspace_comparison_is_disclosed_as_unknown() {
+        let store = store_recorded_for("/projects/ws");
+
+        let relation = workspace_relation(&store, Path::new("/no/such/directory/anywhere")).unwrap();
+
+        assert_eq!(
+            relation,
+            Some(WorkspaceRelation::Unknown),
+            "an unresolvable root leaves the relationship unknown, never implied to match"
+        );
+    }
+
+    // A store with no recorded build cannot be compared either, and is likewise disclosed as unknown.
+    #[test]
+    fn a_store_without_metadata_is_disclosed_as_unknown() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let relation = workspace_relation(&store, dir.path()).unwrap();
+
+        assert_eq!(relation, Some(WorkspaceRelation::Unknown));
+    }
+
+    // A build taking a store over from another workspace announces the handoff naming both roots;
+    // rebuilding a store for the workspace it already describes says nothing.
+    #[test]
+    fn the_workspace_handoff_notice_names_both_roots_only_on_a_handoff() {
+        let store = store_recorded_for("/projects/first");
+
+        let notice = workspace_handoff_notice(&store, Some("/projects/second")).expect("a handoff is disclosed");
+        assert!(notice.contains("/projects/first"), "names the recorded root: {notice}");
+        assert!(notice.contains("/projects/second"), "names the new root: {notice}");
+
+        assert!(
+            workspace_handoff_notice(&store, Some("/projects/first")).is_none(),
+            "rebuilding in place is not a handoff"
+        );
+    }
 
     fn change(kind: ChangeKind, pre_path: Option<&str>, post_path: Option<&str>) -> FileChange {
         FileChange {

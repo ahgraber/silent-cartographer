@@ -428,10 +428,25 @@ fn doctor_handles_an_indexer_that_floods_its_version_output() {
     );
 }
 
-/// Write a SQLite database file at `path` carrying the SQLite magic header and the given
-/// `user_version` stamp — a nonzero stamp marks it a recognizable c10r index store, a zero stamp a
-/// bare SQLite file that is not one.
-fn write_sqlite_store(path: &Path, user_version: i64) {
+/// Write a database at `path` carrying c10r's ownership marker at the given schema version — a store
+/// c10r recognizes as its own.
+fn write_c10r_store(path: &Path, user_version: i64) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch("CREATE TABLE t (x)").unwrap();
+    conn.pragma_update(
+        None,
+        "application_id",
+        silent_cartographer::graph::store::APPLICATION_ID,
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", user_version).unwrap();
+    drop(conn);
+}
+
+/// Write a database at `path` that another application created: a real SQLite file carrying its own
+/// version stamp and no c10r marker. Version stamps are what nearly every application puts in
+/// `user_version`, so this is what a mis-pointed `--db` most plausibly lands on.
+fn write_foreign_store(path: &Path, user_version: i64) {
     let conn = rusqlite::Connection::open(path).unwrap();
     conn.execute_batch("CREATE TABLE t (x)").unwrap();
     conn.pragma_update(None, "user_version", user_version).unwrap();
@@ -445,7 +460,7 @@ fn write_sqlite_store(path: &Path, user_version: i64) {
 fn cache_removes_a_valid_index_store() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    write_sqlite_store(&db, 11);
+    write_c10r_store(&db, 11);
 
     let out = c10r().args(["--json", "--db"]).arg(&db).arg("cache").output().unwrap();
 
@@ -471,7 +486,7 @@ fn cache_removes_a_valid_index_store() {
 fn cache_human_success_line_names_the_removed_path() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    write_sqlite_store(&db, 11);
+    write_c10r_store(&db, 11);
 
     let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
 
@@ -496,7 +511,7 @@ fn cache_human_success_line_names_the_removed_path() {
 fn cache_removes_a_store_with_an_older_user_version() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    write_sqlite_store(&db, 999);
+    write_c10r_store(&db, 999);
 
     let out = c10r().args(["--json", "--db"]).arg(&db).arg("cache").output().unwrap();
 
@@ -509,21 +524,23 @@ fn cache_removes_a_store_with_an_older_user_version() {
     assert!(!db.exists(), "the older-version index was removed");
 }
 
-// _(Index reset: a non-index target is refused)_ — a SQLite file whose `user_version` is zero carries
-// no build stamp, so `cache` refuses to remove it, leaving the file intact and exiting with a failure
-// code rather than the usage code.
+// _(Index reset: a foreign versioned database is refused)_ — a database another application created
+// and stamped with its own version carries no c10r marker, so `cache` refuses to remove it, leaving
+// the file intact and exiting with a failure code rather than the usage code. A version stamp alone
+// is what nearly every SQLite application writes, so it can never stand in for ownership.
 #[test]
-fn cache_refuses_a_sqlite_file_with_a_zero_user_version() {
+fn cache_refuses_a_foreign_versioned_database() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    write_sqlite_store(&db, 0);
+    write_foreign_store(&db, 7);
 
     let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
 
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "an unstamped SQLite file is refused as a plain operational failure, not a usage error"
+        Some(6),
+        "another application's database is refused in the ownership category, like every other target \
+         the guard cannot confirm is c10r's own"
     );
     assert!(db.exists(), "the refused file is left intact");
     assert!(
@@ -550,8 +567,8 @@ fn cache_refuses_a_non_sqlite_text_file_naming_the_rm_alternative() {
 
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "a foreign file is refused, not silently removed"
+        Some(6),
+        "a foreign file is refused in the ownership category, not silently removed"
     );
     assert!(db.exists(), "the foreign file is left intact");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -565,10 +582,42 @@ fn cache_refuses_a_non_sqlite_text_file_naming_the_rm_alternative() {
     );
 }
 
-// _(Index reset: an empty file is a failed-create artifact)_ — a zero-byte file at the `--db` path is a
-// failed-create artifact, not a foreign file, so `cache` removes it as a success.
+// _(Store ownership recognition: an unexaminable path is refused without an ownership claim)_ — a
+// directory at the `--db` path cannot be examined, so `cache` refuses it naming the path and the
+// cause, leaves it in place, and exits with the ownership code. The raw OS error never reaches the
+// caller alone, and the refusal never claims the target is somebody else's — the read that would have
+// established that never completed.
 #[test]
-fn cache_removes_an_empty_file_as_success() {
+fn cache_refuses_a_path_it_cannot_examine() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join(".c10r");
+    std::fs::create_dir(&db).unwrap();
+
+    let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "an unexaminable path exits with the ownership code"
+    );
+    assert!(db.is_dir(), "the directory is left where it was");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot read") && stderr.contains(&db.display().to_string()),
+        "the refusal names the path and that it could not be read: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is not a c10r index store"),
+        "no ownership verdict is claimed: {stderr}"
+    );
+}
+
+// _(Index reset: a non-index target is refused — empty file)_ — a zero-byte file at the `--db` path
+// carries no ownership marker, so `cache` refuses it and leaves it intact. Store creation is atomic
+// (built beside the path, renamed into place), so an empty file there is never c10r's own leftover —
+// it is somebody else's file, and unlinking it on a guess is exactly what the guard exists to stop.
+#[test]
+fn cache_refuses_an_empty_file() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     std::fs::write(&db, b"").unwrap();
@@ -577,15 +626,14 @@ fn cache_removes_an_empty_file_as_success() {
 
     assert_eq!(
         out.status.code(),
-        Some(0),
-        "an empty failed-create artifact is removed as success; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        Some(6),
+        "an empty file is refused in the ownership category, not unlinked on a guess"
     );
-    assert!(!db.exists(), "the empty artifact was removed");
-    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
-    assert_eq!(
-        report["removed"], true,
-        "the empty artifact's removal is disclosed: {report}"
+    assert!(db.exists(), "the refused file is left intact");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not a c10r index") && stderr.contains(&format!("rm {}", db.display())),
+        "the refusal names the manual alternative: {stderr}"
     );
 }
 
@@ -609,18 +657,39 @@ fn cache_is_success_when_there_is_nothing_to_remove() {
     assert_eq!(report["removed"], false, "nothing was removed: {report}");
 }
 
-// _(Index reset: removal error names the path)_ — an OS error removing the index (the path is a
-// directory, not a file) is reported as a failure naming the affected path, exiting with a failure
-// code.
+// _(Index reset: removal error names the path)_ — an OS error removing the index is reported as a
+// failure naming the affected path, exiting with a failure code.
+//
+// The store here is genuinely c10r's own and clears the ownership guard; what fails is the unlink
+// itself, because the directory holding it is not writable. That ordering is the point: a target the
+// guard refuses never reaches `remove_file`, so a fixture the guard rejects (a directory, a foreign
+// file) cannot exercise this scenario at all.
+#[cfg(unix)]
 #[test]
 fn cache_removal_os_error_names_the_path() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("index.db");
-    std::fs::create_dir(&db).unwrap(); // a directory at the db path: remove_file errors on it
+    let holder = dir.path().join("held");
+    std::fs::create_dir(&holder).unwrap();
+    let db = holder.join("index.db");
+    write_c10r_store(&db, 11);
+    std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o500)).unwrap();
 
     let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
 
-    assert_ne!(out.status.code(), Some(0), "an OS removal error is not success");
+    // Root unlinks straight through the directory's write bit, so the failure is unobservable there.
+    let unlinked = !db.exists();
+    std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if unlinked {
+        return;
+    }
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failed unlink is an operational failure, not an ownership refusal — the store was c10r's own"
+    );
     assert!(
         out.stdout.is_empty(),
         "no answer on standard output when the command fails"
@@ -630,5 +699,5 @@ fn cache_removal_os_error_names_the_path() {
         stderr.contains(&db.display().to_string()),
         "the failure diagnostic names the affected path: {stderr}"
     );
-    assert!(db.exists(), "the directory at the db path is untouched");
+    assert!(db.exists(), "the store the unlink failed on is still there");
 }

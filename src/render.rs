@@ -12,7 +12,7 @@
 
 use crate::cli::ColorArg;
 use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
-use crate::query::output::{Answer, ContentLines, Location, Outcome, PageInfo, SymbolView};
+use crate::query::output::{Answer, ContentLines, Location, Outcome, PageInfo, SymbolView, WorkspaceRelation};
 use crate::query::{DependentsReport, FindItem, HorizonDisclosure, SymbolDetail, TraceItem};
 
 const BOLD: &str = "\x1b[1m";
@@ -95,6 +95,11 @@ pub fn should_style(color: ColorArg, json: bool, stdout_is_terminal: bool) -> bo
 pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(header_line(answer, styled));
+    // The workspace disclosure sits directly under the header, above any result, so a human consumer
+    // cannot miss what the structural field tells a machine consumer.
+    if let Some(line) = workspace_relation_line(answer) {
+        lines.push(line);
+    }
     match &answer.outcome {
         Outcome::Found { results } => {
             // The heuristic-grade marker renders above the results, so a human consumer cannot
@@ -386,6 +391,89 @@ fn header_line<T>(answer: &Answer<T>, styled: bool) -> String {
         freshness_label(answer.freshness)
     );
     bold(&base, styled)
+}
+
+/// The workspace-relationship disclosure line, when the answer carries one: a matched workspace
+/// carries no line, mirroring the machine answer's absent field.
+///
+/// The recorded root is caller-supplied text that reached the store through `--db`/the build root, so
+/// it is sanitized like every other structural value the terminal sees.
+fn workspace_relation_line<T>(answer: &Answer<T>) -> Option<String> {
+    match answer.workspace_relation.as_ref()? {
+        WorkspaceRelation::Mismatched { recorded_root } => Some(format!(
+            "warning: this index describes a different workspace (built for {})",
+            sanitize(recorded_root)
+        )),
+        WorkspaceRelation::Unknown => {
+            Some("warning: whether this index describes this workspace could not be determined".to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_disclosure_tests {
+    use super::*;
+    use crate::graph::store::Freshness;
+    use crate::query::output::Provenance;
+
+    fn answer(relation: Option<WorkspaceRelation>) -> Answer<SymbolDetail> {
+        Answer::empty(
+            Provenance {
+                analyzer_name: "test".to_string(),
+                analyzer_version: "0".to_string(),
+            },
+            Freshness::Fresh,
+        )
+        .with_workspace_relation(relation)
+    }
+
+    // Each disclosed state reaches the human render as its own line, and a matched workspace reaches
+    // it as nothing at all — the same three-way shape the machine answer carries.
+    #[test]
+    fn each_workspace_state_renders_as_its_own_line() {
+        let matched = to_human(&answer(None), false);
+        assert!(
+            !matched.contains("workspace"),
+            "a match renders no workspace line: {matched}"
+        );
+
+        let mismatched = to_human(
+            &answer(Some(WorkspaceRelation::Mismatched {
+                recorded_root: "/projects/other".to_string(),
+            })),
+            false,
+        );
+        assert!(
+            mismatched.contains("different workspace") && mismatched.contains("/projects/other"),
+            "a mismatch names the workspace the store describes: {mismatched}"
+        );
+
+        let unknown = to_human(&answer(Some(WorkspaceRelation::Unknown)), false);
+        assert!(
+            unknown.contains("could not be determined"),
+            "an unevaluable comparison reads as undetermined, not as a match: {unknown}"
+        );
+        assert!(
+            !unknown.contains("different workspace"),
+            "an unevaluable comparison is not reported as a mismatch: {unknown}"
+        );
+    }
+
+    // The recorded root reaches the terminal sanitized: it is caller-supplied text that entered the
+    // store through a build root, so it gets the same escape guard every structural value gets.
+    #[test]
+    fn the_recorded_root_is_sanitized_before_it_reaches_the_terminal() {
+        let hostile = to_human(
+            &answer(Some(WorkspaceRelation::Mismatched {
+                recorded_root: "/projects/\u{1b}[31mred".to_string(),
+            })),
+            false,
+        );
+        assert!(
+            !hostile.contains('\u{1b}'),
+            "no raw escape byte reaches the render: {hostile:?}"
+        );
+    }
 }
 
 /// The "N results" header for a row-bearing answer.

@@ -52,6 +52,26 @@ c10r hooks install
 This installs a post-commit hook that reruns `c10r build`, resolved through git so it lands wherever this worktree actually keeps its hooks — a linked worktree or a relocated `core.hooksPath` included.
 It refuses rather than overwrites when a hook is already present at that path; add the `c10r build` line to your existing hook by hand instead.
 
+### The index store
+
+The index lives at `--db` (default `.c10r/index.db`), and `c10r` only ever writes to, replaces, or removes a store it created itself.
+Every store is stamped with an ownership marker at creation, and every command checks that marker before it touches the file, so a mistyped `--db`, a symlinked `.c10r` directory, or a path collision cannot destroy or pollute unrelated data.
+A file that is not `c10r`'s own is refused with exit code `6` and left untouched; the refusal names both recoveries — rebuild if it is a stale `c10r` index, or correct `--db` if it belongs to something else — and never tells you to delete it.
+Exit code `6` covers every way that ownership check can fail to clear, including a `--db` path whose contents cannot be read at all — a directory, or a file the process lacks permission for.
+Those refusals name the path and why the read failed, and deliberately claim nothing about whose file it is, since the check never got far enough to establish that.
+`cache` refuses the same targets rather than unlinking them, naming the manual `rm` instead.
+
+Queries never create a store.
+Asking a question against a path where no index exists exits with the no-index code `3` and tells you to run `c10r build`, leaving the path empty.
+A store `c10r` built under an older schema version is its own to replace: `build` rebuilds it in place, while a query refuses it with exit code `4` and names the rebuild.
+
+Stores built before ownership marking carry no marker, so they are refused with the rebuild branch of that message.
+The index is derived, replayable data — run `c10r build` once per store and the refusal is over.
+
+Each store also records the workspace root it was built from.
+An answer read from a store that describes a different workspace carries a `workspace_relation` marker naming that root (and a warning line in the human rendering), separately from the staleness flag: stale means the graph is behind, mismatched means it is about somewhere else.
+Rebuilding in place re-records the root and clears the marker.
+
 ### Assessing impact
 
 Make an edit, then ask what it could affect:

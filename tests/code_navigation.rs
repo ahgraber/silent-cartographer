@@ -18,6 +18,11 @@ use silent_cartographer::semantic::model::{
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
 };
 
+/// The canonicalized workspace root a directly-ingested fixture store records. These stores are never
+/// queried against a real filesystem root, so a stable stand-in keeps the recorded identity out of the
+/// way of what each test is asserting.
+const WS_ROOT: &str = "/test-ws";
+
 fn ws() -> WorkspaceId {
     WorkspaceId::new("test-ws")
 }
@@ -28,7 +33,7 @@ fn sources() -> Vec<(String, String)> {
 
 fn built_store() -> GraphStore {
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &ws(), &support::fixture_index(), &sources()).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &support::fixture_index(), &sources()).unwrap();
     store
 }
 
@@ -142,7 +147,7 @@ pub fn triple(x: u8) -> u8 {
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("tiers.rs".to_string(), source.to_string())];
     let index = one_doc_index("tiers.rs", support::provenance(), vec![double, triple]);
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     (
         store,
         id_of_pkg("tierscrate", &[("double", SegmentKind::Method)]),
@@ -167,7 +172,7 @@ fn module_tier_store() -> (GraphStore, String, CanonicalId) {
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("mymod.rs".to_string(), source.to_string())];
     let index = one_doc_index("mymod.rs", support::provenance(), vec![module]);
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     (
         store,
         source.to_string(),
@@ -211,7 +216,7 @@ fn python_tier_store() -> (GraphStore, CanonicalId) {
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.py".to_string(), source.to_string())];
     let index = py_synthetic_index("m.py", vec![greet]);
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     (
         store,
         id_of_pkg("pkg", &[("m", SegmentKind::Module), ("greet", SegmentKind::Term)]),
@@ -269,7 +274,7 @@ pub const OFFSET: u8 = 1;
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
     let index = one_doc_index("m.rs", support::provenance(), vec![lookup, offset]);
-    ingest(&mut store, &ws(), &index, &src).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     (
         store,
         id_of_pkg("tierscrate", &[("lookup", SegmentKind::Method)]),
@@ -316,7 +321,7 @@ fn ambiguous_shortname_returns_candidates() {
             }],
         });
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &ws(), &index, &sources()).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources()).unwrap();
     let engine = engine_over(&store, support::provenance());
     match engine.resolve("connect").unwrap() {
         Resolution::Ambiguous(rows) => {
@@ -1214,7 +1219,7 @@ fn get_ambiguous_shortname_returns_typed_candidates_in_json() {
             }],
         });
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &ws(), &index, &sources()).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources()).unwrap();
     let engine = engine_over(&store, support::provenance());
 
     let answer = engine.get("connect", Detail::Location, None, 1).unwrap();
@@ -1827,7 +1832,8 @@ fn trace_implementers_with_none_is_typed_absence() {
 fn depth_with_non_dependents_relation_is_a_teaching_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
-    silent_cartographer::commands::build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    silent_cartographer::commands::build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources())
+        .unwrap();
 
     let err = silent_cartographer::commands::run_trace(
         &db,
@@ -1936,6 +1942,7 @@ fn py_store() -> GraphStore {
     ingest(
         &mut store,
         &py_ws(),
+        Some(WS_ROOT),
         &support::python_fixture_index(),
         &support::python_fixture_sources(),
     )
@@ -2213,7 +2220,7 @@ fn tr_store() -> GraphStore {
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &ws(), &index, &tr_sources()).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &tr_sources()).unwrap();
     store
 }
 
@@ -2399,7 +2406,7 @@ fn trace_tests_python_site_returned() {
         ("pkg/test_api.py".to_string(), test_source.to_string()),
     ];
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &py_ws(), &index, &sources).unwrap();
+    ingest(&mut store, &py_ws(), Some(WS_ROOT), &index, &sources).unwrap();
     let provenance = support::python_fixture_index().provenance;
     let hash = silent_cartographer::graph::content_hash(&sources);
     let engine = QueryEngine::new(&store, provenance, hash, None);
@@ -2517,7 +2524,7 @@ fn ambiguous_tests_subject_carries_no_marker() {
             }],
         });
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &ws(), &index, &sources()).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources()).unwrap();
     let engine = engine_over(&store, support::provenance());
 
     let answer = engine.trace("connect", Relation::Tests, None, None).unwrap();

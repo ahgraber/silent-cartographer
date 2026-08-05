@@ -43,6 +43,26 @@ impl From<Freshness> for FreshnessLabel {
     }
 }
 
+/// How the workspace a store was built for relates to the workspace being queried, disclosed on an
+/// answer whenever the relationship is anything other than a match.
+///
+/// A match carries no disclosure at all, so a matched answer's shape is unchanged. The two disclosed
+/// states are kept apart because they license different reactions: a mismatch says the graph
+/// describes somewhere else, while an unevaluable comparison says only that the question could not be
+/// answered — which is never the same as an answered "they match".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkspaceRelation {
+    /// The store records a different workspace root than the one the query was invoked against.
+    Mismatched {
+        /// The workspace root the store was built for.
+        recorded_root: String,
+    },
+    /// The comparison could not be evaluated, so the relationship is unknown — never implied to
+    /// match.
+    Unknown,
+}
+
 /// The identity+name view of a symbol carried in every answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SymbolView {
@@ -142,6 +162,12 @@ pub struct Answer<T> {
     /// unchanged. Rides independently of provenance and freshness, never replacing either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<&'static str>,
+    /// The workspace-relationship disclosure: present when the store describes a different workspace
+    /// than the one queried, or when that comparison could not be evaluated; absent on a match, so a
+    /// matched answer's shape is unchanged. Rides independently of freshness — a store can be current
+    /// and still describe somewhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_relation: Option<WorkspaceRelation>,
     /// The outcome.
     pub outcome: Outcome<T>,
     /// The result-set paging disclosure, present only when a result limit was applied.
@@ -184,6 +210,7 @@ impl<T> Answer<T> {
             freshness: freshness.into(),
             stale: freshness.is_stale(),
             classification: None,
+            workspace_relation: None,
             outcome,
             page: None,
         }
@@ -193,6 +220,13 @@ impl<T> Answer<T> {
     /// heuristic-grade marker every `tests` answer carries, found and empty alike.
     pub fn convention_classified(mut self) -> Self {
         self.classification = Some("convention");
+        self
+    }
+
+    /// Attach the workspace-relationship disclosure, if any: `None` for a matched workspace, which
+    /// carries no marker.
+    pub fn with_workspace_relation(mut self, relation: Option<WorkspaceRelation>) -> Self {
+        self.workspace_relation = relation;
         self
     }
 }

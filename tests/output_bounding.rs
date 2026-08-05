@@ -24,7 +24,8 @@ fn sources() -> Vec<(String, String)> {
 /// Build the exemplar Rust fixture into a store at `dir/index.db` and return its path.
 fn build_fixture_db(dir: &Path) -> PathBuf {
     let db = dir.join("index.db");
-    silent_cartographer::commands::build_from_index(&db, "bound-ws", &support::fixture_index(), &sources()).unwrap();
+    silent_cartographer::commands::build_from_index(&db, "bound-ws", dir, &support::fixture_index(), &sources())
+        .unwrap();
     db
 }
 
@@ -376,7 +377,8 @@ fn token_after_an_index_rebuild_is_a_usage_error() {
 
     // Rebuild the index over changed source content: the recorded content hash shifts.
     let changed = vec![(support::DOC.to_string(), format!("{}\n// changed\n", support::SOURCE))];
-    silent_cartographer::commands::build_from_index(&db, "bound-ws", &support::fixture_index(), &changed).unwrap();
+    silent_cartographer::commands::build_from_index(&db, "bound-ws", dir.path(), &support::fixture_index(), &changed)
+        .unwrap();
 
     let out = c10r(dir.path())
         .arg("--db")
@@ -422,7 +424,7 @@ fn token_after_an_analyzer_version_change_is_a_usage_error() {
     // Rewrite the recorded metadata with a different analyzer version, leaving the content-hash
     // untouched — the same source, a different extractor build.
     {
-        let store = GraphStore::open(&db).unwrap();
+        let store = GraphStore::open_or_replace(&db).unwrap();
         let mut meta = store.read_metadata().unwrap().expect("the fixture recorded metadata");
         meta.provenance.analyzer_version = format!("{}-changed", meta.provenance.analyzer_version);
         store.write_metadata(&meta).unwrap();
@@ -514,12 +516,12 @@ fn lines_body(n: usize) -> String {
 /// A store at `dir/index.db` holding `count` symbols named `widgetNN`, for result-set bounding.
 fn build_widget_db(dir: &Path, count: usize) -> PathBuf {
     let db = dir.join("index.db");
-    let store = GraphStore::open(&db).unwrap();
+    let store = GraphStore::open_or_replace(&db).unwrap();
     for i in 0..count {
         let name = format!("widget{i:02}");
         put_symbol(&store, &name, &name, None);
     }
-    support::stamp_metadata(&store, "bound-ws");
+    support::stamp_metadata(&store, "bound-ws", dir);
     db
 }
 
@@ -527,7 +529,7 @@ fn build_widget_db(dir: &Path, count: usize) -> PathBuf {
 /// for bounding the `tests` relation.
 fn build_tests_relation_db(dir: &Path, count: usize) -> PathBuf {
     let db = dir.join("index.db");
-    let store = GraphStore::open(&db).unwrap();
+    let store = GraphStore::open_or_replace(&db).unwrap();
     put_symbol(&store, "subject", "subject", None);
     for i in 0..count {
         let name = format!("tcase{i:02}");
@@ -558,7 +560,7 @@ fn build_tests_relation_db(dir: &Path, count: usize) -> PathBuf {
             })
             .unwrap();
     }
-    support::stamp_metadata(&store, "bound-ws");
+    support::stamp_metadata(&store, "bound-ws", dir);
     db
 }
 
@@ -720,9 +722,9 @@ fn get_body_default_max_lines_caps_at_one_hundred() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     {
-        let store = GraphStore::open(&db).unwrap();
+        let store = GraphStore::open_or_replace(&db).unwrap();
         put_symbol(&store, "bigfn", "bigfn", Some(&lines_body(150)));
-        support::stamp_metadata(&store, "bound-ws");
+        support::stamp_metadata(&store, "bound-ws", dir.path());
     }
 
     let out = c10r(dir.path())
@@ -762,13 +764,13 @@ fn trace_row_default_max_lines_caps_at_ten() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     {
-        let store = GraphStore::open(&db).unwrap();
+        let store = GraphStore::open_or_replace(&db).unwrap();
         put_symbol(&store, "container", "container", None);
         put_symbol(&store, "member", "member", Some(&lines_body(20)));
         store
             .insert_edge(EdgeKind::Contains, &ws_id("container"), &ws_id("member"))
             .unwrap();
-        support::stamp_metadata(&store, "bound-ws");
+        support::stamp_metadata(&store, "bound-ws", dir.path());
     }
 
     let out = c10r(dir.path())
@@ -806,9 +808,9 @@ fn from_windows_get_content_and_handles_past_the_end() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     {
-        let store = GraphStore::open(&db).unwrap();
+        let store = GraphStore::open_or_replace(&db).unwrap();
         put_symbol(&store, "win", "win", Some(&lines_body(5)));
-        support::stamp_metadata(&store, "bound-ws");
+        support::stamp_metadata(&store, "bound-ws", dir.path());
     }
 
     // A middle window: two lines from line 2.
@@ -951,12 +953,12 @@ fn ambiguous_candidates_capped_with_disclosed_remainder() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     {
-        let store = GraphStore::open(&db).unwrap();
+        let store = GraphStore::open_or_replace(&db).unwrap();
         // Four distinct symbols sharing the shortname `dup`.
         for i in 0..4 {
             put_symbol(&store, &format!("dup{i}"), "dup", None);
         }
-        support::stamp_metadata(&store, "bound-ws");
+        support::stamp_metadata(&store, "bound-ws", dir.path());
     }
 
     let out = c10r(dir.path())
@@ -1003,7 +1005,7 @@ fn ambiguous_candidates_capped_with_disclosed_remainder() {
 /// depth-1 impact answer holds `direct` detailed rows and a nonempty beyond-bound aggregate.
 fn build_dependents_db(dir: &Path, direct: usize) -> PathBuf {
     let db = dir.join("index.db");
-    let store = GraphStore::open(&db).unwrap();
+    let store = GraphStore::open_or_replace(&db).unwrap();
     put_symbol(&store, "sub", "sub", None);
     for i in 0..direct {
         let name = format!("dep{i:02}");
@@ -1015,7 +1017,7 @@ fn build_dependents_db(dir: &Path, direct: usize) -> PathBuf {
     store
         .insert_edge(EdgeKind::Uses, &ws_id("deep"), &ws_id("dep00"))
         .unwrap();
-    support::stamp_metadata(&store, "bound-ws");
+    support::stamp_metadata(&store, "bound-ws", dir);
     db
 }
 
@@ -1177,9 +1179,9 @@ fn a_huge_max_lines_with_a_nonzero_from_does_not_overflow() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     {
-        let store = GraphStore::open(&db).unwrap();
+        let store = GraphStore::open_or_replace(&db).unwrap();
         put_symbol(&store, "win", "win", Some(&lines_body(5)));
-        support::stamp_metadata(&store, "bound-ws");
+        support::stamp_metadata(&store, "bound-ws", dir.path());
     }
 
     let out = c10r(dir.path())

@@ -20,7 +20,7 @@ fn sources() -> Vec<(String, String)> {
 /// Build the exemplar Rust fixture into a store at `dir/index.db` and return its path.
 fn build_fixture_db(dir: &Path) -> PathBuf {
     let db = dir.join("index.db");
-    silent_cartographer::commands::build_from_index(&db, "op-ws", &support::fixture_index(), &sources()).unwrap();
+    silent_cartographer::commands::build_from_index(&db, "op-ws", dir, &support::fixture_index(), &sources()).unwrap();
     db
 }
 
@@ -205,7 +205,7 @@ fn no_index_code_on_a_schema_stamped_metadata_less_store() {
     // Opening a store at the path creates the schema and stamps the version, but writes no metadata —
     // the shape a build leaves if it never completes.
     {
-        let _store = silent_cartographer::graph::store::GraphStore::open(&db).unwrap();
+        let _store = silent_cartographer::graph::store::GraphStore::open_or_replace(&db).unwrap();
     }
     assert!(db.exists(), "the stamped-but-empty store file exists");
 
@@ -255,15 +255,23 @@ fn stderr_diagnostics_sanitize_a_hostile_path() {
     );
 }
 
-// _(Exit-code taxonomy: incompatible store is distinct)_ — a store stamped with a different schema
-// version exits with the incompatible-store code, distinct from the no-index code.
+// _(Exit-code taxonomy: incompatible store is distinct)_ — a store c10r created, stamped with a
+// different schema version, exits with the incompatible-store code, distinct from the no-index code.
 #[test]
 fn incompatible_store_code_on_a_wrong_user_version() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
 
-    // Stamp a valid SQLite file with a schema version this binary does not recognize.
+    // A store carrying c10r's ownership marker — so it is c10r's own to replace — at a schema
+    // version this binary does not recognize. Without the marker the file would be refused for
+    // ownership instead, which is a different category with the opposite remedy.
     let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.pragma_update(
+        None,
+        "application_id",
+        silent_cartographer::graph::store::APPLICATION_ID,
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 999i64).unwrap();
     drop(conn);
 
@@ -648,12 +656,89 @@ fn malformed_at_position_is_a_usage_error_naming_the_expected_form() {
     assert!(!db.exists(), "the rejected invocation created no index");
 }
 
-// _(Exit-code taxonomy: an unstamped store is the no-index code)_ — a valid SQLite file at the
-// `--db` path whose `user_version` is zero (never stamped by a build) is refused as the no-index
-// code, the same recovery class as an altogether-absent index, distinct from an incompatible
-// (wrong-version) store — observed here at the process level, through the actual exit code.
+// _(Store ownership recognition: a `--db` path is a filename, never a SQLite URI)_ — SQLite reads a
+// filename beginning `file:` as a URI naming a different file. The ownership guard inspects the path
+// as a literal filename, so if a connection resolved it as a URI the guard would clear one file
+// while the command read or wrote another — the guarantee inverted rather than merely bypassed.
+// Both halves are checked here: a query answers from the literal file, and a build leaves the file a
+// URI would have redirected to byte-identical.
+//
+// The spelling only bites for a *relative* path (an absolute one cannot begin with `file:`), so this
+// runs through the binary with a controlled working directory rather than as a unit test.
+#[cfg(unix)]
 #[test]
-fn unstamped_sqlite_store_is_the_no_index_code() {
+fn a_db_path_spelled_like_a_uri_names_the_file_with_that_literal_name() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // The file a URI-parsing open would land on: another application's database, holding its data.
+    let redirect_target = dir.path().join("target.db");
+    {
+        let conn = rusqlite::Connection::open(&redirect_target).unwrap();
+        conn.execute_batch("CREATE TABLE payroll (x); INSERT INTO payroll VALUES (1);")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 4i64).unwrap();
+    }
+    let before = std::fs::read(&redirect_target).unwrap();
+
+    // The file the caller actually named: a store c10r built, whose identity is distinguishable.
+    let literal = dir.path().join("file:target.db");
+    silent_cartographer::commands::build_from_index(
+        &literal,
+        "literal-store",
+        dir.path(),
+        &support::fixture_index(),
+        &sources(),
+    )
+    .unwrap();
+
+    let queried = c10r()
+        .current_dir(dir.path())
+        .args(["--json", "--db", "file:target.db", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        queried.status.code(),
+        Some(0),
+        "the literal store answers: {}",
+        String::from_utf8_lossy(&queried.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&queried.stdout).expect("status emits JSON");
+    assert_eq!(
+        report["workspace"], "literal-store",
+        "the answer came from the file the guard inspected, not a URI redirect: {report}"
+    );
+    assert_eq!(
+        std::fs::read(&redirect_target).unwrap(),
+        before,
+        "the redirect target is untouched by the query"
+    );
+
+    // The same spelling on the write path: `cache` removes the literal store and nothing else.
+    let removed = c10r()
+        .current_dir(dir.path())
+        .args(["--db", "file:target.db", "cache"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        removed.status.code(),
+        Some(0),
+        "the literal store is removable: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!literal.exists(), "the literal store was removed");
+    assert_eq!(
+        std::fs::read(&redirect_target).unwrap(),
+        before,
+        "the redirect target survives the removal byte-identical"
+    );
+}
+
+// _(Exit-code taxonomy: ownership refusal is distinct)_ — a valid SQLite file at the `--db` path
+// that c10r did not create is refused with the unrecognized-store code, distinct from both the
+// no-index code (nothing is there) and the incompatible-store code (rebuild would fix it) — the two
+// it must not be confused with, since the remedy here is the opposite: do not build here at all.
+#[test]
+fn unrecognized_store_is_its_own_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -670,8 +755,8 @@ fn unstamped_sqlite_store_is_the_no_index_code() {
 
     assert_eq!(
         out.status.code(),
-        Some(3),
-        "an unstamped SQLite file is the no-index code: {}",
+        Some(6),
+        "a file c10r did not create is the unrecognized-store code: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

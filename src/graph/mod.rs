@@ -128,10 +128,14 @@ fn index_language(index: &ExtractedIndex) -> Language {
 /// nearest enclosing persisted declaration, populate the (uncontracted) dependency edges, and record
 /// provenance, the content-hash gate, and the join-alignment accounting.
 ///
-/// `sources` are `(document_path, source_text)` pairs.
+/// `sources` are `(document_path, source_text)` pairs. `workspace_root` is the canonicalized
+/// filesystem root the build indexed, recorded so a later query can tell which workspace the store
+/// describes; `None` when it cannot be recorded exactly, which a query discloses as an unknown
+/// workspace relationship rather than a match.
 pub fn ingest(
     store: &mut GraphStore,
     workspace: &WorkspaceId,
+    workspace_root: Option<&str>,
     index: &ExtractedIndex,
     sources: &[(String, String)],
 ) -> Result<JoinAccounting, IngestError> {
@@ -418,6 +422,7 @@ pub fn ingest(
 
     store.write_metadata(&IndexMetadata {
         workspace_id: workspace.clone(),
+        workspace_root: workspace_root.map(str::to_string),
         provenance: index.provenance.clone(),
         content_hash: content,
         accounting: join_result.accounting,
@@ -436,6 +441,7 @@ pub fn ingest(
 pub fn join_guarded(
     store: &mut GraphStore,
     workspace: &WorkspaceId,
+    workspace_root: Option<&str>,
     index: &ExtractedIndex,
     sources: &[(String, String)],
     expected_hash: &str,
@@ -443,7 +449,7 @@ pub fn join_guarded(
     if content_hash(sources) != expected_hash {
         return Err(IngestError::ContentHashMismatch);
     }
-    ingest(store, workspace, index, sources)
+    ingest(store, workspace, workspace_root, index, sources)
 }
 
 /// The definition content persisted for a symbol: its document, byte span, and the body/signature/

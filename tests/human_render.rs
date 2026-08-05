@@ -21,7 +21,8 @@ fn sources() -> Vec<(String, String)> {
 /// Build the exemplar Rust fixture into a store at `dir/index.db` and return its path.
 fn build_fixture_db(dir: &Path) -> PathBuf {
     let db = dir.join("index.db");
-    silent_cartographer::commands::build_from_index(&db, "render-ws", &support::fixture_index(), &sources()).unwrap();
+    silent_cartographer::commands::build_from_index(&db, "render-ws", dir, &support::fixture_index(), &sources())
+        .unwrap();
     db
 }
 
@@ -236,7 +237,7 @@ const HOSTILE_BODY: &str = "line one\x1b[31m\u{9b}31m\u{202e}\nline two";
 /// so a `trace --relation contains` row projects the hostile fields too.
 fn build_hostile_db(dir: &Path) -> PathBuf {
     let db = dir.join("index.db");
-    let store = GraphStore::open(&db).unwrap();
+    let store = GraphStore::open_or_replace(&db).unwrap();
     store
         .insert_symbol(&SymbolRow {
             canonical_id: CanonicalId::from_raw(HOSTILE_ID.to_string()),
@@ -288,7 +289,7 @@ fn build_hostile_db(dir: &Path) -> PathBuf {
             locality: None,
         })
         .unwrap();
-    support::stamp_metadata(&store, "hostile-ws");
+    support::stamp_metadata(&store, "hostile-ws", dir);
     db
 }
 
@@ -478,7 +479,7 @@ fn body_content_sanitizes_terminal_controls_but_json_round_trips_exactly() {
 /// block carrying no injection-hazard characters, to prove content sanitization leaves `\r` intact.
 fn build_crlf_db(dir: &Path) -> PathBuf {
     let db = dir.join("index.db");
-    let store = GraphStore::open(&db).unwrap();
+    let store = GraphStore::open_or_replace(&db).unwrap();
     store
         .insert_symbol(&SymbolRow {
             canonical_id: CanonicalId::from_raw("crlf-ws::win".to_string()),
@@ -494,7 +495,7 @@ fn build_crlf_db(dir: &Path) -> PathBuf {
             test_rule: None,
         })
         .unwrap();
-    support::stamp_metadata(&store, "crlf-ws");
+    support::stamp_metadata(&store, "crlf-ws", dir);
     db
 }
 
@@ -618,7 +619,7 @@ const AMBIGUOUS_HOSTILE_NAME: &str = "dup\x1b[31m\ninjected";
 /// as their display name, so resolving it by shortname is ambiguous.
 fn build_ambiguous_hostile_db(dir: &Path) -> PathBuf {
     let db = dir.join("index.db");
-    let store = GraphStore::open(&db).unwrap();
+    let store = GraphStore::open_or_replace(&db).unwrap();
     for suffix in ["a", "b"] {
         store
             .insert_symbol(&SymbolRow {
@@ -636,7 +637,7 @@ fn build_ambiguous_hostile_db(dir: &Path) -> PathBuf {
             })
             .unwrap();
     }
-    support::stamp_metadata(&store, "hostile-ws");
+    support::stamp_metadata(&store, "hostile-ws", dir);
     db
 }
 
@@ -679,7 +680,7 @@ fn ambiguous_candidate_lines_sanitize_hostile_names() {
 /// `uncovered` only from a production caller, for the `tests`-relation render scenarios.
 fn build_tests_render_db(dir: &Path) -> PathBuf {
     let db = dir.join("index.db");
-    let store = GraphStore::open(&db).unwrap();
+    let store = GraphStore::open_or_replace(&db).unwrap();
     let symbol = |name: &str, span: (usize, usize), test_rule: Option<&str>| SymbolRow {
         canonical_id: CanonicalId::from_raw(format!("tests-ws::{name}")),
         display_name: name.to_string(),
@@ -714,7 +715,7 @@ fn build_tests_render_db(dir: &Path) -> PathBuf {
     store
         .insert_occurrence(&reference("uncovered", (85, 94), "prod"))
         .unwrap();
-    support::stamp_metadata(&store, "tests-ws");
+    support::stamp_metadata(&store, "tests-ws", dir);
     db
 }
 
@@ -784,7 +785,7 @@ fn empty_tests_render_states_scoped_absence() {
 /// impact answer's detail row and summary project the hostile fields.
 fn build_hostile_dependents_db(dir: &Path) -> PathBuf {
     let db = dir.join("index.db");
-    let store = GraphStore::open(&db).unwrap();
+    let store = GraphStore::open_or_replace(&db).unwrap();
     store
         .insert_symbol(&SymbolRow {
             canonical_id: CanonicalId::from_raw("hostile-ws::subject".to_string()),
@@ -822,7 +823,7 @@ fn build_hostile_dependents_db(dir: &Path) -> PathBuf {
             &CanonicalId::from_raw("hostile-ws::subject".to_string()),
         )
         .unwrap();
-    support::stamp_metadata(&store, "hostile-ws");
+    support::stamp_metadata(&store, "hostile-ws", dir);
     db
 }
 

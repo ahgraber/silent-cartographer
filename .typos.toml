@@ -64,6 +64,10 @@ callers = "callers"
 callees = "callees"
 containers = "containers"
 importers = "importers"
+# Hyphenated prose compounds, split at the hyphen before the check ("mis-pointed", "mis-paged").
+mis = "mis"
+# Accepted variant spelling.
+unparseable = "unparseable"
 # Rust compiler terminology (operator sugar lowering).
 desugar = "desugar"
 desugars = "desugars"

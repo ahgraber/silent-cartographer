@@ -1,9 +1,9 @@
 //! The SQLite-core store: persistence and retrieval of symbols, occurrences, edges, and index
 //! metadata, plus staleness evaluation.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::identity::{CanonicalId, WorkspaceId};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
@@ -227,6 +227,13 @@ pub struct DuplicatedGroup {
 pub struct IndexMetadata {
     /// The workspace the index was built under.
     pub workspace_id: WorkspaceId,
+    /// The canonicalized filesystem root the build indexed — the store's durable link to the
+    /// workspace it describes, compared against the root a query is invoked with.
+    ///
+    /// `None` when the build's root could not be recorded exactly (a path that is not valid UTF-8).
+    /// Typed absence rather than a lossy rendering: two distinct roots can render to the same lossy
+    /// text, and a comparison against that text would report a different workspace as a match.
+    pub workspace_root: Option<String>,
     /// The analyzer provenance.
     pub provenance: AnalyzerProvenance,
     /// The content hash of the analyzed sources.
@@ -259,13 +266,199 @@ impl Freshness {
     }
 }
 
+/// The SQLite `application_id` stamped into every store this binary creates: the big-endian bytes of
+/// the ASCII string `c10r`.
+///
+/// The ownership marker, held apart from the schema version so migrating the schema never disturbs
+/// the proof of whose file this is. It is a permanent file-format commitment: changing it would
+/// orphan every stamped store.
+pub const APPLICATION_ID: i32 = 0x6331_3072;
+
+/// The 16-byte magic every SQLite database file opens with.
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// How much of a candidate file's header the recognizer reads: the SQLite header is 100 bytes, and
+/// the two fields the verdict turns on (the magic at offset 0, the `application_id` at offset 68)
+/// sit inside it.
+const HEADER_BYTES: usize = 100;
+
+/// The byte offset of `application_id` in the SQLite file header.
+const APPLICATION_ID_OFFSET: usize = 68;
+
+/// What sits at a store path, decided from the file's header alone.
+///
+/// The verdict is reached by a plain read — no SQLite connection is opened — so recognizing a file
+/// never locks it, never creates journal sidecars beside it, and never writes to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreRecognition {
+    /// No file exists at the path.
+    Absent,
+    /// A file exists, but it is not a store this binary created: not a database at all, truncated,
+    /// or a database carrying a different application's marker (or none).
+    Unrecognized,
+    /// A store carrying this binary's ownership marker.
+    Recognized,
+}
+
+/// Recognize what sits at `path` by reading its header, without opening it as a database.
+///
+/// The single ownership test every store-touching path consults before it writes, replaces, or
+/// deletes. An I/O failure other than "no such file" is surfaced rather than folded into a verdict,
+/// so an unreadable path is never mistaken for an unrecognized one.
+pub fn recognize_store(path: &Path) -> std::io::Result<StoreRecognition> {
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StoreRecognition::Absent),
+        Err(e) => return Err(e),
+    };
+    let mut header = [0u8; HEADER_BYTES];
+    let mut filled = 0;
+    while filled < header.len() {
+        // A signal arriving mid-read is not a failed examination: retry rather than surfacing it.
+        let n = match file.read(&mut header[filled..]) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    if filled < header.len() || &header[0..SQLITE_MAGIC.len()] != SQLITE_MAGIC {
+        return Ok(StoreRecognition::Unrecognized);
+    }
+    let stamped = i32::from_be_bytes([
+        header[APPLICATION_ID_OFFSET],
+        header[APPLICATION_ID_OFFSET + 1],
+        header[APPLICATION_ID_OFFSET + 2],
+        header[APPLICATION_ID_OFFSET + 3],
+    ]);
+    if stamped == APPLICATION_ID {
+        Ok(StoreRecognition::Recognized)
+    } else {
+        Ok(StoreRecognition::Unrecognized)
+    }
+}
+
+/// The recognizer's verdict, with a failed examination rendered as [`StoreOpenError::UnreadableStore`]
+/// rather than a bare I/O error.
+///
+/// Every path that refuses on the verdict reads it through here. A path that cannot be examined is
+/// refused in the same category as an unrecognized one — the caller's next action is identical, so the
+/// exit code is too — while the message stays honest that ownership was never established either way.
+pub fn recognize_or_refuse(path: &Path) -> Result<StoreRecognition, StoreOpenError> {
+    recognize_store(path).map_err(|cause| unreadable_store(path, &cause))
+}
+
+/// Build the refusal for a path whose contents could not be examined.
+///
+/// The operating system's own words carry the cause. A hint is added only where those words do not
+/// imply the fix: naming a directory is the one-token `--db` mistype, and a permissions failure is the
+/// case where claiming the target is not this binary's store would be a claim the read never
+/// established. Every other cause stands on the OS message alone.
+///
+/// The message stays on one line: every refusal reaches the caller through
+/// [`crate::render::sanitize`], which makes control characters visible rather than executing them, so
+/// a literal newline would render as a replacement character instead of a break.
+fn unreadable_store(path: &Path, cause: &std::io::Error) -> StoreOpenError {
+    let hint = match cause.kind() {
+        std::io::ErrorKind::IsADirectory => format!(
+            "; `--db` wants the database file inside it, such as {}",
+            path.join("index.db").display()
+        ),
+        std::io::ErrorKind::PermissionDenied => "; check the file's owner and permissions".to_string(),
+        _ => String::new(),
+    };
+    StoreOpenError::UnreadableStore {
+        path: path.display().to_string(),
+        detail: format!("{cause}{hint}"),
+    }
+}
+
+/// Open `path` as a literal filename, never as a URI, with `access` deciding read-only, read-write,
+/// or read-write-and-create.
+///
+/// SQLite interprets a filename that *begins* with `file:` as a URI naming a different file than the
+/// one on disk with that name — and this build enables that interpretation globally, so withholding
+/// `SQLITE_OPEN_URI` does not switch it off. The ownership guard inspects the path as a literal
+/// filename, so a connection that resolved it any other way would read or write a file the guard
+/// never checked. Handing SQLite an absolute path is what closes that gap: an absolute path cannot
+/// begin with `file:`, so it can only ever name the file the guard inspected. Absolutizing is
+/// lexical — it resolves no symlinks — so which file is named is otherwise unchanged.
+fn open_literal(path: &Path, access: OpenFlags) -> Result<Connection, StoreOpenError> {
+    let literal = std::path::absolute(path)?;
+    Ok(Connection::open_with_flags(
+        literal,
+        access | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?)
+}
+
+/// The path a store is built at before it is renamed into place: the final path with a distinct
+/// suffix carrying the building process's id, so two concurrent builds never contend for one name
+/// and a leftover from an interrupted build never sits at the store path itself.
+fn temp_store_path(path: &Path) -> PathBuf {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(format!(".c10r-tmp-{}", std::process::id()));
+    PathBuf::from(temp)
+}
+
 /// An error opening a graph store.
 ///
-/// The schema-version guard reads `PRAGMA user_version` before any table access — the pragma is
-/// readable regardless of table shapes, which is exactly why it is the guard mechanism (the in-row
-/// `schema_version` column remains as provenance only).
+/// The ownership guard reads the file header before any connection opens; the schema-version guard
+/// then reads `PRAGMA user_version` before any table access — the pragma is readable regardless of
+/// table shapes, which is exactly why it is the guard mechanism (the in-row `schema_version` column
+/// remains as provenance only).
 #[derive(Debug, thiserror::Error)]
 pub enum StoreOpenError {
+    /// A file sits at the store path that this binary did not create, so no operation may touch it.
+    ///
+    /// The two recoveries are stated separately and conditionally: a refused file may be data the
+    /// user must not delete, so the message never instructs deletion unconditionally.
+    #[error(
+        "{path} is not a c10r index store. \
+         If this is an old c10r index, remove it and run `c10r build`; otherwise point `--db` elsewhere."
+    )]
+    UnrecognizedStore {
+        /// The refused file's path, for the teaching message.
+        path: String,
+    },
+    /// A path at the store location whose contents could not be examined at all, so ownership was
+    /// never established either way.
+    ///
+    /// Distinct from an unrecognized file in what it claims, not in what it does: it refuses in the
+    /// same category, but it asserts neither that the target is nor that it is not this binary's
+    /// store. Built by [`unreadable_store`], which supplies the cause and any hint.
+    #[error("cannot read {path}: {detail}")]
+    UnreadableStore {
+        /// The unexaminable path, for the teaching message.
+        path: String,
+        /// The operating system's account of the failure, plus a hint where its words do not imply
+        /// the fix.
+        detail: String,
+    },
+    /// No file exists at the store path, and the operation asked for does not create one.
+    #[error("no index store at {path}; run `c10r build` to create one")]
+    MissingStore {
+        /// The empty path, for the teaching message.
+        path: String,
+    },
+    /// A file already occupies the path a new store is built at.
+    ///
+    /// The exclusive create exists because ownership of that path is unproven — a build file's name
+    /// embeds a process id, and process ids recycle — so the message conditions removal on the file
+    /// being this binary's own leftover rather than asserting that it is.
+    #[error(
+        "build file {path} already exists. \
+         If this is a leftover from an interrupted c10r build, removing it is safe; \
+         otherwise point `--db` elsewhere."
+    )]
+    StaleBuildFile {
+        /// The occupying file's path, for the teaching message.
+        path: String,
+    },
     /// The store was written under a different schema version than this binary expects. A pre-guard
     /// store carries no stamp and reads as version 0.
     #[error(
@@ -283,9 +476,10 @@ pub enum StoreOpenError {
     /// The underlying storage failed.
     #[error("store error: {0}")]
     Storage(#[from] rusqlite::Error),
-    /// Deleting an incompatible store for replacement failed at the filesystem.
-    #[error("replacing incompatible index store: {0}")]
-    Replace(#[from] std::io::Error),
+    /// A filesystem operation on the store's own files — recognizing, creating, renaming, or
+    /// removing them — failed.
+    #[error("index store file operation failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// The SQLite-backed graph store.
@@ -294,18 +488,103 @@ pub struct GraphStore {
 }
 
 impl GraphStore {
-    /// Open a store at `path` for reading, creating a fresh one if none exists.
+    /// Open an existing store at `path` for reading, creating nothing.
     ///
-    /// An existing store's `PRAGMA user_version` stamp is validated against [`SCHEMA_VERSION`]
-    /// before any table is touched; a mismatch (including an unstamped pre-guard store, which reads
-    /// as version 0) refuses with a typed teaching error rather than failing mid-operation on a
-    /// changed table shape.
+    /// Two guards run in order, both before anything is read from the store: the file must be
+    /// recognizable as this binary's own creation (an unrecognized file refuses untouched, one that
+    /// cannot be examined refuses naming why, an absent one refuses naming the build that would create
+    /// it), and its `PRAGMA user_version` stamp must
+    /// match [`SCHEMA_VERSION`] — a mismatch refuses with a typed teaching error rather than failing
+    /// mid-operation on a changed table shape. The connection itself is opened read-only, so a read
+    /// path cannot write to the store even by accident.
     pub fn open(path: &Path) -> Result<Self, StoreOpenError> {
-        if !path.exists() {
-            return Ok(Self::create(path)?);
+        match recognize_or_refuse(path)? {
+            StoreRecognition::Absent => {
+                return Err(StoreOpenError::MissingStore {
+                    path: path.display().to_string(),
+                });
+            }
+            StoreRecognition::Unrecognized => {
+                return Err(StoreOpenError::UnrecognizedStore {
+                    path: path.display().to_string(),
+                });
+            }
+            StoreRecognition::Recognized => {}
         }
-        let conn = Connection::open(path)?;
-        let found = stamped_version(&conn)?;
+        let conn = open_literal(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::guard_version(&conn, path)?;
+        Ok(Self { conn })
+    }
+
+    /// Open a store at `path` for a build: create one if none exists, replace a recognized store
+    /// whose schema version differs, and refuse a file this binary did not create.
+    ///
+    /// The index is derived, replayable data, so rebuild is the migration for a store of this
+    /// binary's own: an incompatible one is deleted and recreated at the current version, and the
+    /// build proceeds. Replacement reaches only recognized stores — an unrecognized file is refused
+    /// with the ownership error, never deleted.
+    pub fn open_or_replace(path: &Path) -> Result<Self, StoreOpenError> {
+        match recognize_or_refuse(path)? {
+            StoreRecognition::Absent => Self::create(path),
+            StoreRecognition::Unrecognized => Err(StoreOpenError::UnrecognizedStore {
+                path: path.display().to_string(),
+            }),
+            StoreRecognition::Recognized => {
+                let conn = open_literal(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+                if stamped_version(&conn)? == SCHEMA_VERSION {
+                    return Ok(Self { conn });
+                }
+                // Close the connection before the files go, so no handle outlives them.
+                drop(conn);
+                remove_store_files(path)?;
+                Self::create(path)
+            }
+        }
+    }
+
+    /// Create a fresh store at `path`, complete and stamped before it ever appears there.
+    ///
+    /// The store is built in a distinctly-named temporary file beside the final path — created
+    /// exclusively, so a leftover from an interrupted build is never reused — and renamed into place
+    /// once its schema and stamps are committed. The store path therefore only ever holds a
+    /// complete, marked store or nothing, so a crash mid-create can never strand a file that the
+    /// ownership guard would later refuse.
+    fn create(path: &Path) -> Result<Self, StoreOpenError> {
+        let temp = temp_store_path(path);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(StoreOpenError::StaleBuildFile {
+                    path: temp.display().to_string(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        }
+        // Scoped so the connection closes — flushing the store whole — before the rename.
+        {
+            let conn = open_literal(&temp, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)?;
+            conn.execute_batch(SCHEMA_SQL)?;
+            conn.pragma_update(None, "application_id", APPLICATION_ID)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        std::fs::rename(&temp, path)?;
+        Ok(Self {
+            conn: open_literal(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?,
+        })
+    }
+
+    /// Open an in-memory store (for tests), applying the schema and both stamps.
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA_SQL)?;
+        conn.pragma_update(None, "application_id", APPLICATION_ID)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(Self { conn })
+    }
+
+    /// Refuse a recognized store whose recorded schema version is not the one this binary writes.
+    fn guard_version(conn: &Connection, path: &Path) -> Result<(), StoreOpenError> {
+        let found = stamped_version(conn)?;
         if found != SCHEMA_VERSION {
             return Err(StoreOpenError::SchemaVersionMismatch {
                 path: path.display().to_string(),
@@ -313,38 +592,7 @@ impl GraphStore {
                 expected: SCHEMA_VERSION,
             });
         }
-        conn.execute_batch(SCHEMA_SQL)?;
-        Ok(Self { conn })
-    }
-
-    /// Open a store at `path` for a build, replacing it wholesale on a schema-version mismatch.
-    ///
-    /// The index is derived, replayable data, so rebuild is the migration: an incompatible store is
-    /// deleted and recreated at the current version, and the build proceeds.
-    pub fn open_or_replace(path: &Path) -> Result<Self, StoreOpenError> {
-        match Self::open(path) {
-            Err(StoreOpenError::SchemaVersionMismatch { .. }) => {
-                remove_store_files(path)?;
-                Ok(Self::create(path)?)
-            }
-            other => other,
-        }
-    }
-
-    /// Create a fresh store at `path`: apply the schema and stamp the version pragma.
-    fn create(path: &Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA_SQL)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        Ok(Self { conn })
-    }
-
-    /// Open an in-memory store (for tests), applying the schema and version stamp.
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA_SQL)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        Ok(Self { conn })
+        Ok(())
     }
 
     /// Begin the single transaction a build's writes run inside.
@@ -380,16 +628,19 @@ impl GraphStore {
             .map(|facts| serde_json::to_string(facts).expect("environment facts serialize"));
         self.conn.execute(
             "INSERT OR REPLACE INTO index_metadata
-                (id, schema_version, workspace_id, analyzer_name, analyzer_version, environment, content_hash,
+                (id, schema_version, workspace_id, workspace_root, analyzer_name, analyzer_version, environment,
+                 content_hash,
                  aligned_exact_count, aligned_crate_root_count, aligned_operator_desugar_count,
                  aligned_module_span_count, aligned_self_keyword_count, aligned_module_name_count,
                  aligned_self_name_count, aligned_module_marker_count, aligned_import_alias_count,
                  aligned_range_literal_count, aligned_use_list_self_count, aligned_super_keyword_count,
                  text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                     ?22, ?23)",
             params![
                 SCHEMA_VERSION,
                 meta.workspace_id.as_str(),
+                meta.workspace_root,
                 meta.provenance.analyzer_name,
                 meta.provenance.analyzer_version,
                 environment,
@@ -424,7 +675,8 @@ impl GraphStore {
                         aligned_module_span_count, aligned_self_keyword_count, aligned_module_name_count,
                         aligned_self_name_count, aligned_module_marker_count, aligned_import_alias_count,
                         aligned_range_literal_count, aligned_use_list_self_count, aligned_super_keyword_count,
-                        text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count
+                        text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count,
+                        workspace_root
                  FROM index_metadata WHERE id = 1",
                 [],
                 |r| {
@@ -441,6 +693,7 @@ impl GraphStore {
                         .transpose()?;
                     Ok(IndexMetadata {
                         workspace_id: WorkspaceId::new(r.get::<_, String>(0)?),
+                        workspace_root: r.get(21)?,
                         provenance: AnalyzerProvenance {
                             analyzer_name: r.get(1)?,
                             analyzer_version: r.get(2)?,
@@ -1237,6 +1490,383 @@ fn escape_like(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal a store-opening call is expected to produce. A store handle carries a live
+    /// connection and so is not printable, which is why this stands in for `expect_err`.
+    fn refused(result: Result<GraphStore, StoreOpenError>, expectation: &str) -> StoreOpenError {
+        match result {
+            Ok(_) => panic!("{expectation}"),
+            Err(error) => error,
+        }
+    }
+
+    /// Write a database at `path` carrying `application_id` and `user_version` as given.
+    fn write_database(path: &Path, application_id: Option<i32>, user_version: i64) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE t (x)").unwrap();
+        if let Some(id) = application_id {
+            conn.pragma_update(None, "application_id", id).unwrap();
+        }
+        conn.pragma_update(None, "user_version", user_version).unwrap();
+    }
+
+    // The recognizer's verdict for every shape a store path can hold: nothing, a file too small or
+    // too foreign to be a database, another application's database (marked or not), and c10r's own.
+    #[test]
+    fn recognize_store_separates_absent_unrecognized_and_own() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent = dir.path().join("absent.db");
+        assert_eq!(recognize_store(&absent).unwrap(), StoreRecognition::Absent);
+
+        let empty = dir.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(recognize_store(&empty).unwrap(), StoreRecognition::Unrecognized);
+
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, b"this is not a database").unwrap();
+        assert_eq!(recognize_store(&text).unwrap(), StoreRecognition::Unrecognized);
+
+        // Long enough to be plausible, short enough that the header never completes.
+        let truncated = dir.path().join("truncated.db");
+        std::fs::write(&truncated, &b"SQLite format 3\0"[..]).unwrap();
+        assert_eq!(recognize_store(&truncated).unwrap(), StoreRecognition::Unrecognized);
+
+        let unmarked = dir.path().join("unmarked.db");
+        write_database(&unmarked, None, 12);
+        assert_eq!(recognize_store(&unmarked).unwrap(), StoreRecognition::Unrecognized);
+
+        let foreign = dir.path().join("foreign.db");
+        write_database(&foreign, Some(0x0102_0304), 12);
+        assert_eq!(recognize_store(&foreign).unwrap(), StoreRecognition::Unrecognized);
+
+        let own = dir.path().join("own.db");
+        write_database(&own, Some(APPLICATION_ID), SCHEMA_VERSION);
+        assert_eq!(recognize_store(&own).unwrap(), StoreRecognition::Recognized);
+    }
+
+    // The ownership refusal states both recoveries conditionally and never instructs deletion on its
+    // own: a refused file may be data the caller must not delete, so every mention of deleting sits
+    // inside the branch that supposes the file is a stale c10r index.
+    #[test]
+    fn the_ownership_refusal_states_both_recoveries_and_deletes_nothing_unconditionally() {
+        let message = StoreOpenError::UnrecognizedStore {
+            path: "/w/.c10r/index.db".to_string(),
+        }
+        .to_string();
+
+        assert!(message.contains("/w/.c10r/index.db"), "names the path: {message}");
+        assert!(
+            message.contains("c10r build"),
+            "names the rebuild recovery for a stale index: {message}"
+        );
+        assert!(
+            message.contains("--db"),
+            "names the path-correction recovery for somebody else's file: {message}"
+        );
+        // Structural, not phrase-matched: wherever the conditional opens, every way of saying
+        // "get rid of it" has to sit after it. Probing for one exact sentence would pass a reworded
+        // message that moved the instruction out of the branch.
+        let lowered = message.to_lowercase();
+        let conditional = lowered.find("if this is").expect("the rebuild branch is conditional");
+        for instruction in ["remove", "delete", "rm "] {
+            assert!(
+                lowered.find(instruction).is_none_or(|at| at > conditional),
+                "`{instruction}` stands outside a conditional branch: {message}"
+            );
+        }
+    }
+
+    // Every refusal reaches the caller through the diagnostic sanitizer, which makes control
+    // characters visible rather than executing them. A message carrying its own newline therefore
+    // renders a replacement character where it meant a line break, so the refusals stay single-line by
+    // construction — a property worth pinning, because the damage is invisible until someone reads
+    // real terminal output.
+    #[test]
+    fn every_store_refusal_survives_the_diagnostic_sanitizer() {
+        let refusals = [
+            StoreOpenError::UnrecognizedStore {
+                path: "/w/index.db".to_string(),
+            },
+            StoreOpenError::UnreadableStore {
+                path: "/w/.c10r".to_string(),
+                detail: "Is a directory (os error 21); `--db` wants the database file inside it".to_string(),
+            },
+            StoreOpenError::MissingStore {
+                path: "/w/index.db".to_string(),
+            },
+            StoreOpenError::StaleBuildFile {
+                path: "/w/index.db.c10r-tmp-1".to_string(),
+            },
+            StoreOpenError::SchemaVersionMismatch {
+                path: "/w/index.db".to_string(),
+                found: 12,
+                expected: SCHEMA_VERSION,
+            },
+        ];
+        for refusal in refusals {
+            let message = refusal.to_string();
+            assert_eq!(
+                crate::render::sanitize(&message),
+                message,
+                "the message is altered on its way to the terminal: {message:?}"
+            );
+        }
+    }
+
+    // A path whose contents cannot be examined at all is refused in the ownership category without an
+    // ownership claim. The read never happened, so the refusal names the path and why, and says
+    // nothing about whose file it is — including through the `--db` hint, which addresses the mistype
+    // rather than the file's provenance.
+    #[cfg(unix)]
+    #[test]
+    fn an_unexaminable_path_is_refused_without_an_ownership_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        // The realistic mistype: `--db` pointed at the directory holding the store, not the store.
+        let db = dir.path().join(".c10r");
+        std::fs::create_dir(&db).unwrap();
+
+        for error in [
+            refused(GraphStore::open(&db), "the read path refuses an unexaminable path"),
+            refused(
+                GraphStore::open_or_replace(&db),
+                "the build path refuses an unexaminable path",
+            ),
+        ] {
+            assert!(
+                matches!(error, StoreOpenError::UnreadableStore { .. }),
+                "the refusal is the unexaminable-path error, not a bare I/O failure: {error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(&db.display().to_string()), "names the path: {message}");
+            assert!(
+                message.contains(&db.join("index.db").display().to_string()),
+                "names the database file `--db` wants instead: {message}"
+            );
+            assert!(
+                !message.contains("is not a c10r index store"),
+                "no ownership verdict is claimed from a read that never happened: {message}"
+            );
+        }
+        assert!(db.is_dir(), "the unexaminable path is left where it was");
+    }
+
+    // The same refusal for a file the process cannot read — and here the store is genuinely c10r's
+    // own, which is the case that makes the rule matter: a store built by another user must never be
+    // told it is somebody else's file.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_refused_without_denying_it_is_ours() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        write_database(&db, Some(APPLICATION_ID), SCHEMA_VERSION);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads straight through the permission bit, so the guarantee is unobservable there.
+        if std::fs::File::open(&db).is_ok() {
+            return;
+        }
+
+        let error = refused(GraphStore::open(&db), "an unreadable file refuses");
+        assert!(
+            matches!(error, StoreOpenError::UnreadableStore { .. }),
+            "the refusal is the unexaminable-path error: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("owner"),
+            "points at the file's owner and permissions: {message}"
+        );
+        assert!(
+            !message.contains("is not a c10r index store"),
+            "the file is c10r's own store; the refusal must not say otherwise: {message}"
+        );
+    }
+
+    // A fresh create lands a store that is recognized, current, and readable — and leaves no build
+    // leftover at either the store path or the temporary path it was built at.
+    #[test]
+    fn create_lands_a_recognized_current_store_and_no_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+
+        let store = GraphStore::create(&db).unwrap();
+        assert!(store.read_metadata().unwrap().is_none(), "a fresh store holds no build");
+
+        assert_eq!(recognize_store(&db).unwrap(), StoreRecognition::Recognized);
+        assert_eq!(stamped_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        let temp = temp_store_path(&db);
+        assert_ne!(temp, db, "the store is built at a path distinct from its own");
+        assert!(
+            !temp.exists(),
+            "the temporary build file is renamed away, not left behind"
+        );
+    }
+
+    // A leftover build file from an interrupted build is never reused or overwritten: the create
+    // refuses, naming it, and the leftover's contents are untouched.
+    #[test]
+    fn create_refuses_to_reuse_a_leftover_build_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let temp = temp_store_path(&db);
+        std::fs::write(&temp, b"leftover").unwrap();
+
+        let error = refused(GraphStore::create(&db), "a leftover build file refuses the create");
+        assert!(
+            matches!(error, StoreOpenError::StaleBuildFile { .. }),
+            "the refusal is typed: {error}"
+        );
+        assert_eq!(std::fs::read(&temp).unwrap(), b"leftover", "the leftover is untouched");
+        assert!(!db.exists(), "nothing was created at the store path");
+
+        // The exclusive create exists because ownership of that path is unproven, so the message
+        // supposes a leftover rather than asserting one, and conditions removal on that supposition.
+        let message = error.to_string();
+        assert!(
+            message.contains(&temp.display().to_string()),
+            "names the occupying file: {message}"
+        );
+        let lowered = message.to_lowercase();
+        let conditional = lowered.find("if this is").expect("the leftover branch is conditional");
+        for claim in ["leftover", "removing", "remove", "delete", "rm "] {
+            assert!(
+                lowered.find(claim).is_none_or(|at| at > conditional),
+                "`{claim}` stands outside the conditional branch: {message}"
+            );
+        }
+    }
+
+    // The read path creates nothing: an absent store refuses with the typed missing-store error and
+    // no file appears at the path.
+    #[test]
+    fn open_refuses_an_absent_store_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+
+        let error = refused(GraphStore::open(&db), "a read against nothing refuses");
+        assert!(
+            matches!(error, StoreOpenError::MissingStore { .. }),
+            "the refusal is typed: {error}"
+        );
+        assert!(error.to_string().contains("c10r build"), "names the remedy: {error}");
+        assert!(!db.exists(), "the read brought no store into being");
+    }
+
+    // A database c10r did not create is refused by the read path with nothing written into it — even
+    // when its version stamp happens to equal the schema version this binary expects, the coincidence
+    // the marker exists to survive.
+    #[test]
+    fn open_refuses_a_foreign_database_leaving_it_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, user_version) in [("other.db", 3), ("coincident.db", SCHEMA_VERSION)] {
+            let db = dir.path().join(name);
+            write_database(&db, None, user_version);
+            let before = std::fs::read(&db).unwrap();
+
+            let error = refused(GraphStore::open(&db), "a foreign database refuses");
+            assert!(
+                matches!(error, StoreOpenError::UnrecognizedStore { .. }),
+                "{name} is refused for ownership, not version: {error}"
+            );
+            assert_eq!(std::fs::read(&db).unwrap(), before, "{name} is untouched");
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = dir.path().join(format!("{name}{suffix}"));
+                assert!(!sidecar.exists(), "no sidecar was created beside {name}");
+            }
+        }
+    }
+
+    // A store c10r created at a different schema version is its own to replace: the build path
+    // replaces it and stamps the current version, while a foreign database at any version — including
+    // one that coincidentally matches — is refused byte-identical instead.
+    #[test]
+    fn open_or_replace_replaces_its_own_store_and_refuses_foreign_ones() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let own = dir.path().join("own.db");
+        write_database(&own, Some(APPLICATION_ID), SCHEMA_VERSION - 1);
+        let store = GraphStore::open_or_replace(&own).expect("c10r's own old store is replaced");
+        assert_eq!(stamped_version(&store.conn).unwrap(), SCHEMA_VERSION);
+
+        for (name, user_version) in [("foreign.db", 3), ("coincident.db", SCHEMA_VERSION)] {
+            let db = dir.path().join(name);
+            write_database(&db, None, user_version);
+            let before = std::fs::read(&db).unwrap();
+
+            let error = refused(GraphStore::open_or_replace(&db), "a foreign database refuses");
+            assert!(
+                matches!(error, StoreOpenError::UnrecognizedStore { .. }),
+                "{name} is refused: {error}"
+            );
+            assert_eq!(std::fs::read(&db).unwrap(), before, "{name} survives byte-identical");
+        }
+    }
+
+    // A file that is not a database at all is refused with the typed ownership error, never a raw
+    // storage failure leaking the SQLite layer's own words.
+    #[test]
+    fn a_non_database_file_is_refused_with_the_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        std::fs::write(&db, b"just some text a caller kept here").unwrap();
+
+        for error in [
+            refused(GraphStore::open(&db), "the read path refuses"),
+            refused(GraphStore::open_or_replace(&db), "the build path refuses"),
+        ] {
+            assert!(
+                matches!(error, StoreOpenError::UnrecognizedStore { .. }),
+                "typed ownership refusal, not a storage error: {error}"
+            );
+        }
+        assert_eq!(std::fs::read(&db).unwrap(), b"just some text a caller kept here");
+    }
+
+    // A store built before ownership marking — a real c10r index by shape, carrying a version stamp
+    // and no marker — is refused, and the refusal's rebuild branch names the recovery.
+    #[test]
+    fn an_unmarked_legacy_store_is_refused_with_rebuild_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1).unwrap();
+        drop(conn);
+
+        let error = refused(GraphStore::open(&db), "an unmarked store refuses");
+        assert!(
+            matches!(error, StoreOpenError::UnrecognizedStore { .. }),
+            "unmarked is unrecognized, whatever its version: {error}"
+        );
+        assert!(
+            error.to_string().contains("c10r build"),
+            "the rebuild branch names the recovery: {error}"
+        );
+    }
+
+    // The recorded workspace root round-trips through the metadata a build writes.
+    #[test]
+    fn metadata_carries_the_recorded_workspace_root() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store
+            .write_metadata(&IndexMetadata {
+                workspace_id: WorkspaceId::new("ws"),
+                workspace_root: Some("/projects/ws".to_string()),
+                provenance: AnalyzerProvenance {
+                    analyzer_name: "test".to_string(),
+                    analyzer_version: "0".to_string(),
+                },
+                content_hash: "hash".to_string(),
+                accounting: JoinAccounting::default(),
+                environment: None,
+            })
+            .unwrap();
+
+        let read = store.read_metadata().unwrap().expect("metadata present");
+        assert_eq!(read.workspace_root.as_deref(), Some("/projects/ws"));
+    }
 
     /// An in-workspace symbol row with a definition span, minimal in every other field.
     fn symbol_at(id: &str, document: &str, start: usize, end: usize) -> SymbolRow {

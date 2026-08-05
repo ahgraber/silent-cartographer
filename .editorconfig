@@ -33,6 +33,10 @@ indent_style = tab
 indent_size = unset
 indent_style = space
 
+[*.rs]
+indent_size = unset
+indent_style = space
+
 [*.tsv]
 indent_style = tab
 
