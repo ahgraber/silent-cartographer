@@ -6,6 +6,8 @@
 
 The system SHALL mark every index store it creates so that the store is recognizable as the system's own artifact independently of the store's schema version, and SHALL NOT write to, alter, or delete a file it does not recognize as a store it created.
 An operation refused for lack of recognition SHALL leave the target file unchanged, and its error SHALL be typed — never a storage-level failure — naming the path and stating the recovery for a genuine but unrecognizable index (rebuild) separately from the recovery for an unrelated file (correct the path), never an unconditional instruction to delete.
+A path whose contents cannot be examined at all SHALL be refused in the same category rather than read as recognized, as absent, or as a bare storage failure; its error SHALL name the path and the reason the examination failed, and SHALL NOT assert that the target is, or is not, a store the system created.
+Creating a store SHALL NOT overwrite a file already occupying the path it builds at; that refusal SHALL leave the file unchanged and SHALL state removal only as conditional on the file being the system's own leftover from an interrupted build.
 
 Serves: own-store-only
 
@@ -50,6 +52,18 @@ Serves: own-store-only
 - **GIVEN** a store the system created carrying the expected schema version
 - **WHEN** the index is built or queried
 - **THEN** the operation proceeds with no ownership error
+
+#### Scenario: Unexaminable path refused without an ownership claim
+
+- **GIVEN** a store path naming something whose contents cannot be read at all, such as a directory
+- **WHEN** the index is built or queried
+- **THEN** the operation refuses in the ownership category, names the path and why the examination failed, claims neither that the target is nor that it is not the system's own store, and leaves the target unchanged
+
+#### Scenario: An occupied build path is not overwritten
+
+- **GIVEN** a file already occupying the path a new store would be built at
+- **WHEN** the index is built
+- **THEN** the build refuses in the ownership category, the occupying file is unchanged, and the refusal states removal only as conditional on the file being an interrupted build's leftover
 
 ### Requirement: Read operations create no store
 

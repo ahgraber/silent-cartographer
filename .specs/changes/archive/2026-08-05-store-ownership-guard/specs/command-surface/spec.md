@@ -6,7 +6,7 @@
 
 > Previously: the taxonomy's named distinctions were success, usage error, absent index, and indexer or setup failure; store-related refusals were not individually named categories.
 
-The system SHALL signal each invocation's outcome through a closed exit-code taxonomy, using a distinct code per category, that distinguishes success — including a typed-empty result — from a usage error, an absent index, a store unusable because its recorded schema version differs, a target refused because it is not recognized as the system's own store, and an indexer or setup failure.
+The system SHALL signal each invocation's outcome through a closed exit-code taxonomy, using a distinct code per category, that distinguishes success — including a typed-empty result — from a usage error, an absent index, a store unusable because its recorded schema version differs, a target refused because the system cannot confirm it is a store the system created, and an indexer or setup failure.
 
 Serves: own-store-only
 
@@ -43,7 +43,7 @@ Serves: own-store-only
 #### Scenario: Ownership refusal is distinct
 
 - **GIVEN** a file at the index path that the system does not recognize as its own store
-- **WHEN** a build or query command runs against it
+- **WHEN** a build, query, or reset command runs against it
 - **THEN** the process exits with the unrecognized-store code, distinct from the absent-index and incompatible-store codes
 
 #### Scenario: Indexer setup failure is distinct
@@ -54,10 +54,10 @@ Serves: own-store-only
 
 ### Requirement: Versioned structural surface index
 
-> Previously: the index state reported by the surface-index command did not distinguish an absent index from an unrecognized file at the index path.
+> Previously: the index state reported by the surface-index command did not distinguish an absent index from a file at the index path the system had not created, could not examine, or had created under a schema version it no longer reads.
 
 The system SHALL provide a command that emits, as its machine-readable answer, a structural index of the CLI surface — a surface version, the commands with each command's valid argument and flag values and defaults, and the current index state — and the surface version SHALL change whenever the command or flag structure changes, so that a caller can detect that its understanding of the surface is out of date.
-The reported index state SHALL distinguish an absent index from a file at the index path that is not recognized as the system's own store, without failing the command.
+The reported index state SHALL distinguish an absent index, a file at the index path that is not recognized as the system's own store, a path at the index path whose contents cannot be examined, and a store the system recognizes as its own whose recorded schema version differs from the version the binary expects, without failing the command.
 
 Serves: own-store-only
 
@@ -84,6 +84,18 @@ Serves: own-store-only
 - **GIVEN** a file at the index path that the system does not recognize as its own store
 - **WHEN** the surface-index command runs
 - **THEN** the answer's index state reports the unrecognized condition, distinct from an absent index, and the command succeeds
+
+#### Scenario: Index state distinguishes an unexaminable path
+
+- **GIVEN** a path at the index path whose contents cannot be read at all, such as a directory
+- **WHEN** the surface-index command runs
+- **THEN** the answer's index state reports that condition, distinct from both an absent index and an unrecognized file, and the command succeeds
+
+#### Scenario: Index state distinguishes an incompatible store
+
+- **GIVEN** a store the system created at the index path, recorded under a different schema version than the binary expects
+- **WHEN** the surface-index command runs
+- **THEN** the answer's index state reports the incompatible condition, distinct from an absent index, and the command succeeds
 
 ### Requirement: Index reset
 

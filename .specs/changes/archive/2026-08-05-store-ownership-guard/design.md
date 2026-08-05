@@ -36,10 +36,44 @@ Any file that fails the read or the check — too short, zero-length, wrong magi
 **Rationale:** opening a foreign database through SQLite is itself contact — it can take locks and, under WAL, materialize `-wal`/`-shm` sidecar files next to data c10r does not own.
 A plain header read touches nothing, and it is the technique `cache` already uses, so the recognizer unifies the two existing check styles instead of adding a third.
 
+The recognizer inspects the store path as a literal filename, so every connection must resolve that same path.
+SQLite reads a filename beginning `file:` as a URI naming a different file, and this build enables that interpretation globally — withholding `SQLITE_OPEN_URI` does not switch it off — so a relative `--db file:something` would let the guard clear one file while the command read or wrote another.
+Connections therefore receive the path absolutized: an absolute path cannot begin with `file:`, and absolutizing is lexical, so which file is named is otherwise unchanged.
+
 **Alternatives considered:**
 
 - `PRAGMA application_id` after `Connection::open`: side effects on foreign files (locks, potential sidecars) before the decision to refuse is made.
 - Schema-shape probing (table names): requires opening the database, and couples recognition to the very schema that migrations change.
+
+### Decision: A path that cannot be examined is refused in the ownership category, without an ownership claim
+
+**Chosen:** the recognizer keeps surfacing an I/O failure rather than folding it into a verdict, and its consumers convert that failure into a typed refusal of its own — naming the path and why the read failed, asserting neither that the target is nor that it is not a store this binary created.
+It carries the ownership exit code, because the caller's next action is identical to an ownership refusal (do not build here, correct the path), and it reports its own index state in `manifest`.
+The human message adds a cause-specific hint only where the operating system's own words do not imply the fix: a directory at the path is told that `--db` wants the database file inside it, and a permissions failure is told to check the file's owner.
+Every other cause carries the operating system's words alone.
+Every refusal stays on one line, because they all reach the caller through the diagnostic sanitizer that makes control characters visible rather than executing them: a literal newline in a message renders as a replacement character, so multi-line refusals are damage, not formatting.
+
+**Rationale:** an unreadable path is an unevaluated ownership question, not an answered one, and this change already fixed the shape of that answer once — an unevaluable workspace comparison is disclosed as unknown rather than folded into "matched".
+Folding "cannot read" into "unrecognized" would state two things the binary has not established: that a store built by another user is not c10r's, and — via the refusal's rebuild branch — that removing it is a recovery, when the caller may not be able to remove it or may be looking at their own live index directory.
+Leaving the failure to surface raw is the opposite error: it says nothing actionable, and it lets `manifest` report the path as an absent index, whose remedy (build here) is the one instruction the guard exists to withhold.
+Splitting the answer — the exit code carries what to do, the message carries what is known — gives the machine caller the same branch it would get from an ownership refusal without making the human message assert an ownership fact.
+
+**Alternatives considered:**
+
+- Fold the I/O failure into `Unrecognized`: no spec change and the smallest diff, but it manufactures an ownership verdict out of a failed read, which is the calibration error the north star names.
+- A fourth `StoreRecognition` verdict carrying the failure: the verdict enum is `Copy`/`PartialEq` and compared directly in the recognizer's tests; carrying an error inside it would cost those derives to express something only the consumers need.
+- Its own exit code: the taxonomy exists so a caller can branch on what to do next, and there is no action that distinguishes this from an ownership refusal.
+
+### Decision: An occupied build path is an ownership refusal, not an internal error
+
+**Chosen:** the refusal raised when a file already occupies the path a store is built at is contracted under the ownership requirement and carries the ownership exit code, and its message states removal only as conditional on the file being an interrupted build's leftover.
+
+**Rationale:** the exclusive create exists precisely because ownership of that path is unproven — a build file's name embeds a process id, and process ids recycle — so a message asserting the file is c10r's leftover claims the very thing the check declines to assume.
+Contracting it under the ownership requirement rather than as its own category keeps one rule for one question: a path this binary cannot prove is its own is refused, named, and left alone.
+
+**Alternatives considered:**
+
+- Leave it uncontracted as an internal operational error, like a full disk: it is user-visible, path-specific, and recoverable by a user action, which is what separates a contracted refusal from an operational failure.
 
 ### Decision: Store creation goes through a temp file and atomic rename
 
@@ -95,12 +129,42 @@ The missing-file case on the query path maps to the existing no-index code 3 —
 - Reuse `IncompatibleStore = 4`: conflates "rebuild fixes it" with "rebuild would destroy it" — the one distinction an automated caller must not miss.
 - Generic failure 1: erases the category entirely.
 
+### Decision: The ownership category belongs to the target, not to the command that met it
+
+**Chosen:** `cache`'s refusal of a target it cannot confirm is c10r's own carries the ownership exit code — the same code a build or a query reaches over that same file — while keeping reset's own message shape (name the manual `rm`).
+A failure raised _after_ the target cleared recognition, such as an unlink the operating system denies, stays a generic operational failure.
+
+**Rationale:** the taxonomy requirement names "a target refused because the system cannot confirm it is a store the system created" as one category, and the category describes the target, not the command.
+Scoping it to build and query would leave one file answering two ways depending on which command met it, and reset is the command whose next step is destructive — the one where a caller most needs to branch on the category rather than parse prose.
+It would also undercut the reason an unexaminable path carries this code: that the caller's next action is identical to an ownership refusal.
+Within `cache` that claim only holds once reset's own ownership refusal carries the same code.
+
+**Alternatives considered:**
+
+- Keep reset's refusal on the generic code and narrow the taxonomy requirement to build and query: contracts the inconsistency instead of resolving it, and leaves an agent branching on the ownership code blind at exactly the destructive command.
+
+### Decision: A recognized store at a schema version this binary does not read is its own index state
+
+**Chosen:** `manifest` reports such a store as a distinct index-state reading, alongside absent, unrecognized, and unexaminable.
+Every other read failure after recognition clears keeps the absent shape.
+
+**Rationale:** an index does exist at that path, and every query against it names the version mismatch and refuses with the incompatible-store code; orientation reporting nothing there would make `manifest` the one surface that disagrees with the rest about the same file.
+The remedy rhymes with an absent index's — `c10r build` either way — but orientation's job is to describe what is there, and "a c10r index this binary cannot read" is a different fact from "nothing here".
+It is also the state every store built before this change is in, so it is what an agent meets on the first run after an upgrade.
+
+**Alternatives considered:**
+
+- Report it as absent because both remedies are `c10r build`: collapses a distinction the rest of the surface makes, and hides the one condition a just-upgraded caller is most likely to hit.
+
 ### Decision: Workspace identity is the canonicalized root path, compared at query time, label-never-refuse
 
 **Chosen:** build records the canonicalized workspace root in `index_metadata` (one new column); every query command — all of which already receive both `--db` and the root — canonicalizes its root and compares.
 A difference sets a workspace-mismatch field in the answer envelope and a corresponding human-render line; it never refuses, and it composes with (never replaces) the staleness flag.
 Build over a recognized store recorded for a different root prints a disclosure naming both roots, proceeds, and re-records.
 The existing `workspace_id` stays as display identity only.
+
+The recorded root is stored as text only when the canonical path converts exactly; a path that does not is recorded as absent, and the comparison then reports unknown.
+A lossy rendering would map distinct paths onto one string, and two workspaces colliding there would compare equal — a false "matched", the one answer this comparison must never give wrongly.
 
 **Rationale:** the wrong-project case degrades answer honesty, not data safety — the store is c10r's own, replayable artifact — so the calibration principle applies: disclose, don't block.
 A canonical path is a strong signal of "different project" but a weak proof (repos legitimately move; containers and bind mounts remount the same project at new paths), so a hard refusal would false-positive against the user's own index; a rebuild in place re-records the identity and clears the marker.
@@ -112,6 +176,14 @@ The build handoff disclosure reads the old store's metadata, which is guaranteed
 - Compare `workspace_id` (directory name): too weak in both directions — two repos named `backend` collide, and a renamed directory false-positives.
 - Refuse on mismatch: punishes moved repos and containerized checkouts; the answer-honesty problem needs a label, not a wall.
 - Separate follow-up change: rejected — the recorded identity is a store-artifact change, and folding it here rides the same v13 bump, one migration instead of two.
+
+### Decision: `SURFACE_VERSION` does not bump
+
+**Chosen:** the surface version stays where it is; the checked-in surface snapshot is unchanged.
+
+**Rationale:** the pinned structure is the command/flag tree — commands, positional arguments, flags, their enumerated values and defaults — and this change touches none of it: no command, flag, value, or default is added, removed, or renamed.
+The surface answer's index-state block gains a distinct reading for an unrecognized file, but that block is the current state of the workspace's index, not part of the pinned structure, and the snapshot fixture does not carry it.
+The exit-code taxonomy is contracted in the command-surface spec rather than enumerated in the surface answer, so the new category adds nothing there either.
 
 ### Decision: Schema version bumps to v13
 

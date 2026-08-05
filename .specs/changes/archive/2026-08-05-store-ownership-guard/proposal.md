@@ -1,8 +1,9 @@
 # Proposal: store-ownership-guard
 
-> **Status: DRAFT — scope ratified, specs & design generated.**
+> **Status: IMPLEMENTED — verified 2026-08-05, awaiting sync.**
 > Created 2026-08-01 from an is-tested review finding, probe-confirmed but out of that change's scope.
-> Scope ratified 2026-08-02 in review discussion; delta specs and `design.md` generated 2026-08-02; wrong-index disclosure folded in 2026-08-02; `tasks.md` deliberately not generated yet.
+> Scope ratified 2026-08-02 in review discussion; delta specs and `design.md` generated 2026-08-02; wrong-index disclosure folded in 2026-08-02.
+> Implemented and verified 2026-08-05 over two remediation rounds: the first gave an unexaminable `--db` path its own typed refusal, the second unified reset's ownership refusal onto the ownership exit code and gave an incompatible store its own index-state reading.
 
 ## Intent
 
