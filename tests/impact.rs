@@ -1137,18 +1137,15 @@ fn narrowing_to_a_renamed_files_post_change_path_still_seeds_it() {
     assert_eq!(seed_names(report(&by_pre_path)), vec!["connect".to_string()]);
 }
 
-// _(Mismatched continuation token refused)_ — an impact answer is a function of the index *and* the
-// diff, and the diff is not a flag. A token minted against one change must not resume against a
-// different one: the working tree can move between two pages, which would silently drop or duplicate
-// rows under a stable-looking token.
-#[test]
-fn a_cursor_is_refused_after_the_seeding_change_moves() {
+/// A repository whose fixture sources gain `count` extra callers of `connect`, indexed to match:
+/// an edit to `connect` then yields enough dependents to truncate the default-bounded page, which
+/// is what the continuation-token tests need a cursor from.
+fn repo_with_many_connect_callers(count: usize) -> (TestRepo, PathBuf) {
     let repo = TestRepo::new();
     repo.write(support::DOC, support::SOURCE);
     repo.write("other/extra.rs", extra_source());
 
-    let caller_count = 30usize;
-    let (callers_source, caller_symbols, connect_refs) = build_callers(caller_count);
+    let (callers_source, caller_symbols, connect_refs) = build_callers(count);
     repo.write("src/callers.rs", &callers_source);
     repo.commit_all("add fixture sources plus many callers");
 
@@ -1183,6 +1180,16 @@ fn a_cursor_is_refused_after_the_seeding_change_moves() {
     let mut sources = base_sources();
     sources.push(("src/callers.rs".to_string(), callers_source));
     build_from_index(&db, &ws, repo.path(), &index, &sources).unwrap();
+    (repo, db)
+}
+
+// _(Mismatched continuation token refused)_ — an impact answer is a function of the index *and* the
+// diff, and the diff is not a flag. A token minted against one change must not resume against a
+// different one: the working tree can move between two pages, which would silently drop or duplicate
+// rows under a stable-looking token.
+#[test]
+fn a_cursor_is_refused_after_the_seeding_change_moves() {
+    let (repo, db) = repo_with_many_connect_callers(30);
 
     let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
     repo.write(support::DOC, &edited);
@@ -1203,6 +1210,45 @@ fn a_cursor_is_refused_after_the_seeding_change_moves() {
         Some(2),
         "a token issued against a different change is refused, not resumed: {}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+// _(Dependents order selector: a continuation token binds its ordering — impact)_ — `impact`
+// populates the token identity at its own site, apart from `trace`'s, so the binding is pinned
+// here through the real command: a cursor minted under the ranked default is refused when
+// presented with `--order unranked`, while the same cursor under the same ordering resumes.
+#[test]
+fn an_impact_cursor_issued_under_ranked_is_refused_under_unranked() {
+    let (repo, db) = repo_with_many_connect_callers(30);
+
+    let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
+    repo.write(support::DOC, &edited);
+
+    let first = run_impact_json(&repo, &db, &[]);
+    let cursor = first["page"]["cursor"]
+        .as_str()
+        .expect("a cursor on a truncated page")
+        .to_string();
+
+    let out = run_impact(&repo, &db, &["--order", "unranked", "--cursor", &cursor]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an ordering switch refuses the token as a usage error: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("different query parameters"),
+        "the refusal names the identity mismatch: {stderr}"
+    );
+
+    // The same token under the same ordering resumes — the refusal above is the ordering switch,
+    // not the token itself.
+    let resumed = run_impact_json(&repo, &db, &["--cursor", &cursor]);
+    assert_eq!(
+        resumed["page"]["page_index"], 1,
+        "the unswitched cursor resumes the second page: {resumed}"
     );
 }
 
@@ -2198,4 +2244,23 @@ fn an_impact_answer_discloses_a_workspace_mismatch() {
         report.get("workspace_relation").is_none(),
         "a matched workspace carries no marker: {report}"
     );
+}
+
+// _(Ordering disclosure: impact answers carry it too)_ — the impact answer envelope discloses the
+// ordering in effect through the same single structural field a `dependents` trace carries:
+// `ranked` by default, `unranked` on request — a separate wiring site from `trace`, checked
+// separately.
+#[test]
+fn impact_answers_disclose_the_ordering_in_effect() {
+    let (repo, db, _ws) = setup_repo_with_index();
+    repo.write(
+        support::DOC,
+        &edit_line(support::SOURCE, 4, "        pub fn connect(&self, x: u8) {}"),
+    );
+
+    let ranked = run_impact_json(&repo, &db, &[]);
+    assert_eq!(ranked["ordering"], "ranked", "the default is disclosed: {ranked}");
+
+    let unranked = run_impact_json(&repo, &db, &["--order", "unranked"]);
+    assert_eq!(unranked["ordering"], "unranked", "the request is disclosed: {unranked}");
 }

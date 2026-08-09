@@ -7,8 +7,10 @@ pub mod output;
 pub mod page;
 pub mod resolve;
 
+use crate::graph::rank;
 use crate::graph::store::{
-    DEPENDENTS_HORIZON, EdgeKind, Freshness, GraphStore, OccurrenceRow, PersistedClass, SymbolRow,
+    DEPENDENTS_HORIZON, DependentRow, EdgeKind, Freshness, GraphStore, OccurrenceRow, PersistedClass, SymbolRow,
+    kind_order,
 };
 use crate::identity::CanonicalId;
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
@@ -49,6 +51,28 @@ pub enum Relation {
     /// answer to "what test code exercises this symbol". Convention-based classification, not
     /// resolved semantic fact; every answer carries the heuristic-grade marker.
     Tests,
+}
+
+/// How the detailed rows of a `dependents`/`impact` answer are ordered. Distance is always the
+/// primary key; the mode decides what breaks ties within a distance layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderMode {
+    /// Within each distance layer, order by codebase-wide structural importance (a heuristic),
+    /// most important first: `(distance, rank desc, kind order, identity)`.
+    Ranked,
+    /// Order derived only from the answer's stable structural keys: `(distance, kind order,
+    /// identity)` — free of any ranking model.
+    Unranked,
+}
+
+impl OrderMode {
+    /// The closed-vocabulary label this mode carries in query identities and answer disclosures.
+    pub fn label(&self) -> &'static str {
+        match self {
+            OrderMode::Ranked => "ranked",
+            OrderMode::Unranked => "unranked",
+        }
+    }
 }
 
 /// A query error distinct from a typed-absence answer (which is a successful "none").
@@ -303,6 +327,7 @@ impl<'a> QueryEngine<'a> {
         depth: u32,
         detail: Option<Detail>,
         max_lines: Option<usize>,
+        order: OrderMode,
     ) -> Result<Answer<DependentsReport>, QueryError> {
         let (provenance, freshness) = self.provenance_and_freshness()?;
         let subject = match self.resolve(reference)? {
@@ -314,10 +339,11 @@ impl<'a> QueryEngine<'a> {
             Resolution::None => return Ok(Answer::absent(provenance, freshness)),
         };
 
-        let rows = self.store.dependents(&subject.canonical_id, DEPENDENTS_HORIZON)?;
+        let mut rows = self.store.dependents(&subject.canonical_id, DEPENDENTS_HORIZON)?;
         if rows.is_empty() {
             return Ok(Answer::empty(provenance, freshness));
         }
+        self.order_dependent_rows(&mut rows, order)?;
 
         // Split at the depth bound: detailed rows up to the bound (already ordered by the store),
         // aggregate counts by (distance, kind) beyond it. `cut_at_horizon` is computed independently
@@ -466,6 +492,43 @@ impl<'a> QueryEngine<'a> {
             Some(row) => Ok(projected_content(&row, Some(detail), max_lines)),
             None => Ok((None, false)),
         }
+    }
+
+    /// Apply the order selector to a dependents walk's rows.
+    ///
+    /// `Unranked` keeps the store's own `(distance, kind order, identity)` order untouched.
+    /// `Ranked` recomputes global rank over the projected graph and re-sorts to `(distance, rank
+    /// descending, kind order, identity)`: distance stays primary, importance breaks ties within a
+    /// layer, and the trailing structural keys keep the sort total under exact score ties. Rank
+    /// values compare via IEEE total order, and the rank itself is deterministic (fixed iteration
+    /// and summation order), so identical inputs always order identically. Ordering never changes
+    /// which rows are present. A row absent from the projection ranks as zero — the projection
+    /// spans every in-workspace symbol, and only in-workspace symbols appear as dependents, so the
+    /// fallback is a safety net rather than an expected path.
+    fn order_dependent_rows(&self, rows: &mut [DependentRow], order: OrderMode) -> Result<(), QueryError> {
+        // No rows, nothing to order: an empty walk (an impact over a seedless diff) never pays for
+        // a whole-graph rank it cannot use.
+        if order == OrderMode::Unranked || rows.is_empty() {
+            return Ok(());
+        }
+        let projection = self.store.rank_projection()?;
+        let scores = rank::global_rank(&projection);
+        let rank_of: std::collections::HashMap<&str, f64> = projection
+            .nodes
+            .iter()
+            .zip(scores.iter().copied())
+            .map(|(id, score)| (id.as_str(), score))
+            .collect();
+        rows.sort_by(|a, b| {
+            let rank_a = rank_of.get(a.id.as_str()).copied().unwrap_or(0.0);
+            let rank_b = rank_of.get(b.id.as_str()).copied().unwrap_or(0.0);
+            a.depth
+                .cmp(&b.depth)
+                .then_with(|| rank_b.total_cmp(&rank_a))
+                .then_with(|| kind_order(&a.kind).cmp(&kind_order(&b.kind)))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(())
     }
 }
 

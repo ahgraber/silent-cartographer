@@ -156,6 +156,17 @@ pub struct DependentRow {
     pub kind: String,
 }
 
+/// The rank graph projection [`GraphStore::rank_projection`] loads: the node universe and the
+/// collapsed dependency edges, both in canonical-identity order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankProjection {
+    /// Every in-workspace symbol, ordered by canonical identity. Isolated symbols are included.
+    pub nodes: Vec<CanonicalId>,
+    /// The collapsed dependency edges as `(src, dst)` indices into `nodes`, ordered by the source's
+    /// then the destination's canonical identity. `src` depends on `dst`.
+    pub edges: Vec<(usize, usize)>,
+}
+
 /// A persisted join-discrepancy row: one non-aligned occurrence's inspectable detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscrepancyRow {
@@ -1340,6 +1351,55 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// The rank graph projection: every in-workspace symbol, and every dependency edge (`uses`,
+    /// `imports`, `type_hierarchy`) whose both endpoints are in-workspace, with a pair related under
+    /// several kinds collapsed to a single edge.
+    ///
+    /// Nodes are returned in canonical-identity order and edges in `(src, dst)` canonical-identity
+    /// order, so a computation iterating them visits in a fixed order — the property the ranking's
+    /// determinism rests on. External symbols are excluded outright (they never appear as
+    /// dependents, and their mass would distort the scores of symbols that do); `contains` is
+    /// excluded because enclosure is structure, not dependency. An in-workspace symbol with no
+    /// projected edge is still a node, so it participates in the rank universe.
+    pub fn rank_projection(&self) -> rusqlite::Result<RankProjection> {
+        // Both reads run inside one transaction so they share a single snapshot: a rebuild
+        // committing between them could otherwise surface an edge whose endpoints the node query
+        // never saw, and the endpoint lookups below would abort on a torn view rather than a real
+        // invariant violation. Read-only, so the rollback on drop is a no-op.
+        let snapshot = self.conn.unchecked_transaction()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT canonical_id FROM symbols WHERE class = 'in_workspace' ORDER BY canonical_id")?;
+        let nodes: Vec<CanonicalId> = stmt
+            .query_map([], |r| Ok(CanonicalId::from_raw(r.get::<_, String>(0)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let index_of: std::collections::HashMap<&str, usize> =
+            nodes.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT e.src_id, e.dst_id FROM edges e
+             JOIN symbols s ON s.canonical_id = e.src_id AND s.class = 'in_workspace'
+             JOIN symbols d ON d.canonical_id = e.dst_id AND d.class = 'in_workspace'
+             WHERE e.kind IN ('uses', 'imports', 'type_hierarchy')
+             ORDER BY e.src_id, e.dst_id",
+        )?;
+        let edges: Vec<(usize, usize)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .map(|row| {
+                let (src, dst) = row?;
+                Ok((
+                    *index_of.get(src.as_str()).expect("edge source is a projected node"),
+                    *index_of
+                        .get(dst.as_str())
+                        .expect("edge destination is a projected node"),
+                ))
+            })
+            .collect::<rusqlite::Result<_>>()?;
+        drop(snapshot);
+
+        Ok(RankProjection { nodes, edges })
+    }
+
     /// Every reference-role occurrence of `id`, ordered deterministically.
     pub fn references_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<OccurrenceRow>> {
         let mut stmt = self.conn.prepare(
@@ -1473,7 +1533,7 @@ impl RootPair {
 /// The fallback bucket is unreachable while `EdgeKind` stays closed to the three dependency kinds
 /// above; adding a new edge kind to the dependents walk requires adding it here too, or it will
 /// silently sort last instead of taking its intended tie-break position.
-fn kind_order(tag: &str) -> u8 {
+pub(crate) fn kind_order(tag: &str) -> u8 {
     match tag {
         "uses" => 0,
         "imports" => 1,
@@ -1957,5 +2017,58 @@ mod tests {
         let outer_rows: Vec<_> = deps.iter().filter(|d| d.id == outer).collect();
         assert_eq!(outer_rows.len(), 1, "outer reported once despite reaching every chunk");
         assert_eq!(outer_rows[0].depth, 2);
+    }
+
+    /// An external symbol row (no definition span), minimal in every other field.
+    fn external_symbol(id: &str) -> SymbolRow {
+        SymbolRow {
+            canonical_id: CanonicalId::from_raw(id.to_string()),
+            display_name: id.to_string(),
+            kind: "function".to_string(),
+            class: PersistedClass::External,
+            document_path: None,
+            span: None,
+            span_text: None,
+            signature_text: None,
+            interface_text: None,
+            duplicated: false,
+            test_rule: None,
+        }
+    }
+
+    // The rank projection holds exactly the in-workspace universe and the collapsed dependency
+    // edges: an external symbol is absent (as node and through its edges), a `contains` edge is
+    // absent, a pair related under two kinds yields one edge, and an isolated in-workspace symbol
+    // is present in the node universe.
+    #[test]
+    fn rank_projection_projects_workspace_dependency_edges_only() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.insert_symbol(&symbol_at("ws::a", "doc.rs", 0, 10)).unwrap();
+        store.insert_symbol(&symbol_at("ws::b", "doc.rs", 20, 30)).unwrap();
+        store
+            .insert_symbol(&symbol_at("ws::isolated", "doc.rs", 40, 50))
+            .unwrap();
+        store.insert_symbol(&external_symbol("ext::x")).unwrap();
+
+        let a = CanonicalId::from_raw("ws::a".to_string());
+        let b = CanonicalId::from_raw("ws::b".to_string());
+        let ext = CanonicalId::from_raw("ext::x".to_string());
+        // The same pair under two kinds collapses to one projected edge.
+        store.insert_edge(EdgeKind::Uses, &a, &b).unwrap();
+        store.insert_edge(EdgeKind::Imports, &a, &b).unwrap();
+        // Enclosure is excluded outright.
+        store.insert_edge(EdgeKind::Contains, &b, &a).unwrap();
+        // An edge touching an external endpoint is excluded in either direction.
+        store.insert_edge(EdgeKind::Uses, &a, &ext).unwrap();
+        store.insert_edge(EdgeKind::Uses, &ext, &b).unwrap();
+
+        let projection = store.rank_projection().unwrap();
+        let names: Vec<&str> = projection.nodes.iter().map(|n| n.as_str()).collect();
+        assert_eq!(names, vec!["ws::a", "ws::b", "ws::isolated"]);
+        assert_eq!(
+            projection.edges,
+            vec![(0, 1)],
+            "one collapsed a→b edge and nothing else"
+        );
     }
 }

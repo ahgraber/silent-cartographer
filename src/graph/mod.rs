@@ -3,6 +3,7 @@
 
 pub mod join;
 pub mod range;
+pub mod rank;
 pub mod schema;
 pub mod store;
 pub mod syntax;

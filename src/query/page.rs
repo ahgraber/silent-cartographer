@@ -15,10 +15,11 @@ use super::output::{Answer, Outcome, PageInfo};
 use super::{DependentItem, DependentsReport};
 
 /// The query identity a continuation token is bound to: the command, subject, relation/detail, the
-/// depth bound, the output bounds (result limit, content-line bound, and `get`'s window start), and
-/// the recorded index identity (content-hash plus analyzer provenance). A token resumes only against
-/// the exact same identity — a different query, or an index rebuilt underneath (changed sources or a
-/// changed analyzer version), changes the hash and is rejected.
+/// depth bound, the order selector and ranking-model version (for orderable answers), the output
+/// bounds (result limit, content-line bound, and `get`'s window start), and the recorded index
+/// identity (content-hash plus analyzer provenance). A token resumes only against the exact same
+/// identity — a different query, an index rebuilt underneath (changed sources or a changed analyzer
+/// version), or a changed ranking model, changes the hash and is rejected.
 pub struct PageIdentity {
     /// The command name (`get`, `trace`, `find`, or `impact`).
     pub command: &'static str,
@@ -30,6 +31,11 @@ pub struct PageIdentity {
     pub detail: Option<&'static str>,
     /// The requested depth bound (the `dependents` relation); `None` elsewhere.
     pub depth: Option<u32>,
+    /// The ordering identity for an orderable answer (`dependents` traces and `impact`); `None`
+    /// for commands whose answers carry no orderable rows. Bound so a token issued under one
+    /// ordering, or under a prior ranking model, is rejected rather than resumed against a
+    /// differently-ordered sequence.
+    pub ordering: Option<OrderingIdentity>,
     /// The effective result limit — the applied default or an explicit value; `None` for an
     /// explicit unbounded request (`--limit 0`).
     pub limit: Option<usize>,
@@ -45,6 +51,38 @@ pub struct PageIdentity {
     pub index_hash: String,
 }
 
+/// The ordering half of a query identity: the selector and the ranking model's version, sealed
+/// into one value so a site that binds the mode cannot fail to bind the version.
+///
+/// The version is not a parameter: [`OrderingIdentity::current`] — the only production
+/// constructor — stamps [`crate::graph::rank::RANK_VERSION`] itself, making "the selector and the
+/// ranking model's version are part of the query identity" a property of the type rather than a
+/// discipline every identity-building site must remember. Within one binary the constant cannot
+/// vary, so no runtime test can catch a site that binds the mode but not the version; sealing the
+/// pair is what closes that untestable gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderingIdentity {
+    mode: &'static str,
+    rank_version: u32,
+}
+
+impl OrderingIdentity {
+    /// The ordering identity for `mode` under the ranking model this binary ships.
+    pub fn current(mode: crate::query::OrderMode) -> Self {
+        Self {
+            mode: mode.label(),
+            rank_version: crate::graph::rank::RANK_VERSION,
+        }
+    }
+
+    /// An ordering identity with an arbitrary version, for exercising cross-version token
+    /// rejection — constructible only in tests, so production sites cannot bind a stale version.
+    #[cfg(test)]
+    fn with_version(mode: &'static str, rank_version: u32) -> Self {
+        Self { mode, rank_version }
+    }
+}
+
 impl PageIdentity {
     /// The parameter-identity hash: a hex digest over every field that must match for a token to
     /// resume. It is deliberately not the token itself — the token additionally carries the page
@@ -57,6 +95,8 @@ impl PageIdentity {
             self.relation.unwrap_or(""),
             self.detail.unwrap_or(""),
             &self.depth.map(|n| n.to_string()).unwrap_or_default(),
+            self.ordering.map(|o| o.mode).unwrap_or(""),
+            &self.ordering.map(|o| o.rank_version.to_string()).unwrap_or_default(),
             &self.limit.map(|n| n.to_string()).unwrap_or_default(),
             &self.max_lines.map(|n| n.to_string()).unwrap_or_default(),
             &self.from.map(|n| n.to_string()).unwrap_or_default(),
@@ -115,6 +155,7 @@ pub fn apply_pagination<T>(
         stale,
         classification,
         workspace_relation,
+        ordering,
         outcome,
         page: _,
     } = answer;
@@ -140,6 +181,7 @@ pub fn apply_pagination<T>(
             stale,
             classification,
             workspace_relation,
+            ordering,
             outcome: Outcome::Ambiguous {
                 candidates,
                 candidates_total,
@@ -160,6 +202,7 @@ pub fn apply_pagination<T>(
             stale,
             classification,
             workspace_relation,
+            ordering,
             outcome,
             page: None,
         });
@@ -173,6 +216,7 @@ pub fn apply_pagination<T>(
             stale,
             classification,
             workspace_relation,
+            ordering,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -207,6 +251,7 @@ pub fn apply_pagination<T>(
         stale,
         classification,
         workspace_relation,
+        ordering,
         outcome: Outcome::Found { results: page_results },
         page,
     })
@@ -242,6 +287,7 @@ pub fn apply_report_pagination<T>(
         stale,
         classification,
         workspace_relation,
+        ordering,
         outcome,
         page: _,
     } = answer;
@@ -257,6 +303,7 @@ pub fn apply_report_pagination<T>(
             stale,
             classification,
             workspace_relation,
+            ordering,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -297,6 +344,7 @@ pub fn apply_report_pagination<T>(
         stale,
         classification,
         workspace_relation,
+        ordering,
         outcome: Outcome::Found { results: vec![report] },
         page,
     })
@@ -421,11 +469,91 @@ mod tests {
             relation: None,
             detail: None,
             depth: None,
+            ordering: None,
             limit: Some(limit),
             max_lines: None,
             from: None,
             index_hash: "hash".to_string(),
         }
+    }
+
+    // _(Dependents order selector: a continuation token does not outlive its ranking model)_ — a
+    // well-formed token hashed under one rank version is refused when presented under another,
+    // through both pagination write-sites: the plain result-set path and the report-shaped
+    // dependents path.
+    #[test]
+    fn a_token_hashed_under_a_different_rank_version_is_refused_on_both_paths() {
+        let stale_identity = |order, version| {
+            let mut identity = identity(1);
+            identity.ordering = Some(OrderingIdentity::with_version(order, version));
+            identity
+        };
+
+        // Plain path: a found result set under the current model refuses a prior model's token.
+        let token = encode_token(&stale_identity("ranked", 1).hash(), 1);
+        let answer = Answer::found(vec!["a".to_string(), "b".to_string()], provenance(), Freshness::Fresh);
+        let err = apply_pagination(answer, Some(1), Some(&token), &stale_identity("ranked", 2))
+            .expect_err("a prior rank version's token is refused, not resumed");
+        assert!(
+            err.to_string().contains("different query parameters"),
+            "the refusal names the identity mismatch: {err}"
+        );
+
+        // Report-shaped path: the dependents pagination refuses through the same identity check.
+        let detail: Vec<DependentItem> = (0..2)
+            .map(|i| DependentItem {
+                symbol: crate::query::output::SymbolView {
+                    canonical_id: crate::identity::CanonicalId::from_raw(format!("test-ws::dep{i}")),
+                    name: format!("dep{i}"),
+                    kind: "function".to_string(),
+                    external: false,
+                },
+                kind: "uses".to_string(),
+                distance: 1,
+                location: None,
+                content: None,
+                content_truncated: false,
+            })
+            .collect();
+        let report = DependentsReport {
+            depth_bound: 1,
+            horizon: 1,
+            disclosure: HorizonDisclosure::EndsWithinBound,
+            detail,
+            beyond_bound: Vec::new(),
+        };
+        let answer = Answer::found(vec![report], provenance(), Freshness::Fresh);
+        let token = encode_token(&stale_identity("ranked", 1).hash(), 1);
+        let err = apply_dependents_pagination(answer, Some(1), Some(&token), &stale_identity("ranked", 2))
+            .expect_err("the report path refuses a prior rank version's token too");
+        assert!(
+            err.to_string().contains("different query parameters"),
+            "the refusal names the identity mismatch: {err}"
+        );
+    }
+
+    // _(Dependents order selector: the selector is part of the query identity)_ — two identities
+    // differing only in the order mode hash differently, so a token issued under one ordering can
+    // never validate against the other.
+    #[test]
+    fn identities_differing_only_in_order_mode_hash_differently() {
+        let mut ranked = identity(1);
+        ranked.ordering = Some(OrderingIdentity::with_version("ranked", 1));
+        let mut unranked = identity(1);
+        unranked.ordering = Some(OrderingIdentity::with_version("unranked", 1));
+        assert_ne!(ranked.hash(), unranked.hash());
+    }
+
+    // _(Dependents order selector: the ranking model's version is part of the query identity)_ —
+    // two identities differing only in the rank version hash differently, so a token never
+    // outlives its ranking model.
+    #[test]
+    fn identities_differing_only_in_rank_version_hash_differently() {
+        let mut old = identity(1);
+        old.ordering = Some(OrderingIdentity::with_version("ranked", 1));
+        let mut new = identity(1);
+        new.ordering = Some(OrderingIdentity::with_version("ranked", 2));
+        assert_ne!(old.hash(), new.hash());
     }
 
     // _(Bounded and resumable answers: mismatched continuation token refused — out-of-range page)_ —

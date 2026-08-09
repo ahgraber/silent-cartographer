@@ -1320,3 +1320,195 @@ fn get_answers_despite_a_hanging_analyzer_and_discloses_the_timeout() {
         "the timeout is disclosed on standard error: {stderr}"
     );
 }
+
+/// A store at `dir/index.db` for ranked paging: a subject with six direct dependents whose
+/// codebase-wide importance differs — `dep05` is used by three further symbols, `dep03` by two,
+/// `dep01` by one, and the rest by none — so the ranked distance-1 layer is
+/// `dep05, dep03, dep01, dep00, dep02, dep04` (importance descending, identity breaking the ties).
+fn build_ranked_dependents_db(dir: &Path) -> PathBuf {
+    let db = dir.join("index.db");
+    let store = GraphStore::open_or_replace(&db).unwrap();
+    put_symbol(&store, "sub", "sub", None);
+    for i in 0..6 {
+        let name = format!("dep{i:02}");
+        put_symbol(&store, &name, &name, None);
+        store.insert_edge(EdgeKind::Uses, &ws_id(&name), &ws_id("sub")).unwrap();
+    }
+    let mut user = 0;
+    for (dep, users) in [("dep05", 3), ("dep03", 2), ("dep01", 1)] {
+        for _ in 0..users {
+            let name = format!("user{user:02}");
+            user += 1;
+            put_symbol(&store, &name, &name, None);
+            store.insert_edge(EdgeKind::Uses, &ws_id(&name), &ws_id(dep)).unwrap();
+        }
+    }
+    support::stamp_metadata(&store, "bound-ws", dir);
+    db
+}
+
+/// Run a `dependents` trace over the ranked fixture as JSON, with optional extra flags.
+fn ranked_trace(dir: &Path, db: &Path, extra: &[&str]) -> std::process::Output {
+    let mut cmd = c10r(dir);
+    cmd.arg("--db").arg(db).arg("--json");
+    cmd.args(["trace", "bound-ws::sub", "--relation", "dependents"]);
+    cmd.args(extra);
+    cmd.output().unwrap()
+}
+
+// _(Ranked ordering: a truncated page holds the head of the ordered sequence)_ — with a result
+// limit smaller than the distance-1 layer, the detailed rows are the most important distance-1
+// dependents, truncation is disclosed with a continuation, and resuming yields the next rows of
+// the ranked sequence with no repeats or omissions.
+#[test]
+fn ranked_truncated_page_holds_the_most_important_head_and_resumes_without_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_ranked_dependents_db(dir.path());
+
+    let first = json_answer(&ranked_trace(dir.path(), &db, &["--limit", "3"]));
+    assert_eq!(
+        dependent_ids(&first),
+        vec!["bound-ws::dep05", "bound-ws::dep03", "bound-ws::dep01"],
+        "the first page holds the most important distance-1 dependents, most important first"
+    );
+    assert_eq!(first["page"]["truncated"], true, "the truncation is disclosed: {first}");
+    let token = first["page"]["cursor"].as_str().expect("a continuation").to_string();
+
+    let second = json_answer(&ranked_trace(dir.path(), &db, &["--limit", "3", "--cursor", &token]));
+    assert_eq!(
+        dependent_ids(&second),
+        vec!["bound-ws::dep00", "bound-ws::dep02", "bound-ws::dep04"],
+        "the resumed page continues the ranked sequence with no repeats or omissions"
+    );
+}
+
+// _(Dependents order selector: a continuation token binds its ordering)_ — a token issued under
+// the ranked (default) ordering presented with `--order unranked` is rejected as a usage error
+// rather than resumed against a differently-ordered sequence.
+#[test]
+fn a_token_issued_under_ranked_is_refused_under_unranked() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_ranked_dependents_db(dir.path());
+
+    let first = json_answer(&ranked_trace(dir.path(), &db, &["--limit", "3"]));
+    let token = first["page"]["cursor"].as_str().expect("a continuation").to_string();
+
+    let out = ranked_trace(
+        dir.path(),
+        &db,
+        &["--limit", "3", "--cursor", &token, "--order", "unranked"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an ordering switch refuses the token as a usage error: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("different query parameters"),
+        "the refusal names the identity mismatch: {stderr}"
+    );
+}
+
+// _(Dependents order selector: unranked ordering on request)_ — `--order unranked` reproduces the
+// structural `(distance, kind, identity)` order over the same fixture the ranked default reorders.
+#[test]
+fn explicit_unranked_reproduces_the_structural_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_ranked_dependents_db(dir.path());
+
+    let answer = json_answer(&ranked_trace(dir.path(), &db, &["--order", "unranked", "--limit", "0"]));
+    let d1_ids: Vec<String> = dependent_ids(&answer)
+        .into_iter()
+        .filter(|id| id.contains("::dep"))
+        .collect();
+    assert_eq!(
+        d1_ids,
+        (0..6).map(|i| format!("bound-ws::dep{i:02}")).collect::<Vec<_>>(),
+        "the unranked distance-1 layer is in identity order"
+    );
+}
+
+// _(Ordering disclosure: machine answer discloses the ordering in effect)_ — the JSON answer
+// carries the single `ordering` field: `ranked` by default, `unranked` on request, and a
+// typed-empty dependents answer still carries it.
+#[test]
+fn json_answers_disclose_the_ordering_in_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_ranked_dependents_db(dir.path());
+
+    let ranked = json_answer(&ranked_trace(dir.path(), &db, &[]));
+    assert_eq!(ranked["ordering"], "ranked", "the default is disclosed: {ranked}");
+
+    let unranked = json_answer(&ranked_trace(dir.path(), &db, &["--order", "unranked"]));
+    assert_eq!(unranked["ordering"], "unranked", "the request is disclosed: {unranked}");
+
+    // `user00` depends on `dep05` and nothing depends on it, so its dependents answer is
+    // typed-empty — and still carries the disclosure.
+    let mut cmd = c10r(dir.path());
+    cmd.arg("--db").arg(&db).arg("--json");
+    cmd.args(["trace", "bound-ws::user00", "--relation", "dependents"]);
+    let empty = json_answer(&cmd.output().unwrap());
+    assert_eq!(empty["outcome"]["outcome"], "empty", "a typed-empty answer: {empty}");
+    assert_eq!(
+        empty["ordering"], "ranked",
+        "the disclosure survives an empty answer: {empty}"
+    );
+}
+
+// _(Dependents order selector: an unknown order value is refused naming the valid set)_ — a value
+// outside the closed vocabulary is rejected before any traversal, enumerating `ranked` and
+// `unranked`.
+#[test]
+fn an_unknown_order_value_names_the_valid_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_ranked_dependents_db(dir.path());
+
+    let out = ranked_trace(dir.path(), &db, &["--order", "bogus"]);
+    assert_eq!(out.status.code(), Some(2), "an out-of-set value is a usage error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ranked") && stderr.contains("unranked"),
+        "the rejection enumerates the valid set: {stderr}"
+    );
+}
+
+// _(Dependents order selector: the real CLI distinguishes an explicit `--order` from its default)_
+// — through the built binary, `trace --relation references --order ranked` is refused as a usage
+// error naming where the selector applies, while the same invocation without the flag succeeds:
+// the explicit-flag wiring, not just the handler's rejection, is what this pins.
+#[test]
+fn cli_rejects_explicit_order_on_references_but_not_the_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_ranked_dependents_db(dir.path());
+
+    let trace_references = |extra: &[&str]| {
+        let mut cmd = c10r(dir.path());
+        cmd.arg("--db").arg(&db);
+        cmd.args(["trace", "bound-ws::sub", "--relation", "references"]);
+        cmd.args(extra);
+        cmd.output().unwrap()
+    };
+
+    let explicit = trace_references(&["--order", "ranked"]);
+    assert_eq!(
+        explicit.status.code(),
+        Some(2),
+        "an explicit --order with references is a usage error: {}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&explicit.stderr);
+    assert!(
+        stderr.contains("--order") && stderr.contains("references") && stderr.contains("dependents"),
+        "the refusal names the flag, the offending relation, and where the selector applies: {stderr}"
+    );
+
+    let default = trace_references(&[]);
+    assert_eq!(
+        default.status.code(),
+        Some(0),
+        "the defaulted order stays dormant on references: {}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+}

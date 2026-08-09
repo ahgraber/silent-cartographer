@@ -108,6 +108,13 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
                 lines
                     .push("note: results are convention-classified test code, not resolved semantic fact".to_string());
             }
+            // The ordering disclosure's heuristic note, likewise: only a ranked answer is presented
+            // as heuristic — an unranked ordering derives from stable structural keys alone.
+            if answer.ordering == Some("ranked") {
+                lines.push(
+                    "note: rows within a distance layer are ordered by a structural importance heuristic".to_string(),
+                );
+            }
             T::render_found(results, &mut lines, styled)
         }
         Outcome::Ambiguous {

@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 use crate::graph::syntax::Language;
-use crate::query::{Detail, Relation};
+use crate::query::{Detail, OrderMode, Relation};
 
 /// The `c10r` CLI: precise, type-aware navigation over a persisted code graph.
 #[derive(Debug, Parser)]
@@ -148,6 +148,27 @@ impl From<RelationArg> for Relation {
     }
 }
 
+/// The order of the detailed dependent rows in a `dependents` trace or an `impact` assessment.
+/// Distance is always the primary key; the mode decides what breaks ties within a distance layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OrderArg {
+    /// Within each distance layer, order rows by a structural-importance heuristic (codebase-wide,
+    /// most important first) — guidance for reading order, not resolved semantic fact.
+    Ranked,
+    /// Order rows only by the answer's stable structural keys: distance, then dependency kind,
+    /// then canonical identity — free of any ranking model.
+    Unranked,
+}
+
+impl From<OrderArg> for OrderMode {
+    fn from(o: OrderArg) -> Self {
+        match o {
+            OrderArg::Ranked => OrderMode::Ranked,
+            OrderArg::Unranked => OrderMode::Unranked,
+        }
+    }
+}
+
 /// The result-set paging bounds shared by the query commands (`get`, `trace`, `find`). Defined
 /// per-command rather than globally so clap rejects them on commands they are meaningless for
 /// (`build`, `status`, `doctor`, `cache`, `manifest`) as a usage error before any side effect.
@@ -215,6 +236,13 @@ pub struct TraceArgs {
     #[arg(long, value_enum)]
     pub detail: Option<DetailArg>,
 
+    /// For the `dependents` relation, how the detailed rows are ordered: `ranked` (the default)
+    /// orders each distance layer by a structural-importance heuristic, most important first;
+    /// `unranked` orders by distance, dependency kind, then identity. Never changes which rows are
+    /// returned. Supplying it with any other relation is an error.
+    #[arg(long, value_enum, default_value = "ranked")]
+    pub order: OrderArg,
+
     /// Cap the lines of content projected onto each row, for a content-bearing detail. Defaults to
     /// 10; `0` means unbounded. Applies only when `--detail` selects a content-bearing tier.
     #[arg(long, default_value_t = 10)]
@@ -253,6 +281,12 @@ pub struct ImpactArgs {
     /// detailed rows, every dependent counted in the aggregate.
     #[arg(long, default_value_t = 1)]
     pub depth: u32,
+
+    /// How the detailed dependent rows are ordered: `ranked` (the default) orders each distance
+    /// layer by a structural-importance heuristic, most important first; `unranked` orders by
+    /// distance, dependency kind, then identity. Never changes which rows are returned.
+    #[arg(long, value_enum, default_value = "ranked")]
+    pub order: OrderArg,
 
     /// Narrow the seed to these paths, after `--`. A renamed file is reached by either its
     /// pre-change or its post-change path.

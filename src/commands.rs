@@ -21,9 +21,10 @@ use crate::query::diff::{self, FileChange};
 use crate::query::impact::{ImpactRequest, shell_quote};
 use crate::query::output::{Answer, WorkspaceRelation};
 use crate::query::page::{
-    PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination, precheck_cursor,
+    OrderingIdentity, PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination,
+    precheck_cursor,
 };
-use crate::query::{Detail, QueryEngine, Relation};
+use crate::query::{Detail, OrderMode, QueryEngine, Relation};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
 use crate::semantic::probe::PROBE_DEADLINE;
 use crate::semantic::python_adapter::{PythonAdapter, environment_facts, resolve_environment};
@@ -821,6 +822,7 @@ pub fn run_get(
         relation: None,
         detail: Some(detail_label(detail)),
         depth: None,
+        ordering: None,
         limit: effective_limit,
         max_lines: effective_max_lines,
         from: Some(from),
@@ -847,6 +849,8 @@ pub fn run_trace(
     detail: Option<Detail>,
     max_lines: usize,
     max_lines_explicit: bool,
+    order: OrderMode,
+    order_explicit: bool,
     limit: usize,
     cursor: Option<&str>,
     json: bool,
@@ -856,6 +860,17 @@ pub fn run_trace(
         return Err(Failure::Usage(format!(
             "the `--depth` flag applies only to the `dependents` relation, but it was given with `{}`; \
              relations that accept `--depth`: dependents",
+            relation_label(relation)
+        ))
+        .into());
+    }
+    // The order selector is defined only where its orderings are — a `dependents` trace (and
+    // `impact`); an explicit `--order` with any other relation is refused before any traversal.
+    // The defaulted value stays dormant, so an orderless invocation of another relation is fine.
+    if !matches!(relation, Relation::Dependents) && order_explicit {
+        return Err(Failure::Usage(format!(
+            "the `--order` flag applies only to the `dependents` relation and `impact`, but it was given with \
+             `{}`; relations that accept `--order`: dependents",
             relation_label(relation)
         ))
         .into());
@@ -887,17 +902,23 @@ pub fn run_trace(
         // The effective depth bound: `dependents` defaults to 1 when the flag is omitted, so an
         // explicit `--depth 1` and the default bind to the same identity.
         depth: matches!(relation, Relation::Dependents).then(|| depth.unwrap_or(1)),
+        // The ordering identity — the selector together with the ranking model's version — binds
+        // only where an ordering is defined; an explicit `--order ranked` and the default bind to
+        // the same identity.
+        ordering: matches!(relation, Relation::Dependents).then(|| OrderingIdentity::current(order)),
         limit: effective_limit,
         max_lines: effective_max_lines,
         from: None,
         index_hash,
     };
     if matches!(relation, Relation::Dependents) {
-        let answer = engine.dependents(reference, depth.unwrap_or(1), detail, effective_max_lines)?;
+        let answer = engine.dependents(reference, depth.unwrap_or(1), detail, effective_max_lines, order)?;
         // Dependents pages its detailed rows under the limit; the depth/horizon/disclosure/beyond-bound
-        // summary is repeated on every page as context.
+        // summary is repeated on every page as context. Every dependents answer — typed-empty
+        // included — carries the ordering disclosure.
         let answer = apply_dependents_pagination(answer, effective_limit, cursor, &identity)?
-            .with_workspace_relation(relation_disclosure);
+            .with_workspace_relation(relation_disclosure)
+            .with_ordering(order.label());
         return Ok(render(&answer, json, styled));
     }
     let answer = engine.trace(reference, relation, detail, effective_max_lines)?;
@@ -937,6 +958,7 @@ pub fn run_find(
         relation: None,
         detail: None,
         depth: None,
+        ordering: None,
         limit: effective_limit,
         max_lines: None,
         from: None,
@@ -983,6 +1005,7 @@ pub fn run_impact(
     revspec: Option<&str>,
     staged: bool,
     depth: u32,
+    order: OrderMode,
     paths: &[PathBuf],
     limit: usize,
     cursor: Option<&str>,
@@ -1145,6 +1168,7 @@ pub fn run_impact(
         untracked_sources: &untracked_sources,
         range_head: range_head.as_deref(),
         depth,
+        order,
     };
     let answer = engine.impact(&request)?;
 
@@ -1172,13 +1196,16 @@ pub fn run_impact(
         relation: None,
         detail: None,
         depth: Some(depth),
+        ordering: Some(OrderingIdentity::current(order)),
         limit: effective_limit,
         max_lines: None,
         from: None,
         index_hash: page_index_hash,
     };
-    let answer =
-        apply_impact_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+    // Every impact answer carries the ordering disclosure, whatever its outcome.
+    let answer = apply_impact_pagination(answer, effective_limit, cursor, &identity)?
+        .with_workspace_relation(relation)
+        .with_ordering(order.label());
     Ok(render(&answer, json, styled))
 }
 

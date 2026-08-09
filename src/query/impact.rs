@@ -13,7 +13,7 @@ use crate::identity::CanonicalId;
 
 use super::diff::{FileChange, LineIndex};
 use super::output::{Answer, Location, SymbolView};
-use super::{DependentItem, DependentsReport, HorizonDisclosure, QueryEngine, QueryError};
+use super::{DependentItem, DependentsReport, HorizonDisclosure, OrderMode, QueryEngine, QueryError};
 
 /// Whether the index the answer was drawn from matches the change's pre-change state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -168,6 +168,8 @@ pub struct ImpactRequest<'a> {
     pub range_head: Option<&'a str>,
     /// The depth bound the detailed dependents run to.
     pub depth: u32,
+    /// The order selector for the detailed dependent rows.
+    pub order: OrderMode,
 }
 
 impl QueryEngine<'_> {
@@ -186,7 +188,7 @@ impl QueryEngine<'_> {
             })
             .collect();
 
-        let dependents = self.union_dependents(seeds.keys(), request.depth)?;
+        let dependents = self.union_dependents(seeds.keys(), request.depth, request.order)?;
 
         let exactness = if request.pre_change_hash == request.index_hash && request.reconstructible {
             Exactness::Exact
@@ -288,15 +290,17 @@ impl QueryEngine<'_> {
     /// The union of `dependents` reached from every seed: one combined walk over the whole seed set
     /// (see [`GraphStore::dependents_of_seeds`](crate::graph::store::GraphStore::dependents_of_seeds)),
     /// so each dependent arrives exactly once at its shortest distance from any seed, under the same
-    /// `(distance, kind order, identity)` order a single-seed answer uses — then split at `depth`
+    /// order selector a single-seed answer applies — then split at `depth`
     /// exactly as [`QueryEngine::dependents`] splits a single-seed walk.
     fn union_dependents<'a>(
         &self,
         seed_ids: impl Iterator<Item = &'a CanonicalId>,
         depth: u32,
+        order: OrderMode,
     ) -> Result<DependentsReport, QueryError> {
         let seeds: Vec<CanonicalId> = seed_ids.cloned().collect();
-        let rows = self.store.dependents_of_seeds(&seeds, DEPENDENTS_HORIZON)?;
+        let mut rows = self.store.dependents_of_seeds(&seeds, DEPENDENTS_HORIZON)?;
+        self.order_dependent_rows(&mut rows, order)?;
 
         let mut detailed: Vec<DependentItem> = Vec::new();
         let mut aggregate: BTreeMap<(u32, String), u64> = BTreeMap::new();
@@ -514,7 +518,14 @@ fn recovery_recipe(request: &ImpactRequest<'_>) -> RecoveryRecipe {
         rerun.push(' ');
         rerun.push_str(&args);
     }
-    rerun.push_str(&format!(" --depth {} --db {tmp_db}", request.depth));
+    // The re-run reproduces every answer-shaping parameter of the original question — the order
+    // selector included, or a caller who asked for `unranked` would get back an "exact" answer
+    // whose first bounded page is ordered by the ranked default they did not ask for.
+    rerun.push_str(&format!(
+        " --depth {} --order {} --db {tmp_db}",
+        request.depth,
+        request.order.label()
+    ));
     if !request.paths.is_empty() {
         rerun.push_str(" -- ");
         let quoted: Vec<String> = request
@@ -677,6 +688,7 @@ mod tests {
             untracked_sources: &[],
             range_head: None,
             depth: 1,
+            order: OrderMode::Unranked,
         }
     }
 
@@ -1136,7 +1148,9 @@ mod tests {
         write_metadata(&store, hash);
         let engine = engine(&store, hash);
 
-        let report = engine.union_dependents([&seed_a, &seed_b].into_iter(), 1).unwrap();
+        let report = engine
+            .union_dependents([&seed_a, &seed_b].into_iter(), 1, OrderMode::Unranked)
+            .unwrap();
         assert_eq!(report.detail.len(), 1, "{:?}", report.detail);
         assert_eq!(report.detail[0].symbol.canonical_id, dep);
         assert_eq!(report.detail[0].distance, 1);
@@ -1144,9 +1158,68 @@ mod tests {
         assert_eq!(report.disclosure, HorizonDisclosure::BeyondBound);
 
         // With a depth bound covering both hops, reach ends within bound.
-        let report = engine.union_dependents([&seed_a, &seed_b].into_iter(), 2).unwrap();
+        let report = engine
+            .union_dependents([&seed_a, &seed_b].into_iter(), 2, OrderMode::Unranked)
+            .unwrap();
         assert_eq!(report.disclosure, HorizonDisclosure::EndsWithinBound);
         assert_eq!(report.detail.len(), 2);
+    }
+
+    // _(Ranked ordering of dependents: impact answers order each layer by importance)_ — the
+    // multi-seed union is its own write-site for the ranked ordering: with two seeds whose
+    // same-distance dependents differ in codebase-wide importance, the ranked union orders the
+    // layer most-important-first while the unranked union keeps identity order.
+    #[test]
+    fn ranked_union_orders_each_layer_by_importance() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let seed_a = CanonicalId::from_raw("ws::sa");
+        let seed_b = CanonicalId::from_raw("ws::sb");
+        for (name, span) in [
+            ("ws::sa", 0),
+            ("ws::sb", 10),
+            ("ws::a_leaf", 20),
+            ("ws::z_hub", 30),
+            ("ws::u1", 40),
+            ("ws::u2", 50),
+            ("ws::u3", 60),
+        ] {
+            store.insert_symbol(&symbol_at(name, "doc.rs", span, span + 5)).unwrap();
+        }
+        // Both dependents sit at distance 1 (one per seed) under the same edge kind; only their
+        // codebase-wide importance differs — three further symbols use `z_hub`.
+        let a_leaf = CanonicalId::from_raw("ws::a_leaf");
+        let z_hub = CanonicalId::from_raw("ws::z_hub");
+        store.insert_edge(EdgeKind::Uses, &a_leaf, &seed_a).unwrap();
+        store.insert_edge(EdgeKind::Uses, &z_hub, &seed_b).unwrap();
+        for user in ["ws::u1", "ws::u2", "ws::u3"] {
+            store
+                .insert_edge(EdgeKind::Uses, &CanonicalId::from_raw(user), &z_hub)
+                .unwrap();
+        }
+
+        let hash = "h";
+        write_metadata(&store, hash);
+        let engine = engine(&store, hash);
+
+        let ids_under = |order: OrderMode| -> Vec<String> {
+            engine
+                .union_dependents([&seed_a, &seed_b].into_iter(), 1, order)
+                .unwrap()
+                .detail
+                .iter()
+                .map(|d| d.symbol.canonical_id.as_str().to_string())
+                .collect()
+        };
+        assert_eq!(
+            ids_under(OrderMode::Ranked),
+            vec!["ws::z_hub", "ws::a_leaf"],
+            "the ranked layer is most-important-first"
+        );
+        assert_eq!(
+            ids_under(OrderMode::Unranked),
+            vec!["ws::a_leaf", "ws::z_hub"],
+            "the unranked layer keeps identity order"
+        );
     }
 
     // Multi-seed detailed rows keep the single-seed order — distance, then the fixed kind order,
@@ -1188,7 +1261,9 @@ mod tests {
         write_metadata(&store, hash);
         let engine = engine(&store, hash);
 
-        let report = engine.union_dependents([&seed_1, &seed_2].into_iter(), 2).unwrap();
+        let report = engine
+            .union_dependents([&seed_1, &seed_2].into_iter(), 2, OrderMode::Unranked)
+            .unwrap();
         let ordered: Vec<(&str, u32, &str)> = report
             .detail
             .iter()
@@ -1242,7 +1317,9 @@ mod tests {
         write_metadata(&store, hash);
         let engine = engine(&store, hash);
 
-        let report = engine.union_dependents([&seed_1, &seed_2].into_iter(), 1).unwrap();
+        let report = engine
+            .union_dependents([&seed_1, &seed_2].into_iter(), 1, OrderMode::Unranked)
+            .unwrap();
         assert_eq!(report.disclosure, HorizonDisclosure::CutAtHorizon);
         // The detailed rows still hold both seeds' distance-one reach.
         let names: Vec<&str> = report.detail.iter().map(|d| d.symbol.canonical_id.as_str()).collect();
@@ -1300,6 +1377,32 @@ mod tests {
         assert!(results[0].recovery.is_some());
     }
 
+    // _(Dependents order selector: the recovery re-run reproduces the selected order)_ — the
+    // recipe's re-run line carries the order the caller chose, so following an unranked answer's
+    // recipe cannot silently come back under the ranked default; the ranked default is carried
+    // explicitly too.
+    #[test]
+    fn recipe_rerun_carries_the_selected_order() {
+        let changes: Vec<FileChange> = vec![];
+        let pre_contents = BTreeMap::new();
+        for (order, flag) in [
+            (OrderMode::Unranked, "--order unranked"),
+            (OrderMode::Ranked, "--order ranked"),
+        ] {
+            let req = ImpactRequest {
+                order,
+                ..request(&changes, &pre_contents, "different", "h")
+            };
+            let recipe = recovery_recipe(&req);
+            let rerun = recipe
+                .steps
+                .iter()
+                .find(|s| s.contains("c10r impact"))
+                .expect("the recipe carries a re-run step");
+            assert!(rerun.contains(flag), "the re-run reproduces the order: {rerun}");
+        }
+    }
+
     // The recipe carries the substituted base revision and workspace identity, builds into and
     // re-queries a throwaway index rather than the queried one, includes the untracked-copy step
     // exactly when untracked sources are present, and shell-quotes a path containing a space.
@@ -1323,6 +1426,7 @@ mod tests {
             untracked_sources: &untracked,
             range_head: None,
             depth: 2,
+            order: OrderMode::Unranked,
         };
         let recipe = recovery_recipe(&req);
         assert_eq!(recipe.base_revision, "0123456789abcdef");
@@ -1357,6 +1461,7 @@ mod tests {
                 untracked_sources: &untracked,
                 range_head: None,
                 depth: 1,
+                order: OrderMode::Unranked,
             }
         };
         let recipe = recovery_recipe(&req_no_untracked);
@@ -1385,6 +1490,7 @@ mod tests {
             untracked_sources: &[],
             range_head: None,
             depth: 1,
+            order: OrderMode::Unranked,
         };
         let recipe = recovery_recipe(&req);
         let build_step = recipe
@@ -1427,6 +1533,7 @@ mod tests {
             untracked_sources: &[],
             range_head: None,
             depth: 1,
+            order: OrderMode::Unranked,
         };
         let recipe = recovery_recipe(&req);
         let build_step = recipe
@@ -1464,6 +1571,7 @@ mod tests {
             untracked_sources: &[],
             range_head: Some("fedcba9876543210"),
             depth: 1,
+            order: OrderMode::Unranked,
         };
         let recipe = recovery_recipe(&req);
         let rerun = recipe
@@ -1514,6 +1622,7 @@ mod tests {
             untracked_sources: &untracked,
             range_head: None,
             depth: 1,
+            order: OrderMode::Unranked,
         };
         let recipe = recovery_recipe(&req_with);
         let copy_step = recipe
@@ -1542,6 +1651,7 @@ mod tests {
                 untracked_sources: &untracked,
                 range_head: None,
                 depth: 1,
+                order: OrderMode::Unranked,
             }
         };
         let recipe = recovery_recipe(&req_without);
@@ -1573,6 +1683,7 @@ mod tests {
             untracked_sources: &untracked,
             range_head: Some("fedcba9876543210"),
             depth: 1,
+            order: OrderMode::Unranked,
         };
         let recipe = recovery_recipe(&range_req);
         assert_eq!(
@@ -1616,6 +1727,7 @@ mod tests {
                 untracked_sources: &[],
                 range_head: Some("unused"),
                 depth: 1,
+                order: OrderMode::Unranked,
             }
         };
         let recipe = recovery_recipe(&wt_req);
@@ -1657,6 +1769,7 @@ mod tests {
             untracked_sources: &untracked,
             range_head: None,
             depth: 2,
+            order: OrderMode::Unranked,
         };
         let script = recovery_recipe(&req).steps.join("\n");
 
@@ -1691,6 +1804,7 @@ mod tests {
             untracked_sources: &[],
             range_head: Some("fedcba9876543210"),
             depth: 1,
+            order: OrderMode::Unranked,
         };
         let script = recovery_recipe(&req).steps.join("\n");
 

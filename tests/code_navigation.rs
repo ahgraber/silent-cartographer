@@ -12,7 +12,7 @@ use silent_cartographer::identity::{
 };
 use silent_cartographer::query::output::Outcome;
 use silent_cartographer::query::resolve::Resolution;
-use silent_cartographer::query::{Detail, QueryEngine, Relation};
+use silent_cartographer::query::{Detail, OrderMode, QueryEngine, Relation};
 use silent_cartographer::semantic::model::{
     AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
@@ -1365,7 +1365,9 @@ fn dependents_reports_kind_and_distance() {
     use silent_cartographer::query::DependentsReport;
     let store = dep_graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 1, None, None).unwrap();
+    let answer = engine
+        .dependents("test-ws::seed", 1, None, None, OrderMode::Unranked)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -1387,7 +1389,9 @@ fn dependents_reach_ends_within_bound() {
         &[(EdgeKind::Uses, "a", "seed"), (EdgeKind::Uses, "b", "seed")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 1, None, None).unwrap();
+    let answer = engine
+        .dependents("test-ws::seed", 1, None, None, OrderMode::Unranked)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1408,7 +1412,9 @@ fn dependents_beyond_bound_aggregates_by_kind_and_distance() {
         &[(EdgeKind::Uses, "mid", "seed"), (EdgeKind::Uses, "outer", "mid")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 1, None, None).unwrap();
+    let answer = engine
+        .dependents("test-ws::seed", 1, None, None, OrderMode::Unranked)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1440,7 +1446,9 @@ fn dependents_aggregate_discloses_the_horizon() {
         .collect();
     let store = dep_graph(&name_refs, &edges);
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::f0", 1, None, None).unwrap();
+    let answer = engine
+        .dependents("test-ws::f0", 1, None, None, OrderMode::Unranked)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1473,7 +1481,7 @@ fn dependents_discloses_cut_when_depth_equals_horizon() {
     let store = dep_graph(&name_refs, &edges);
     let engine = dep_engine(&store);
     let answer = engine
-        .dependents("test-ws::f0", DEPENDENTS_HORIZON, None, None)
+        .dependents("test-ws::f0", DEPENDENTS_HORIZON, None, None, OrderMode::Unranked)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
@@ -1500,7 +1508,7 @@ fn dependents_discloses_cut_when_depth_exceeds_horizon() {
     let store = dep_graph(&name_refs, &edges);
     let engine = dep_engine(&store);
     let answer = engine
-        .dependents("test-ws::f0", DEPENDENTS_HORIZON + 5, None, None)
+        .dependents("test-ws::f0", DEPENDENTS_HORIZON + 5, None, None, OrderMode::Unranked)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
@@ -1526,7 +1534,7 @@ fn dependents_shallow_network_ends_within_bound_even_at_large_depth() {
     );
     let engine = dep_engine(&store);
     let answer = engine
-        .dependents("test-ws::seed", DEPENDENTS_HORIZON, None, None)
+        .dependents("test-ws::seed", DEPENDENTS_HORIZON, None, None, OrderMode::Unranked)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
@@ -1549,7 +1557,9 @@ fn dependents_depth_zero_is_aggregate_only() {
         &[(EdgeKind::Uses, "a", "seed"), (EdgeKind::Uses, "b", "seed")],
     );
     let engine = dep_engine(&store);
-    let answer = engine.dependents("test-ws::seed", 0, None, None).unwrap();
+    let answer = engine
+        .dependents("test-ws::seed", 0, None, None, OrderMode::Unranked)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -1567,7 +1577,7 @@ fn dependents_of_leaf_is_typed_absence() {
     let store = dep_graph(&["lonely"], &[]);
     let engine = dep_engine(&store);
     let answer = engine
-        .dependents("test-ws::lonely", 1, None, None)
+        .dependents("test-ws::lonely", 1, None, None, OrderMode::Unranked)
         .expect("no dependents is a successful typed answer, not a failure");
     assert!(
         matches!(answer.outcome, Outcome::Empty),
@@ -1591,7 +1601,7 @@ fn trace_dependents_interface_detail_carries_dependent_interface() {
     let engine = dep_engine(&store);
 
     let answer = engine
-        .dependents("test-ws::seed", 1, Some(Detail::Interface), None)
+        .dependents("test-ws::seed", 1, Some(Detail::Interface), None, OrderMode::Unranked)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -1624,7 +1634,7 @@ fn trace_json_with_detail_carries_content_and_aggregates_carry_none() {
     let engine = dep_engine(&store);
 
     let answer = engine
-        .dependents("test-ws::seed", 1, Some(Detail::Signature), None)
+        .dependents("test-ws::seed", 1, Some(Detail::Signature), None, OrderMode::Unranked)
         .unwrap();
     let json = answer.to_json();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1845,6 +1855,8 @@ fn depth_with_non_dependents_relation_is_a_teaching_error() {
         None,
         /* max_lines */ 10,
         /* max_lines_explicit */ false,
+        /* order */ silent_cartographer::query::OrderMode::Ranked,
+        /* order_explicit */ false,
         /* limit */ 25,
         /* cursor */ None,
         false,
@@ -1855,6 +1867,202 @@ fn depth_with_non_dependents_relation_is_a_teaching_error() {
     assert!(msg.contains("--depth"), "names the flag: {msg}");
     assert!(msg.contains("contains"), "names the offending relation: {msg}");
     assert!(msg.contains("dependents"), "names the relation that accepts it: {msg}");
+}
+
+/// The detailed dependent identities of a `dependents` answer under `order`, in answer order.
+fn detail_ids_under(engine: &QueryEngine<'_>, reference: &str, depth: u32, order: OrderMode) -> Vec<String> {
+    let answer = engine.dependents(reference, depth, None, None, order).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    results[0]
+        .detail
+        .iter()
+        .map(|d| d.symbol.canonical_id.as_str().to_string())
+        .collect()
+}
+
+// _(Ranked ordering of dependents: within a layer the widely-depended-upon dependent ranks first)_ —
+// two direct dependents differ in codebase-wide importance: the ranked ordering puts the
+// widely-depended-upon one first even though identity order favors the other, while the unranked
+// ordering keeps the structural identity order.
+#[test]
+fn ranked_order_puts_the_widely_depended_upon_dependent_first() {
+    // `a_leaf` and `z_hub` both use the seed; three further symbols use `z_hub`, so it is the
+    // widely-depended-upon dependent, while identity order would put `a_leaf` first.
+    let store = dep_graph(
+        &["seed", "a_leaf", "z_hub", "u1", "u2", "u3"],
+        &[
+            (EdgeKind::Uses, "a_leaf", "seed"),
+            (EdgeKind::Uses, "z_hub", "seed"),
+            (EdgeKind::Uses, "u1", "z_hub"),
+            (EdgeKind::Uses, "u2", "z_hub"),
+            (EdgeKind::Uses, "u3", "z_hub"),
+        ],
+    );
+    let engine = dep_engine(&store);
+
+    assert_eq!(
+        detail_ids_under(&engine, "test-ws::seed", 1, OrderMode::Ranked),
+        vec!["test-ws::z_hub", "test-ws::a_leaf"],
+        "ranked puts the widely-depended-upon dependent first"
+    );
+    assert_eq!(
+        detail_ids_under(&engine, "test-ws::seed", 1, OrderMode::Unranked),
+        vec!["test-ws::a_leaf", "test-ws::z_hub"],
+        "unranked keeps the structural identity order"
+    );
+}
+
+// _(Ranked ordering of dependents: distance outranks importance)_ — the most widely-depended-upon
+// symbol in the graph sits at distance 2; every distance-1 row is still returned before it.
+#[test]
+fn ranked_order_keeps_distance_primary() {
+    let store = dep_graph(
+        &["seed", "d1a", "d1b", "z_hub", "u1", "u2", "u3", "u4"],
+        &[
+            (EdgeKind::Uses, "d1a", "seed"),
+            (EdgeKind::Uses, "d1b", "seed"),
+            (EdgeKind::Uses, "z_hub", "d1a"),
+            (EdgeKind::Uses, "u1", "z_hub"),
+            (EdgeKind::Uses, "u2", "z_hub"),
+            (EdgeKind::Uses, "u3", "z_hub"),
+            (EdgeKind::Uses, "u4", "z_hub"),
+        ],
+    );
+    let engine = dep_engine(&store);
+
+    let ids = detail_ids_under(&engine, "test-ws::seed", 2, OrderMode::Ranked);
+    let hub_at = ids.iter().position(|id| id == "test-ws::z_hub").expect("hub detailed");
+    for d1 in ["test-ws::d1a", "test-ws::d1b"] {
+        let at = ids.iter().position(|id| id == d1).expect("distance-1 row detailed");
+        assert!(at < hub_at, "distance-1 row {d1} precedes the distance-2 hub: {ids:?}");
+    }
+}
+
+// _(Dependents order selector: both orderings return the same answer set)_ — the same trace under
+// each ordering contains exactly the same symbols with the same distances and kinds, the same
+// beyond-bound aggregates, and the same horizon disclosure; only row order differs.
+#[test]
+fn ranked_and_unranked_return_the_same_answer_set() {
+    use silent_cartographer::query::DependentsReport;
+    let store = dep_graph(
+        &["seed", "d1a", "d1b", "z_hub", "u1", "u2", "u3", "u4"],
+        &[
+            (EdgeKind::Uses, "d1a", "seed"),
+            (EdgeKind::Imports, "d1b", "seed"),
+            (EdgeKind::Uses, "z_hub", "d1a"),
+            (EdgeKind::Uses, "u1", "z_hub"),
+            (EdgeKind::Uses, "u2", "z_hub"),
+            (EdgeKind::Uses, "u3", "z_hub"),
+            (EdgeKind::Uses, "u4", "z_hub"),
+        ],
+    );
+    let engine = dep_engine(&store);
+
+    let report_under = |order: OrderMode| -> DependentsReport {
+        let answer = engine.dependents("test-ws::seed", 2, None, None, order).unwrap();
+        let Outcome::Found { results } = answer.outcome else {
+            panic!("expected found");
+        };
+        results.into_iter().next().unwrap()
+    };
+    let ranked = report_under(OrderMode::Ranked);
+    let unranked = report_under(OrderMode::Unranked);
+
+    let row_set = |report: &DependentsReport| -> std::collections::BTreeSet<(String, u32, String)> {
+        report
+            .detail
+            .iter()
+            .map(|d| (d.symbol.canonical_id.as_str().to_string(), d.distance, d.kind.clone()))
+            .collect()
+    };
+    assert_eq!(row_set(&ranked), row_set(&unranked), "the answer set never changes");
+    assert_eq!(ranked.beyond_bound, unranked.beyond_bound, "aggregates are untouched");
+    assert_eq!(
+        ranked.disclosure, unranked.disclosure,
+        "the horizon disclosure is untouched"
+    );
+    assert_eq!(ranked.depth_bound, unranked.depth_bound);
+    assert_eq!(ranked.horizon, unranked.horizon);
+}
+
+// _(Dependents order selector: unranked ordering on request)_ — the unranked ordering is exactly
+// distance, then dependency kind order (`uses` < `imports` < `type_hierarchy`), then canonical
+// identity; the identities are chosen so a plain identity sort would disagree.
+#[test]
+fn unranked_order_is_distance_kind_then_identity() {
+    let store = dep_graph(
+        &["seed", "zz", "aa", "mm"],
+        &[
+            (EdgeKind::Uses, "zz", "seed"),
+            (EdgeKind::Imports, "aa", "seed"),
+            (EdgeKind::TypeHierarchy, "mm", "seed"),
+        ],
+    );
+    let engine = dep_engine(&store);
+    assert_eq!(
+        detail_ids_under(&engine, "test-ws::seed", 1, OrderMode::Unranked),
+        vec!["test-ws::zz", "test-ws::aa", "test-ws::mm"],
+        "kind order breaks the distance tie, not identity"
+    );
+}
+
+// _(Dependents order selector: an order requested outside its relations is refused)_ — an explicit
+// `--order` with a non-`dependents` relation fails before any traversal with a teaching error
+// naming the flag and where the selector applies; the defaulted value stays dormant.
+#[test]
+fn order_with_non_dependents_relation_is_a_teaching_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    silent_cartographer::commands::build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources())
+        .unwrap();
+
+    let err = silent_cartographer::commands::run_trace(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "net::Client",
+        Relation::References,
+        None,
+        None,
+        /* max_lines */ 10,
+        /* max_lines_explicit */ false,
+        /* order */ OrderMode::Ranked,
+        /* order_explicit */ true,
+        /* limit */ 25,
+        /* cursor */ None,
+        false,
+        false,
+    )
+    .expect_err("--order with references must fail");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("--order"), "names the flag: {msg}");
+    assert!(msg.contains("references"), "names the offending relation: {msg}");
+    assert!(msg.contains("dependents"), "names where the selector applies: {msg}");
+    assert!(
+        msg.contains("impact"),
+        "names the sibling command that accepts it: {msg}"
+    );
+}
+
+// _(Ordering disclosure: the self-description states the heuristic)_ — `trace`'s and `impact`'s
+// self-descriptions present the ranked ordering as a structural-importance heuristic.
+#[test]
+fn order_self_description_presents_ranked_as_heuristic() {
+    use clap::CommandFactory;
+    let mut cmd = silent_cartographer::cli::Cli::command();
+    for name in ["trace", "impact"] {
+        let mut sub = cmd
+            .find_subcommand_mut(name)
+            .unwrap_or_else(|| panic!("{name} subcommand present"))
+            .clone();
+        let help = sub.render_long_help().to_string();
+        assert!(
+            help.contains("structural-importance heuristic"),
+            "{name}'s self-description presents ranked ordering as heuristic: {help}"
+        );
+    }
 }
 
 // _(Relationship trace — self-description)_ — the command's self-description presents `dependents` as
@@ -2018,7 +2226,9 @@ fn python_dependents_trace_carries_kind_and_distance() {
     use silent_cartographer::query::DependentsReport;
     let store = py_store();
     let engine = py_engine(&store);
-    let answer = engine.dependents(py_widget_id().as_str(), 1, None, None).unwrap();
+    let answer = engine
+        .dependents(py_widget_id().as_str(), 1, None, None, OrderMode::Unranked)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -2039,6 +2249,65 @@ fn python_dependents_trace_carries_kind_and_distance() {
         .unwrap_or_else(|| panic!("the importing module is a dependent: {:?}", report.detail));
     assert_eq!(imports.kind, "imports", "the importing module is an imports dependent");
     assert_eq!(imports.distance, 1);
+}
+
+// _(Ranked ordering of dependents — Python-built store)_ — the ranked ordering reflects
+// codebase-wide importance over a store built through the Python pipeline: with the consumer
+// module made more widely depended-upon than `build`, ranked order inverts the unranked kind order
+// (`uses` before `imports`) that would otherwise put `build` first.
+#[test]
+fn python_ranked_order_reflects_codebase_importance() {
+    let store = py_store();
+    // Two further in-workspace symbols depending on the consumer module raise its codebase-wide
+    // importance above `build`'s.
+    for name in ["extra_a", "extra_b"] {
+        let id = CanonicalId::from_raw(format!("python-conformance-ws::{name}"));
+        store
+            .insert_symbol(&SymbolRow {
+                canonical_id: id.clone(),
+                display_name: name.to_string(),
+                kind: "function".to_string(),
+                class: PersistedClass::InWorkspace,
+                document_path: None,
+                span: None,
+                span_text: None,
+                signature_text: None,
+                interface_text: None,
+                duplicated: false,
+                test_rule: None,
+            })
+            .unwrap();
+        store
+            .insert_edge(EdgeKind::Uses, &id, &py_consumer_module_id())
+            .unwrap();
+    }
+    let engine = py_engine(&store);
+
+    let ids = |order: OrderMode| -> Vec<CanonicalId> {
+        let answer = engine
+            .dependents(py_widget_id().as_str(), 1, None, None, order)
+            .unwrap();
+        let Outcome::Found { results } = &answer.outcome else {
+            panic!("expected found, got {:?}", answer.outcome);
+        };
+        results[0]
+            .detail
+            .iter()
+            .map(|d| d.symbol.canonical_id.clone())
+            .collect()
+    };
+
+    let ranked = ids(OrderMode::Ranked);
+    let unranked = ids(OrderMode::Unranked);
+    let position = |ids: &[CanonicalId], id: &CanonicalId| ids.iter().position(|x| x == id).expect("row present");
+    assert!(
+        position(&ranked, &py_consumer_module_id()) < position(&ranked, &py_build_id()),
+        "ranked puts the widely-depended-upon consumer module first: {ranked:?}"
+    );
+    assert!(
+        position(&unranked, &py_build_id()) < position(&unranked, &py_consumer_module_id()),
+        "unranked keeps the kind order, `uses` before `imports`: {unranked:?}"
+    );
 }
 
 // _(Scenario: Python dotted qualified name resolves)_ — a `pkg.module.Class` style reference

@@ -1,5 +1,5 @@
 {
-  "surface_version": 5,
+  "surface_version": 6,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -122,6 +122,16 @@
           "global": false
         },
         {
+          "name": "order",
+          "takes_value": true,
+          "values": [
+            "ranked",
+            "unranked"
+          ],
+          "default": "ranked",
+          "global": false
+        },
+        {
           "name": "max-lines",
           "takes_value": true,
           "default": "10",
@@ -240,6 +250,16 @@
           "name": "depth",
           "takes_value": true,
           "default": "1",
+          "global": false
+        },
+        {
+          "name": "order",
+          "takes_value": true,
+          "values": [
+            "ranked",
+            "unranked"
+          ],
+          "default": "ranked",
           "global": false
         },
         {

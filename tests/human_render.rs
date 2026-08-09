@@ -853,7 +853,48 @@ fn dependents_rows_render_sanitized_in_human_output() {
         !stdout.contains('\u{1b}') && !stdout.contains('\u{9b}') && !stdout.contains('\u{202e}'),
         "no raw terminal control reaches the dependents rendering: {stdout:?}"
     );
-    // header + summary line + "1 detailed" + one row: the hostile path's embedded newline forges no
-    // extra row.
-    assert_eq!(stdout.lines().count(), 4, "no forged row: {stdout:?}");
+    // header + ranked-ordering note + summary line + "1 detailed" + one row: the hostile path's
+    // embedded newline forges no extra row.
+    assert_eq!(stdout.lines().count(), 5, "no forged row: {stdout:?}");
+}
+
+// _(Ordering disclosure: human render states the heuristic — and only for ranked)_ — the human
+// `dependents` rendering carries the structural-importance-heuristic note under the ranked
+// (default) ordering and carries no heuristic presentation under `--order unranked`; the note is a
+// render-only line, never a JSON field.
+#[test]
+fn ranked_note_renders_for_ranked_answers_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_hostile_dependents_db(dir.path());
+    let note = "ordered by a structural importance heuristic";
+
+    let trace = |extra: &[&str]| -> String {
+        let mut cmd = c10r(dir.path());
+        cmd.arg("--db").arg(&db);
+        cmd.args(["trace", "hostile-ws::subject", "--relation", "dependents"]);
+        cmd.args(extra);
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let ranked = trace(&[]);
+    assert!(ranked.contains(note), "the ranked render carries the note: {ranked}");
+
+    let unranked = trace(&["--order", "unranked"]);
+    assert!(
+        unranked.find(note).is_none() && unranked.to_lowercase().find("heuristic").is_none(),
+        "the unranked render is not presented as heuristic: {unranked}"
+    );
+
+    let json = trace(&["--json"]);
+    assert!(
+        json.find(note).is_none(),
+        "the note is a render line, not a machine field: {json}"
+    );
 }

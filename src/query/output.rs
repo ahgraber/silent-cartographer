@@ -168,6 +168,15 @@ pub struct Answer<T> {
     /// and still describe somewhere else.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_relation: Option<WorkspaceRelation>,
+    /// The ordering disclosure every `dependents`/`impact` answer carries, a typed-empty answer
+    /// included: which ordering is in effect (`ranked` or `unranked`). `ranked` orders rows within
+    /// a distance layer by a structural-importance heuristic — guidance, never resolved semantic
+    /// fact; `unranked` derives only from the answer's stable structural keys. Absent on answers
+    /// with no orderable rows, so their shape is unchanged; rides beside provenance and freshness,
+    /// never replacing either — and distinct from the heuristic-grade `classification` marker,
+    /// which speaks to answer content, not ordering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ordering: Option<&'static str>,
     /// The outcome.
     pub outcome: Outcome<T>,
     /// The result-set paging disclosure, present only when a result limit was applied.
@@ -211,6 +220,7 @@ impl<T> Answer<T> {
             stale: freshness.is_stale(),
             classification: None,
             workspace_relation: None,
+            ordering: None,
             outcome,
             page: None,
         }
@@ -227,6 +237,13 @@ impl<T> Answer<T> {
     /// carries no marker.
     pub fn with_workspace_relation(mut self, relation: Option<WorkspaceRelation>) -> Self {
         self.workspace_relation = relation;
+        self
+    }
+
+    /// Attach the ordering disclosure — the single structural field every `dependents`/`impact`
+    /// answer carries, whatever its outcome, naming the ordering in effect.
+    pub fn with_ordering(mut self, ordering: &'static str) -> Self {
+        self.ordering = Some(ordering);
         self
     }
 }
