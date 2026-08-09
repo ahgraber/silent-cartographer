@@ -75,7 +75,8 @@ Rank values are f64 compared via total order; the iteration visits nodes and edg
 
 **Chosen:** A closed-vocabulary flag `--order <ranked|unranked>` on `trace` and `impact`, default `ranked`, accepted only where the ordering is defined — `trace` rejects it as a usage error for relations other than `dependents`, before any traversal, naming where the selector applies.
 A `RANK_VERSION` constant identifies the ranking model — algorithm, projection, damping, iteration count, and weights together; any change to any of them bumps it, with a migration note, satisfying the retrieval-scoring governance rule.
-The order mode and `RANK_VERSION` both join `PageIdentity`, so a continuation token is rejected across an ordering switch or a scoring change by the same path that rejects any parameter mismatch — never resumed against a reordered sequence with silently skipped or repeated rows.
+The order mode and `RANK_VERSION` join `PageIdentity` as a single sealed ordering-identity value whose only production constructor stamps the current `RANK_VERSION` itself, so a site that binds the mode cannot fail to bind the version — a clause no runtime test can check, since the version is a compile-time constant within one binary.
+A continuation token is therefore rejected across an ordering switch or a scoring change by the same path that rejects any parameter mismatch — never resumed against a reordered sequence with silently skipped or repeated rows.
 
 **Rationale:** Reuses the established closed-flag and token-identity machinery; a selector silently ignored on unranked relations would be a lie of omission; `PageIdentity` today binds only query parameters and index identity, so without `RANK_VERSION` an old token would validate across a release that changed scoring and resume wrong.
 

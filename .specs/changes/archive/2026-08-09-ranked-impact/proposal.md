@@ -33,7 +33,7 @@ As an agent consuming an impact answer, I want the answer to state which orderin
 
 - Deterministic ranked ordering of detailed dependent rows for `trace` over the `dependents` relation and for `impact`: distance remains the primary key; within each distance layer, rows order by the dependent's codebase-wide structural importance.
 - Ranked as the default ordering; an order selector accepting `ranked` and `unranked`, where `unranked` reproduces the prior distance/kind/identity order exactly, and the selector is refused where its orderings are not defined.
-- An ordering disclosure on every dependents/impact answer — machine answer and human render alike, empty answers included — naming the ordering in effect, with ranked ordering presented as heuristic.
+- An ordering disclosure on every dependents/impact answer: a structural field on every machine answer, empty answers included, naming the ordering in effect; the human render presents a ranked answer's ordering as a structural-importance heuristic and never presents an unranked answer as heuristic.
 - Continuation tokens bind the order selector and the ranking model's version as part of query identity and resume the selected ordering deterministically.
 - Surface index update (SURFACE_VERSION bump) and surface manifest snapshot refresh for the new selector.
 
