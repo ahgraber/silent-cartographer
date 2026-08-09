@@ -92,6 +92,23 @@ Every answer carries an `exactness` grade.
 `exact` means the index matches the change's pre-change state, so the reach shown is the real reach.
 `approximate` means something has drifted since the build (an unrelated edit, a change made before the index was refreshed), so the dependents shown may be incomplete; treat it as directional, not a ship/no-ship verdict.
 
+### Reading order: ranked by default
+
+Dependents answers — `trace --relation dependents` and `impact` — order their detailed rows by distance first, and within each distance layer by how load-bearing each dependent is to the codebase as a whole, most important first.
+That within-layer order is a structural-importance heuristic (global PageRank over the workspace's dependency edges), so the first bounded page shows the nearest, most load-bearing dependents rather than an arbitrary slice of the layer.
+Ranking only reorders rows: which symbols the answer contains, the depth bound, the beyond-bound aggregates, and the horizon disclosure never change, and no numeric score is ever published.
+
+`--order unranked` requests an ordering derived only from the answer's stable structural keys — distance, then dependency kind, then canonical identity — free of any ranking model:
+
+```sh
+c10r trace some_symbol --relation dependents --order unranked
+c10r impact --order unranked
+```
+
+Every dependents/impact answer, empty ones included, discloses the ordering in effect through an `ordering` field (`ranked` or `unranked`); the human rendering of a ranked answer carries a matching note line naming the heuristic.
+Continuation tokens bind the selector and the ranking model's version, so a token issued under one ordering — or under an older ranking model — is refused rather than resumed against a differently-ordered sequence.
+The selector applies only where the ordering is defined: requesting `--order` on any other `trace` relation is a usage error naming where it applies.
+
 ### Finding a symbol's tests
 
 Before changing a symbol, ask what test code exercises it:
