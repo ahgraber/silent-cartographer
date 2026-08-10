@@ -18,18 +18,12 @@ use silent_cartographer::semantic::model::{
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
 };
 
+use crate::support::{id_of_pkg, line_col, one_doc_index, one_occ_symbol, sources, ws};
+
 /// The canonicalized workspace root a directly-ingested fixture store records. These stores are never
 /// queried against a real filesystem root, so a stable stand-in keeps the recorded identity out of the
 /// way of what each test is asserting.
 const WS_ROOT: &str = "/test-ws";
-
-fn ws() -> WorkspaceId {
-    WorkspaceId::new("test-ws")
-}
-
-fn sources() -> Vec<(String, String)> {
-    vec![(support::DOC.to_string(), support::SOURCE.to_string())]
-}
 
 fn built_store() -> GraphStore {
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -58,57 +52,6 @@ fn connect_id() -> CanonicalId {
 
 fn client_id() -> CanonicalId {
     id_of(&[("net", SegmentKind::Module), ("Client", SegmentKind::Type)])
-}
-
-/// The identity of a symbol under an arbitrary package, for hand-built tier fixtures.
-fn id_of_pkg(package: &str, segments: &[(&str, SegmentKind)]) -> CanonicalId {
-    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
-    project_one(&ws(), &Descriptor::new(package, segs))
-}
-
-/// A one-document index over `path`, for hand-built tier fixtures.
-fn one_doc_index(path: &str, provenance: AnalyzerProvenance, symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
-    ExtractedIndex {
-        provenance,
-        documents: vec![SourceDocument {
-            path: path.to_string(),
-            encoding: PositionEncoding::Utf8,
-        }],
-        symbols,
-        duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
-        environment: None,
-    }
-}
-
-/// A symbol with one occurrence, for hand-built tier fixtures.
-fn one_occ_symbol(
-    package: &str,
-    segments: &[(&str, SegmentKind)],
-    kind: SymbolKind,
-    class: SymbolClass,
-    doc: &str,
-    range: SourceRange,
-    role: OccurrenceRole,
-) -> ExtractedSymbol {
-    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
-    ExtractedSymbol {
-        descriptor: Some(Descriptor::new(package, segs)),
-        kind,
-        class,
-        occurrences: vec![ExtractedOccurrence {
-            document_path: doc.to_string(),
-            range,
-            role,
-        }],
-    }
-}
-
-/// The zero-based `(line, col)` of the byte at `pos` in single-byte-per-char test sources.
-fn line_col(source: &str, pos: usize) -> (u32, u32) {
-    let line = source[..pos].matches('\n').count() as u32;
-    let line_start = source[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    (line, (pos - line_start) as u32)
 }
 
 /// A store over a documented Rust function (`double`) and an undocumented one (`triple`), for the
@@ -146,7 +89,7 @@ pub fn triple(x: u8) -> u8 {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("tiers.rs".to_string(), source.to_string())];
-    let index = one_doc_index("tiers.rs", support::provenance(), vec![double, triple]);
+    let index = one_doc_index("tiers.rs", vec![double, triple]);
     ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     (
         store,
@@ -171,7 +114,7 @@ fn module_tier_store() -> (GraphStore, String, CanonicalId) {
     );
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("mymod.rs".to_string(), source.to_string())];
-    let index = one_doc_index("mymod.rs", support::provenance(), vec![module]);
+    let index = one_doc_index("mymod.rs", vec![module]);
     ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     (
         store,
@@ -273,7 +216,7 @@ pub const OFFSET: u8 = 1;
 
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
-    let index = one_doc_index("m.rs", support::provenance(), vec![lookup, offset]);
+    let index = one_doc_index("m.rs", vec![lookup, offset]);
     ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     (
         store,
@@ -1293,8 +1236,6 @@ fn get_unknown_reference_returns_typed_absence_in_json() {
     assert!(absent_json.contains("freshness"));
 }
 
-// ---- Dependents: the depth-bounded impact answer ----
-
 /// A synthetic identity for a dependents-graph symbol.
 fn dep_id(name: &str) -> CanonicalId {
     CanonicalId::from_raw(format!("test-ws::{name}"))
@@ -2111,10 +2052,7 @@ fn deterministic_ordering_across_repeated_queries() {
     assert_eq!(locs(&first), locs(&second), "identical queries return the same order");
 }
 
-// ---------------------------------------------------------------------------
-// Python (fixture-level): navigation over the committed python-conformance
-// fixture — no live tool.
-// ---------------------------------------------------------------------------
+// Python (fixture-level): navigation over the committed python-conformance fixture — no live tool.
 
 fn py_ws() -> WorkspaceId {
     WorkspaceId::new("py-ws")
@@ -2321,8 +2259,6 @@ fn python_dotted_qualified_name_resolves() {
         other => panic!("expected a unique resolution, got {other:?}"),
     }
 }
-
-// ---- The `tests` relation ----
 
 const TR_LIB_DOC: &str = "src/lib.rs";
 const TR_API_DOC: &str = "tests/api.rs";

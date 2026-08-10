@@ -13,7 +13,7 @@ use crate::identity::CanonicalId;
 
 use super::diff::{FileChange, LineIndex};
 use super::output::{Answer, Location, SymbolView};
-use super::{DependentItem, DependentsReport, HorizonDisclosure, OrderMode, QueryEngine, QueryError};
+use super::{DependentsReport, OrderMode, QueryEngine, QueryError};
 
 /// Whether the index the answer was drawn from matches the change's pre-change state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -302,54 +302,8 @@ impl QueryEngine<'_> {
         let mut rows = self.store.dependents_of_seeds(&seeds, DEPENDENTS_HORIZON)?;
         self.order_dependent_rows(&mut rows, order)?;
 
-        let mut detailed: Vec<DependentItem> = Vec::new();
-        let mut aggregate: BTreeMap<(u32, String), u64> = BTreeMap::new();
-        let mut beyond_exists = false;
-        let mut cut_at_horizon = false;
-        for row in &rows {
-            if row.depth >= DEPENDENTS_HORIZON {
-                cut_at_horizon = true;
-            }
-            if row.depth <= depth {
-                let Some(symbol) = self.store.symbol(&row.id)? else {
-                    return Err(QueryError::MissingSymbol(row.id.clone()));
-                };
-                detailed.push(DependentItem {
-                    symbol: super::symbol_view(&symbol),
-                    kind: row.kind.clone(),
-                    distance: row.depth,
-                    location: super::location_of(&symbol),
-                    content: None,
-                    content_truncated: false,
-                });
-            } else {
-                beyond_exists = true;
-                *aggregate.entry((row.depth, row.kind.clone())).or_insert(0) += 1;
-            }
-        }
-
-        // Precedence matches `QueryEngine::dependents`: a horizon cut is disclosed first, then
-        // beyond-bound reach, then the fully-within-bound case.
-        let disclosure = if cut_at_horizon {
-            HorizonDisclosure::CutAtHorizon
-        } else if beyond_exists {
-            HorizonDisclosure::BeyondBound
-        } else {
-            HorizonDisclosure::EndsWithinBound
-        };
-
-        let beyond_bound = aggregate
-            .into_iter()
-            .map(|((distance, kind), count)| super::AggregateCount { kind, distance, count })
-            .collect();
-
-        Ok(DependentsReport {
-            depth_bound: depth,
-            horizon: DEPENDENTS_HORIZON,
-            disclosure,
-            detail: detailed,
-            beyond_bound,
-        })
+        // No detail level: a multi-seed walk answers with location-only rows.
+        self.dependents_report(&rows, depth, None, None)
     }
 }
 
@@ -609,6 +563,7 @@ mod tests {
     use crate::graph::join::JoinAccounting;
     use crate::graph::store::{EdgeKind, GraphStore, IndexMetadata, PersistedClass};
     use crate::identity::WorkspaceId;
+    use crate::query::HorizonDisclosure;
     use crate::query::diff::{ChangeKind, LineRange};
     use crate::query::output::Outcome;
     use crate::semantic::model::AnalyzerProvenance;

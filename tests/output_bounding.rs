@@ -16,17 +16,9 @@ use std::process::Command;
 use silent_cartographer::graph::store::{EdgeKind, GraphStore, OccurrenceRow, PersistedClass, SymbolRow};
 use silent_cartographer::identity::CanonicalId;
 
-/// The single fixture source, paired with its workspace-relative path.
-fn sources() -> Vec<(String, String)> {
-    vec![(support::DOC.to_string(), support::SOURCE.to_string())]
-}
-
 /// Build the exemplar Rust fixture into a store at `dir/index.db` and return its path.
 fn build_fixture_db(dir: &Path) -> PathBuf {
-    let db = dir.join("index.db");
-    silent_cartographer::commands::build_from_index(&db, "bound-ws", dir, &support::fixture_index(), &sources())
-        .unwrap();
-    db
+    support::build_fixture_db(dir, "bound-ws")
 }
 
 /// A fresh invocation of the built binary (never the ambient `c10r` on `PATH`), run in an empty
@@ -479,10 +471,6 @@ fn malformed_cursor_is_a_usage_error_not_a_panic() {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Bounding defaults and windowing
-// ---------------------------------------------------------------------------
 
 /// A symbol identity under the fixture workspace, for directly-built stores.
 fn ws_id(name: &str) -> CanonicalId {

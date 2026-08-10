@@ -345,62 +345,7 @@ impl<'a> QueryEngine<'a> {
         }
         self.order_dependent_rows(&mut rows, order)?;
 
-        // Split at the depth bound: detailed rows up to the bound (already ordered by the store),
-        // aggregate counts by (distance, kind) beyond it. `cut_at_horizon` is computed independently
-        // of that split: a dependent at the horizon depth means deeper reach may exist unexplored,
-        // regardless of whether that row is detailed or aggregated, so it must not depend on
-        // `depth < DEPENDENTS_HORIZON` to be observed.
-        let mut detailed = Vec::new();
-        let mut aggregate: std::collections::BTreeMap<(u32, String), u64> = std::collections::BTreeMap::new();
-        let mut beyond_exists = false;
-        let mut cut_at_horizon = false;
-        for r in &rows {
-            if r.depth >= DEPENDENTS_HORIZON {
-                cut_at_horizon = true;
-            }
-            if r.depth <= depth {
-                let Some(row) = self.store.symbol(&r.id)? else {
-                    // NOT NULL foreign keys tie every edge to a symbol row, so a miss here means the
-                    // store's invariant was violated, not a legitimate absence.
-                    return Err(QueryError::MissingSymbol(r.id.clone()));
-                };
-                let (content, content_truncated) = projected_content(&row, detail, max_lines);
-                detailed.push(DependentItem {
-                    content,
-                    content_truncated,
-                    symbol: symbol_view(&row),
-                    kind: r.kind.clone(),
-                    distance: r.depth,
-                    location: location_of(&row),
-                });
-            } else {
-                beyond_exists = true;
-                *aggregate.entry((r.depth, r.kind.clone())).or_insert(0) += 1;
-            }
-        }
-
-        // Precedence: a horizon cut is disclosed first — it means the walk itself stopped early, so
-        // "ends within bound" or "beyond bound" would both overstate confidence in the reach shown.
-        let disclosure = if cut_at_horizon {
-            HorizonDisclosure::CutAtHorizon
-        } else if beyond_exists {
-            HorizonDisclosure::BeyondBound
-        } else {
-            HorizonDisclosure::EndsWithinBound
-        };
-
-        let beyond_bound = aggregate
-            .into_iter()
-            .map(|((distance, kind), count)| AggregateCount { kind, distance, count })
-            .collect();
-
-        let report = DependentsReport {
-            depth_bound: depth,
-            horizon: DEPENDENTS_HORIZON,
-            disclosure,
-            detail: detailed,
-            beyond_bound,
-        };
+        let report = self.dependents_report(&rows, depth, detail, max_lines)?;
         Ok(Answer::found(vec![report], provenance, freshness))
     }
 
@@ -529,6 +474,76 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(())
+    }
+
+    /// Project an ordered dependents walk into the report a caller answers with.
+    ///
+    /// Split at the depth bound: detailed rows up to the bound (in the order `rows` already carries),
+    /// aggregate counts by (distance, kind) beyond it. `cut_at_horizon` is computed independently of
+    /// that split: a dependent at the horizon depth means deeper reach may exist unexplored,
+    /// regardless of whether that row is detailed or aggregated, so it must not depend on
+    /// `depth < DEPENDENTS_HORIZON` to be observed.
+    ///
+    /// `detail` requests the dependent's own tier content on the detailed rows; passing `None`
+    /// projects location-only rows, which is what a multi-seed walk answers with.
+    fn dependents_report(
+        &self,
+        rows: &[DependentRow],
+        depth: u32,
+        detail: Option<Detail>,
+        max_lines: Option<usize>,
+    ) -> Result<DependentsReport, QueryError> {
+        let mut detailed = Vec::new();
+        let mut aggregate: std::collections::BTreeMap<(u32, String), u64> = std::collections::BTreeMap::new();
+        let mut beyond_exists = false;
+        let mut cut_at_horizon = false;
+        for r in rows {
+            if r.depth >= DEPENDENTS_HORIZON {
+                cut_at_horizon = true;
+            }
+            if r.depth <= depth {
+                let Some(row) = self.store.symbol(&r.id)? else {
+                    // NOT NULL foreign keys tie every edge to a symbol row, so a miss here means the
+                    // store's invariant was violated, not a legitimate absence.
+                    return Err(QueryError::MissingSymbol(r.id.clone()));
+                };
+                let (content, content_truncated) = projected_content(&row, detail, max_lines);
+                detailed.push(DependentItem {
+                    content,
+                    content_truncated,
+                    symbol: symbol_view(&row),
+                    kind: r.kind.clone(),
+                    distance: r.depth,
+                    location: location_of(&row),
+                });
+            } else {
+                beyond_exists = true;
+                *aggregate.entry((r.depth, r.kind.clone())).or_insert(0) += 1;
+            }
+        }
+
+        // Precedence: a horizon cut is disclosed first — it means the walk itself stopped early, so
+        // "ends within bound" or "beyond bound" would both overstate confidence in the reach shown.
+        let disclosure = if cut_at_horizon {
+            HorizonDisclosure::CutAtHorizon
+        } else if beyond_exists {
+            HorizonDisclosure::BeyondBound
+        } else {
+            HorizonDisclosure::EndsWithinBound
+        };
+
+        let beyond_bound = aggregate
+            .into_iter()
+            .map(|((distance, kind), count)| AggregateCount { kind, distance, count })
+            .collect();
+
+        Ok(DependentsReport {
+            depth_bound: depth,
+            horizon: DEPENDENTS_HORIZON,
+            disclosure,
+            detail: detailed,
+            beyond_bound,
+        })
     }
 }
 

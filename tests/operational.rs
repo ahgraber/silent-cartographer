@@ -22,9 +22,7 @@ use silent_cartographer::semantic::model::{
 };
 use silent_cartographer::semantic::python_adapter::PythonAdapter;
 
-fn sources() -> Vec<(String, String)> {
-    vec![(support::DOC.to_string(), support::SOURCE.to_string())]
-}
+use crate::support::sources;
 
 // _(exercises the join + persistence path end-to-end)_ — `build` over a fixture workspace produces a
 // queryable index.

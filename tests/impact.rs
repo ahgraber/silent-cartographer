@@ -32,9 +32,7 @@ use silent_cartographer::semantic::model::{
     SourceRange, SymbolClass, SymbolKind,
 };
 
-// ---------------------------------------------------------------------------
 // A throwaway git repository, isolated from the developer's own git config.
-// ---------------------------------------------------------------------------
 
 /// A throwaway git repository for one test, with a root commit so `HEAD` always resolves.
 struct TestRepo {
@@ -132,9 +130,7 @@ fn workspace_id(repo: &TestRepo) -> String {
     resolve_workspace(None, repo.path()).unwrap().as_str().to_string()
 }
 
-// ---------------------------------------------------------------------------
 // The index fixture: the shared `net.rs` fixture plus a second, independent module.
-// ---------------------------------------------------------------------------
 
 /// A second, independent module (`other/extra.rs`), alongside the shared `net.rs` fixture, so a
 /// path-narrowing test has a second directory whose edit would otherwise also seed something.
@@ -212,10 +208,6 @@ fn edit_line(source: &str, line: usize, new_line: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Running `impact` and reading its answer.
-// ---------------------------------------------------------------------------
-
 /// Run `impact --json <args>` against `db` in `repo`.
 fn run_impact(repo: &TestRepo, db: &Path, args: &[&str]) -> std::process::Output {
     repo.c10r()
@@ -284,10 +276,6 @@ fn dependent_names(report: &serde_json::Value) -> Vec<String> {
         .map(|d| d["symbol"]["name"].as_str().unwrap().to_string())
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Seeding and modes
-// ---------------------------------------------------------------------------
 
 // _(Working-tree default mode)_ — editing an indexed symbol in the working tree returns that
 // symbol's dependents in the default mode. `Client` is referenced from `open` (a `uses` edge, from
@@ -439,10 +427,6 @@ fn deleted_symbol_resolves_from_the_pre_change_side() {
         "connect's and Client's dependent (open) is reported: {report}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Exit taxonomy
-// ---------------------------------------------------------------------------
 
 // _(Absent git)_ — with no `git` reachable on `PATH`, `impact` exits with the indexer/setup-failure
 // code and names the missing tool.
@@ -616,10 +600,6 @@ fn change_to_untracked_file_kinds_is_typed_absence_not_unresolvable() {
         "a non-source file is not a region the index failed to resolve: {report}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Freshness and recovery
-// ---------------------------------------------------------------------------
 
 // _(Unrelated drift without untracked sources)_ — with `connect`'s edit staged and a separate,
 // unrelated file (`extra.rs`) edited but not staged, `--staged` seeds only `connect` while the
@@ -843,10 +823,6 @@ fn unmappable_regions_are_disclosed_on_an_approximate_answer() {
         "the region in the unindexed tracked file is disclosed: {report}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Output contract
-// ---------------------------------------------------------------------------
 
 // _(JSON/human parity)_ — `--json` and the human render present the same seeds and the same
 // dependents, in the same order.
@@ -1363,9 +1339,7 @@ fn following_the_recipe_leaves_the_queried_index_byte_for_byte_unchanged() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Following the recovery recipe to convergence
-// ---------------------------------------------------------------------------
+// Following the recovery recipe to convergence.
 //
 // The delta requires that following an approximate answer's recipe *yields an exact answer for the
 // seed mode it was emitted for*. That is a claim about the recipe as a whole, so the tests below run
@@ -1836,10 +1810,6 @@ fn a_range_recipe_converges_for_a_workspace_below_the_repository_root() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Reconstructibility partitions
-// ---------------------------------------------------------------------------
-
 // _(A bare single-revision spec names no range head)_ — `git diff <rev>` spans that revision to the
 // worktree exactly as the working-tree mode spans `HEAD` to the worktree, so nothing sits outside
 // the selected diff and the pre-change side is reconstructible. HEAD here is deliberately *not*
@@ -1925,10 +1895,6 @@ fn a_range_at_the_checkout_with_an_uncommitted_source_edit_is_approximate() {
         "an approximate answer carries a recipe: {dirty_report}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Continuation tokens, forward reach, and per-page disclosures
-// ---------------------------------------------------------------------------
 
 /// Extend `index` with the generated `src/callers.rs` module: `count` functions calling `connect`,
 /// their persisted symbols, and their reference occurrences onto `connect`. Returns the source text

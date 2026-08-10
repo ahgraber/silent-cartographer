@@ -9,7 +9,9 @@
 
 use silent_cartographer::graph::join::JoinAccounting;
 use silent_cartographer::graph::store::{GraphStore, IndexMetadata};
-use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind, WorkspaceId};
+use silent_cartographer::identity::{
+    CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one,
+};
 use silent_cartographer::semantic::model::{
     AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
@@ -160,6 +162,75 @@ pub fn fixture_index() -> ExtractedIndex {
         library_roots: Default::default(),
         environment: None,
     }
+}
+
+/// The single fixture source, paired with its workspace-relative path.
+pub fn sources() -> Vec<(String, String)> {
+    vec![(DOC.to_string(), SOURCE.to_string())]
+}
+
+/// Build the exemplar Rust fixture into a store at `dir/index.db` under `workspace`, returning its
+/// path.
+pub fn build_fixture_db(dir: &std::path::Path, workspace: &str) -> std::path::PathBuf {
+    let db = dir.join("index.db");
+    silent_cartographer::commands::build_from_index(&db, workspace, dir, &fixture_index(), &sources()).unwrap();
+    db
+}
+
+/// The workspace identity hand-built fixture stores are namespaced under.
+pub fn ws() -> WorkspaceId {
+    WorkspaceId::new("test-ws")
+}
+
+/// The canonical identity of a synthetic symbol under an explicit package.
+pub fn id_of_pkg(package: &str, segments: &[(&str, SegmentKind)]) -> CanonicalId {
+    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
+    project_one(&ws(), &Descriptor::new(package, segs))
+}
+
+/// A one-document index over `path`, carrying the fixture [`provenance`].
+pub fn one_doc_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
+    ExtractedIndex {
+        provenance: provenance(),
+        documents: vec![SourceDocument {
+            path: path.to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols,
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    }
+}
+
+/// A symbol with one occurrence, for hand-built rule and tier fixtures.
+pub fn one_occ_symbol(
+    package: &str,
+    segments: &[(&str, SegmentKind)],
+    kind: SymbolKind,
+    class: SymbolClass,
+    doc: &str,
+    range: SourceRange,
+    role: OccurrenceRole,
+) -> ExtractedSymbol {
+    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
+    ExtractedSymbol {
+        descriptor: Some(Descriptor::new(package, segs)),
+        kind,
+        class,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: doc.to_string(),
+            range,
+            role,
+        }],
+    }
+}
+
+/// The zero-based `(line, col)` of the byte at `pos` in single-byte-per-char test sources.
+pub fn line_col(source: &str, pos: usize) -> (u32, u32) {
+    let line = source[..pos].matches('\n').count() as u32;
+    let line_start = source[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    (line, (pos - line_start) as u32)
 }
 
 /// The committed Python conformance fixture directory (`tests/fixtures/python-conformance`).

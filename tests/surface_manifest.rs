@@ -273,9 +273,14 @@ fn manifest_enumerates_the_surface_through_the_binary_with_and_without_an_index(
     assert_eq!(with_json, manifest, "--json changes nothing for manifest's answer");
 
     // With a built fixture index, manifest reports its state.
-    let sources = vec![(support::DOC.to_string(), support::SOURCE.to_string())];
-    silent_cartographer::commands::build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources)
-        .unwrap();
+    silent_cartographer::commands::build_from_index(
+        &db,
+        "op-ws",
+        dir.path(),
+        &support::fixture_index(),
+        &support::sources(),
+    )
+    .unwrap();
 
     let built = c10r()
         .current_dir(dir.path())

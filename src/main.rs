@@ -101,6 +101,9 @@ fn run_completions(matches: &ArgMatches, args: &CompletionsArgs) -> ! {
     std::process::exit(ExitCode::Success.code());
 }
 
+/// The default `rust-analyzer` executable query commands probe for freshness/version detection.
+const DEFAULT_ANALYZER: &str = "rust-analyzer";
+
 /// Whether a subcommand flag was typed on the command line, as opposed to filled by its default —
 /// the distinction the modal content-bound teaching errors turn on. A flag absent from the invoked
 /// subcommand reads as not explicit.
@@ -121,7 +124,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
         Command::Get(args) => commands::run_get(
             &cli.db,
             &root,
-            &default_analyzer(),
+            DEFAULT_ANALYZER,
             args.reference.as_deref(),
             args.at.as_deref(),
             args.detail.into(),
@@ -137,7 +140,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
         Command::Trace(args) => commands::run_trace(
             &cli.db,
             &root,
-            &default_analyzer(),
+            DEFAULT_ANALYZER,
             &args.reference,
             args.relation.into(),
             args.depth,
@@ -154,7 +157,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
         Command::Find(args) => commands::run_find(
             &cli.db,
             &root,
-            &default_analyzer(),
+            DEFAULT_ANALYZER,
             &args.fragment,
             args.paging.limit,
             args.paging.cursor.as_deref(),
@@ -164,7 +167,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
         Command::Impact(args) => commands::run_impact(
             &cli.db,
             &root,
-            &default_analyzer(),
+            DEFAULT_ANALYZER,
             cli.workspace.as_deref(),
             args.revspec.as_deref(),
             args.staged,
@@ -199,7 +202,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
         Command::Status(args) => commands::run_status(
             &cli.db,
             &root,
-            &default_analyzer(),
+            DEFAULT_ANALYZER,
             cli.json,
             args.discrepancies,
             args.all,
@@ -220,14 +223,9 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
         // The structural index is always machine-readable JSON: `--json` is accepted (it is
         // global) but changes nothing, since manifest's answer is the machine answer.
         Command::Manifest => {
-            let index = commands::index_state(&cli.db, &root, &default_analyzer());
+            let index = commands::index_state(&cli.db, &root, DEFAULT_ANALYZER);
             let manifest = manifest::to_manifest_json(&Cli::command(), index);
             Ok(serde_json::to_string_pretty(&manifest)?)
         }
     }
-}
-
-/// The default `rust-analyzer` executable used by query commands for freshness/version detection.
-fn default_analyzer() -> String {
-    "rust-analyzer".to_string()
 }

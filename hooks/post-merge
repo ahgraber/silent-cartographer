@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # c10r reindex doorbell.
 #
-# Triggers an index rebuild after a commit so the code graph tracks the working
-# tree. Install by symlinking (or copying) into .git/hooks/, or point core.hooksPath
-# at this directory:
+# Triggers an index rebuild after a merge — `git merge`, and the merge half of a
+# `git pull` — so the code graph tracks the working tree. Install by symlinking (or
+# copying) into .git/hooks/, or point core.hooksPath at this directory:
 #
 #   git config core.hooksPath hooks
 #
-# The rebuild runs in the background and never blocks or fails the commit: an
-# indexing hiccup must not get in the way of committing.
+# The rebuild runs in the background and never blocks or fails the merge: an
+# indexing hiccup must not get in the way of merging.
 set -u
 
 # Resolve the c10r binary: prefer one on PATH, else the debug/release build.
-if command -v c10r >/dev/null 2>&1; then
+if command -v c10r > /dev/null 2>&1; then
   C10R="c10r"
-elif [ -x "target/release/c10r" ]; then
+elif [[ -x "target/release/c10r" ]]; then
   C10R="target/release/c10r"
-elif [ -x "target/debug/c10r" ]; then
+elif [[ -x "target/debug/c10r" ]]; then
   C10R="target/debug/c10r"
 else
   # No binary available; nothing to ring.
   exit 0
 fi
 
-# Fire and forget: rebuild the index without blocking the commit.
-"${C10R}" build . >/dev/null 2>&1 &
+# Fire and forget: rebuild the index without blocking the merge.
+"${C10R}" build . > /dev/null 2>&1 &
 
 exit 0

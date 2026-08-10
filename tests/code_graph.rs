@@ -13,18 +13,12 @@ use silent_cartographer::semantic::model::{
     OccurrenceRole, PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind, normalize,
 };
 
+use crate::support::{id_of_pkg, line_col, one_doc_index, one_occ_symbol, sources, ws};
+
 /// The canonicalized workspace root a directly-ingested fixture store records. These stores are never
 /// queried against a real filesystem root, so a stable stand-in keeps the recorded identity out of the
 /// way of what each test is asserting.
 const WS_ROOT: &str = "/test-ws";
-
-fn ws() -> WorkspaceId {
-    WorkspaceId::new("test-ws")
-}
-
-fn sources() -> Vec<(String, String)> {
-    vec![(support::DOC.to_string(), support::SOURCE.to_string())]
-}
 
 /// Ingest the standard fixture into a fresh in-memory store, returning the store and identities.
 fn ingest_fixture() -> GraphStore {
@@ -714,8 +708,6 @@ impl Gone for Thing {}
         "no identity is fabricated for the unresolved trait name"
     );
 }
-
-// ---- Dependents traversal ----
 
 /// A synthetic canonical identity for a traversal-graph symbol.
 fn sid(name: &str) -> CanonicalId {
@@ -2443,7 +2435,7 @@ fn discrepancies_are_superseded_per_build() {
 
     // Second build over an all-aligned source: the prior discrepancy must not survive.
     let index2 = support::fixture_index();
-    let src2 = vec![(support::DOC.to_string(), support::SOURCE.to_string())];
+    let src2 = sources();
     ingest(&mut store, &ws(), Some(WS_ROOT), &index2, &src2).unwrap();
     let rows = store.all_discrepancies().unwrap();
     assert!(
@@ -2589,53 +2581,6 @@ fn content_hash_gate_refuses_non_matching_sources() {
     let drifted = vec![(support::DOC.to_string(), format!("{}// drift\n", support::SOURCE))];
     let err = join_guarded(&mut store, &ws(), Some(WS_ROOT), &index, &drifted, &expected);
     assert!(err.is_err(), "content-hash gate must refuse a non-matching tree");
-}
-
-// ---- Typed alignment rules ----
-
-/// A one-document index over `path`.
-fn one_doc_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
-    ExtractedIndex {
-        provenance: support::provenance(),
-        documents: vec![SourceDocument {
-            path: path.to_string(),
-            encoding: PositionEncoding::Utf8,
-        }],
-        symbols: symbols.to_vec(),
-        duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
-        environment: None,
-    }
-}
-
-/// A symbol with one occurrence, for rule fixtures.
-fn one_occ_symbol(
-    package: &str,
-    segments: &[(&str, SegmentKind)],
-    kind: SymbolKind,
-    class: SymbolClass,
-    doc: &str,
-    range: SourceRange,
-    role: OccurrenceRole,
-) -> ExtractedSymbol {
-    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
-    ExtractedSymbol {
-        descriptor: Some(Descriptor::new(package, segs)),
-        kind,
-        class,
-        occurrences: vec![ExtractedOccurrence {
-            document_path: doc.to_string(),
-            range,
-            role,
-        }],
-    }
-}
-
-/// The zero-based `(line, col)` of the byte at `pos` in single-byte-per-char test sources.
-fn line_col(source: &str, pos: usize) -> (u32, u32) {
-    let line = source[..pos].matches('\n').count() as u32;
-    let line_start = source[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    (line, (pos - line_start) as u32)
 }
 
 // _(Guarded positional join — crate-root branch)_ — a use-site reference to an external crate root,
@@ -3835,8 +3780,6 @@ impl From<X> for Y {
     assert_eq!(acc.text_mismatch, 0);
 }
 
-// ---- Range-literal family coverage ----
-
 // _(Guarded positional join — range-literal branch)_ — `Range` at `a..b` and `RangeFrom` at `a..`
 // both align under the range-literal rule, per the closed shape correspondence.
 #[test]
@@ -3918,8 +3861,6 @@ fn range_occurrence_with_mismatched_shape_stays_refused() {
         "the mismatched occurrence is refused and surfaced"
     );
 }
-
-// ---- Use-list-self family coverage ----
 
 // _(Guarded positional join — use-list-self branch)_ — a module occurrence at the `self` in
 // `use crate::walk::{self};` aligns under the use-list-self rule when it spells the enclosing path's
@@ -4152,8 +4093,6 @@ fn path_start_self_for_foreign_module_stays_refused() {
     );
 }
 
-// ---- Super-keyword family coverage ----
-
 // _(Guarded positional join — super-keyword branch)_ — a `super` token resolving to the document's
 // own module's parent aligns, and a `super::super` token (depth 2) resolving to the grandparent
 // aligns too.
@@ -4332,8 +4271,6 @@ mod tests {
     );
     assert_eq!(acc.text_mismatch, 0);
 }
-
-// ---- Operator-desugar family coverage: one acceptance test per correspondence family ----
 
 /// Ingest one reference occurrence of desugar-correspondence `method` at the first occurrence of
 /// `token` in `source`, returning the build's accounting. Each family test pins its own method and
@@ -4601,8 +4538,6 @@ impl output::Answer {
     );
     assert_eq!(acc.text_mismatch, 0);
 }
-
-// ---- Locality attribution ----
 
 /// A twin symbol carrying only its own definition occurrence, for a group-addressed duplicate index.
 fn twin(descriptor: Descriptor, kind: SymbolKind, doc: &str, def_range: SourceRange) -> ExtractedSymbol {
@@ -5851,8 +5786,6 @@ fn twin_crate_roots_produce_per_target_imports_edges_after_normalization() {
     );
 }
 
-// ---- Duplicated-descriptor disclosure ----
-
 // _(Duplicated descriptors are disclosed — retrievable branch, store surface)_ — a store with a
 // duplicated descriptor's twins returns one group naming the shared descriptor's base and both
 // definitions.
@@ -5965,10 +5898,8 @@ fn canonical_collision_groups_are_not_reported_as_duplicated_descriptors() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Python (fixture-level): the guarded join and derived edges over the committed
-// python-conformance fixture — no live tool.
-// ---------------------------------------------------------------------------
+// Python (fixture-level): the guarded join and derived edges over the committed python-conformance
+// fixture — no live tool.
 
 fn py_ws() -> WorkspaceId {
     WorkspaceId::new("py-ws")
@@ -7053,14 +6984,6 @@ fn rust_use_alias_accepted_under_document_binding() {
         "the persisted attribution carries the import-alias provenance: {occs:?}"
     );
 }
-
-/// The canonical identity of a synthetic symbol under an explicit package.
-fn id_of_pkg(package: &str, segments: &[(&str, SegmentKind)]) -> CanonicalId {
-    let segs: Vec<DescriptorSegment> = segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect();
-    silent_cartographer::identity::project_one(&ws(), &Descriptor::new(package, segs))
-}
-
-// ---- Per-symbol test classification ----
 
 /// An index over several documents, for classification fixtures spanning more than one file.
 fn docs_index(paths: &[&str], symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {

@@ -12,16 +12,9 @@ use std::process::{Command, Stdio};
 
 use clap::CommandFactory;
 
-/// The single fixture source, paired with its workspace-relative path.
-fn sources() -> Vec<(String, String)> {
-    vec![(support::DOC.to_string(), support::SOURCE.to_string())]
-}
-
 /// Build the exemplar Rust fixture into a store at `dir/index.db` and return its path.
 fn build_fixture_db(dir: &Path) -> PathBuf {
-    let db = dir.join("index.db");
-    silent_cartographer::commands::build_from_index(&db, "op-ws", dir, &support::fixture_index(), &sources()).unwrap();
-    db
+    support::build_fixture_db(dir, "op-ws")
 }
 
 /// A fresh invocation of the built binary (never the ambient `c10r` on `PATH`).
@@ -689,7 +682,7 @@ fn a_db_path_spelled_like_a_uri_names_the_file_with_that_literal_name() {
         "literal-store",
         dir.path(),
         &support::fixture_index(),
-        &sources(),
+        &support::sources(),
     )
     .unwrap();
 
