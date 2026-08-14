@@ -968,6 +968,122 @@ pub fn run_find(
     Ok(render(&answer, json, styled))
 }
 
+/// `search`: the corpus symbols nearest a natural-language query by estimated relevance — the
+/// fused vector and lexical ranking over the persisted semantic corpus.
+#[allow(clippy::too_many_arguments)] // the CLI's flat query-command surface travels together
+pub fn run_search(
+    db: &Path,
+    root: &Path,
+    rust_analyzer: &str,
+    query: &str,
+    detail: Detail,
+    max_lines: usize,
+    max_lines_explicit: bool,
+    limit: usize,
+    cursor: Option<&str>,
+    json: bool,
+    styled: bool,
+) -> Result<String> {
+    // Row content exists only under a content-bearing detail; an explicit `--max-lines` at location
+    // detail is a modal usage error, decided before the store opens.
+    let content_bearing = matches!(detail, Detail::Signature | Detail::Interface | Detail::Body);
+    if !content_bearing && max_lines_explicit {
+        return Err(content_bound_misuse("--max-lines").into());
+    }
+    let effective_limit = (limit != 0).then_some(limit);
+    let effective_max_lines = (max_lines != 0).then_some(max_lines);
+    // Store-independent cursor checks run before the store opens, so a malformed cursor or a cursor
+    // against an unbounded set is a usage error even against an absent index.
+    precheck_cursor(cursor, effective_limit)?;
+    let store = open_query_store(db)?;
+    let index_hash = recorded_index_hash(&store)?;
+    let relation = workspace_relation(&store, root)?;
+    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let engine = QueryEngine::new(&store, provenance, hash, environment);
+    let answer = engine.search(query, detail, effective_max_lines)?;
+    let identity = PageIdentity {
+        command: "search",
+        reference: query.to_string(),
+        relation: None,
+        detail: Some(detail_label(detail)),
+        depth: None,
+        ordering: None,
+        limit: effective_limit,
+        max_lines: effective_max_lines,
+        from: None,
+        index_hash,
+    };
+    let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+    Ok(render(&answer, json, styled))
+}
+
+/// `similar`: the corpus symbols most similar in content to a subject symbol, the subject named by
+/// reference or by source position, with deterministic clone-certainty markers above the estimated
+/// ranking.
+#[allow(clippy::too_many_arguments)] // the CLI's flat query-command surface travels together
+pub fn run_similar(
+    db: &Path,
+    root: &Path,
+    rust_analyzer: &str,
+    reference: Option<&str>,
+    at: Option<&str>,
+    detail: Detail,
+    max_lines: usize,
+    max_lines_explicit: bool,
+    limit: usize,
+    cursor: Option<&str>,
+    json: bool,
+    styled: bool,
+) -> Result<String> {
+    // The invocation's shape is validated before the store is opened, so a malformed `similar` is a
+    // usage error even against an absent index.
+    let position = at.map(parse_position).transpose()?;
+    let reference = match position {
+        Some(_) => None,
+        None => Some(
+            reference.ok_or_else(|| Failure::Usage("similar requires a reference or --at position".to_string()))?,
+        ),
+    };
+    let content_bearing = matches!(detail, Detail::Signature | Detail::Interface | Detail::Body);
+    if !content_bearing && max_lines_explicit {
+        return Err(content_bound_misuse("--max-lines").into());
+    }
+    let effective_limit = (limit != 0).then_some(limit);
+    let effective_max_lines = (max_lines != 0).then_some(max_lines);
+    let subject = reference
+        .map(str::to_string)
+        .or_else(|| at.map(str::to_string))
+        .unwrap_or_default();
+    precheck_cursor(cursor, effective_limit)?;
+    let store = open_query_store(db)?;
+    let index_hash = recorded_index_hash(&store)?;
+    let relation = workspace_relation(&store, root)?;
+    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let engine = QueryEngine::new(&store, provenance, hash, environment);
+    let answer = match &position {
+        Some((doc, offset)) => engine.similar_by_position(doc, *offset, detail, effective_max_lines)?,
+        None => engine.similar(
+            reference.expect("required when --at is absent"),
+            detail,
+            effective_max_lines,
+        )?,
+    };
+    let identity = PageIdentity {
+        command: "similar",
+        reference: subject,
+        relation: None,
+        detail: Some(detail_label(detail)),
+        depth: None,
+        ordering: None,
+        limit: effective_limit,
+        max_lines: effective_max_lines,
+        from: None,
+        index_hash,
+    };
+    let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+    Ok(render(&answer, json, styled))
+}
+
 /// `impact`: the reverse-reachability impact of a change, seeded from a git diff rather than from a
 /// symbol the caller names.
 ///

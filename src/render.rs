@@ -13,6 +13,7 @@
 use crate::cli::ColorArg;
 use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
 use crate::query::output::{Answer, ContentLines, Location, Outcome, PageInfo, SymbolView, WorkspaceRelation};
+use crate::query::search::{CloneCertainty, SearchItem, SimilarItem};
 use crate::query::{DependentsReport, FindItem, HorizonDisclosure, SymbolDetail, TraceItem};
 
 const BOLD: &str = "\x1b[1m";
@@ -100,13 +101,29 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
     if let Some(line) = workspace_relation_line(answer) {
         lines.push(line);
     }
+    // The semantic-index provenance a `search`/`similar` answer carries, rendered with the header
+    // block so the human view names the same identity the machine answer does.
+    if let Some(semantic) = &answer.semantic_index {
+        lines.push(format!(
+            "semantic index: {} · corpus definition v{}",
+            sanitize(&semantic.model_identity),
+            semantic.corpus_definition_version
+        ));
+    }
     match &answer.outcome {
         Outcome::Found { results } => {
             // The heuristic-grade marker renders above the results, so a human consumer cannot
-            // miss what the structural field tells a machine consumer.
-            if answer.classification.is_some() {
-                lines
-                    .push("note: results are convention-classified test code, not resolved semantic fact".to_string());
+            // miss what the structural field tells a machine consumer. Each marker names its own
+            // grade: estimation for a model-derived ranking, convention for classified test code.
+            match answer.classification {
+                Some("estimation") => lines.push(
+                    "note: rows are the nearest candidates by model-derived estimation — not the complete set of \
+                     relevant code"
+                        .to_string(),
+                ),
+                Some(_) => lines
+                    .push("note: results are convention-classified test code, not resolved semantic fact".to_string()),
+                None => {}
             }
             // The ordering disclosure's heuristic note, likewise: only a ranked answer is presented
             // as heuristic — an unranked ordering derives from stable structural keys alone.
@@ -133,10 +150,14 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
             }
         }
         // The two typed-none outcomes read as definite, distinct from a failure and from each other.
-        // A convention-classified empty answer scopes its absence to the classification: no
-        // convention-classified site was found — never proof that nothing tests the subject.
+        // A marked empty answer scopes its absence to its grade: an estimation-marked empty says the
+        // corpus offered no candidates — never that no relevant code exists; a convention-marked
+        // empty says no convention-classified site was found — never that nothing tests the subject.
         Outcome::Absent => lines.push("absent: nothing resolved (a definite none, not a failure)".to_string()),
         Outcome::Empty => lines.push(match answer.classification {
+            Some("estimation") => {
+                "empty: the semantic corpus offered no candidates (not proof that no relevant code exists)".to_string()
+            }
             Some(_) => {
                 "empty: no convention-classified test reference found (not proof that nothing tests the subject)"
                     .to_string()
@@ -261,6 +282,57 @@ impl HumanRender for FindItem {
                 sanitize(&item.symbol.name),
                 location_at(item.location.as_ref())
             ));
+        }
+    }
+}
+
+impl HumanRender for SearchItem {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+        lines.push(results_header(results.len(), styled));
+        for item in results {
+            lines.push(format!(
+                "  {}  {}  [{}]{} at {}",
+                sanitize(item.symbol.canonical_id.as_str()),
+                sanitize(&item.symbol.name),
+                sanitize(&item.symbol.kind),
+                external_tag(item.symbol.external),
+                location_at(item.location.as_ref())
+            ));
+            if let Some(text) = &item.content {
+                push_content(lines, Some(text));
+            }
+            push_truncation(lines, item.content_truncated);
+        }
+    }
+}
+
+impl HumanRender for SimilarItem {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+        lines.push(results_header(results.len(), styled));
+        for item in results {
+            // The clone marker renders on the row as deterministic fact — the certainty tier above
+            // the estimated ranking — never as part of the estimation grade.
+            let certainty = match item.clone_certainty {
+                Some(CloneCertainty::ExactClone) => "  [exact clone: identical token sequence]",
+                Some(CloneCertainty::VariantClone) => {
+                    "  [variant clone: identical token structure, names/literals substituted — not behavioral \
+                     equivalence]"
+                }
+                None => "",
+            };
+            lines.push(format!(
+                "  {}  {}  [{}]{} at {}{}",
+                sanitize(item.symbol.canonical_id.as_str()),
+                sanitize(&item.symbol.name),
+                sanitize(&item.symbol.kind),
+                external_tag(item.symbol.external),
+                location_at(item.location.as_ref()),
+                certainty
+            ));
+            if let Some(text) = &item.content {
+                push_content(lines, Some(text));
+            }
+            push_truncation(lines, item.content_truncated);
         }
     }
 }

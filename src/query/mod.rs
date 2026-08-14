@@ -6,6 +6,7 @@ pub mod impact;
 pub mod output;
 pub mod page;
 pub mod resolve;
+pub mod search;
 
 use crate::graph::rank;
 use crate::graph::store::{

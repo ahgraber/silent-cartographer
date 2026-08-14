@@ -1,6 +1,9 @@
 //! The code graph: the guarded join, the SQLite-core store, and the ingest that unifies the two
 //! oracles into one persisted graph.
 
+pub mod clone;
+pub mod corpus;
+pub mod embed;
 pub mod join;
 pub mod range;
 pub mod rank;
@@ -242,8 +245,14 @@ pub fn ingest(
     // superseded (a same-version rebuild never accumulates or leaves stale rows), and the guard
     // rolls everything back on a failed build, so the store always holds exactly one whole build.
     let tx = store.begin_build()?;
+    // The prior build's semantic representations, read before the clear so an entry whose render is
+    // unchanged carries its embedding forward instead of re-embedding.
+    let prior_semantic = store.semantic_representations()?;
     store.clear_derived()?;
 
+    // The rows are retained after insertion: the semantic-corpus pass below reads their tier
+    // content and containment to assemble the corpus.
+    let mut symbol_rows: Vec<SymbolRow> = Vec::new();
     for (idx, sym) in index.symbols.iter().enumerate() {
         let Some(Some(id)) = identities.get(idx) else {
             continue;
@@ -259,7 +268,7 @@ pub fn ingest(
                 .as_ref()
                 .is_some_and(|d| definition_count_by_descriptor.get(d).copied().unwrap_or(0) > 1);
         let content = definition_content(sym, id, &def_name_span, &source_map, language);
-        store.insert_symbol(&SymbolRow {
+        symbol_rows.push(SymbolRow {
             canonical_id: id.clone(),
             display_name,
             kind: kind_tag(sym.kind).to_string(),
@@ -271,8 +280,28 @@ pub fn ingest(
             interface_text: content.interface_text,
             duplicated,
             test_rule: test_rules.get(id).map(|rule| (*rule).to_string()),
-        })?;
+        });
     }
+    for row in &symbol_rows {
+        store.insert_symbol(row)?;
+    }
+    // Which symbols contribute corpus entries, decided from tier content alone. Containment for
+    // corpus purposes counts contributing children only — a symbol enclosing nothing but name-only
+    // symbols (a Python function over its parameter symbols) stays a leaf — so both containment
+    // signals below filter through this set.
+    let contributing: std::collections::HashSet<&CanonicalId> = symbol_rows
+        .iter()
+        .filter(|row| row.class == PersistedClass::InWorkspace)
+        .filter(|row| {
+            corpus::content_contributes(
+                &row.display_name,
+                row.signature_text.as_deref(),
+                row.interface_text.as_deref(),
+                row.span_text.as_deref(),
+            )
+        })
+        .map(|row| &row.canonical_id)
+        .collect();
 
     // Persist aligned occurrences, attributing references to the nearest enclosing persisted symbol.
     for aligned in &join_result.aligned {
@@ -307,7 +336,10 @@ pub fn ingest(
     }
 
     // Derive `contains` edges from enclosure: each definition's nearest enclosing persisted
-    // declaration contains it.
+    // declaration contains it. Parents of *contributing* children double as the corpus's container
+    // set: a symbol that contains another corpus-contributing symbol contributes its interface
+    // tier, never its full body.
+    let mut container_ids: std::collections::HashSet<CanonicalId> = std::collections::HashSet::new();
     for aligned in &join_result.aligned {
         if aligned.role != OccurrenceRole::Definition {
             continue;
@@ -315,12 +347,24 @@ pub fn ingest(
         // An empty aligned span (the Python module origin marker) has a position but no extent;
         // reading enclosure from it would fabricate containment — a document whose first byte sits
         // inside a declaration would make that declaration "contain" the module — so it derives no
-        // parent.
+        // parent. A whole-document span (a Rust file module) has the symmetric problem: its start
+        // byte sits inside whichever declaration opens the document, and nothing within a document
+        // encloses the module the document itself defines — so it derives no parent either.
         if aligned.name_span.start == aligned.name_span.end {
+            continue;
+        }
+        if aligned.name_span.start == 0
+            && source_map
+                .get(aligned.document_path.as_str())
+                .is_some_and(|source| aligned.name_span.end == source.len())
+        {
             continue;
         }
         if let Some(parent) = parent_of_definition(aligned, &source_map, &def_name_span, &type_by_name, language) {
             store.insert_edge(EdgeKind::Contains, &parent, &aligned.symbol)?;
+            if contributing.contains(&aligned.symbol) {
+                container_ids.insert(parent);
+            }
         }
     }
 
@@ -420,6 +464,113 @@ pub fn ingest(
         })
         .collect();
     store.insert_discrepancies(&discrepancies)?;
+
+    // The semantic corpus and its representations. Containment for corpus purposes is the union of
+    // two signals: the `contains`-edge parents (which catch a type whose methods live in `impl`
+    // blocks outside its own span) and span containment within a document (which catches a file
+    // module, whose members' enclosing-declaration chains are empty so no edge ever names it).
+    let mut span_containers: std::collections::HashSet<&CanonicalId> = std::collections::HashSet::new();
+    {
+        /// One contributing symbol's identity, definition span, and whether it is a module,
+        /// grouped per document below. Only contributing symbols enter: containment over
+        /// non-contributing symbols (name-only parameter tokens) must not turn their encloser into
+        /// a container.
+        type SpannedSymbol<'a> = (&'a CanonicalId, (usize, usize), bool);
+        let mut spans_by_doc: HashMap<&str, Vec<SpannedSymbol<'_>>> = HashMap::new();
+        for row in &symbol_rows {
+            if !contributing.contains(&row.canonical_id) {
+                continue;
+            }
+            if let (Some(doc), Some(span)) = (row.document_path.as_deref(), row.span) {
+                spans_by_doc
+                    .entry(doc)
+                    .or_default()
+                    .push((&row.canonical_id, span, row.kind == "module"));
+            }
+        }
+        for spans in spans_by_doc.values() {
+            for (id, outer, is_module) in spans {
+                // Containment compares identities, not spans: a file module whose span exactly
+                // equals its sole declaration's span still encloses it. Equal spans confer
+                // containment only on the module side of the pair (a document encloses its
+                // declarations), so the declaration stays a leaf.
+                let contains_other = spans.iter().any(|(other, inner, _)| {
+                    *other != *id && outer.0 <= inner.0 && inner.1 <= outer.1 && (*inner != *outer || *is_module)
+                });
+                if contains_other {
+                    span_containers.insert(id);
+                }
+            }
+        }
+    }
+    let corpus_sources: Vec<corpus::CorpusSource<'_>> = symbol_rows
+        .iter()
+        .filter(|row| row.class == PersistedClass::InWorkspace)
+        .map(|row| corpus::CorpusSource {
+            canonical_id: &row.canonical_id,
+            display_name: &row.display_name,
+            kind: &row.kind,
+            signature_text: row.signature_text.as_deref(),
+            interface_text: row.interface_text.as_deref(),
+            span_text: row.span_text.as_deref(),
+            contains_persisted: container_ids.contains(&row.canonical_id)
+                || span_containers.contains(&row.canonical_id),
+        })
+        .collect();
+    let entries = corpus::assemble(&corpus_sources);
+
+    // Each entry's vector: carried forward when the render is byte-identical to the prior build's
+    // (the model is deterministic and pinned, so the carried and recomputed vectors are identical
+    // by construction), embedded in one batch otherwise.
+    let mut vectors: Vec<Option<Vec<u8>>> = vec![None; entries.len()];
+    let mut pending: Vec<usize> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        match prior_semantic.get(entry.symbol_id.as_str()) {
+            Some(prior) if prior.render == entry.render => vectors[i] = Some(prior.embedding.clone()),
+            _ => pending.push(i),
+        }
+    }
+    if !pending.is_empty() {
+        let texts: Vec<String> = pending.iter().map(|&i| entries[i].render.clone()).collect();
+        for (&i, vector) in pending.iter().zip(embed::embed_batch(&texts)) {
+            vectors[i] = Some(embed::vector_bytes(&vector));
+        }
+    }
+    for (entry, vector) in entries.iter().zip(&vectors) {
+        let vector = vector.as_ref().expect("every corpus entry embeds or carries forward");
+        let words = corpus::split_words(&entry.render).join(" ");
+        store.insert_corpus_entry(&entry.symbol_id, &entry.render, &words, vector)?;
+    }
+
+    // Clone-equivalence keys for the corpus's leaves, from each leaf's spelled token sequence.
+    // Containers carry none: a container "clone" over interface text would assert a body
+    // equivalence the key never examined.
+    let mut trees: HashMap<&str, Option<syntax::SyntaxTree>> = HashMap::new();
+    for source in &corpus_sources {
+        if source.contains_persisted || !source.contributes() {
+            continue;
+        }
+        let row = symbol_rows
+            .iter()
+            .find(|row| &row.canonical_id == source.canonical_id)
+            .expect("corpus sources are drawn from the retained rows");
+        let (Some(doc), Some((start, end))) = (row.document_path.as_deref(), row.span) else {
+            continue;
+        };
+        let tree = trees.entry(doc).or_insert_with(|| {
+            source_map
+                .get(doc)
+                .copied()
+                .and_then(|s| syntax::SyntaxTree::parse(s, language))
+        });
+        let Some(tree) = tree.as_ref() else {
+            continue;
+        };
+        let tokens = tree.spelled_tokens(ByteSpan { start, end });
+        if let Some(keys) = clone::clone_keys(&tokens) {
+            store.set_clone_keys(source.canonical_id, &keys.formatting_key, &keys.substitution_key)?;
+        }
+    }
 
     store.write_metadata(&IndexMetadata {
         workspace_id: workspace.clone(),

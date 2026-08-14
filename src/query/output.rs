@@ -63,6 +63,16 @@ pub enum WorkspaceRelation {
     Unknown,
 }
 
+/// The semantic-index identity a `search`/`similar` answer carries as provenance: the embedding
+/// model and the corpus definition the store's semantic representations were built under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticIndexView {
+    /// The embedding model identity (upstream repository at its vendored revision).
+    pub model_identity: String,
+    /// The corpus definition version the render derives under.
+    pub corpus_definition_version: u32,
+}
+
 /// The identity+name view of a symbol carried in every answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SymbolView {
@@ -157,11 +167,16 @@ pub struct Answer<T> {
     /// Whether the answer is stale (either reason).
     pub stale: bool,
     /// The heuristic-grade marker: `Some("convention")` when the answer derives from
-    /// convention-based classification rather than resolved semantic fact (the `tests` relation).
+    /// convention-based classification rather than resolved semantic fact (the `tests` relation),
+    /// `Some("estimation")` when its ranking is model-derived estimation (`search`/`similar`).
     /// Absent for relations derived only from resolved reference evidence, so their shape is
     /// unchanged. Rides independently of provenance and freshness, never replacing either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<&'static str>,
+    /// The semantic-index provenance every `search`/`similar` answer carries — a typed-empty answer
+    /// included. Absent on every other answer, so their shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_index: Option<SemanticIndexView>,
     /// The workspace-relationship disclosure: present when the store describes a different workspace
     /// than the one queried, or when that comparison could not be evaluated; absent on a match, so a
     /// matched answer's shape is unchanged. Rides independently of freshness — a store can be current
@@ -219,6 +234,7 @@ impl<T> Answer<T> {
             freshness: freshness.into(),
             stale: freshness.is_stale(),
             classification: None,
+            semantic_index: None,
             workspace_relation: None,
             ordering: None,
             outcome,
@@ -230,6 +246,19 @@ impl<T> Answer<T> {
     /// heuristic-grade marker every `tests` answer carries, found and empty alike.
     pub fn convention_classified(mut self) -> Self {
         self.classification = Some("convention");
+        self
+    }
+
+    /// Mark the answer's ranking as model-derived estimation and attach the semantic-index
+    /// provenance — the pair every `search`/`similar` answer carries, found and empty alike. The
+    /// marker accompanies provenance, freshness, and staleness, never replacing any of them.
+    ///
+    /// The parameter is optional because it mirrors the store's optional read: a `None` arises
+    /// only for a store recorded without a completed build, which the query surface refuses before
+    /// any engine answers — it is not a reachable answer shape.
+    pub fn estimated(mut self, semantic_index: Option<SemanticIndexView>) -> Self {
+        self.classification = Some("estimation");
+        self.semantic_index = semantic_index;
         self
     }
 

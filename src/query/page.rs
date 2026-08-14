@@ -21,7 +21,7 @@ use super::{DependentItem, DependentsReport};
 /// identity — a different query, an index rebuilt underneath (changed sources or a changed analyzer
 /// version), or a changed ranking model, changes the hash and is rejected.
 pub struct PageIdentity {
-    /// The command name (`get`, `trace`, `find`, or `impact`).
+    /// The command name (`get`, `trace`, `find`, `search`, `similar`, or `impact`).
     pub command: &'static str,
     /// The subject reference (or source-position string), as presented.
     pub reference: String,
@@ -154,6 +154,7 @@ pub fn apply_pagination<T>(
         freshness,
         stale,
         classification,
+        semantic_index,
         workspace_relation,
         ordering,
         outcome,
@@ -180,6 +181,7 @@ pub fn apply_pagination<T>(
             freshness,
             stale,
             classification,
+            semantic_index,
             workspace_relation,
             ordering,
             outcome: Outcome::Ambiguous {
@@ -201,6 +203,7 @@ pub fn apply_pagination<T>(
             freshness,
             stale,
             classification,
+            semantic_index,
             workspace_relation,
             ordering,
             outcome,
@@ -215,6 +218,7 @@ pub fn apply_pagination<T>(
             freshness,
             stale,
             classification,
+            semantic_index,
             workspace_relation,
             ordering,
             outcome: Outcome::Found { results },
@@ -250,6 +254,7 @@ pub fn apply_pagination<T>(
         freshness,
         stale,
         classification,
+        semantic_index,
         workspace_relation,
         ordering,
         outcome: Outcome::Found { results: page_results },
@@ -286,6 +291,7 @@ pub fn apply_report_pagination<T>(
         freshness,
         stale,
         classification,
+        semantic_index,
         workspace_relation,
         ordering,
         outcome,
@@ -302,6 +308,7 @@ pub fn apply_report_pagination<T>(
             freshness,
             stale,
             classification,
+            semantic_index,
             workspace_relation,
             ordering,
             outcome: Outcome::Found { results },
@@ -343,6 +350,7 @@ pub fn apply_report_pagination<T>(
         freshness,
         stale,
         classification,
+        semantic_index,
         workspace_relation,
         ordering,
         outcome: Outcome::Found { results: vec![report] },

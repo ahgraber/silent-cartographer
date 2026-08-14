@@ -62,6 +62,20 @@ pub enum Command {
     /// Case folding is ASCII-only: an ASCII letter in the fragment matches regardless of case, while
     /// a non-ASCII character matches only exactly.
     Find(FindArgs),
+    /// Search indexed code by meaning: describe what the code does in natural language and get the
+    /// nearest candidate symbols by estimated relevance — not the complete set of relevant code.
+    ///
+    /// The ranking is model-derived estimation over the indexed content (names, documentation, and
+    /// source alike are evidence), so an empty or truncated answer is never proof that no relevant
+    /// code exists.
+    Search(SearchArgs),
+    /// Rank the indexed symbols most similar in content to a subject symbol — the nearest
+    /// candidates by estimated similarity, not the complete set of similar code.
+    ///
+    /// The ranking is model-derived estimation; rows that are deterministic clones of the subject
+    /// (token-identical, or identical up to consistently renamed identifiers and substituted
+    /// literal values) carry a typed clone marker and rank ahead of the estimate.
+    Similar(SimilarArgs),
     /// Assess what a change could affect: the dependents of every symbol the change touched, seeded
     /// from a git diff rather than from a symbol the caller names.
     Impact(ImpactArgs),
@@ -257,6 +271,53 @@ pub struct TraceArgs {
 pub struct FindArgs {
     /// The name fragment to search for.
     pub fragment: String,
+
+    #[command(flatten)]
+    pub paging: PageArgs,
+}
+
+/// Arguments for `search`.
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// The natural-language query describing what the code does.
+    pub query: String,
+
+    /// Project each result row's tier content at this detail. Never changes which symbols are
+    /// returned or their order.
+    #[arg(long, value_enum, default_value = "signature")]
+    pub detail: DetailArg,
+
+    /// Cap the lines of content projected onto each row, for a content-bearing detail. Defaults to
+    /// 10; `0` means unbounded.
+    #[arg(long, default_value_t = 10)]
+    pub max_lines: usize,
+
+    #[command(flatten)]
+    pub paging: PageArgs,
+}
+
+/// Arguments for `similar`.
+#[derive(Debug, Args)]
+pub struct SimilarArgs {
+    /// The subject symbol reference (identity, qualified name, or shortname). Omit when using
+    /// `--at`.
+    #[arg(conflicts_with = "at")]
+    pub reference: Option<String>,
+
+    /// Take the symbol enclosing a source position as the subject, given as `path:byte_offset`.
+    /// Mutually exclusive with a positional reference.
+    #[arg(long)]
+    pub at: Option<String>,
+
+    /// Project each result row's tier content at this detail. Never changes which symbols are
+    /// returned or their order.
+    #[arg(long, value_enum, default_value = "signature")]
+    pub detail: DetailArg,
+
+    /// Cap the lines of content projected onto each row, for a content-bearing detail. Defaults to
+    /// 10; `0` means unbounded.
+    #[arg(long, default_value_t = 10)]
+    pub max_lines: usize,
 
     #[command(flatten)]
     pub paging: PageArgs,

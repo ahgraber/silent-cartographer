@@ -163,3 +163,9 @@ chrome-profile
 !.gitignore
 # Checked-in SCIP test fixtures are source, not build artifacts.
 !tests/fixtures/*.scip
+
+# -------------------------------------------------------
+# Embedding-model payload: fetched and checksum-verified by build.rs against
+# models/potion-code-16M-v2.manifest.json; never committed.
+# -------------------------------------------------------
+models/potion-code-16M-v2/

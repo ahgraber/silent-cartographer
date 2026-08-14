@@ -1,9 +1,9 @@
 //! The SQLite-core schema.
 //!
-//! One embedded store holds the symbols, their occurrences, type-tagged edges, and per-index
-//! metadata (analyzer provenance, source content hash, join-alignment accounting). The shape
-//! reserves room for the deferred semantic pillar — a vector column on `symbols` and an FTS5 index
-//! over spans — without committing to their form; those arrive as an additive migration.
+//! One embedded store holds the symbols, their occurrences, type-tagged edges, the semantic-corpus
+//! representations (render text, embedding vectors, lexical index, clone-equivalence keys), and
+//! per-index metadata (analyzer provenance, source content hash, join-alignment accounting,
+//! semantic-index identity).
 
 /// The current schema version. Bumped on any schema-affecting change under the reproducibility
 /// policy. Stamped into each store's `PRAGMA user_version` at creation and validated at open,
@@ -12,10 +12,17 @@
 /// Version is not ownership: whose file this is lives in `PRAGMA application_id`
 /// ([`crate::graph::store::APPLICATION_ID`]), which no migration disturbs.
 ///
-/// Migration: version 13 added `index_metadata.workspace_root`. The index is derived, replayable
+/// The semantic-index identity (the embedding model, the corpus definition) folds into this
+/// version: the model is compiled into the binary, so an identity change can only arrive in a new
+/// binary, and bumping this version makes every stale store refuse wholesale — no separate
+/// semantic-compatibility gate exists.
+///
+/// Migration: version 14 added the semantic corpus (`semantic_corpus`, `semantic_lexical`,
+/// `semantic_vectors`), the clone-key columns on `symbols`, and the semantic-index identity in
+/// `index_metadata`. The index is derived, replayable
 /// data, so rebuild is the migration — a build replaces an older store of its own wholesale and a
 /// query refuses it with recovery guidance (the replace-or-refuse contract).
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -31,6 +38,10 @@ PRAGMA foreign_keys = ON;
 -- It is nullable: a root that is not valid UTF-8 cannot be recorded exactly, and a lossy rendering
 -- would let a different workspace compare equal, so it is recorded as absent instead.
 -- `workspace_id` stays a display name and is never compared.
+-- `semantic_model_identity` and `corpus_definition_version` are the semantic-index identity in
+-- effect at build time — the embedding model (compiled into the binary) and the corpus/render
+-- definition that produced the build's semantic representations — retrievable as provenance and
+-- carried on every semantic answer.
 CREATE TABLE IF NOT EXISTS index_metadata (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version      INTEGER NOT NULL,
@@ -39,6 +50,8 @@ CREATE TABLE IF NOT EXISTS index_metadata (
     analyzer_name       TEXT    NOT NULL,
     analyzer_version    TEXT    NOT NULL,
     environment         TEXT,
+    semantic_model_identity   TEXT    NOT NULL,
+    corpus_definition_version INTEGER NOT NULL,
     content_hash                   TEXT    NOT NULL,
     aligned_exact_count            INTEGER NOT NULL DEFAULT 0,
     aligned_crate_root_count       INTEGER NOT NULL DEFAULT 0,
@@ -70,8 +83,13 @@ CREATE TABLE IF NOT EXISTS index_metadata (
 -- symbol is test code, with the convention rule that stamped it as provenance ('test_attribute',
 -- 'test_configuration', 'test_file', 'test_directory' — an open set a consumer must not treat as
 -- closed). The predicate and its provenance are one column so they cannot disagree.
--- The reserved `embedding` column holds the deferred semantic-pillar vector; its shape is not yet
--- committed, so it is a nullable BLOB placeholder that a future additive migration reshapes.
+-- `clone_formatting_key` and `clone_substitution_key` are the clone-equivalence keys over a leaf
+-- symbol's spelled token sequence: the formatting-insensitive key collides exactly when two token
+-- sequences are identical after comments and whitespace are disregarded; the substitution-insensitive
+-- key collides exactly when they additionally match under a consistent one-to-one substitution of
+-- identifiers and literal values. Both are NULL for containers (a container "clone" over interface
+-- text would assert a body equivalence the key never examined), for externals, and for symbols whose
+-- source spelled no tokens.
 CREATE TABLE IF NOT EXISTS symbols (
     canonical_id     TEXT    PRIMARY KEY,
     display_name     TEXT    NOT NULL,
@@ -85,7 +103,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     interface_text   TEXT,
     duplicated       INTEGER NOT NULL DEFAULT 0,
     test_rule        TEXT,
-    embedding        BLOB
+    clone_formatting_key    TEXT,
+    clone_substitution_key  TEXT
 );
 
 -- One row per occurrence of a symbol. `role` is 'definition' or 'reference'. `rule` is the
@@ -142,4 +161,24 @@ CREATE TABLE IF NOT EXISTS join_discrepancies (
     found_text     TEXT
 );
 CREATE INDEX IF NOT EXISTS join_discrepancies_by_group ON join_discrepancies(outcome, expected_name);
+
+-- The semantic corpus: one row per corpus-contributing symbol, holding the deterministic render its
+-- representations derive from. A leaf's render carries its own source content; a container's its
+-- interface tier. Wholly rewritten in the same transaction as each build. The rowid links each
+-- entry to its vector row (`semantic_vectors`) and its lexical row (`semantic_lexical`).
+CREATE TABLE IF NOT EXISTS semantic_corpus (
+    id        INTEGER PRIMARY KEY,
+    symbol_id TEXT NOT NULL UNIQUE REFERENCES symbols(canonical_id),
+    render    TEXT NOT NULL
+);
+
+-- The lexical representation: FTS5/BM25 over the identifier-split words of each entry's render,
+-- rowid-linked to `semantic_corpus`. The words are pre-split (camel-case and underscore compounds
+-- become plain words), so the default unicode61 tokenizer never mangles identifiers.
+CREATE VIRTUAL TABLE IF NOT EXISTS semantic_lexical USING fts5(words);
+
+-- The vector representation: sqlite-vec KNN over the corpus embeddings, rowid-linked to
+-- `semantic_corpus`. The embeddings are L2-normalized by the model, so the default L2 distance
+-- orders identically to cosine similarity.
+CREATE VIRTUAL TABLE IF NOT EXISTS semantic_vectors USING vec0(embedding float[256]);
 "#;

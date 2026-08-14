@@ -59,6 +59,28 @@ pub struct DeclarationTiers {
     pub interface: String,
 }
 
+/// The class of one spelled token: what a clone-equivalence normalization may substitute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenClass {
+    /// A name token a consistent renaming may substitute.
+    Identifier,
+    /// A literal value a consistent substitution may replace.
+    Literal,
+    /// Structure: keywords, punctuation, operators — never substituted.
+    Other,
+}
+
+/// One token of a declaration's spelled sequence, comments and whitespace excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpelledToken {
+    /// The token's substitution class.
+    pub class: TokenClass,
+    /// The token text as spelled in the source.
+    pub text: String,
+    /// The token's starting byte offset, fixing source order.
+    pub start: usize,
+}
+
 /// The name-token spans of the trait and the implementing type in one `impl Trait for Type` block.
 ///
 /// Each span points at the terminal identifier token — the identifier inside a generic type
@@ -841,6 +863,68 @@ impl SyntaxTree {
         }
     }
 
+    /// The spelled token sequence within `span`, comments excluded — the input to the
+    /// clone-equivalence keys.
+    ///
+    /// Every token carries its class: an identifier (a name a consistent renaming may substitute),
+    /// a literal (a value a consistent substitution may replace, emitted whole — a string literal
+    /// is one token, not its quote and content pieces), or plain structure (keywords, punctuation,
+    /// operators). Whitespace never appears (the tree carries none) and comment nodes are skipped,
+    /// so two sources differing only in layout or comments spell the same sequence.
+    pub fn spelled_tokens(&self, span: ByteSpan) -> Vec<SpelledToken> {
+        let root = self.tree.root_node();
+        let mut out = Vec::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.end_byte() <= span.start || node.start_byte() >= span.end {
+                continue;
+            }
+            let kind = node.kind();
+            if comment_kinds(self.language).contains(&kind) {
+                continue;
+            }
+            if literal_kinds(self.language).contains(&kind) {
+                if let Some(text) = self.source.get(node.start_byte()..node.end_byte()) {
+                    out.push(SpelledToken {
+                        class: TokenClass::Literal,
+                        text: text.to_string(),
+                        start: node.start_byte(),
+                    });
+                }
+                continue;
+            }
+            if node.child_count() == 0 {
+                let Some(text) = self.source.get(node.start_byte()..node.end_byte()) else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                let class = if identifier_kinds(self.language).contains(&kind) {
+                    TokenClass::Identifier
+                } else {
+                    TokenClass::Other
+                };
+                out.push(SpelledToken {
+                    class,
+                    text: text.to_string(),
+                    start: node.start_byte(),
+                });
+                continue;
+            }
+            // Children are pushed in reverse so the stack pops them in source order.
+            let children: Vec<Node> = node.children(&mut cursor).collect();
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+        // Overlapping shapes (a literal wrapping another node kind) cannot reorder tokens, but the
+        // stack walk guarantees source order only per level; sort by position to make it total.
+        out.sort_by_key(|token| token.start);
+        out
+    }
+
     /// The tree-sitter node backing `decl`: the smallest node containing its name span, walked up to
     /// the ancestor whose kind matches `decl.node_kind`. `None` when no such ancestor exists (the
     /// declaration does not correspond to any node in this tree).
@@ -965,6 +1049,48 @@ fn name_token(node: Node) -> Option<Node> {
         "generic_type" => node.child_by_field_name("type").and_then(name_token),
         "scoped_type_identifier" | "scoped_identifier" => node.child_by_field_name("name").and_then(name_token),
         _ => None,
+    }
+}
+
+/// The comment node kinds for `language` — excluded from the spelled token sequence. Rust doc
+/// comments are comment nodes, so they are excluded with the rest; a Python docstring is a string
+/// literal and stays in the sequence as a literal.
+fn comment_kinds(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Rust => &["line_comment", "block_comment"],
+        Language::Python => &["comment"],
+    }
+}
+
+/// The literal node kinds for `language` — each emitted as one whole token of class
+/// [`TokenClass::Literal`], never decomposed into its quote or content pieces.
+fn literal_kinds(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Rust => &[
+            "integer_literal",
+            "float_literal",
+            "string_literal",
+            "raw_string_literal",
+            "char_literal",
+            "byte_literal",
+            "byte_string_literal",
+            "raw_byte_string_literal",
+            "boolean_literal",
+        ],
+        Language::Python => &["integer", "float", "string", "true", "false", "none"],
+    }
+}
+
+/// The identifier node kinds for `language` — leaf tokens of class [`TokenClass::Identifier`].
+fn identifier_kinds(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Rust => &[
+            "identifier",
+            "field_identifier",
+            "type_identifier",
+            "shorthand_field_identifier",
+        ],
+        Language::Python => &["identifier"],
     }
 }
 

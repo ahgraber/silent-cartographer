@@ -1,0 +1,16 @@
+# Secret-scanning configuration.
+#
+# Every default gitleaks rule stays active; this file only records the one path
+# whose high-entropy strings are content digests rather than credentials.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+Model-payload manifests pin the upstream revision and the per-file SHA-256 of
+publicly downloadable model weights. The digests are the integrity gate build.rs
+verifies against, so they exist to be committed and read; they grant no access.
+"""
+targetRules = ["generic-api-key"]
+paths = ['''models/.*\.manifest\.json$''']

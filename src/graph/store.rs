@@ -132,6 +132,10 @@ pub const FOUND_TEXT_MAX_BYTES: usize = 120;
 /// summary marks itself truncated; its totals are computed over the full persisted set regardless.
 pub const DISCREPANCY_GROUP_CAP: usize = 50;
 
+/// The largest `k` the sqlite-vec extension accepts in one KNN query. A vector-signal request over a
+/// corpus larger than this ranks the nearest `KNN_MAX_K` candidates rather than erroring.
+const KNN_MAX_K: usize = 4096;
+
 /// The widest frontier the dependents walk binds into a single query; a wider frontier is chunked
 /// across several queries within the same round. Held safely under SQLite's lowest historical
 /// bound-parameter limit (999) so the walk never fails on a hub symbol's frontier.
@@ -254,6 +258,27 @@ pub struct IndexMetadata {
     /// The backend's declared interpreter-environment facts, if it declared any (`None` for the
     /// Rust adapter). Compared whole against the environment in effect by [`GraphStore::freshness`].
     pub environment: Option<EnvironmentFacts>,
+}
+
+/// The semantic-index identity recorded with a build: the embedding model and the corpus/render
+/// definition that produced the build's semantic representations. Carried on every `search` and
+/// `similar` answer as provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticIndexIdentity {
+    /// The embedding model identity (upstream repository at its vendored revision).
+    pub model_identity: String,
+    /// The corpus definition version the render derives under.
+    pub corpus_definition_version: u32,
+}
+
+/// One persisted semantic representation: a corpus entry's render together with its embedding
+/// bytes, keyed by its symbol identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticRepresentation {
+    /// The render text the representations derive from.
+    pub render: String,
+    /// The embedding vector as little-endian `f32` bytes.
+    pub embedding: Vec<u8>,
 }
 
 /// The freshness of the index relative to the sources, analyzer, and declared environment currently
@@ -389,6 +414,26 @@ fn unreadable_store(path: &Path, cause: &std::io::Error) -> StoreOpenError {
     }
 }
 
+/// Register the sqlite-vec extension for every connection this process opens, exactly once.
+///
+/// The schema declares a `vec0` virtual table, so the extension must be present before any
+/// connection creates, opens, or queries a store. Auto-extension registration makes SQLite load the
+/// statically-compiled extension into each new connection; both open chokepoints
+/// ([`open_literal`], [`GraphStore::open_in_memory`]) call this first.
+fn ensure_vec_extension() {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut std::os::raw::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> i32,
+        >(sqlite_vec::sqlite3_vec_init as *const ())));
+    });
+}
+
 /// Open `path` as a literal filename, never as a URI, with `access` deciding read-only, read-write,
 /// or read-write-and-create.
 ///
@@ -400,6 +445,7 @@ fn unreadable_store(path: &Path, cause: &std::io::Error) -> StoreOpenError {
 /// begin with `file:`, so it can only ever name the file the guard inspected. Absolutizing is
 /// lexical — it resolves no symlinks — so which file is named is otherwise unchanged.
 fn open_literal(path: &Path, access: OpenFlags) -> Result<Connection, StoreOpenError> {
+    ensure_vec_extension();
     let literal = std::path::absolute(path)?;
     Ok(Connection::open_with_flags(
         literal,
@@ -586,6 +632,7 @@ impl GraphStore {
 
     /// Open an in-memory store (for tests), applying the schema and both stamps.
     pub fn open_in_memory() -> rusqlite::Result<Self> {
+        ensure_vec_extension();
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA_SQL)?;
         conn.pragma_update(None, "application_id", APPLICATION_ID)?;
@@ -626,11 +673,19 @@ impl GraphStore {
         self.conn.execute("DELETE FROM occurrences", [])?;
         self.conn.execute("DELETE FROM edges", [])?;
         self.conn.execute("DELETE FROM join_discrepancies", [])?;
+        self.conn.execute("DELETE FROM semantic_lexical", [])?;
+        self.conn.execute("DELETE FROM semantic_vectors", [])?;
+        self.conn.execute("DELETE FROM semantic_corpus", [])?;
         self.conn.execute("DELETE FROM symbols", [])?;
         Ok(())
     }
 
     /// Replace the index metadata row with the given build's metadata.
+    ///
+    /// The semantic-index identity columns are written from the binary's own constants
+    /// ([`crate::graph::embed::MODEL_ID`], [`crate::graph::corpus::CORPUS_DEFINITION_VERSION`]):
+    /// the model is compiled into the binary, so the identity in effect at build time is exactly
+    /// the binary's identity — no caller can supply a different one.
     pub fn write_metadata(&self, meta: &IndexMetadata) -> rusqlite::Result<()> {
         // Declared environment facts persist as JSON text; a backend that declares none writes NULL.
         let environment = meta
@@ -645,9 +700,10 @@ impl GraphStore {
                  aligned_module_span_count, aligned_self_keyword_count, aligned_module_name_count,
                  aligned_self_name_count, aligned_module_marker_count, aligned_import_alias_count,
                  aligned_range_literal_count, aligned_use_list_self_count, aligned_super_keyword_count,
-                 text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count)
+                 text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count,
+                 semantic_model_identity, corpus_definition_version)
              VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                     ?22, ?23)",
+                     ?22, ?23, ?24, ?25)",
             params![
                 SCHEMA_VERSION,
                 meta.workspace_id.as_str(),
@@ -672,6 +728,8 @@ impl GraphStore {
                 meta.accounting.semantic_only as i64,
                 meta.accounting.duplicate_ambiguous as i64,
                 meta.accounting.syntax_only as i64,
+                crate::graph::embed::MODEL_ID,
+                crate::graph::corpus::CORPUS_DEFINITION_VERSION as i64,
             ],
         )?;
         Ok(())
@@ -733,6 +791,173 @@ impl GraphStore {
                 },
             )
             .optional()
+    }
+
+    /// The semantic-index identity recorded with the persisted build, if one exists.
+    pub fn semantic_index_identity(&self) -> rusqlite::Result<Option<SemanticIndexIdentity>> {
+        self.conn
+            .query_row(
+                "SELECT semantic_model_identity, corpus_definition_version FROM index_metadata WHERE id = 1",
+                [],
+                |r| {
+                    Ok(SemanticIndexIdentity {
+                        model_identity: r.get(0)?,
+                        corpus_definition_version: r.get::<_, i64>(1)? as u32,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// The persisted semantic representations, keyed by symbol identity.
+    ///
+    /// The build reads this before [`Self::clear_derived`] so an entry whose render is unchanged
+    /// carries its embedding forward instead of re-embedding; tests read it to observe what a build
+    /// persisted.
+    pub fn semantic_representations(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<String, SemanticRepresentation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.symbol_id, c.render, v.embedding
+             FROM semantic_corpus c JOIN semantic_vectors v ON v.rowid = c.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                SemanticRepresentation {
+                    render: r.get(1)?,
+                    embedding: r.get(2)?,
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Insert one corpus entry with both its representations: the render row, the lexical row over
+    /// its identifier-split words, and the vector row, all sharing one rowid.
+    pub fn insert_corpus_entry(
+        &self,
+        symbol_id: &CanonicalId,
+        render: &str,
+        words: &str,
+        embedding: &[u8],
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO semantic_corpus (symbol_id, render) VALUES (?1, ?2)",
+            params![symbol_id.as_str(), render],
+        )?;
+        let rowid = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "INSERT INTO semantic_lexical (rowid, words) VALUES (?1, ?2)",
+            params![rowid, words],
+        )?;
+        self.conn.execute(
+            "INSERT INTO semantic_vectors (rowid, embedding) VALUES (?1, ?2)",
+            params![rowid, embedding],
+        )?;
+        Ok(())
+    }
+
+    /// The persisted embedding of one corpus entry, as its stored bytes. `None` when the symbol
+    /// contributes no corpus entry.
+    pub fn semantic_vector_of(&self, id: &CanonicalId) -> rusqlite::Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "SELECT v.embedding FROM semantic_corpus c JOIN semantic_vectors v ON v.rowid = c.id
+                 WHERE c.symbol_id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// The persisted render of one corpus entry — the text the lexical signal of a `similar` query
+    /// derives its word set from. `None` when the symbol contributes no corpus entry.
+    pub fn semantic_render_of(&self, id: &CanonicalId) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT render FROM semantic_corpus WHERE symbol_id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// The number of corpus entries in the persisted build.
+    pub fn corpus_size(&self) -> rusqlite::Result<u64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM semantic_corpus", [], |r| r.get::<_, i64>(0))
+            .map(|n| n as u64)
+    }
+
+    /// The vector signal: the `k` nearest corpus entries to `query` (little-endian `f32` bytes), as
+    /// `(symbol, distance)` ordered nearest first, distance ties broken by canonical identity.
+    ///
+    /// The embeddings are L2-normalized, so the L2 ordering is the cosine ordering. `k` is clamped
+    /// to the extension's KNN ceiling: on a corpus larger than the ceiling the signal ranks the
+    /// nearest [`KNN_MAX_K`] candidates — an honest candidate pool under the
+    /// candidates-not-completeness framing, never an error.
+    pub fn vector_neighbors(&self, query: &[u8], k: usize) -> rusqlite::Result<Vec<(CanonicalId, f64)>> {
+        let k = k.min(KNN_MAX_K);
+        let mut stmt = self.conn.prepare(
+            "SELECT c.symbol_id, v.distance
+             FROM semantic_vectors v JOIN semantic_corpus c ON c.id = v.rowid
+             WHERE v.embedding MATCH ?1 AND k = ?2",
+        )?;
+        let rows = stmt.query_map(params![query, k as i64], |r| {
+            Ok((CanonicalId::from_raw(r.get::<_, String>(0)?), r.get::<_, f64>(1)?))
+        })?;
+        let mut out: Vec<(CanonicalId, f64)> = rows.collect::<rusqlite::Result<_>>()?;
+        out.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+        Ok(out)
+    }
+
+    /// The lexical signal: the corpus entries matching an FTS5 `match_expr` over the identifier-split
+    /// render words, as `(symbol, rank)` ordered best first (FTS5 `rank` ascends from best), rank
+    /// ties broken by canonical identity.
+    pub fn lexical_neighbors(&self, match_expr: &str, k: usize) -> rusqlite::Result<Vec<(CanonicalId, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.symbol_id, l.rank
+             FROM semantic_lexical l JOIN semantic_corpus c ON c.id = l.rowid
+             WHERE l.words MATCH ?1
+             ORDER BY l.rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![match_expr, k as i64], |r| {
+            Ok((CanonicalId::from_raw(r.get::<_, String>(0)?), r.get::<_, f64>(1)?))
+        })?;
+        let mut out: Vec<(CanonicalId, f64)> = rows.collect::<rusqlite::Result<_>>()?;
+        out.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+        Ok(out)
+    }
+
+    /// Record a leaf symbol's clone-equivalence keys.
+    pub fn set_clone_keys(
+        &self,
+        id: &CanonicalId,
+        formatting_key: &str,
+        substitution_key: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE symbols SET clone_formatting_key = ?2, clone_substitution_key = ?3 WHERE canonical_id = ?1",
+            params![id.as_str(), formatting_key, substitution_key],
+        )?;
+        Ok(())
+    }
+
+    /// The clone-equivalence keys persisted for a symbol: `(formatting, substitution)`, or `None`
+    /// when the symbol carries no keys (a container, an external, or an unknown identity).
+    pub fn clone_keys_of(&self, id: &CanonicalId) -> rusqlite::Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT clone_formatting_key, clone_substitution_key FROM symbols WHERE canonical_id = ?1",
+                params![id.as_str()],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map(|row| match row {
+                Some((Some(f), Some(s))) => Some((f, s)),
+                _ => None,
+            })
     }
 
     /// Insert a symbol row.

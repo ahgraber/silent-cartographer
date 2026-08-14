@@ -1,5 +1,5 @@
 {
-  "surface_version": 6,
+  "surface_version": 7,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -187,6 +187,147 @@
         }
       ],
       "flags": [
+        {
+          "name": "limit",
+          "takes_value": true,
+          "default": "25",
+          "global": false
+        },
+        {
+          "name": "cursor",
+          "takes_value": true,
+          "global": false
+        },
+        {
+          "name": "db",
+          "takes_value": true,
+          "default": ".c10r/index.db",
+          "global": true
+        },
+        {
+          "name": "workspace",
+          "takes_value": true,
+          "global": true
+        },
+        {
+          "name": "json",
+          "takes_value": false,
+          "global": true
+        },
+        {
+          "name": "color",
+          "takes_value": true,
+          "values": [
+            "auto",
+            "always",
+            "never"
+          ],
+          "default": "auto",
+          "global": true
+        }
+      ]
+    },
+    {
+      "name": "search",
+      "about": "Search indexed code by meaning: describe what the code does in natural language and get the nearest candidate symbols by estimated relevance — not the complete set of relevant code",
+      "args": [
+        {
+          "name": "query",
+          "required": true
+        }
+      ],
+      "flags": [
+        {
+          "name": "detail",
+          "takes_value": true,
+          "values": [
+            "location",
+            "signature",
+            "interface",
+            "body"
+          ],
+          "default": "signature",
+          "global": false
+        },
+        {
+          "name": "max-lines",
+          "takes_value": true,
+          "default": "10",
+          "global": false
+        },
+        {
+          "name": "limit",
+          "takes_value": true,
+          "default": "25",
+          "global": false
+        },
+        {
+          "name": "cursor",
+          "takes_value": true,
+          "global": false
+        },
+        {
+          "name": "db",
+          "takes_value": true,
+          "default": ".c10r/index.db",
+          "global": true
+        },
+        {
+          "name": "workspace",
+          "takes_value": true,
+          "global": true
+        },
+        {
+          "name": "json",
+          "takes_value": false,
+          "global": true
+        },
+        {
+          "name": "color",
+          "takes_value": true,
+          "values": [
+            "auto",
+            "always",
+            "never"
+          ],
+          "default": "auto",
+          "global": true
+        }
+      ]
+    },
+    {
+      "name": "similar",
+      "about": "Rank the indexed symbols most similar in content to a subject symbol — the nearest candidates by estimated similarity, not the complete set of similar code",
+      "args": [
+        {
+          "name": "reference",
+          "required": false
+        }
+      ],
+      "flags": [
+        {
+          "name": "at",
+          "takes_value": true,
+          "global": false
+        },
+        {
+          "name": "detail",
+          "takes_value": true,
+          "values": [
+            "location",
+            "signature",
+            "interface",
+            "body"
+          ],
+          "default": "signature",
+          "global": false
+        },
+        {
+          "name": "max-lines",
+          "takes_value": true,
+          "default": "10",
+          "global": false
+        },
         {
           "name": "limit",
           "takes_value": true,

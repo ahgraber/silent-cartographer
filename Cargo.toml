@@ -34,11 +34,23 @@ tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 # Content-hash gate over analyzed sources.
 sha2 = "0.11"
+# Static code-embedding runtime for the semantic corpus. `local-only` removes the network path
+# (the model is compiled into the binary); `fancy-regex` keeps the tokenizer pure Rust.
+model2vec-rs = { version = "=0.2.1", default-features = false, features = ["local-only", "fancy-regex"] }
+# Vector KNN inside the SQLite store; the extension's C source is compiled in statically.
+# Pinned exactly: the crate is pre-v1 and its on-disk format is warned unstable.
+sqlite-vec = "=0.1.9"
 # Error plumbing.
 anyhow = "1"
 thiserror = "2"
 # Descriptive process title for host process identification.
 proctitle = "0.1"
+
+[build-dependencies]
+# The model-payload fetch/verify script: manifest parsing and checksum verification.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
