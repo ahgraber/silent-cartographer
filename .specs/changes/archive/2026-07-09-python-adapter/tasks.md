@@ -2,7 +2,7 @@
 
 Standing rules for every task, restated so no task needs outside context:
 
-- Never read, grep, or index anything under `/Users/mithras/_code/_worktrees/silent-cartographer/` (clean-room wall).
+- Never read, grep, or index anything under `/Users/mithras/_code/_worktrees/silent-cartographer/old-c10r-worktree/` (clean-room wall).
 - Test-first for every contract scenario: write the named failing test, then make it pass.
   Never weaken an existing test to make it pass.
 - Do not loosen the default name-token alignment rule to raise Python's aligned count — refusals are the correct launch behavior (design.md, launch posture).

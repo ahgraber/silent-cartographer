@@ -2,7 +2,7 @@
 
 Standing rules for every task, restated so no task needs outside context:
 
-- Never read, grep, or index anything under `/Users/mithras/_code/_worktrees/silent-cartographer/` (clean-room wall).
+- Never read, grep, or index anything under `/Users/mithras/_code/_worktrees/silent-cartographer/old-c10r-worktree/` (clean-room wall).
 - Test-first for every contract scenario: write the named failing test, then make it pass.
   Never weaken an existing test; the two sanctioned existing-test changes are spelled out below where they occur.
 - Every failure direction is refusal: when in doubt, an occurrence stays refused — never attributed by guess.

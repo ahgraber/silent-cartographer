@@ -13,7 +13,7 @@ If directives conflict, prioritize:
 
 ## Clean-Room Independence (the wall)
 
-This is a from-scratch reimplementation of a prior tool ("the source") at `/Users/mithras/_code/_worktrees/silent-cartographer/`.
+This is a from-scratch reimplementation of a prior tool ("the source") at `/Users/mithras/_code/_worktrees/silent-cartographer/old-c10r-worktree/`.
 The rewrite must stay uncontaminated by _how the source is built_ so the new design is reasoned out independently.
 This section overrides ordinary "read the existing code" reflexes.
 
@@ -148,9 +148,13 @@ The required checks are the full test suite and every hook in `.pre-commit-confi
 Slow, or looking unrelated to the change, is not a reason to skip one.
 
 - The requested behavior works as specified.
+
 - The test suite passes, not just tests for this change; previously working behavior is part of the acceptance criteria.
+
 - Behavior changes are covered by tests, or testing gaps are explicitly stated.
+
 - Public contract changes are documented.
+
 - The hooks pass on everything changed since `HEAD`, staged or not, including new files.
   Pass the paths NUL-delimited so names with spaces survive:
 
@@ -159,10 +163,13 @@ Slow, or looking unrelated to the change, is not a reason to skip one.
   ```
 
   Report failing hook output verbatim and fix the cause — a failure is a defect, not an unavailable check.
+
 - A check is unavailable only when the command itself fails to run — missing binary, permission error, no network.
   Then name the check, quote the error, and give the user the exact command to run.
+
 - Never call a change "confirmed", "verified", or "working" unless you ran the command in this session and read its output.
   Do not describe expected output as if you had seen it.
+
 - Re-read a file immediately before reporting on it.
   Never report from a snapshot taken earlier in the session — the user edits files between turns.
 

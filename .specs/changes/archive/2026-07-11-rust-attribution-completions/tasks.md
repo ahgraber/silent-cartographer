@@ -2,7 +2,7 @@
 
 Standing rules for every task, restated so no task needs outside context:
 
-- Never read, grep, or index anything under `/Users/mithras/_code/_worktrees/silent-cartographer/` (clean-room wall).
+- Never read, grep, or index anything under `/Users/mithras/_code/_worktrees/silent-cartographer/old-c10r-worktree/` (clean-room wall).
 - Test-first for every contract scenario: write the named failing test, then make it pass.
   Never weaken an existing test; the one sanctioned existing-test change is spelled out below where it occurs.
 - Every failure direction is refusal: when in doubt, an occurrence stays refused — never attributed by guess.
@@ -18,10 +18,11 @@ Definition of done: the two gated families have recorded verdicts; no rule code 
 - [x] CHARACTERIZE FIRST (gates the trait-`Self` tasks): on the ripgrep clone's raw index (`/private/tmp/claude-501/-Users-mithras--code-silent-cartographer/57ecf74a-9eb1-48ce-91c9-fa19b61801e6/scratchpad/ripgrep/index.scip`, scip-check tool in the sibling `scip-check/` dir), inspect a refusing trait-`Self` site (expected `Matcher`, found `Self` — find one via the store's `join_discrepancies`).
   Record: the occurrence's exact symbol (is it the trait itself?), its span (exactly the `Self` token?), and whether generics appear in the expected name (self's `From<DetailArg>` rows say yes).
   If the occurrence is the trait symbol at the `Self` token, the trait-side tasks below proceed; anything murkier → record the family residual, skip those tasks, and flag that the delta's trait clause needs amending before sync.
-  **Verdict (recorded in dogfood.md): the emission is a synthetic impl-block symbol (``impl#[`&'a M`][Matcher]``) at exactly the `Self` token, trailing descriptor = the trait, generics present in the expected name; user approved amending the delta/design to this shape — the trait-side tasks proceed against the amended clause.**
+  **Verdict (recorded in dogfood.md): the emission is a synthetic impl-block symbol (`` impl#[`&'a M`][Matcher] ``) at exactly the `Self` token, trailing descriptor = the trait, generics present in the expected name; user approved amending the delta/design to this shape — the trait-side tasks proceed against the amended clause.**
 - [x] CHARACTERIZE FIRST (gates the `super` tasks): on self's raw index (`/Users/mithras/_code/silent-cartographer/index.scip`), confirm Rust module symbols carry hierarchical descriptors (does module `semantic::scip`'s descriptor nest `semantic` then `scip`?) and confirm the whole-document module definition occurrence exists per file (the shape the module-span rule accepts).
   Record both; if descriptors are not nested, the `super` rule cannot anchor on prefix ancestry — record residual, skip its tasks, flag the delta clause.
-  **Verdict (recorded in dogfood.md): confirmed — `semantic/scip/` nests `semantic` then `scip`, `graph/join/` nests under `graph/`, and every sampled file carries a whole-document module definition occurrence; crate root spells `crate/` (its own descriptor, not an empty prefix), so crate-root `super` chains stay refused. The `super` tasks proceed.**
+  **Verdict (recorded in dogfood.md): confirmed — `semantic/scip/` nests `semantic` then `scip`, `graph/join/` nests under `graph/`, and every sampled file carries a whole-document module definition occurrence; crate root spells `crate/` (its own descriptor, not an empty prefix), so crate-root `super` chains stay refused.
+  The `super` tasks proceed.**
 
 ## Syntax Oracles
 
@@ -61,7 +62,6 @@ Definition of done: the delta's Rust scenarios accept and refuse as written; new
 - [x] Test `trait_reference_accepted_at_self_keyword` (scenario: Trait reference accepted at a self-type keyword within its implementation): synthetic — an occurrence whose expected name is `From<X>` at `Self` inside `impl From<X> for Y`.
 - [x] SANCTIONED existing-test change: the existing foreign-implementation self-keyword refusal test pins "expected type differs from the impl's self type → refused", a universal the trait clause narrows (delta scenario "Self keyword in a foreign implementation stays refused" now requires matching neither the self type nor the trait).
   Extend its setup so the expected symbol matches neither, keeping its refusal assertions; do not delete it.
-
 - [x] EMERGED (aliased self-import write-site): the use-list-self rule accepts at the `self` token itself so the import-alias pass verifies aliased self-imports (`{self as w}`) at the binding target; the `use_list_self_context` oracle looks through a `use_as_clause`.
   Test `aliased_use_list_self_composes_with_import_alias` covers the composed path; the oracle test gained the aliased case.
 - [x] EMERGED (inline-module containment, found on real ripgrep rows): the super rule resolves from the CONTAINING module — the doc module extended by inline `mod` names enclosing the token — not the document module alone (`use super::…` inside `mod tests` was refusing).
@@ -69,7 +69,7 @@ Definition of done: the delta's Rust scenarios accept and refuse as written; new
 - [x] EMERGED (scope added with user approval 2026-07-11): path-start `self` rule — a module occurrence at a path-start `self` token (`use self::x;`, `self::helper()`) accepted when the expected module IS the containing module; rides the `self_name` bucket (cross-language, like `import_alias`); oracle `path_start_self(span)`.
   Tests `path_start_self_recognized_only_at_path_start` (oracle), `path_start_self_token_accepted_for_containing_module`, `path_start_self_for_foreign_module_stays_refused`.
 - [x] INVESTIGATED (desugar reconciliation finding): the correspondence table was already complete — every family the proposal listed was present at baseline, and every non-macro operator site already aligned; the harvest's `index`/`not`/`sub`/`mul` residual rows sit inside macro invocation bodies (token trees to tree-sitter, unverifiable, correctly refused; 30/30 sampled macro-adjacent).
-  Final table: branch→?; eq/ne/lt/le/gt/ge; add/sub/mul/div/rem (+_assign); bitand/bitor/bitxor/shl/shr (+_assign); neg; not; index/index_mut; deref/deref_mut; call/call_mut/call_once; into_iter/next.
+  Final table: branch→?; eq/ne/lt/le/gt/ge; add/sub/mul/div/rem (+\_assign); bitand/bitor/bitxor/shl/shr (+\_assign); neg; not; index/index_mut; deref/deref_mut; call/call_mut/call_once; into_iter/next.
 
 ## Schema v10 & Render Surfaces
 
