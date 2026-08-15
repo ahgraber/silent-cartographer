@@ -1,0 +1,1017 @@
+diff --git a/README.md b/README.md
+index df1733f..4bef754 100644
+--- a/README.md
++++ b/README.md
+@@ -138,7 +138,13 @@ c10r similar some_symbol
+ c10r similar --at src/lib.rs:1042
+ ```
+
+-The answer ranks every other indexed symbol by estimated content similarity, subject excluded, using the same fused ranking `search` uses.
++The answer ranks every other indexed symbol by estimated similarity, subject excluded.
++Two kinds of evidence decide the order: what a candidate's code says, through the same fused content ranking `search` uses, and where a candidate sits in the dependency graph relative to the subject — who calls it, what it uses, which types it is wired through.
++Symbols the codebase itself treats as a family (functions invoked from the same call sites, parallel implementations threaded through the same seams) therefore rank ahead of code that merely reads alike.
++
++Being widely referenced is not similarity: a symbol that nearly everything touches shares a neighbor with nearly everything, so overlap through such a symbol counts for almost nothing and breadth of references alone never lifts a row.
++A candidate with no dependency edges at all is still ranked, on its content evidence.
++
+ Two deterministic clone markers can ride on rows, above the estimated ranking:
+
+ - `exact_clone` — the row's token sequence is identical to the subject's; the sources differ only in whitespace and comments.
+diff --git a/src/commands.rs b/src/commands.rs
+index 307cccb..b80d68e 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -21,8 +21,8 @@ use crate::query::diff::{self, FileChange};
+ use crate::query::impact::{ImpactRequest, shell_quote};
+ use crate::query::output::{Answer, WorkspaceRelation};
+ use crate::query::page::{
+-    OrderingIdentity, PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination,
+-    precheck_cursor,
++    OrderingIdentity, PageIdentity, SimilarityIdentity, apply_dependents_pagination, apply_impact_pagination,
++    apply_pagination, precheck_cursor,
+ };
+ use crate::query::{Detail, OrderMode, QueryEngine, Relation};
+ use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
+@@ -823,6 +823,7 @@ pub fn run_get(
+         detail: Some(detail_label(detail)),
+         depth: None,
+         ordering: None,
++        similarity: None,
+         limit: effective_limit,
+         max_lines: effective_max_lines,
+         from: Some(from),
+@@ -906,6 +907,7 @@ pub fn run_trace(
+         // only where an ordering is defined; an explicit `--order ranked` and the default bind to
+         // the same identity.
+         ordering: matches!(relation, Relation::Dependents).then(|| OrderingIdentity::current(order)),
++        similarity: None,
+         limit: effective_limit,
+         max_lines: effective_max_lines,
+         from: None,
+@@ -959,6 +961,7 @@ pub fn run_find(
+         detail: None,
+         depth: None,
+         ordering: None,
++        similarity: None,
+         limit: effective_limit,
+         max_lines: None,
+         from: None,
+@@ -1008,6 +1011,7 @@ pub fn run_search(
+         detail: Some(detail_label(detail)),
+         depth: None,
+         ordering: None,
++        similarity: None,
+         limit: effective_limit,
+         max_lines: effective_max_lines,
+         from: None,
+@@ -1017,7 +1021,7 @@ pub fn run_search(
+     Ok(render(&answer, json, styled))
+ }
+
+-/// `similar`: the corpus symbols most similar in content to a subject symbol, the subject named by
++/// `similar`: the corpus symbols most similar to a subject symbol, the subject named by
+ /// reference or by source position, with deterministic clone-certainty markers above the estimated
+ /// ranking.
+ #[allow(clippy::too_many_arguments)] // the CLI's flat query-command surface travels together
+@@ -1075,6 +1079,7 @@ pub fn run_similar(
+         detail: Some(detail_label(detail)),
+         depth: None,
+         ordering: None,
++        similarity: Some(SimilarityIdentity::current()),
+         limit: effective_limit,
+         max_lines: effective_max_lines,
+         from: None,
+@@ -1313,6 +1318,7 @@ pub fn run_impact(
+         detail: None,
+         depth: Some(depth),
+         ordering: Some(OrderingIdentity::current(order)),
++        similarity: None,
+         limit: effective_limit,
+         max_lines: None,
+         from: None,
+diff --git a/src/graph/store.rs b/src/graph/store.rs
+index ba63c6d..0a3b4f7 100644
+--- a/src/graph/store.rs
++++ b/src/graph/store.rs
+@@ -160,6 +160,46 @@ pub struct DependentRow {
+     pub kind: String,
+ }
+
++/// The common table expression naming the subject's dependency neighborhood, `?1` binding the
++/// subject: `subject_neighbors(n)` holds each symbol one dependency edge away in either direction,
++/// deduplicated across directions and edge kinds by the `UNION`.
++const SUBJECT_NEIGHBORS_CTE: &str = "\
++subject_neighbors(n) AS (
++    SELECT dst_id FROM edges
++     WHERE kind IN ('uses', 'imports', 'type_hierarchy') AND src_id = ?1 AND dst_id <> ?1
++    UNION
++    SELECT src_id FROM edges
++     WHERE kind IN ('uses', 'imports', 'type_hierarchy') AND dst_id = ?1 AND src_id <> ?1
++)";
++
++/// The common table expression naming the subject's distance-2 frontier, built on
++/// [`SUBJECT_NEIGHBORS_CTE`]: `neighbor_peers(shared, candidate)` pairs each subject neighbor with
++/// every symbol one dependency edge from it, in either direction. Read by candidate it enumerates
++/// the distance-2 symbols with the neighbors they share with the subject; read by neighbor it
++/// enumerates each shared neighbor's own neighborhood, whose size is that neighbor's degree.
++const NEIGHBOR_PEERS_CTE: &str = "\
++neighbor_peers(shared, candidate) AS (
++    SELECT sn.n, e.src_id FROM subject_neighbors sn
++      JOIN edges e ON e.dst_id = sn.n AND e.kind IN ('uses', 'imports', 'type_hierarchy')
++     WHERE e.src_id <> sn.n
++    UNION
++    SELECT sn.n, e.dst_id FROM subject_neighbors sn
++      JOIN edges e ON e.src_id = sn.n AND e.kind IN ('uses', 'imports', 'type_hierarchy')
++     WHERE e.dst_id <> sn.n
++)";
++
++/// One shared-neighbor row of the similarity signal: a distance-2 candidate, one neighborhood symbol
++/// it shares with the subject, and that shared neighbor's own neighborhood size.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SharedNeighborRow {
++    /// The candidate symbol, at graph distance two from the subject and contributing to the corpus.
++    pub candidate: CanonicalId,
++    /// A symbol in both the subject's and the candidate's dependency neighborhood.
++    pub shared: CanonicalId,
++    /// The shared neighbor's own dependency-neighborhood size — how ubiquitous it is.
++    pub shared_neighborhood_size: u64,
++}
++
+ /// The rank graph projection [`GraphStore::rank_projection`] loads: the node universe and the
+ /// collapsed dependency edges, both in canonical-identity order.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -1625,6 +1665,83 @@ impl GraphStore {
+         Ok(RankProjection { nodes, edges })
+     }
+
++    /// The subject's dependency neighborhood: every symbol one `uses`/`imports`/`type_hierarchy`
++    /// edge away in either direction, deduplicated and in canonical-identity order.
++    ///
++    /// Direction-inclusive because structural siblinghood is undirected — two functions called from
++    /// the same site share that caller, two implementations of one trait share the trait — and a
++    /// pair related under several kinds counts once. Enclosure (`contains`) is excluded for the same
++    /// reason the dependents walk excludes it: it is structure, not dependency. A self-referencing
++    /// symbol is not its own neighbor.
++    pub fn dependency_neighborhood(&self, id: &CanonicalId) -> rusqlite::Result<Vec<CanonicalId>> {
++        let mut stmt = self.conn.prepare(&format!(
++            "WITH {SUBJECT_NEIGHBORS_CTE} SELECT n FROM subject_neighbors ORDER BY n"
++        ))?;
++        let rows = stmt.query_map(params![id.as_str()], |r| {
++            Ok(CanonicalId::from_raw(r.get::<_, String>(0)?))
++        })?;
++        rows.collect()
++    }
++
++    /// The subject's distance-2 candidates paired with the neighborhood symbols they share with it.
++    ///
++    /// One row per `(candidate, shared neighbor)` pair, carrying that shared neighbor's own
++    /// neighborhood size, in `(candidate, shared)` canonical-identity order — the fixed order a
++    /// caller's floating-point summation depends on. Candidates are restricted to corpus-contributing
++    /// symbols and exclude the subject, which its own neighbors reach back. The set is derived in one
++    /// query off the destination- and source-keyed edge indexes, so the cost scales with the subject's
++    /// two-hop neighborhood rather than with the corpus.
++    pub fn shared_neighbors_of(&self, subject: &CanonicalId) -> rusqlite::Result<Vec<SharedNeighborRow>> {
++        let mut stmt = self.conn.prepare(&format!(
++            "WITH {SUBJECT_NEIGHBORS_CTE},
++             {NEIGHBOR_PEERS_CTE},
++             degree(shared, size) AS (SELECT shared, COUNT(*) FROM neighbor_peers GROUP BY shared)
++             SELECT p.candidate, p.shared, d.size FROM neighbor_peers p
++               JOIN degree d ON d.shared = p.shared
++               JOIN semantic_corpus c ON c.symbol_id = p.candidate
++              WHERE p.candidate <> ?1
++              ORDER BY p.candidate, p.shared"
++        ))?;
++        let rows = stmt.query_map(params![subject.as_str()], |r| {
++            Ok(SharedNeighborRow {
++                candidate: CanonicalId::from_raw(r.get::<_, String>(0)?),
++                shared: CanonicalId::from_raw(r.get::<_, String>(1)?),
++                shared_neighborhood_size: r.get(2)?,
++            })
++        })?;
++        rows.collect()
++    }
++
++    /// The dependency-neighborhood size of every candidate [`shared_neighbors_of`] reports for
++    /// `subject`, in canonical-identity order — the second endpoint of the overlap's union.
++    ///
++    /// [`shared_neighbors_of`]: Self::shared_neighbors_of
++    pub fn candidate_neighborhood_sizes(&self, subject: &CanonicalId) -> rusqlite::Result<Vec<(CanonicalId, u64)>> {
++        let mut stmt = self.conn.prepare(&format!(
++            "WITH {SUBJECT_NEIGHBORS_CTE},
++             {NEIGHBOR_PEERS_CTE},
++             candidates(id) AS (
++                 SELECT DISTINCT p.candidate FROM neighbor_peers p
++                   JOIN semantic_corpus c ON c.symbol_id = p.candidate
++                  WHERE p.candidate <> ?1
++             ),
++             candidate_peers(id, peer) AS (
++                 SELECT c.id, e.dst_id FROM candidates c
++                   JOIN edges e ON e.src_id = c.id AND e.kind IN ('uses', 'imports', 'type_hierarchy')
++                  WHERE e.dst_id <> c.id
++                 UNION
++                 SELECT c.id, e.src_id FROM candidates c
++                   JOIN edges e ON e.dst_id = c.id AND e.kind IN ('uses', 'imports', 'type_hierarchy')
++                  WHERE e.src_id <> c.id
++             )
++             SELECT id, COUNT(*) FROM candidate_peers GROUP BY id ORDER BY id"
++        ))?;
++        let rows = stmt.query_map(params![subject.as_str()], |r| {
++            Ok((CanonicalId::from_raw(r.get::<_, String>(0)?), r.get::<_, u64>(1)?))
++        })?;
++        rows.collect()
++    }
++
+     /// Every reference-role occurrence of `id`, ordered deterministically.
+     pub fn references_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<OccurrenceRow>> {
+         let mut stmt = self.conn.prepare(
+@@ -2296,4 +2413,109 @@ mod tests {
+             "one collapsed a→b edge and nothing else"
+         );
+     }
++
++    /// The neighborhood fixture, every symbol contributing to the corpus so none is filtered out of
++    /// the candidate set:
++    ///
++    /// ```text
++    /// subject ──uses──▶ near        elsewhere ──uses──▶ far
++    /// caller  ──uses──▶ subject
++    /// sibling ──uses──▶ near, caller
++    /// cousin  ──uses──▶ near
++    /// distant ──uses──▶ near
++    /// ```
++    ///
++    /// `subject`'s neighborhood is `{near, caller}` — one edge out and one edge in. `near` is the
++    /// busier shared neighbor (four peers) and `caller` the sparser (two). `elsewhere` and `far`
++    /// share nothing with the subject.
++    fn neighborhood_fixture() -> GraphStore {
++        let store = GraphStore::open_in_memory().unwrap();
++        let names = [
++            "subject",
++            "near",
++            "caller",
++            "sibling",
++            "cousin",
++            "distant",
++            "elsewhere",
++            "far",
++        ];
++        for (i, name) in names.iter().enumerate() {
++            let id = format!("ws::{name}");
++            store
++                .insert_symbol(&symbol_at(&id, "doc.rs", i * 10, i * 10 + 5))
++                .unwrap();
++            // A zeroed embedding: these tests read the graph queries, never the vector ranking.
++            store
++                .insert_corpus_entry(&CanonicalId::from_raw(id), name, name, &vec![0u8; 1024])
++                .unwrap();
++        }
++        let uses = |src: &str, dst: &str| {
++            store
++                .insert_edge(
++                    EdgeKind::Uses,
++                    &CanonicalId::from_raw(format!("ws::{src}")),
++                    &CanonicalId::from_raw(format!("ws::{dst}")),
++                )
++                .unwrap()
++        };
++        uses("subject", "near");
++        uses("caller", "subject");
++        uses("sibling", "near");
++        uses("sibling", "caller");
++        uses("cousin", "near");
++        uses("distant", "near");
++        uses("elsewhere", "far");
++        store
++    }
++
++    fn ws_id(name: &str) -> CanonicalId {
++        CanonicalId::from_raw(format!("ws::{name}"))
++    }
++
++    // The dependency neighborhood is direction-inclusive: a symbol the subject uses and a symbol
++    // that uses the subject are both neighbors.
++    #[test]
++    fn dependency_neighborhood_is_direction_inclusive() {
++        let store = neighborhood_fixture();
++        let neighborhood = store.dependency_neighborhood(&ws_id("subject")).unwrap();
++        let names: Vec<&str> = neighborhood.iter().map(|n| n.as_str()).collect();
++        assert_eq!(names, vec!["ws::caller", "ws::near"]);
++    }
++
++    // Each distance-2 symbol is reported as a candidate paired with every neighbor it shares with
++    // the subject and that neighbor's own neighborhood size. The subject itself, which its
++    // neighbors reach back, and symbols sharing no neighbor are absent.
++    #[test]
++    fn shared_neighbors_pair_candidates_with_their_shared_neighbors_and_sizes() {
++        let store = neighborhood_fixture();
++        let rows = store.shared_neighbors_of(&ws_id("subject")).unwrap();
++        let reported: Vec<(&str, &str, u64)> = rows
++            .iter()
++            .map(|r| (r.candidate.as_str(), r.shared.as_str(), r.shared_neighborhood_size))
++            .collect();
++        assert_eq!(
++            reported,
++            vec![
++                // `caller`'s neighborhood is {subject, sibling}; `near`'s is
++                // {subject, sibling, cousin, distant}.
++                ("ws::cousin", "ws::near", 4),
++                ("ws::distant", "ws::near", 4),
++                ("ws::sibling", "ws::caller", 2),
++                ("ws::sibling", "ws::near", 4),
++            ]
++        );
++    }
++
++    // Each candidate's own neighborhood size is reported once, over the same candidate set.
++    #[test]
++    fn candidate_neighborhood_sizes_measure_each_candidates_own_neighborhood() {
++        let store = neighborhood_fixture();
++        let sizes = store.candidate_neighborhood_sizes(&ws_id("subject")).unwrap();
++        let reported: Vec<(&str, u64)> = sizes.iter().map(|(id, size)| (id.as_str(), *size)).collect();
++        assert_eq!(
++            reported,
++            vec![("ws::cousin", 1), ("ws::distant", 1), ("ws::sibling", 2)]
++        );
++    }
+ }
+diff --git a/src/query/mod.rs b/src/query/mod.rs
+index a15a067..55ea511 100644
+--- a/src/query/mod.rs
++++ b/src/query/mod.rs
+@@ -3,6 +3,7 @@
+
+ pub mod diff;
+ pub mod impact;
++pub mod neighborhood;
+ pub mod output;
+ pub mod page;
+ pub mod resolve;
+diff --git a/src/query/page.rs b/src/query/page.rs
+index 1e4669f..6a3885b 100644
+--- a/src/query/page.rs
++++ b/src/query/page.rs
+@@ -15,11 +15,12 @@ use super::output::{Answer, Outcome, PageInfo};
+ use super::{DependentItem, DependentsReport};
+
+ /// The query identity a continuation token is bound to: the command, subject, relation/detail, the
+-/// depth bound, the order selector and ranking-model version (for orderable answers), the output
+-/// bounds (result limit, content-line bound, and `get`'s window start), and the recorded index
+-/// identity (content-hash plus analyzer provenance). A token resumes only against the exact same
+-/// identity — a different query, an index rebuilt underneath (changed sources or a changed analyzer
+-/// version), or a changed ranking model, changes the hash and is rejected.
++/// depth bound, the order selector and ranking-model version (for orderable answers), the
++/// similarity-ranking version (for `similar`), the output bounds (result limit, content-line bound,
++/// and `get`'s window start), and the recorded index identity (content-hash plus analyzer
++/// provenance). A token resumes only against the exact same identity — a different query, an index
++/// rebuilt underneath (changed sources or a changed analyzer version), or a changed ranking model,
++/// changes the hash and is rejected.
+ pub struct PageIdentity {
+     /// The command name (`get`, `trace`, `find`, `search`, `similar`, or `impact`).
+     pub command: &'static str,
+@@ -36,6 +37,10 @@ pub struct PageIdentity {
+     /// ordering, or under a prior ranking model, is rejected rather than resumed against a
+     /// differently-ordered sequence.
+     pub ordering: Option<OrderingIdentity>,
++    /// The similarity-ranking identity for a `similar` answer; `None` for every other command.
++    /// `similar`'s ordering can change in a binary upgrade with no persisted state changing, so
++    /// nothing else in this identity would reject a token issued under the prior ranking.
++    pub similarity: Option<SimilarityIdentity>,
+     /// The effective result limit — the applied default or an explicit value; `None` for an
+     /// explicit unbounded request (`--limit 0`).
+     pub limit: Option<usize>,
+@@ -83,6 +88,35 @@ impl OrderingIdentity {
+     }
+ }
+
++/// The similarity-ranking half of a `similar` query identity: the version of the ranking model that
++/// produced the answer's order.
++///
++/// Sealed exactly as [`OrderingIdentity`] is: [`SimilarityIdentity::current`] — the only production
++/// constructor — stamps [`crate::query::search::SIMILARITY_RANK_VERSION`] itself, so a call site
++/// cannot bind `similar`'s page identity without binding the ranking that produced it. Within one
++/// binary the constant cannot vary, so no runtime test can catch a site that forgot the version;
++/// having no other way to construct the value is what closes that gap.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SimilarityIdentity {
++    rank_version: u32,
++}
++
++impl SimilarityIdentity {
++    /// The similarity-ranking identity under the ranking model this binary ships.
++    pub fn current() -> Self {
++        Self {
++            rank_version: crate::query::search::SIMILARITY_RANK_VERSION,
++        }
++    }
++
++    /// A similarity identity with an arbitrary version, for exercising cross-version token
++    /// rejection — constructible only in tests, so production sites cannot bind a stale version.
++    #[cfg(test)]
++    fn with_version(rank_version: u32) -> Self {
++        Self { rank_version }
++    }
++}
++
+ impl PageIdentity {
+     /// The parameter-identity hash: a hex digest over every field that must match for a token to
+     /// resume. It is deliberately not the token itself — the token additionally carries the page
+@@ -97,6 +131,7 @@ impl PageIdentity {
+             &self.depth.map(|n| n.to_string()).unwrap_or_default(),
+             self.ordering.map(|o| o.mode).unwrap_or(""),
+             &self.ordering.map(|o| o.rank_version.to_string()).unwrap_or_default(),
++            &self.similarity.map(|s| s.rank_version.to_string()).unwrap_or_default(),
+             &self.limit.map(|n| n.to_string()).unwrap_or_default(),
+             &self.max_lines.map(|n| n.to_string()).unwrap_or_default(),
+             &self.from.map(|n| n.to_string()).unwrap_or_default(),
+@@ -478,6 +513,7 @@ mod tests {
+             detail: None,
+             depth: None,
+             ordering: None,
++            similarity: None,
+             limit: Some(limit),
+             max_lines: None,
+             from: None,
+@@ -540,6 +576,48 @@ mod tests {
+         );
+     }
+
++    // _(Similarity-ranking version binds continuation tokens)_ — a well-formed `similar` token
++    // hashed under one similarity-ranking version is refused, as a usage error naming the recovery,
++    // when presented under another. The constant cannot vary within one binary, so the cross-version
++    // presentation is only reachable here.
++    #[test]
++    fn a_similar_token_hashed_under_a_different_similarity_version_is_refused() {
++        let stale_identity = |version| {
++            let mut identity = identity(1);
++            identity.command = "similar";
++            identity.similarity = Some(SimilarityIdentity::with_version(version));
++            identity
++        };
++
++        let token = encode_token(&stale_identity(1).hash(), 1);
++        let answer = Answer::found(vec!["a".to_string(), "b".to_string()], provenance(), Freshness::Fresh);
++        let err = apply_pagination(answer, Some(1), Some(&token), &stale_identity(2))
++            .expect_err("a prior similarity-ranking version's token is refused, not resumed");
++        let message = err.to_string();
++        assert!(
++            message.contains("different query parameters"),
++            "the refusal names the identity mismatch: {message}"
++        );
++        assert!(
++            message.contains("re-issue the query without --cursor"),
++            "the refusal names the recovery: {message}"
++        );
++    }
++
++    // _(Similarity-ranking version binds continuation tokens)_ — two `similar` identities differing
++    // only in the similarity-ranking version hash differently, so a token never outlives the ranking
++    // that produced its order.
++    #[test]
++    fn similar_identities_differing_only_in_similarity_version_hash_differently() {
++        let mut old = identity(1);
++        old.command = "similar";
++        old.similarity = Some(SimilarityIdentity::with_version(1));
++        let mut new = identity(1);
++        new.command = "similar";
++        new.similarity = Some(SimilarityIdentity::with_version(2));
++        assert_ne!(old.hash(), new.hash());
++    }
++
+     // _(Dependents order selector: the selector is part of the query identity)_ — two identities
+     // differing only in the order mode hash differently, so a token issued under one ordering can
+     // never validate against the other.
+diff --git a/src/query/search.rs b/src/query/search.rs
+index 29d218f..a1875bb 100644
+--- a/src/query/search.rs
++++ b/src/query/search.rs
+@@ -15,6 +15,7 @@ use crate::graph::store::SymbolRow;
+ use crate::graph::{corpus, embed};
+ use crate::identity::CanonicalId;
+
++use super::neighborhood;
+ use super::output::{Answer, Location, SemanticIndexView, SymbolView};
+ use super::resolve::Resolution;
+ use super::{Detail, QueryEngine, QueryError, location_of, projected_content, symbol_view};
+@@ -23,6 +24,20 @@ use super::{Detail, QueryEngine, QueryError, location_of, projected_content, sym
+ /// signal's top rank from dominating the fusion.
+ const RRF_K: f64 = 60.0;
+
++/// The `similar` ranking model's version, bound into every continuation token `similar` issues so a
++/// token never resumes against a differently-ordered sequence.
++///
++/// It covers the whole ranking composition: which signals are fused (the subject's vector neighbors,
++/// BM25 over its render words, and the dependency-neighborhood overlap), the fusion constant, the
++/// graph signal's score form, and the clone-certainty tier's ordering. Changing any of them is a
++/// retrieval-scoring change under the repository's governance rule: bump this constant and record a
++/// migration note in the changelog.
++///
++/// It is deliberately independent of [`crate::graph::rank::RANK_VERSION`], which versions the
++/// dependents ordering: the two version unrelated models, and a bump for either must not refuse the
++/// other's tokens.
++pub const SIMILARITY_RANK_VERSION: u32 = 1;
++
+ /// The deterministic clone-certainty marker a `similar` row can carry, derived from the persisted
+ /// equivalence keys — never from estimated similarity.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+@@ -124,9 +139,10 @@ impl QueryEngine<'_> {
+         Ok(Answer::found(items, provenance, freshness).estimated(semantic_index))
+     }
+
+-    /// `similar`: the corpus symbols most similar in content to a subject symbol, most similar
+-    /// first — the same two-signal RRF hybrid `search` uses (the subject's vector neighbors fused
+-    /// with BM25 over the subject's render words), beneath the deterministic clone-certainty tier.
++    /// `similar`: the corpus symbols most similar to a subject symbol, most similar first — the RRF
++    /// fusion of the two content signals `search` uses (the subject's vector neighbors and BM25 over
++    /// its render words) with the dependency-neighborhood overlap signal, beneath the deterministic
++    /// clone-certainty tier.
+     ///
+     /// The subject never appears in its own answer. An ambiguous subject reference yields the typed
+     /// candidate set; a corpus offering no other symbol is a typed-empty answer.
+@@ -168,10 +184,15 @@ impl QueryEngine<'_> {
+         }
+     }
+
+-    /// The `similar` ranking for a resolved subject: the two-signal RRF hybrid — the subject's vector
+-    /// neighbors fused with BM25 of the subject's own render words — with the subject excluded,
+-    /// clone-marked rows lifted above unmarked ones (exact before variant), fused estimated order
+-    /// within each certainty class.
++    /// The `similar` ranking for a resolved subject: the three-signal RRF hybrid — the subject's
++    /// vector neighbors, BM25 of the subject's own render words, and the degree-damped overlap of
++    /// the subject's dependency neighborhood — with the subject excluded, clone-marked rows lifted
++    /// above unmarked ones (exact before variant), fused estimated order within each certainty class.
++    ///
++    /// A candidate the graph signal has no opinion about (one sharing no neighbor with the subject,
++    /// or any candidate at all when the subject has no dependency edges) is simply absent from that
++    /// signal's list, and the content signals carry it — RRF fuses ranks, so a signal that abstains
++    /// costs a candidate nothing beyond the rank it did not gain.
+     fn similar_of(
+         &self,
+         subject: &SymbolRow,
+@@ -206,7 +227,8 @@ impl QueryEngine<'_> {
+                 .collect(),
+             None => Vec::new(),
+         };
+-        let fused = rrf_fuse(&[vector_ranks, lexical_ranks]);
++        let graph_ranks = neighborhood::neighborhood_ranks(self.store, &subject.canonical_id)?;
++        let fused = rrf_fuse(&[vector_ranks, lexical_ranks, graph_ranks]);
+         let subject_keys = self.store.clone_keys_of(&subject.canonical_id)?;
+
+         let mut items = Vec::with_capacity(fused.len().saturating_sub(1));
+diff --git a/tests/semantic_search.rs b/tests/semantic_search.rs
+index a01e07e..c976d0f 100644
+--- a/tests/semantic_search.rs
++++ b/tests/semantic_search.rs
+@@ -400,47 +400,350 @@ fn a_position_resolves_the_enclosing_symbol_as_subject() {
+     assert_eq!(results[0].clone_certainty, Some(CloneCertainty::ExactClone));
+ }
+
+-// _(Similar ranks by the two-signal hybrid)_ — the answer's row order is the RRF fusion of the
+-// subject's vector neighbors with BM25 over the subject's own render words, beneath the certainty
+-// classes. Recomputing the fusion from the store's two signals must reproduce the answer's order —
+-// evidence the ranking is fused, which a vector-only ranking would fail.
+-#[test]
+-fn similar_order_is_the_fused_two_leg_ranking() {
+-    use silent_cartographer::query::search::{rrf_fuse, subject_word_expr};
++// ---- The wired workspace: `similar` where the subject occupies a position in the graph ----
++
++const WIRED_DOC: &str = "wired.rs";
++
++/// The wired-workspace fixture's declarations, in source order, each named function paired with its
++/// body. The named roles:
++///
++/// - `blend_totals` — the subject.
++/// - `merge_totals`, `combine_totals` — two renamed rewrites of the subject's arithmetic. Only
++///   `merge_totals` is wired into the subject's neighborhood.
++/// - `fold_totals` — a near-copy of the subject wired into a disjoint half of the workspace.
++/// - `format_banner` — string work wired exactly like `merge_totals`: structurally adjacent to the
++///   subject, unlike it in content.
++/// - `scale_value`, `run_pipeline` — the shared dependency and the shared caller that make up the
++///   subject's neighborhood.
++/// - `registry_lookup` — the hub every wired symbol and every filler references.
++/// - `remote_scale` — the dependency `fold_totals` is wired to instead.
++/// - `orphan_totals` — a content-similar rewrite carrying no dependency edge at all.
++/// - `tally_NN` — filler symbols, arithmetic like the subject but not rewrites of it, so the corpus
++///   is deep enough for "dissimilar in content" to mean a distant content rank rather than one of a
++///   handful of positions.
++const WIRED_DECLARATIONS: &str = "\
++pub fn blend_totals(x: u32, y: u32) -> u32 {
++    let total = x + y;
++    total * 3
++}
+
+-    let (store, srcs) = clones_store();
+-    let subject = m1_alpha();
++pub fn merge_totals(a: u32, b: u32) -> u32 {
++    let sum = a + b;
++    sum * 3 + 1
++}
+
+-    let subject_vector = store.semantic_vector_of(&subject).unwrap().unwrap();
++pub fn combine_totals(x: u32, y: u32) -> u32 {
++    let total = x + y;
++    let scaled = total * 3;
++    scaled
++}
++
++pub fn fold_totals(x: u32, y: u32) -> u32 {
++    let total = x + y;
++    let bumped = total + 1;
++    bumped * 3
++}
++
++pub fn format_banner(title: &str, width: usize) -> String {
++    let mut banner = String::new();
++    banner.push_str(\"=== \");
++    banner.push_str(title);
++    banner.push_str(\" ===\");
++    while banner.chars().count() < width {
++        banner.insert(0, ' ');
++        banner.push(' ');
++    }
++    banner
++}
++
++pub fn scale_value(v: u32) -> u32 {
++    v * 2
++}
++
++pub fn run_pipeline(x: u32) -> u32 {
++    x
++}
++
++pub fn registry_lookup(key: &str) -> usize {
++    key.len()
++}
++
++pub fn remote_scale(v: u32) -> u32 {
++    v * 7
++}
++
++pub fn orphan_totals(m: u32, n: u32) -> u32 {
++    let joined = m + n;
++    let tripled = joined * 3;
++    tripled - 1
++}
++";
++
++/// The filler count: chosen so a content-dissimilar candidate lands far enough down the content
++/// signals that its rank, not merely its presence, decides the fusion — the regime a real corpus
++/// puts every ranking in.
++const WIRED_FILLERS: usize = 70;
++
++fn wired_source() -> String {
++    let mut source = String::from(WIRED_DECLARATIONS);
++    for i in 0..WIRED_FILLERS {
++        source.push_str(&format!(
++            "\npub fn tally_{i:02}(x: u32, y: u32) -> u32 {{\n    let total = x % {};\n    total + y\n}}\n",
++            i + 2
++        ));
++    }
++    source
++}
++
++fn wired_names() -> Vec<String> {
++    let mut names: Vec<String> = [
++        "blend_totals",
++        "merge_totals",
++        "combine_totals",
++        "fold_totals",
++        "format_banner",
++        "scale_value",
++        "run_pipeline",
++        "registry_lookup",
++        "remote_scale",
++        "orphan_totals",
++    ]
++    .iter()
++    .map(|n| (*n).to_string())
++    .collect();
++    names.extend((0..WIRED_FILLERS).map(|i| format!("tally_{i:02}")));
++    names
++}
++
++/// The wired-workspace store: the fixture's symbols and corpus, then the dependency edges that give
++/// each candidate its position relative to the subject.
++///
++/// ```text
++/// run_pipeline ──uses──▶ blend_totals, merge_totals, format_banner
++/// blend_totals, merge_totals, format_banner ──uses──▶ scale_value
++/// every wired symbol and every filler ──uses──▶ registry_lookup
++/// fold_totals ──uses──▶ remote_scale          (a disjoint half of the workspace)
++/// orphan_totals — no edge in either direction
++/// ```
++///
++/// So the subject's neighborhood is `{scale_value, run_pipeline, registry_lookup}`; `merge_totals`
++/// and `format_banner` occupy it entirely, `combine_totals` meets it only at the hub, and
++/// `fold_totals` and `orphan_totals` do not meet it at all.
++fn wired_store() -> (GraphStore, Vec<(String, String)>) {
++    use silent_cartographer::graph::store::EdgeKind;
++
++    let source = wired_source();
++    let names = wired_names();
++    let (store, srcs) = store_over(
++        WIRED_DOC,
++        Box::leak(source.into_boxed_str()),
++        &names.iter().map(String::as_str).collect::<Vec<_>>(),
++    );
++
++    let uses = |src: &str, dst: &str| store.insert_edge(EdgeKind::Uses, &sem_id(src), &sem_id(dst)).unwrap();
++    for wired in ["blend_totals", "merge_totals", "format_banner"] {
++        uses("run_pipeline", wired);
++        uses(wired, "scale_value");
++    }
++    for referrer in [
++        "blend_totals",
++        "merge_totals",
++        "combine_totals",
++        "format_banner",
++        "scale_value",
++        "run_pipeline",
++    ] {
++        uses(referrer, "registry_lookup");
++    }
++    for i in 0..WIRED_FILLERS {
++        uses(&format!("tally_{i:02}"), "registry_lookup");
++    }
++    uses("fold_totals", "remote_scale");
++    (store, srcs)
++}
++
++/// The rank position of `name` in the `similar` answer for the wired fixture's subject.
++fn wired_position(rows: &[(String, Option<CloneCertainty>)], name: &str) -> usize {
++    rows.iter()
++        .position(|(id, _)| *id == sem_id(name).as_str())
++        .unwrap_or_else(|| panic!("{name} is in the answer"))
++}
++
++/// The wired fixture's subject.
++const WIRED_SUBJECT: &str = "blend_totals";
++
++/// The three rank lists `similar` fuses for the wired fixture's subject, recomputed from the store:
++/// the subject's vector neighbors, BM25 over the subject's render words, and the dependency
++/// neighborhood overlap.
++fn wired_rank_lists(store: &GraphStore) -> Vec<Vec<CanonicalId>> {
++    use silent_cartographer::query::neighborhood::neighborhood_ranks;
++    use silent_cartographer::query::search::subject_word_expr;
++
++    let subject = sem_id(WIRED_SUBJECT);
+     let corpus_size = store.corpus_size().unwrap() as usize;
+-    let vector_ranks: Vec<CanonicalId> = store
++    let subject_vector = store.semantic_vector_of(&subject).unwrap().unwrap();
++    let vector_ranks = store
+         .vector_neighbors(&subject_vector, corpus_size)
+         .unwrap()
+         .into_iter()
+         .map(|(id, _)| id)
+         .collect();
+     let render = store.semantic_render_of(&subject).unwrap().unwrap();
+-    let expr = subject_word_expr(&render).expect("a render spells words");
+-    let lexical_ranks: Vec<CanonicalId> = store
++    let expr = subject_word_expr(&render).expect("the subject's render spells words");
++    let lexical_ranks = store
+         .lexical_neighbors(&expr, corpus_size)
+         .unwrap()
+         .into_iter()
+         .map(|(id, _)| id)
+         .collect();
+-    let expected: Vec<String> = rrf_fuse(&[vector_ranks, lexical_ranks])
++    let graph_ranks = neighborhood_ranks(store, &subject).unwrap();
++    vec![vector_ranks, lexical_ranks, graph_ranks]
++}
++
++// _(Similar ranks by the fused hybrid)_ — the answer's row order is the RRF fusion of all three
++// signals: the subject's vector neighbors, BM25 over its render words, and the dependency
++// neighborhood overlap. Recomputing the fusion from the store's three rank lists must reproduce the
++// answer's order, which a fusion of the two content signals alone would fail on this fixture.
++#[test]
++fn similar_order_is_the_fused_three_signal_ranking() {
++    use silent_cartographer::query::search::rrf_fuse;
++
++    let (store, srcs) = wired_store();
++    let subject = sem_id(WIRED_SUBJECT);
++    let lists = wired_rank_lists(&store);
++    let expected: Vec<String> = rrf_fuse(&lists)
++        .into_iter()
++        .filter(|id| *id != subject)
++        .map(|id| id.as_str().to_string())
++        .collect();
++
++    let rows = similar_rows(&store, &srcs, WIRED_SUBJECT);
++    assert!(
++        rows.iter().all(|(_, marker)| marker.is_none()),
++        "no fixture row is a clone of the subject, so the certainty tier leaves the fused order intact"
++    );
++    let answered: Vec<String> = rows.into_iter().map(|(id, _)| id).collect();
++    assert_eq!(answered, expected);
++
++    // The graph signal is load-bearing: dropping it changes the order the answer publishes.
++    let content_only: Vec<String> = rrf_fuse(&lists[..2])
+         .into_iter()
+         .filter(|id| *id != subject)
+         .map(|id| id.as_str().to_string())
+         .collect();
++    assert_ne!(answered, content_only, "the third list actually moves the order");
++}
+
+-    let rows = similar_rows(&store, &srcs, "m1::alpha");
+-    assert_eq!(rows.len(), expected.len(), "the answer spans the fused candidate set");
+-    // The certainty tier reorders across classes but preserves the fused order within each class;
+-    // restricted to the unmarked rows, the answer's order is exactly the fused order.
+-    let unmarked_in_answer: Vec<&String> = rows.iter().filter(|(_, m)| m.is_none()).map(|(id, _)| id).collect();
+-    let unmarked_ids: std::collections::HashSet<&String> = unmarked_in_answer.iter().copied().collect();
+-    let unmarked_expected: Vec<&String> = expected.iter().filter(|id| unmarked_ids.contains(id)).collect();
+-    assert_eq!(unmarked_in_answer, unmarked_expected);
++// _(A structurally adjacent candidate outranks its content peer)_ — two rewrites of the subject's
++// arithmetic, one wired into the subject's neighborhood and one only meeting it at the hub. The
++// content signals rank the unwired rewrite nearer; the answer puts the wired one first.
++#[test]
++fn a_structurally_adjacent_candidate_outranks_its_content_peer() {
++    use silent_cartographer::query::search::rrf_fuse;
++
++    let (store, srcs) = wired_store();
++    let lists = wired_rank_lists(&store);
++    let content_only = rrf_fuse(&lists[..2]);
++    let content_position = |name: &str| {
++        content_only
++            .iter()
++            .position(|id| *id == sem_id(name))
++            .expect("a corpus symbol is content-ranked")
++    };
++    assert!(
++        content_position("combine_totals") < content_position("merge_totals"),
++        "on content alone the unwired rewrite is the nearer of the two"
++    );
++
++    let rows = similar_rows(&store, &srcs, WIRED_SUBJECT);
++    assert!(
++        wired_position(&rows, "merge_totals") < wired_position(&rows, "combine_totals"),
++        "the rewrite sharing the subject's caller and dependencies precedes the one that does not"
++    );
++}
++
++// _(An isolated candidate is still ranked)_ — a rewrite of the subject carrying no dependency edge
++// at all is absent from the graph signal, and the content signals still carry it into the answer.
++#[test]
++fn an_isolated_candidate_is_still_ranked() {
++    let (store, srcs) = wired_store();
++    let orphan = sem_id("orphan_totals");
++    assert!(
++        store.dependency_neighborhood(&orphan).unwrap().is_empty(),
++        "the isolated candidate carries no dependency edge"
++    );
++    let lists = wired_rank_lists(&store);
++    assert!(
++        !lists[2].contains(&orphan),
++        "an isolated symbol is absent from the graph signal rather than ranked last by it"
++    );
++
++    let rows = similar_rows(&store, &srcs, WIRED_SUBJECT);
++    assert!(
++        rows.iter().any(|(id, _)| *id == orphan.as_str()),
++        "the isolated candidate is still in the answer"
++    );
++}
++
++// _(A ubiquitous symbol is not lifted by its ubiquity)_ — the hub every wired symbol and every
++// filler references shares two of the subject's three neighbors, yet its content is unlike the
++// subject's; it must not precede the candidates the content signals rank as similar.
++#[test]
++fn a_ubiquitous_symbol_is_not_lifted_by_its_ubiquity() {
++    let (store, srcs) = wired_store();
++    let hub = sem_id("registry_lookup");
++    assert!(
++        store.dependency_neighborhood(&hub).unwrap().len() > WIRED_FILLERS,
++        "the hub is referenced across the fixture"
++    );
++
++    let rows = similar_rows(&store, &srcs, WIRED_SUBJECT);
++    let hub_position = wired_position(&rows, "registry_lookup");
++    for content_similar in ["merge_totals", "combine_totals", "fold_totals"] {
++        assert!(
++            wired_position(&rows, content_similar) < hub_position,
++            "{content_similar} precedes the widely-referenced symbol"
++        );
++    }
++}
++
++// _(A near-copy wired elsewhere keeps its content rank)_ — a near-copy of the subject wired into a
++// disjoint half of the workspace shares none of the subject's dependency relationships, so the graph
++// signal has no opinion about it; it still precedes a candidate wired exactly like the subject but
++// unlike it in content.
++#[test]
++fn a_near_copy_wired_elsewhere_keeps_its_content_rank() {
++    let (store, srcs) = wired_store();
++    let near_copy = sem_id("fold_totals");
++    let lists = wired_rank_lists(&store);
++    assert!(
++        !lists[2].contains(&near_copy),
++        "the near-copy shares no neighbor with the subject"
++    );
++    assert!(
++        lists[2].contains(&sem_id("format_banner")),
++        "the content-dissimilar candidate is structurally adjacent"
++    );
++
++    let rows = similar_rows(&store, &srcs, WIRED_SUBJECT);
++    assert!(
++        wired_position(&rows, "fold_totals") < wired_position(&rows, "format_banner"),
++        "the near-copy precedes the structurally adjacent but content-dissimilar candidate"
++    );
++}
++
++// _(Calibrated output is deterministic)_ — two stores built from the same sources answer the same
++// `similar` query byte-identically: the graph signal's rows arrive in a fixed order, its sums
++// accumulate in that order, and every rank ties break on canonical identity.
++#[test]
++fn identical_stores_yield_byte_identical_similar_answers() {
++    let answer_json = || {
++        let (store, srcs) = wired_store();
++        let engine = engine_over(&store, &srcs);
++        let answer = engine.similar(WIRED_SUBJECT, Detail::Signature, None).unwrap();
++        serde_json::to_string(&answer).unwrap()
++    };
++    assert_eq!(answer_json(), answer_json());
+ }
+
+ // _(An ambiguous reference yields candidates)_ — a shortname shared by two indexed symbols returns
+diff --git a/src/query/neighborhood.rs b/src/query/neighborhood.rs
+new file mode 100644
+index 0000000..14aad30
+--- /dev/null
++++ b/src/query/neighborhood.rs
+@@ -0,0 +1,75 @@
++//! The graph similarity signal: corpus symbols ranked by how much of a subject's dependency
++//! neighborhood they occupy, damped so that ubiquity never reads as similarity.
++//!
++//! Two symbols are structural siblings when the codebase wires them the same way — co-called
++//! functions share their callers, parallel implementations share the types they are threaded
++//! through. The signal measures that as overlap between one-hop dependency neighborhoods
++//! (`uses`/`imports`/`type_hierarchy`, both directions), a shared-neighbor measure with long
++//! code-domain precedent.
++//!
++//! Hubs would leak into such a ranking from both ends, so each end is damped by a published measure:
++//! a shared neighbor contributes `1 / (its own neighborhood size)`, the Resource Allocation index, so
++//! a symbol everything touches certifies almost nothing; and the sum is divided by the size of the
++//! two neighborhoods' union, the Jaccard denominator, so a candidate cannot rank on the sheer breadth
++//! of its own references. Both are smooth functions of persisted counts — no threshold, no cap, no
++//! excluded kind.
++//!
++//! Scores are internal: they order the rank list this module emits and are then discarded, never
++//! serialized into any answer.
++
++use std::collections::HashMap;
++
++use crate::graph::store::GraphStore;
++use crate::identity::CanonicalId;
++
++/// Rank `subject`'s distance-2 candidates by degree-damped neighborhood overlap, most overlapping
++/// first, ties broken by canonical identity.
++///
++/// A candidate sharing no neighbor with the subject is absent from the list rather than ranked last:
++/// absence is how a rank list states that this signal has no opinion, which is exactly the claim for
++/// an isolated symbol or for a parallel implementation wired into another half of the workspace. A
++/// subject with no dependency edges at all therefore yields an empty list.
++///
++/// Determinism: the store returns the shared-neighbor rows in a fixed `(candidate, shared)` order and
++/// the sums accumulate in that order, so identical stores produce bit-identical scores and identical
++/// orders.
++pub fn neighborhood_ranks(store: &GraphStore, subject: &CanonicalId) -> rusqlite::Result<Vec<CanonicalId>> {
++    let subject_size = store.dependency_neighborhood(subject)?.len() as u64;
++    if subject_size == 0 {
++        return Ok(Vec::new());
++    }
++    let rows = store.shared_neighbors_of(subject)?;
++    if rows.is_empty() {
++        return Ok(Vec::new());
++    }
++    let candidate_sizes: HashMap<CanonicalId, u64> =
++        store.candidate_neighborhood_sizes(subject)?.into_iter().collect();
++
++    // The rows arrive grouped by candidate in identity order; each group's contributions accumulate
++    // in that same order, which is what fixes the floating-point summation.
++    let mut scored: Vec<(CanonicalId, f64)> = Vec::new();
++    let mut allocation = 0.0f64;
++    let mut shared_count = 0u64;
++    for (index, row) in rows.iter().enumerate() {
++        allocation += 1.0 / row.shared_neighborhood_size as f64;
++        shared_count += 1;
++        let group_ends = rows.get(index + 1).is_none_or(|next| next.candidate != row.candidate);
++        if group_ends {
++            // A candidate is adjacent to every neighbor it shares, so its neighborhood is at least
++            // the shared set; the clamp keeps the union at least the subject's neighborhood, and
++            // therefore positive, however the two aggregations were interleaved with a rebuild.
++            let candidate_size = candidate_sizes
++                .get(&row.candidate)
++                .copied()
++                .unwrap_or(0)
++                .max(shared_count);
++            let union = (subject_size + candidate_size - shared_count) as f64;
++            scored.push((row.candidate.clone(), allocation / union));
++            allocation = 0.0;
++            shared_count = 0;
++        }
++    }
++
++    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
++    Ok(scored.into_iter().map(|(id, _)| id).collect())
++}
