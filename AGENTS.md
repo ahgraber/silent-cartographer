@@ -118,6 +118,8 @@ When editing existing code:
 - Never resolve a mismatch between request and design by duplicating a function, class, or module and editing the copy.
 - Remove imports/variables/functions that YOUR changes made unused.
 - Don't remove pre-existing dead code unless asked — mention it instead.
+- Propose unrequested improvements in one line at the end; don't fold them into the change.
+- Change one thing at a time and report it before starting the next.
 
 ## 4. Goal-Driven Execution
 
@@ -142,12 +144,27 @@ For multi-step tasks, state a brief plan defining the step task and associated v
 
 ## 5. Definition of Done
 
+The required checks are the full test suite and every hook in `.pre-commit-config.yaml`.
+Slow, or looking unrelated to the change, is not a reason to skip one.
+
 - The requested behavior works as specified.
-- The full existing test suite passes, not just tests for this change.
-  Previously working behavior is part of the acceptance criteria.
+- The test suite passes, not just tests for this change; previously working behavior is part of the acceptance criteria.
 - Behavior changes are covered by tests, or testing gaps are explicitly stated.
 - Public contract changes are documented.
-- Required checks were run when available; if not run, state what was skipped and why.
+- The hooks pass on everything changed since `HEAD`, staged or not, including new files.
+  Pass the paths NUL-delimited so names with spaces survive:
+
+  ```sh
+  { git diff -z --name-only --diff-filter=d HEAD; git ls-files -z --others --exclude-standard; } | xargs -0 {{ hook_runner }} run --files
+  ```
+
+  Report failing hook output verbatim and fix the cause — a failure is a defect, not an unavailable check.
+- A check is unavailable only when the command itself fails to run — missing binary, permission error, no network.
+  Then name the check, quote the error, and give the user the exact command to run.
+- Never call a change "confirmed", "verified", or "working" unless you ran the command in this session and read its output.
+  Do not describe expected output as if you had seen it.
+- Re-read a file immediately before reporting on it.
+  Never report from a snapshot taken earlier in the session — the user edits files between turns.
 
 ## Defaults
 
@@ -165,6 +182,15 @@ For multi-step tasks, state a brief plan defining the step task and associated v
 - Do not hand-wrap markdown prose; write each sentence (or a natural paragraph) on a single line and let the formatter hook reflow it (the repo uses a one-sentence-per-line style).
 - Write tests for public behavior and regressions, not implementation details.
 
+## Terminology and Tone
+
+- Prefer the tone of a professional technical writer.
+- Use the vocabulary already in the project.
+  Do not invent jargon, and name a thing after its effect rather than its mechanism.
+- State findings plainly.
+  No flattery, no hedging.
+- Label an unresolved question `OPEN QUESTION` and queue it; do not present it as a conclusion.
+
 ## Technology & Data Handling Requirements
 
 This is a multi-language repo (Python and Rust).
@@ -179,6 +205,8 @@ Cross-cutting rules apply to both; language-specific tooling is grouped under it
 
 - Python code runs in the uv-managed environment; dependencies are pinned via uv/lockfiles (pyproject.toml + uv.lock) and honored by Nix devshells — no ad-hoc global installs.
 - Process identification: Every Python process MUST set a descriptive process title using `setproctitle` so hosts running multiple Python processes can distinguish them.
+- Give executable Python scripts a `uv` shebang, not a system interpreter: `#!/usr/bin/env -S uv run --script`, paired with a PEP 723 `# /// script` block declaring `requires-python` and `dependencies`.
+  This makes the script self-contained and reproducible; `#!/usr/bin/env python3` picks up whatever interpreter and site-packages happen to be on `PATH`.
 
 ### Rust
 
@@ -188,6 +216,11 @@ Cross-cutting rules apply to both; language-specific tooling is grouped under it
 - Formatting and lints are config-driven via the dotfiles `.rustfmt.toml` (edition-2024 style, 119-column width) and `.clippy.toml`.
   Run `cargo fmt` and `cargo clippy` through project tooling; do not hand-format.
 - Process identification: long-running Rust processes SHOULD set a descriptive process title (e.g. the `proctitle` crate) for parity with the Python rule above.
+- Running `c10r`: the copy on `PATH` (installed with `cargo install --path . --locked` into `~/.cargo/bin`) is a released build and never reflects the working tree.
+  Exercise working-tree changes with `cargo run --release -- <args>`, which rebuilds if stale; do not put `target/` on `PATH`.
+  Run `which -a c10r` before concluding anything from a bare `c10r` invocation — unrelated binaries of that name may shadow the installed one.
+- Give the working-tree build its own store, e.g. `cargo run --release -- --db .c10r/dev.db …`.
+  The `--db` default `.c10r/index.db` is shared with the installed build, and a store written under a different schema version is refused on open.
 - Config and trust boundaries map the Python stack onto Rust crates:
   - (de)serialization (pydantic models) → `serde` with `toml` / `serde_json`;
   - layered configuration, pydantic-settings style (defaults < file < env < flags) → `figment` (or `config`);
@@ -228,6 +261,9 @@ TBD
 
 ## Commit & Review Guidelines
 
+- Run `prek run --all-files` before committing.
+  Report failing hook output verbatim and fix the cause.
+  Never pass `--no-verify` or work around a hook silently.
 - **Hard gate before committing**: before running `git agent-commit`, present the user with (1) the proposed commit message and (2) a concise diff summary covering which files changed and what each change does.
   Wait for explicit user approval; do not proceed if the user requests changes.
 - **Every commit message draft, without exception, must be produced by invoking the `commit-message` skill first.**
@@ -237,9 +273,11 @@ TBD
   Scope should reflect directories or logical surfaces.
 - Separate unrelated changes (docs vs configs vs lockfile updates) into distinct commits.
 - Use `git agent-commit` (not `git commit`) to create signed commits; this alias uses the dedicated agent signing key at `~/.ssh/id_ed25519_agent_signing`.
+- Commit only when the user asks, and draft the message at that point, not in advance.
+- Never pass `--no-verify` or work around a hook silently.
 
 ## Sandbox Limitations
 
-- The sandbox may not be able to run `uv sync` or read `.env` / `.env.example` (permission errors) — attempt the command first rather than assuming failure.
-- Delegate to the user only if a command actually fails on a permission or missing-tool error.
-  Describe the exact command to run (e.g., `uv run pytest tests/...`).
+- The sandbox may not be able to run installs, network calls, or other privileged commands (permission errors) — attempt the command first rather than assuming failure.
+- **Delegate to the user** only if a command actually fails on a permission or network error.
+  Describe the exact command to run.
