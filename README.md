@@ -1,6 +1,6 @@
 # silent-cartographer
 
-Silent Cartographer (`c10r`) is a persistent code knowledge graph with a command-line interface built for coding agents and the humans who work with them.
+Silent Cartographer (`c10r`) is a persistent code knowledge graph with a command-line interface and an MCP server, built for coding agents and the humans who work with them.
 It indexes a Rust or Python workspace once, stores the result in a single SQLite file, and then answers precise questions — where a symbol is defined, what references it, what breaks if it changes, what tests exercise it, what code matches a natural-language description — in milliseconds and a handful of tokens.
 
 It exists because coding agents fail on non-trivial codebases in two compounding ways.
@@ -203,6 +203,112 @@ c10r completions bash > ~/.local/share/bash-completion/completions/c10r
 # or source it directly in ~/.bashrc:
 source <(c10r completions bash)
 ```
+
+## MCP server
+
+An agent in an MCP host can reach `c10r` as named tools instead of composing shell invocations.
+The server lives in `mcp/`, runs over stdio, and runs the `c10r` binary you installed — it bundles nothing and changes nothing about the CLI.
+
+It advertises eight tools, one per command it covers: `get`, `trace`, `find`, `search`, `similar`, `impact`, `build`, and `hooks_install`.
+Each returns the command's own structured answer unmodified, so provenance, freshness, typed absence, and heuristic-grade labels arrive intact.
+A command failure arrives as a tool error carrying the exit category and `c10r`'s own diagnostic, so a caller recovers from the error alone.
+`cache` is deliberately absent — nothing on this surface removes an index store.
+
+### Install
+
+```sh
+cargo build --release          # the server runs the c10r you install
+cargo install --path . --locked
+uv sync --project mcp
+```
+
+### Configure a client
+
+The server answers about one workspace per call.
+Precedence is the `root` a tool call names, then the root the server was launched for, then the directory the server process is started in.
+
+Per repository, where the launch directory is already the project, no root ever needs naming:
+
+```json
+{
+  "mcpServers": {
+    "c10r": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/path/to/silent-cartographer/mcp",
+        "c10r-mcp"
+      ]
+    }
+  }
+}
+```
+
+Installed once for every project, pin the workspace explicitly rather than relying on where the host starts the process:
+
+```json
+{
+  "mcpServers": {
+    "c10r": {
+      "command": "c10r-mcp",
+      "args": [
+        "--workspace",
+        "/path/to/project"
+      ]
+    }
+  }
+}
+```
+
+| Setting            | Effect                                                   |
+| ------------------ | -------------------------------------------------------- |
+| `--workspace PATH` | The workspace root used when a call names none           |
+| `C10R_WORKSPACE`   | The same, when no `--workspace` is given                 |
+| `C10R_BINARY`      | An explicit path to `c10r`, overriding the `PATH` lookup |
+
+A configured workspace that is not an existing directory is refused at startup rather than silently replaced by the process's own directory.
+An answer that is correct about the wrong project is indistinguishable from a correct one until it causes damage.
+
+### Two startup refusals, two different remedies
+
+The server checks the binary before advertising anything, and refuses on either of two conditions.
+They are kept apart because their remedies are unrelated:
+
+| Refusal                                                                          | Remedy                                                                                                           |
+| -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| The binary's command-surface version is not the one the server was built against | Align the versions — upgrade the server package, or install a matching `c10r`. Rebuilding an index does nothing. |
+| The binary cannot be found or cannot be run                                      | Install `c10r`, or point `C10R_BINARY` at it                                                                     |
+
+Neither is an index-state failure.
+An absent or incompatible index arrives per call, as an `absent_index` or `incompatible_store` tool error carrying `c10r`'s own diagnostic, and is fixed by a rebuild.
+
+### Changing state requires consent
+
+`build` and `hooks_install` are gated twice.
+Each refuses until the call sets its `acknowledge` parameter, and the refusal states what the operation would do — so an agent cannot stumble into a rebuild while exploring the surface.
+Acknowledgment proves deliberateness but not consent, since the agent sets it itself, so each tool then asks the user to confirm, through whichever mechanism the negotiated protocol era provides.
+
+If the client offers no elicitation capability, the operation is refused rather than performed, and the refusal names the command that does the job — `c10r build` or `c10r hooks install`.
+The guarantee is constant that way: the operation happens behind confirmed consent or not at all, and the answer always says which.
+
+Every tool runs to completion within its call.
+A `build` on a large repository can outlast a client's request timeout; run `c10r build` in a shell when it does, and install the commit hook so a manual rebuild stays rare.
+
+### Tests
+
+The Rust suite and the server's suite are separate commands:
+
+```sh
+cargo test
+uv run --directory mcp pytest
+```
+
+`--directory` rather than `--project`: pytest reads its configuration from the directory it starts in, and the server's settings live in `mcp/pyproject.toml`.
+Started from the repository root, pytest finds no configuration and every asynchronous test fails.
+
+The server's tests run against a real `c10r` binary and a real index built by it; they fail rather than skip when no binary is present, since a skipped conformance check reports as a pass.
+Build one with `cargo build --release` first.
 
 ## Embedded model credit
 
