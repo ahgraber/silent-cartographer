@@ -88,6 +88,19 @@ c10r hooks install
 This installs a post-commit hook that reruns `c10r build`, resolved through git so it lands wherever this worktree actually keeps its hooks — a linked worktree or a relocated `core.hooksPath` included.
 It refuses rather than overwrites when a hook is already present at that path; add the `c10r build` line to your existing hook by hand instead.
 
+A build that has nothing to do costs nothing.
+Before analyzing anything, `build` compares the stored index against the workspace's current sources, analyzer, and declared environment; when all of them match, it analyzes nothing, leaves the store untouched, and reports the index already current.
+So rerunning `c10r build` is safe to do freely, and a commit that changes no indexed source returns in a fraction of a second instead of reindexing the repository.
+
+```sh
+c10r build                        # nothing analyzed when the index is already current
+c10r build --force                # build regardless of that check
+```
+
+Under `--json`, the build answer carries `"rebuilt"`: `true` when the workspace was analyzed and the store rewritten, `false` when the stored index was already current.
+Anything the check cannot confirm drives a build rather than a skip — an absent index, a store built under an older schema version, a store recorded for a different workspace or workspace root, or metadata it cannot read.
+Use `--force` when you have reason to distrust the check itself; changing a source, upgrading the analyzer, or altering the environment already invalidates it on its own.
+
 ### Assessing impact
 
 Make an edit, then ask what it could affect:
@@ -293,7 +306,8 @@ If the client offers no elicitation capability, the operation is refused rather 
 The guarantee is constant that way: the operation happens behind confirmed consent or not at all, and the answer always says which.
 
 Every tool runs to completion within its call.
-A `build` on a large repository can outlast a client's request timeout; run `c10r build` in a shell when it does, and install the commit hook so a manual rebuild stays rare.
+A `build` that finds the stored index already current returns immediately, so a repeat call is cheap; a `build` that must analyze a large repository can outlast a client's request timeout, and then the answer is to run `c10r build` in a shell and install the commit hook so a manual rebuild stays rare.
+The `build` tool takes `force` to build regardless of the currency check, and its answer carries `rebuilt` either way.
 
 ### Tests
 
