@@ -1644,25 +1644,39 @@ impl GraphStore {
         current: &AnalyzerProvenance,
         current_environment: Option<&EnvironmentFacts>,
     ) -> rusqlite::Result<Option<Freshness>> {
-        let Some(meta) = self.read_metadata()? else {
-            return Ok(None);
-        };
-        // Content change takes precedence in reporting; version change flags reindex.
-        if meta.content_hash != current_hash {
-            return Ok(Some(Freshness::StaleContent));
-        }
-        if meta.provenance.analyzer_version != current.analyzer_version
-            || meta.provenance.analyzer_name != current.analyzer_name
-        {
-            return Ok(Some(Freshness::StaleVersion));
-        }
-        // The whole declared environment must match, absence included: a recorded environment that
-        // can no longer be resolved is drift, never reported fresh.
-        if meta.environment.as_ref() != current_environment {
-            return Ok(Some(Freshness::StaleEnvironment));
-        }
-        Ok(Some(Freshness::Fresh))
+        Ok(self
+            .read_metadata()?
+            .map(|meta| freshness_of(&meta, current_hash, current, current_environment)))
     }
+}
+
+/// Evaluate one metadata value's freshness against the sources' current content hash, the analyzer
+/// in effect, and the declared environment in effect.
+///
+/// Pure over the metadata it is handed, so a caller that already read the metadata — the build's
+/// currency check — compares every field from that one read rather than racing a second read
+/// against a concurrent build.
+pub fn freshness_of(
+    meta: &IndexMetadata,
+    current_hash: &str,
+    current: &AnalyzerProvenance,
+    current_environment: Option<&EnvironmentFacts>,
+) -> Freshness {
+    // Content change takes precedence in reporting; version change flags reindex.
+    if meta.content_hash != current_hash {
+        return Freshness::StaleContent;
+    }
+    if meta.provenance.analyzer_version != current.analyzer_version
+        || meta.provenance.analyzer_name != current.analyzer_name
+    {
+        return Freshness::StaleVersion;
+    }
+    // The whole declared environment must match, absence included: a recorded environment that
+    // can no longer be resolved is drift, never reported fresh.
+    if meta.environment.as_ref() != current_environment {
+        return Freshness::StaleEnvironment;
+    }
+    Freshness::Fresh
 }
 
 /// The schema version stamped in a store's `PRAGMA user_version` (0 for an unstamped store).

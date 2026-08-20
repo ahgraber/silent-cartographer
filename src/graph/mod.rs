@@ -5,6 +5,7 @@ pub mod clone;
 pub mod corpus;
 pub mod embed;
 pub mod join;
+pub mod prepared;
 pub mod range;
 pub mod rank;
 pub mod schema;
@@ -20,6 +21,7 @@ use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, Sy
 use crate::semantic::python_adapter::PythonAdapter;
 
 use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join, module_by_document};
+use prepared::PreparedCorpus;
 use range::ByteSpan;
 use store::{
     DiscrepancyRow, EdgeKind, Freshness, GraphStore, IndexMetadata, OccurrenceRow, PersistedClass, SymbolRow,
@@ -146,13 +148,15 @@ pub fn ingest(
     let identities = project_identities(workspace, index);
     let language = index_language(index);
     let corpus = SourceCorpus::new(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
+    // One parse per document: every syntax-reading derivation below borrows this corpus rather
+    // than parsing anything itself.
+    let prepared = PreparedCorpus::prepare(&corpus, language);
     // The document→module derivation runs before the join: the join's self-name and super-keyword
     // rules compare each occurrence against its containing document's own module, and the module
     // bookkeeping below reads the same map — one derivation, two consumers.
-    let doc_module = module_by_document(index, &identities, &corpus, language);
-    let join_result = join(index, &corpus, &identities, language, &doc_module);
+    let doc_module = module_by_document(index, &identities, &prepared, language);
+    let join_result = join(index, &prepared, &identities, language, &doc_module);
 
-    let source_map: HashMap<&str, &str> = sources.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
     let content = content_hash(sources);
 
     // Map each in-workspace symbol's aligned definition to its name-span, so enclosure and
@@ -164,6 +168,26 @@ pub fn ingest(
                 .entry(aligned.symbol.clone())
                 .or_insert((aligned.document_path.clone(), aligned.name_span));
         }
+    }
+
+    // The inverse map enclosure resolves through: a definition-role aligned location → the identity
+    // defined there, so an attribution is one lookup rather than a scan over every definition. A
+    // location holding definitions of more than one persisted symbol resolves to no symbol — the
+    // refusal is stored as `None` so the lookup carries it, and the occurrence attributes as though
+    // no declaration enclosed it (disagreement is represented, never silently resolved).
+    let mut definitions_at: HashMap<(&str, ByteSpan), Option<&CanonicalId>> = HashMap::new();
+    for aligned in &join_result.aligned {
+        if aligned.role != OccurrenceRole::Definition {
+            continue;
+        }
+        definitions_at
+            .entry((aligned.document_path.as_str(), aligned.name_span))
+            .and_modify(|entry| {
+                if *entry != Some(&aligned.symbol) {
+                    *entry = None;
+                }
+            })
+            .or_insert(Some(&aligned.symbol));
     }
 
     // A name -> identity index over persisted type symbols, so an `impl` block attributes its
@@ -219,7 +243,7 @@ pub fn ingest(
         index,
         &identities,
         language,
-        &source_map,
+        &prepared,
         &def_name_span,
         &module_by_doc,
         &join_result.aligned,
@@ -267,7 +291,7 @@ pub fn ingest(
                 .descriptor
                 .as_ref()
                 .is_some_and(|d| definition_count_by_descriptor.get(d).copied().unwrap_or(0) > 1);
-        let content = definition_content(sym, id, &def_name_span, &source_map, language);
+        let content = definition_content(sym, id, &def_name_span, &prepared);
         symbol_rows.push(SymbolRow {
             canonical_id: id.clone(),
             display_name,
@@ -310,15 +334,15 @@ pub fn ingest(
             OccurrenceRole::Reference => "reference",
         };
         let enclosing_id = if aligned.role == OccurrenceRole::Reference {
-            let source = source_map
-                .get(aligned.document_path.as_str())
-                .copied()
+            let source = prepared
+                .get(&aligned.document_path)
+                .map(|doc| doc.tree.source())
                 .unwrap_or_default();
             enclosing_symbol(
                 &aligned.enclosing,
                 &aligned.document_path,
                 source,
-                &def_name_span,
+                &definitions_at,
                 &type_by_name,
             )
         } else {
@@ -354,13 +378,13 @@ pub fn ingest(
             continue;
         }
         if aligned.name_span.start == 0
-            && source_map
-                .get(aligned.document_path.as_str())
-                .is_some_and(|source| aligned.name_span.end == source.len())
+            && prepared
+                .get(&aligned.document_path)
+                .is_some_and(|doc| aligned.name_span.end == doc.tree.source().len())
         {
             continue;
         }
-        if let Some(parent) = parent_of_definition(aligned, &source_map, &def_name_span, &type_by_name, language) {
+        if let Some(parent) = parent_of_definition(aligned, &prepared, &definitions_at, &type_by_name) {
             store.insert_edge(EdgeKind::Contains, &parent, &aligned.symbol)?;
             if contributing.contains(&aligned.symbol) {
                 container_ids.insert(parent);
@@ -376,15 +400,15 @@ pub fn ingest(
         if aligned.role != OccurrenceRole::Reference {
             continue;
         }
-        let source = source_map
-            .get(aligned.document_path.as_str())
-            .copied()
+        let source = prepared
+            .get(&aligned.document_path)
+            .map(|doc| doc.tree.source())
             .unwrap_or_default();
         match enclosing_symbol(
             &aligned.enclosing,
             &aligned.document_path,
             source,
-            &def_name_span,
+            &definitions_at,
             &type_by_name,
         ) {
             // A reference from inside a declaration: the declaration uses the referenced symbol.
@@ -416,15 +440,13 @@ pub fn ingest(
             .entry((aligned.document_path.as_str(), aligned.name_span))
             .or_insert_with(|| aligned.symbol.clone());
     }
-    for (path, source) in &source_map {
-        let Some(tree) = syntax::SyntaxTree::parse(source, language) else {
-            continue;
-        };
+    for (path, doc) in prepared.iter() {
+        let tree = &doc.tree;
         match language {
             Language::Rust => {
                 for imp in tree.trait_impls() {
-                    let ty = occ_by_location.get(&(*path, imp.type_name_span));
-                    let tr = occ_by_location.get(&(*path, imp.trait_name_span));
+                    let ty = occ_by_location.get(&(path, imp.type_name_span));
+                    let tr = occ_by_location.get(&(path, imp.trait_name_span));
                     if let (Some(ty), Some(tr)) = (ty, tr) {
                         store.insert_edge(EdgeKind::TypeHierarchy, ty, tr)?;
                     }
@@ -435,11 +457,11 @@ pub fn ingest(
             // no aligned occurrence contributes no edge (skip, never guess).
             Language::Python => {
                 for class in tree.class_bases() {
-                    let Some(sub) = occ_by_location.get(&(*path, class.class_name_span)) else {
+                    let Some(sub) = occ_by_location.get(&(path, class.class_name_span)) else {
                         continue;
                     };
                     for base_span in class.base_name_spans {
-                        if let Some(base) = occ_by_location.get(&(*path, base_span)) {
+                        if let Some(base) = occ_by_location.get(&(path, base_span)) {
                             store.insert_edge(EdgeKind::TypeHierarchy, sub, base)?;
                         }
                     }
@@ -545,7 +567,6 @@ pub fn ingest(
     // Clone-equivalence keys for the corpus's leaves, from each leaf's spelled token sequence.
     // Containers carry none: a container "clone" over interface text would assert a body
     // equivalence the key never examined.
-    let mut trees: HashMap<&str, Option<syntax::SyntaxTree>> = HashMap::new();
     for source in &corpus_sources {
         if source.contains_persisted || !source.contributes() {
             continue;
@@ -557,16 +578,10 @@ pub fn ingest(
         let (Some(doc), Some((start, end))) = (row.document_path.as_deref(), row.span) else {
             continue;
         };
-        let tree = trees.entry(doc).or_insert_with(|| {
-            source_map
-                .get(doc)
-                .copied()
-                .and_then(|s| syntax::SyntaxTree::parse(s, language))
-        });
-        let Some(tree) = tree.as_ref() else {
+        let Some(doc) = prepared.get(doc) else {
             continue;
         };
-        let tokens = tree.spelled_tokens(ByteSpan { start, end });
+        let tokens = doc.tree.spelled_tokens(ByteSpan { start, end });
         if let Some(keys) = clone::clone_keys(&tokens) {
             store.set_clone_keys(source.canonical_id, &keys.formatting_key, &keys.substitution_key)?;
         }
@@ -634,8 +649,7 @@ fn definition_content(
     sym: &ExtractedSymbol,
     id: &CanonicalId,
     def_name_span: &HashMap<CanonicalId, (String, ByteSpan)>,
-    sources: &HashMap<&str, &str>,
-    language: Language,
+    prepared: &PreparedCorpus,
 ) -> DefinitionContent {
     if sym.class == SymbolClass::External {
         return DefinitionContent::default();
@@ -643,23 +657,17 @@ fn definition_content(
     let Some((doc, name_span)) = def_name_span.get(id) else {
         return DefinitionContent::default();
     };
-    let Some(source) = sources.get(doc.as_str()) else {
+    let Some(prepared_doc) = prepared.get(doc) else {
         return DefinitionContent {
             document_path: Some(doc.clone()),
             ..Default::default()
         };
     };
-    let tree = syntax::SyntaxTree::parse(source, language);
-    let matched = tree.as_ref().and_then(|tree| {
-        tree.all_declarations()
-            .into_iter()
-            .find(|decl| decl.name_span == *name_span)
-    });
+    let source = prepared_doc.tree.source();
 
-    if let Some(decl) = matched {
-        let tree = tree.as_ref().expect("a matched declaration implies a parsed tree");
+    if let Some(decl) = prepared_doc.declaration_at(*name_span) {
         let text = source.get(decl.full_span.start..decl.full_span.end).map(str::to_string);
-        let tiers = tree.declaration_tiers(&decl);
+        let tiers = prepared_doc.tree.declaration_tiers(decl);
         return DefinitionContent {
             document_path: Some(doc.clone()),
             span: Some((decl.full_span.start, decl.full_span.end)),
@@ -671,7 +679,7 @@ fn definition_content(
 
     if sym.kind == SymbolKind::Module {
         let qualified = qualified_name(id);
-        let interface = match tree.as_ref().and_then(|tree| tree.module_documentation()) {
+        let interface = match prepared_doc.tree.module_documentation() {
             Some(docs) => format!("{qualified}\n{}", docs.trim_end()),
             None => qualified.to_string(),
         };
@@ -704,27 +712,55 @@ fn qualified_name(id: &CanonicalId) -> &str {
         .unwrap_or(id.as_str())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Candidate comparisons performed while resolving attributions on this thread: one per chain
+    /// declaration an attribution lookup considers. Thread-local because ingest is single-threaded,
+    /// so a thread-scoped count is exact regardless of other tests running in parallel.
+    static ATTRIBUTION_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset this thread's attribution-comparison counter.
+#[cfg(test)]
+pub fn reset_attribution_comparisons() {
+    ATTRIBUTION_COMPARISONS.with(|count| count.set(0));
+}
+
+/// The number of candidate comparisons attribution lookups performed on this thread since the last
+/// reset.
+#[cfg(test)]
+pub fn attribution_comparisons() -> usize {
+    ATTRIBUTION_COMPARISONS.with(|count| count.get())
+}
+
 /// Map an enclosing syntax-declaration chain to the identity of the nearest persisted declaration.
 ///
-/// The chain is innermost-first. A declaration attributes to a persisted symbol when its name-span
-/// matches that symbol's definition name-span. An `impl_item` is not itself a persisted symbol — it
-/// associates its members with the type it implements — so it resolves to the persisted type whose
-/// terminal name equals the impl's type identifier, which is how a method attributes to its type.
-/// An empty chain (or no match) attributes to the module — represented as `None`, which the store
-/// reads as "the module/file itself".
+/// The chain is innermost-first. A declaration attributes to the persisted symbol whose aligned
+/// definition sits at the declaration's own name-span location, resolved through the
+/// definition-location map — one lookup per chain declaration. A location holding definitions of
+/// more than one persisted symbol resolves to no symbol, and the occurrence attributes as though no
+/// declaration enclosed it. An `impl_item` is not itself a persisted symbol — it associates its
+/// members with the type it implements — so it resolves to the persisted type whose terminal name
+/// equals the impl's type identifier, which is how a method attributes to its type. An empty chain
+/// (or no match) attributes to the module — represented as `None`, which the store reads as "the
+/// module/file itself".
 fn enclosing_symbol(
     chain: &[syntax::SyntaxDeclaration],
     document_path: &str,
     source: &str,
-    def_name_span: &HashMap<CanonicalId, (String, ByteSpan)>,
+    definitions_at: &HashMap<(&str, ByteSpan), Option<&CanonicalId>>,
     type_by_name: &HashMap<String, CanonicalId>,
 ) -> Option<CanonicalId> {
     for decl in chain {
-        // A direct persisted declaration: name-span matches a definition.
-        for (id, (doc, span)) in def_name_span {
-            if doc == document_path && *span == decl.name_span {
-                return Some(id.clone());
-            }
+        #[cfg(test)]
+        ATTRIBUTION_COMPARISONS.with(|count| count.set(count.get() + 1));
+        match definitions_at.get(&(document_path, decl.name_span)) {
+            // A direct persisted declaration: exactly one definition at this location.
+            Some(Some(id)) => return Some((*id).clone()),
+            // More than one persisted definition at this location: naming either would be a guess,
+            // so the whole attribution refuses and the occurrence falls to its module.
+            Some(None) => return None,
+            None => {}
         }
         // An impl block: resolve to the type it implements, by the type identifier's text.
         if decl.node_kind == "impl_item"
@@ -741,21 +777,19 @@ fn enclosing_symbol(
 /// the definition itself.
 fn parent_of_definition(
     aligned: &AlignedOccurrence,
-    sources: &HashMap<&str, &str>,
-    def_name_span: &HashMap<CanonicalId, (String, ByteSpan)>,
+    prepared: &PreparedCorpus,
+    definitions_at: &HashMap<(&str, ByteSpan), Option<&CanonicalId>>,
     type_by_name: &HashMap<String, CanonicalId>,
-    language: Language,
 ) -> Option<CanonicalId> {
-    let source = sources.get(aligned.document_path.as_str())?;
-    let tree = syntax::SyntaxTree::parse(source, language)?;
-    let chain = tree.enclosing_declarations(aligned.name_span.start);
+    let doc = prepared.get(&aligned.document_path)?;
+    let chain = doc.tree.enclosing_declarations(aligned.name_span.start);
     let parent_chain: Vec<syntax::SyntaxDeclaration> =
         chain.into_iter().filter(|d| d.name_span != aligned.name_span).collect();
     enclosing_symbol(
         &parent_chain,
         &aligned.document_path,
-        source,
-        def_name_span,
+        doc.tree.source(),
+        definitions_at,
         type_by_name,
     )
 }
@@ -772,35 +806,33 @@ fn classify_test_symbols(
     index: &ExtractedIndex,
     identities: &[Option<CanonicalId>],
     language: Language,
-    source_map: &HashMap<&str, &str>,
+    prepared: &PreparedCorpus,
     def_name_span: &HashMap<CanonicalId, (String, ByteSpan)>,
     module_by_doc: &HashMap<String, CanonicalId>,
     aligned: &[AlignedOccurrence],
 ) -> HashMap<CanonicalId, &'static str> {
-    // Per-document convention signals, read once per document from its syntax tree: the name spans
-    // of test-attributed declarations, the spans of inline `#[cfg(test)]` module bodies, the gated
-    // out-of-line module declarations, and every out-of-line module declaration (through which
-    // gating propagates into other documents).
+    // Per-document convention signals, read once per document from its prepared syntax tree: the
+    // name spans of test-attributed declarations, the spans of inline `#[cfg(test)]` module bodies,
+    // the gated out-of-line module declarations, and every out-of-line module declaration (through
+    // which gating propagates into other documents).
     let mut attr_names: HashMap<String, std::collections::HashSet<ByteSpan>> = HashMap::new();
     let mut inline_gated: HashMap<String, Vec<ByteSpan>> = HashMap::new();
     let mut gated_mod_decls: Vec<(String, ByteSpan)> = Vec::new();
     let mut out_of_line_mods: HashMap<String, Vec<ByteSpan>> = HashMap::new();
     if language == Language::Rust {
-        for (path, source) in source_map {
-            let Some(tree) = syntax::SyntaxTree::parse(source, language) else {
-                continue;
-            };
+        for (path, doc) in prepared.iter() {
+            let tree = &doc.tree;
             attr_names.insert(
-                (*path).to_string(),
+                path.to_string(),
                 tree.test_attributed_declaration_names().into_iter().collect(),
             );
             for gated in tree.cfg_test_modules() {
                 match gated.inline_span {
-                    Some(span) => inline_gated.entry((*path).to_string()).or_default().push(span),
-                    None => gated_mod_decls.push(((*path).to_string(), gated.name_span)),
+                    Some(span) => inline_gated.entry(path.to_string()).or_default().push(span),
+                    None => gated_mod_decls.push((path.to_string(), gated.name_span)),
                 }
             }
-            out_of_line_mods.insert((*path).to_string(), tree.out_of_line_module_names());
+            out_of_line_mods.insert(path.to_string(), tree.out_of_line_module_names());
         }
     }
 
@@ -946,4 +978,155 @@ pub fn freshness(
 ) -> rusqlite::Result<Option<Freshness>> {
     let hash = content_hash(sources);
     store.freshness(&hash, current, current_environment)
+}
+
+/// Shared fixtures for the work-bound tests: minimal Rust-shaped indexes whose symbols and
+/// references align through the ordinary join, so parse and comparison counts measure real ingests.
+#[cfg(test)]
+pub(crate) mod work_bound_fixture {
+    use crate::identity::{Descriptor, DescriptorSegment, SegmentKind};
+    use crate::semantic::model::{
+        AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
+        SourceDocument, SourceRange, SymbolClass, SymbolKind,
+    };
+
+    /// An in-workspace function symbol defined at `fn <name>() {}` on line `line` of `doc`, with
+    /// any extra occurrences appended.
+    pub(crate) fn fn_symbol(name: &str, doc: &str, line: u32) -> ExtractedSymbol {
+        ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "crate",
+                vec![DescriptorSegment::new(name, SegmentKind::Term)],
+            )),
+            kind: SymbolKind::Function,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![ExtractedOccurrence {
+                document_path: doc.to_string(),
+                range: SourceRange::new(line, 3, line, 3 + name.len() as u32),
+                role: OccurrenceRole::Definition,
+            }],
+        }
+    }
+
+    /// A Rust index over `(document, symbols)` pairs, every document UTF-8 encoded.
+    pub(crate) fn index_over(docs: &[(&str, Vec<ExtractedSymbol>)]) -> ExtractedIndex {
+        ExtractedIndex {
+            provenance: AnalyzerProvenance {
+                analyzer_name: "rust-analyzer".to_string(),
+                analyzer_version: "1.0.0".to_string(),
+            },
+            documents: docs
+                .iter()
+                .map(|(path, _)| SourceDocument {
+                    path: path.to_string(),
+                    encoding: PositionEncoding::Utf8,
+                })
+                .collect(),
+            symbols: docs.iter().flat_map(|(_, symbols)| symbols.clone()).collect(),
+            duplicate_groups: Vec::new(),
+            library_roots: Default::default(),
+            environment: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::work_bound_fixture::{fn_symbol, index_over};
+    use super::*;
+    use crate::semantic::model::{ExtractedOccurrence, SourceRange};
+
+    /// A workspace of one document holding `callee_count` callee functions plus one caller whose
+    /// body references the first callee: `fn f0() {} … fn caller() { f0(); }`.
+    fn workspace_with_callees(callee_count: u32) -> (ExtractedIndex, Vec<(String, String)>) {
+        let mut source = String::new();
+        let mut symbols = Vec::new();
+        for i in 0..callee_count {
+            symbols.push(fn_symbol(&format!("f{i}"), "m.rs", i));
+            source.push_str(&format!("fn f{i}() {{}}\n"));
+        }
+        let caller_line = callee_count;
+        let mut caller = fn_symbol("caller", "m.rs", caller_line);
+        source.push_str("fn caller() { f0(); }\n");
+        // The reference to `f0` inside `caller`'s body: `fn caller() { ` is 14 bytes, `f0` is 2.
+        symbols[0].occurrences.push(ExtractedOccurrence {
+            document_path: "m.rs".to_string(),
+            range: SourceRange::new(caller_line, 14, caller_line, 16),
+            role: OccurrenceRole::Reference,
+        });
+        // `caller` is 6 characters at column 3.
+        caller.occurrences[0].range = SourceRange::new(caller_line, 3, caller_line, 9);
+        symbols.push(caller);
+        (index_over(&[("m.rs", symbols)]), vec![("m.rs".to_string(), source)])
+    }
+
+    /// Run one full ingest and return the attribution comparisons it performed.
+    fn comparisons_during_ingest(index: &ExtractedIndex, sources: &[(String, String)]) -> usize {
+        let mut store = GraphStore::open_in_memory().unwrap();
+        reset_attribution_comparisons();
+        ingest(&mut store, &WorkspaceId::new("bound-ws"), None, index, sources).unwrap();
+        attribution_comparisons()
+    }
+
+    // _(Reference occurrences carry enclosing-declaration attribution — work bound)_ — attribution
+    // work per occurrence is unchanged when the workspace persists many times as many definitions.
+    #[test]
+    fn attribution_work_per_occurrence_is_independent_of_definition_count() {
+        let (small_index, small_sources) = workspace_with_callees(1);
+        let (large_index, large_sources) = workspace_with_callees(16);
+        let small = comparisons_during_ingest(&small_index, &small_sources);
+        let large = comparisons_during_ingest(&large_index, &large_sources);
+        assert!(small > 0, "the reference attributed, so comparisons were performed");
+        assert_eq!(
+            small, large,
+            "one reference costs the same comparisons under 2 and 17 persisted definitions"
+        );
+    }
+
+    // _(Reference occurrences carry enclosing-declaration attribution — shared-location refusal)_ —
+    // an occurrence whose nearest enclosing declaration's location holds two persisted definitions
+    // attributes to its module, never to an arbitrary one of the two.
+    #[test]
+    fn occurrence_under_a_shared_definition_location_attributes_to_its_module() {
+        let source = "fn x() { b(); }\nfn b() {}\n";
+        // Two persisted symbols both defining at `x`'s name token: identical location, distinct
+        // descriptors (a synthetic collision, the shape scip-python emits for `codes = (` openers).
+        let x_as_term = fn_symbol("x", "m.rs", 0);
+        let mut x_as_type = fn_symbol("x", "m.rs", 0);
+        x_as_type.descriptor = Some(crate::identity::Descriptor::new(
+            "crate",
+            vec![crate::identity::DescriptorSegment::new(
+                "x",
+                crate::identity::SegmentKind::Type,
+            )],
+        ));
+        let mut b = fn_symbol("b", "m.rs", 1);
+        // The reference to `b` inside `fn x`'s body: `fn x() { ` is 9 bytes, `b` is 1.
+        b.occurrences.push(ExtractedOccurrence {
+            document_path: "m.rs".to_string(),
+            range: SourceRange::new(0, 9, 0, 10),
+            role: OccurrenceRole::Reference,
+        });
+        let b_descriptor = b.descriptor.clone().unwrap();
+        let index = index_over(&[("m.rs", vec![x_as_term, x_as_type, b])]);
+
+        let mut store = GraphStore::open_in_memory().unwrap();
+        let ws = WorkspaceId::new("bound-ws");
+        ingest(
+            &mut store,
+            &ws,
+            None,
+            &index,
+            &[("m.rs".to_string(), source.to_string())],
+        )
+        .unwrap();
+
+        let b_id = crate::identity::project_one(&ws, &b_descriptor);
+        let refs = store.references_of(&b_id).unwrap();
+        assert_eq!(refs.len(), 1, "the reference to b persists");
+        assert_eq!(
+            refs[0].enclosing_id, None,
+            "a shared definition location refuses: the occurrence attributes to its module"
+        );
+    }
 }

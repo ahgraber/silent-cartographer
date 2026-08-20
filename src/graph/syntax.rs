@@ -17,6 +17,26 @@ use tree_sitter::{Node, Parser, Tree};
 
 use super::range::ByteSpan;
 
+#[cfg(test)]
+thread_local! {
+    /// Documents parsed on this thread: the syntax-work evidence the in-crate work-bound tests
+    /// read. Thread-local because ingest is single-threaded, so a thread-scoped count is exact
+    /// regardless of other tests running in parallel in the same binary.
+    static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset this thread's parse counter.
+#[cfg(test)]
+pub fn reset_parse_count() {
+    PARSE_COUNT.with(|count| count.set(0));
+}
+
+/// The number of [`SyntaxTree::parse`] calls on this thread since the last reset.
+#[cfg(test)]
+pub fn parse_count() -> usize {
+    PARSE_COUNT.with(|count| count.get())
+}
+
 /// The source language a [`SyntaxTree`] is parsed as, selecting its declaration-kind and name-node
 /// tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +241,8 @@ fn span_of(node: Node) -> ByteSpan {
 impl SyntaxTree {
     /// Parse `source` as `language`. Returns `None` only if the parser cannot be initialized.
     pub fn parse(source: &str, language: Language) -> Option<Self> {
+        #[cfg(test)]
+        PARSE_COUNT.with(|count| count.set(count.get() + 1));
         let mut parser = Parser::new();
         let grammar = match language {
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),

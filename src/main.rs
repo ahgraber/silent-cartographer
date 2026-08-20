@@ -207,7 +207,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             styled,
         ),
         Command::Build(args) => {
-            let accounting = commands::run_build(
+            let outcome = commands::run_build(
                 &cli.db,
                 cli.workspace.as_deref(),
                 &args.root,
@@ -215,15 +215,14 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
                 "scip-python",
                 args.environment.as_deref(),
                 args.language.map(Into::into),
+                args.force,
             )?;
             // Under `--json` the standard-output answer is the structured machine projection of the
-            // same accounting the human line renders.
+            // same accounting the human line renders, carrying whether the store was rewritten.
             if cli.json {
-                Ok(serde_json::to_string_pretty(&commands::build_accounting_json(
-                    &accounting,
-                ))?)
+                Ok(serde_json::to_string_pretty(&commands::build_outcome_json(&outcome))?)
             } else {
-                Ok(commands::build_accounting_line(&accounting))
+                Ok(commands::build_outcome_line(&outcome))
             }
         }
         Command::Status(args) => commands::run_status(

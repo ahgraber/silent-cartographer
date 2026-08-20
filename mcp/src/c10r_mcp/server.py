@@ -606,24 +606,47 @@ def _register_lifecycle_tools(mcp: FastMCP, runner: Runner) -> None:
                 )
             ),
         ] = None,
+        force: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Rebuild even when the stored index already matches the workspace's "
+                    "sources, analyzer, and environment. Without it, an already-current "
+                    "index is left untouched and the call reports it current."
+                )
+            ),
+        ] = False,
     ) -> dict[str, Any] | ToolResult | mcp_types.InputRequiredResult:
         """Build or refresh the index for a workspace.
 
         Call this when a query reports the `absent_index` or `incompatible_store`
-        category. It runs an external indexer across the whole workspace and can
-        take minutes on a large repository, and it runs to completion within this
-        call. Install the commit hook with `hooks_install` afterwards so the index
-        keeps up with commits and this stays rare.
+        category. It first checks the stored index against the workspace's current
+        sources, analyzer, and environment, and does no work when they already
+        match; otherwise it runs an external indexer across the whole workspace,
+        which can take minutes on a large repository and runs to completion within
+        this call. Set `force` to rebuild regardless of that check. Install the
+        commit hook with `hooks_install` afterwards so the index keeps up with
+        commits and this stays rare.
         """
+        cost = (
+            "runs an external indexer across the whole workspace and can take minutes, rewriting the index store."
+            if force
+            else (
+                "does nothing when the stored index already matches the workspace; "
+                "otherwise it runs an external indexer across the whole workspace, "
+                "which can take minutes and rewrites the index store."
+            )
+        )
+        # The displayed command is composed from the effective arguments, so what the user
+        # acknowledges, confirms, or is told to run in a shell is exactly what would run.
+        args = ["build", *_option("language", language), *_option("force", force)]
         return await gated(
             ctx,
             tool="build",
             acknowledge=acknowledge,
-            cost=(
-                "runs an external indexer across the whole workspace and can take minutes, rewriting the index store."
-            ),
-            command="c10r build",
-            args=["build", *_option("language", language)],
+            cost=cost,
+            command=" ".join(["c10r", *args]),
+            args=args,
             root=root,
         )
 

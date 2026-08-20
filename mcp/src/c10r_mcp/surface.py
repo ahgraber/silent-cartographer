@@ -24,7 +24,7 @@ from typing import Any
 
 from c10r_mcp import binary
 
-SURFACE_VERSION = 7
+SURFACE_VERSION = 8
 """The command-surface version these tools were written against.
 
 Raise this together with the tool definitions whenever `c10r`'s surface version

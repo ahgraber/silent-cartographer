@@ -6,8 +6,8 @@ mod support;
 use std::path::Path;
 
 use silent_cartographer::commands::{
-    build_accounting_json, build_accounting_line, build_from_index, detect_language, resolve_workspace, run_build,
-    run_status,
+    build_accounting_json, build_accounting_line, build_from_index, collect_python_sources, detect_language,
+    resolve_workspace, run_build, run_status,
 };
 use silent_cartographer::graph::content_hash;
 use silent_cartographer::graph::join::JoinAccounting;
@@ -17,10 +17,10 @@ use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind, 
 use silent_cartographer::query::output::Outcome;
 use silent_cartographer::query::{Detail, QueryEngine};
 use silent_cartographer::semantic::model::{
-    ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding, SourceDocument,
-    SourceRange, SymbolClass, SymbolKind,
+    AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
+    SourceDocument, SourceRange, SymbolClass, SymbolKind,
 };
-use silent_cartographer::semantic::python_adapter::PythonAdapter;
+use silent_cartographer::semantic::python_adapter::{PythonAdapter, environment_facts};
 
 use crate::support::sources;
 
@@ -620,6 +620,30 @@ fn build_json_projection_carries_every_bucket() {
     }
 }
 
+// _(Scenario: Rebuilding an unchanged workspace analyzes nothing — the report)_ — the two build
+// outcomes render distinctly: a skip's human line names the index current and the explicit rebuild
+// option, and the machine projection carries `rebuilt` for both outcomes.
+#[test]
+fn build_outcome_renders_distinguish_a_skip_from_a_build() {
+    let accounting = JoinAccounting::default();
+
+    let skip = silent_cartographer::commands::BuildOutcome::AlreadyCurrent(accounting);
+    let line = silent_cartographer::commands::build_outcome_line(&skip);
+    assert!(line.contains("already current"), "the skip line says so: {line}");
+    assert!(line.contains("--force"), "the skip line names the escape hatch: {line}");
+    let json = silent_cartographer::commands::build_outcome_json(&skip);
+    assert_eq!(json["rebuilt"], serde_json::Value::Bool(false), "a skip: {json}");
+
+    let built = silent_cartographer::commands::BuildOutcome::Rebuilt(accounting);
+    let line = silent_cartographer::commands::build_outcome_line(&built);
+    assert!(
+        line.starts_with("built:"),
+        "a build renders the accounting line: {line}"
+    );
+    let json = silent_cartographer::commands::build_outcome_json(&built);
+    assert_eq!(json["rebuilt"], serde_json::Value::Bool(true), "a build: {json}");
+}
+
 /// An index over two documents, each defining `dupcrate::Widget` under an identical descriptor — a
 /// duplicated-descriptor group with no group-addressed references (the disclosure surface cares only
 /// about the group's shared descriptor and its definitions).
@@ -793,6 +817,7 @@ fn python_manifest_selects_python_backend() {
         missing_tool.to_str().unwrap(),
         None,
         None,
+        false,
     )
     .expect_err("the indexer is absent");
     assert!(
@@ -818,6 +843,7 @@ fn two_manifests_without_selection_refuse() {
         "scip-python",
         None,
         None,
+        false,
     )
     .expect_err("two manifests are ambiguous");
     assert!(
@@ -881,6 +907,7 @@ fn failed_build_leaves_existing_store_untouched() {
         "scip-python",
         None,
         None,
+        false,
     )
     .expect_err("the analyzer is absent");
     assert_eq!(
@@ -901,6 +928,7 @@ fn failed_build_leaves_existing_store_untouched() {
         missing_scip.to_str().unwrap(),
         None,
         Some(Language::Python),
+        false,
     )
     .expect_err("the indexer is absent");
     assert_eq!(
@@ -932,6 +960,7 @@ fn explicit_environment_refusal_precedes_tool_lookup() {
         missing_tool.to_str().unwrap(),
         Some(missing_env.as_path()),
         None,
+        false,
     )
     .expect_err("the explicit environment does not exist");
     let message = err.to_string();
@@ -1260,5 +1289,420 @@ fn a_symlinked_path_to_a_foreign_database_is_refused() {
         std::fs::read(&target).unwrap(),
         before,
         "the link's target is untouched"
+    );
+}
+
+/// Write an executable stub analyzer that answers `--version` with `version` and fails every other
+/// invocation, so a test can tell whether a build attempted analysis.
+fn write_version_only_stub(dir: &Path, name: &str, version: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"{version}\"\n  exit 0\nfi\nexit 1\n"),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// A workspace whose store already describes it, alongside a stub analyzer that reports the recorded
+/// version and fails if asked to analyze.
+fn already_built_workspace() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "Cargo.toml");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+
+    let db = dir.path().join("index.db");
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
+
+    let stub = write_version_only_stub(dir.path(), "rust-analyzer", &support::provenance().analyzer_version);
+    (dir, db, stub)
+}
+
+// _(Scenario: Rebuilding an unchanged workspace analyzes nothing)_ — the stub analyzer fails on any
+// invocation other than `--version`, so a build that reports the index already current is a build
+// that never analyzed; the store's bytes are unchanged.
+#[test]
+fn a_build_over_an_unchanged_workspace_analyzes_nothing() {
+    let (dir, db, stub) = already_built_workspace();
+    let before = std::fs::read(&db).unwrap();
+
+    let outcome = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+    )
+    .expect("an already-current index is not an error");
+
+    assert!(!outcome.rebuilt(), "the build reports the index already current");
+    assert_eq!(std::fs::read(&db).unwrap(), before, "the store is byte-identical");
+}
+
+// _(Scenario: An explicit rebuild ignores currency)_ — with the explicit option the same workspace is
+// analyzed, which the stub refuses, so the attempt surfaces as an indexing failure rather than as a
+// skip.
+#[test]
+fn an_explicit_rebuild_analyzes_an_unchanged_workspace() {
+    let (dir, db, stub) = already_built_workspace();
+
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        true,
+    )
+    .expect_err("the stub analyzer refuses to analyze");
+    assert!(
+        err.to_string().contains("indexing failed"),
+        "the forced build attempted analysis: {err}"
+    );
+}
+
+// _(Scenario: Rebuilding an unchanged workspace analyzes nothing — unreadable-metadata arm)_ — a
+// recognized store whose recorded metadata cannot be read is not current: the build analyzes and
+// re-records rather than aborting on the corrupt row.
+#[test]
+fn corrupt_metadata_in_a_recognized_store_rebuilds() {
+    let (dir, db, stub) = already_built_workspace();
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE index_metadata SET environment = 'not json'", [])
+            .unwrap();
+    }
+
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+    )
+    .expect_err("the stub analyzer refuses to analyze");
+    assert!(
+        err.to_string().contains("indexing failed"),
+        "corrupt metadata drove the build to analyze: {err}"
+    );
+}
+
+// _(Scenario: An edited source rebuilds)_ — editing one source file makes the store stale, so the
+// build analyzes rather than reporting the index current.
+#[test]
+fn an_edited_source_rebuilds() {
+    let (dir, db, stub) = already_built_workspace();
+    std::fs::write(
+        dir.path().join(support::DOC),
+        format!("{}\n// edited\n", support::SOURCE),
+    )
+    .unwrap();
+
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+    )
+    .expect_err("the stub analyzer refuses to analyze");
+    assert!(
+        err.to_string().contains("indexing failed"),
+        "the changed source drove the build to analyze: {err}"
+    );
+}
+
+// _(Scenario: A changed analyzer rebuilds)_ — the same sources under a different analyzer version are
+// not current, because resolution can differ between analyzer versions.
+#[test]
+fn a_changed_analyzer_version_rebuilds() {
+    let (dir, db, _) = already_built_workspace();
+    let newer = write_version_only_stub(dir.path(), "rust-analyzer-next", "9.99.0");
+
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        newer.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+    )
+    .expect_err("the stub analyzer refuses to analyze");
+    assert!(
+        err.to_string().contains("indexing failed"),
+        "the changed analyzer version drove the build to analyze: {err}"
+    );
+}
+
+/// A fake Python environment under `dir/.venv`: a version-only `bin/python` stub and a
+/// site-packages directory holding one installed distribution — enough for `environment_facts` to
+/// resolve an interpreter version and a package fingerprint.
+fn write_fake_venv(dir: &Path) -> std::path::PathBuf {
+    let venv = dir.join(".venv");
+    let bin = venv.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_version_only_stub(&bin, "python", "Python 3.12.0");
+    let site = venv.join("lib").join("python3.12").join("site-packages");
+    std::fs::create_dir_all(site.join("foo-1.0.dist-info")).unwrap();
+    venv
+}
+
+// _(Scenario: A changed environment rebuilds)_ — the same sources under the same analyzer but a
+// drifted interpreter environment (here, one more installed distribution) are not current, because
+// Python resolution depends on the installed packages.
+#[test]
+fn a_changed_declared_environment_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "pyproject.toml");
+    std::fs::write(dir.path().join("app.py"), "x = 1\n").unwrap();
+    let venv = write_fake_venv(dir.path());
+    let stub = write_version_only_stub(dir.path(), "scip-python", "0.6.0");
+
+    // Record the store exactly as a Python build would: scip-python provenance, the environment
+    // facts in effect, and the hash of the sources discovery collects.
+    let index = ExtractedIndex {
+        provenance: AnalyzerProvenance {
+            analyzer_name: "scip-python".to_string(),
+            analyzer_version: "0.6.0".to_string(),
+        },
+        documents: vec![],
+        symbols: vec![],
+        duplicate_groups: vec![],
+        library_roots: Default::default(),
+        environment: Some(environment_facts(&venv).unwrap()),
+    };
+    let db = dir.path().join("index.db");
+    let collected = collect_python_sources(dir.path()).unwrap();
+    build_from_index(&db, "op-ws", dir.path(), &index, &collected).unwrap();
+
+    // Sanity: with the environment unchanged the build reports the index already current, so the
+    // rebuild below is attributable to the environment alone.
+    let outcome = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        "rust-analyzer",
+        stub.to_str().unwrap(),
+        Some(venv.as_path()),
+        None,
+        false,
+    )
+    .expect("an unchanged environment is current");
+    assert!(
+        !outcome.rebuilt(),
+        "the unchanged environment reports the index current"
+    );
+
+    // Install one more distribution: the package fingerprint drifts.
+    std::fs::create_dir(
+        venv.join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("bar-2.0.dist-info"),
+    )
+    .unwrap();
+
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        "rust-analyzer",
+        stub.to_str().unwrap(),
+        Some(venv.as_path()),
+        None,
+        false,
+    )
+    .expect_err("the stub indexer refuses to analyze");
+    assert!(
+        err.to_string().contains("indexing failed"),
+        "the changed environment drove the build to analyze: {err}"
+    );
+}
+
+// _(Scenario: An absent index builds)_ — with no store at the path there is nothing to compare
+// against, so the build analyzes.
+#[test]
+fn an_absent_index_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "Cargo.toml");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+    let stub = write_version_only_stub(dir.path(), "rust-analyzer", "1.85.0");
+
+    let err = run_build(
+        &dir.path().join("absent.db"),
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+    )
+    .expect_err("the stub analyzer refuses to analyze");
+    assert!(
+        err.to_string().contains("indexing failed"),
+        "the absent index drove the build to analyze: {err}"
+    );
+}
+
+// _(Scenario: An absent index builds — incompatible-store arm)_ — the other way to have no
+// compatible store to compare against: one c10r created under a schema version this binary does not
+// recognize. It is never reported current; the build analyzes and replaces it, leaving a store at
+// the current schema version.
+#[test]
+fn an_incompatible_store_builds_rather_than_reporting_it_current() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "Cargo.toml");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+
+    let db = dir.path().join("index.db");
+    write_marked_old_store(&db);
+    let stub = write_indexing_stub(dir.path(), "rust-analyzer", "1.85.0");
+
+    let outcome = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+    )
+    .expect("an incompatible store is c10r's own to replace, not a refusal");
+
+    assert!(outcome.rebuilt(), "the incompatible store drove the build to analyze");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let stamped: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        stamped,
+        silent_cartographer::graph::schema::SCHEMA_VERSION,
+        "the replaced store carries the current schema version"
+    );
+}
+
+// _(Scenario: A store recorded for another workspace builds)_ — the same sources under a different
+// workspace identity produce different canonical identities, so a store recorded for another
+// workspace is never current: the build analyzes and re-records rather than skipping.
+#[test]
+fn a_store_recorded_for_another_workspace_is_not_current() {
+    let (dir, db, stub) = already_built_workspace();
+
+    let err = run_build(
+        &db,
+        Some("a-different-workspace"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+    )
+    .expect_err("the stub analyzer refuses to analyze");
+    assert!(
+        err.to_string().contains("indexing failed"),
+        "the workspace mismatch drove the build to analyze: {err}"
+    );
+}
+
+/// Write an executable stub analyzer that answers `--version` with `version` and, for any other
+/// invocation, writes an empty SCIP index to the path after `--output` and succeeds — so a build
+/// driven by it runs to completion without a real analyzer.
+fn write_indexing_stub(dir: &Path, name: &str, version: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n  echo \"{version}\"\n  exit 0\nfi\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 if [ \"$1\" = \"--output\" ]; then\n    : > \"$2\"\n    exit 0\n  fi\n\
+             \x20 shift\n\
+             done\n\
+             exit 1\n"
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+// _(Scenario: A store recorded for another workspace builds)_ — the recorded workspace root is part
+// of the same comparison, and the whole outcome holds: the build analyzes rather than reporting the
+// index current, discloses the handoff naming both roots, and leaves the store recording the
+// workspace it now describes. Driven through the built binary, because the disclosure is a
+// stderr-stream guarantee.
+#[test]
+fn a_store_recorded_at_another_root_builds_discloses_and_re_records() {
+    // The original workspace is kept alive for the store it holds, but the build runs against the
+    // second one below.
+    let (dir, db, _) = already_built_workspace();
+    let stub = write_indexing_stub(
+        dir.path(),
+        "rust-analyzer-indexing",
+        &support::provenance().analyzer_version,
+    );
+    let recorded_root = std::fs::canonicalize(dir.path()).unwrap();
+
+    // A second workspace holding byte-identical sources, so only the recorded root differs.
+    let elsewhere = tempfile::tempdir().unwrap();
+    write_manifest(elsewhere.path(), "Cargo.toml");
+    std::fs::create_dir_all(elsewhere.path().join("src")).unwrap();
+    std::fs::write(elsewhere.path().join(support::DOC), support::SOURCE).unwrap();
+    let new_root = std::fs::canonicalize(elsewhere.path()).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+        .arg("--db")
+        .arg(&db)
+        .args(["--workspace", "op-ws", "build"])
+        .arg(elsewhere.path())
+        .arg("--rust-analyzer")
+        .arg(&stub)
+        .args(["--language", "rust"])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "the handoff build succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let notice = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        notice.contains(recorded_root.to_str().unwrap()) && notice.contains(new_root.to_str().unwrap()),
+        "the handoff is disclosed naming both roots: {notice}"
+    );
+
+    let store = GraphStore::open(&db).unwrap();
+    let metadata = store.read_metadata().unwrap().expect("the handoff build re-recorded");
+    assert_eq!(
+        metadata.workspace_root.as_deref(),
+        new_root.to_str(),
+        "the store records the workspace it now describes"
     );
 }

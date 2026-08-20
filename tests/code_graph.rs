@@ -2833,6 +2833,7 @@ fn whole_document_span_on_non_module_stays_refused() {
 #[test]
 fn rust_doc_module_derived_from_whole_document_definition() {
     use silent_cartographer::graph::join::{SourceCorpus, module_by_document};
+    use silent_cartographer::graph::prepared::PreparedCorpus;
     use silent_cartographer::graph::syntax::Language;
     use silent_cartographer::identity::project_all;
     use silent_cartographer::identity::{DefinitionSite, ProjectionInput};
@@ -2863,8 +2864,9 @@ fn rust_doc_module_derived_from_whole_document_definition() {
     .map(Some)
     .collect();
     let corpus = SourceCorpus::new([("mymod.rs", source)]);
+    let prepared = PreparedCorpus::prepare(&corpus, Language::Rust);
 
-    let by_doc = module_by_document(&index, &identities, &corpus, Language::Rust);
+    let by_doc = module_by_document(&index, &identities, &prepared, Language::Rust);
     assert_eq!(
         by_doc.get("mymod.rs"),
         Some(&0),
@@ -5502,6 +5504,10 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
         vec![group_occ],
     );
     let corpus = SourceCorpus::new([("a.rs", a_source), ("b.rs", b_source), ("c.rs", c_source)]);
+    let prepared = silent_cartographer::graph::prepared::PreparedCorpus::prepare(
+        &corpus,
+        silent_cartographer::graph::syntax::Language::Rust,
+    );
     // The twins' identities as identity projection would assign them: shared base, `#<rank>` each.
     let identities = vec![
         Some(CanonicalId::from_raw("test-ws::dupcrate::Widget#0")),
@@ -5510,7 +5516,7 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
 
     let result = join(
         &index,
-        &corpus,
+        &prepared,
         &identities,
         silent_cartographer::graph::syntax::Language::Rust,
         &std::collections::HashMap::new(),
@@ -5535,7 +5541,7 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
     let no_identities = vec![None, None];
     let result = join(
         &index,
-        &corpus,
+        &prepared,
         &no_identities,
         silent_cartographer::graph::syntax::Language::Rust,
         &std::collections::HashMap::new(),

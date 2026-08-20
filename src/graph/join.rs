@@ -30,8 +30,9 @@ use std::collections::{HashMap, HashSet};
 use crate::identity::{CanonicalId, Descriptor, SegmentKind};
 use crate::semantic::model::{ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, SymbolKind};
 
-use super::range::{ByteSpan, LineIndex, range_to_span};
-use super::syntax::{AliasBinding, ConstructAt, Language, RangeShape, SyntaxDeclaration, SyntaxTree};
+use super::prepared::{PreparedCorpus, PreparedDocument};
+use super::range::{ByteSpan, range_to_span};
+use super::syntax::{ConstructAt, Language, RangeShape, SyntaxDeclaration, SyntaxTree};
 
 /// The named alignment rule that accepted an attribution. Stored as provenance on every aligned
 /// occurrence; each rule also carries its own acceptance bucket in the accounting.
@@ -299,18 +300,17 @@ impl<'a> SourceCorpus<'a> {
         }
     }
 
-    fn get(&self, path: &str) -> Option<&'a str> {
-        self.texts.get(path).copied()
+    /// Iterate the corpus's `(document_path, source_text)` pairs.
+    pub fn entries(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
+        self.texts.iter().map(|(path, text)| (*path, *text))
     }
 }
 
-/// A parsed document: its syntax tree, line index, and declared alias bindings, keyed for reuse
-/// across occurrences.
-struct PreparedDocument {
-    tree: SyntaxTree,
-    line_index: LineIndex,
-    alias_bindings: Vec<AliasBinding>,
-}
+/// The join's working view over the prepared corpus: the prepared documents the index actually
+/// references. Restricting to the index's documents keeps the join's outcomes — which document an
+/// occurrence reconciles against, and which documents the syntax-only accounting visits — a
+/// function of the index, not of whatever else the workspace happens to contain.
+type PreparedView<'a> = HashMap<&'a str, &'a PreparedDocument>;
 
 /// The position (into `index.symbols`) of the module symbol each document defines, dispatched by
 /// language on each definition occurrence's structural shape: Python's zero-width origin marker (a
@@ -327,7 +327,7 @@ struct PreparedDocument {
 pub fn module_by_document(
     index: &ExtractedIndex,
     identities: &[Option<CanonicalId>],
-    corpus: &SourceCorpus,
+    prepared: &PreparedCorpus,
     language: Language,
 ) -> HashMap<String, usize> {
     use crate::semantic::model::SourceRange;
@@ -346,14 +346,14 @@ pub fn module_by_document(
         let is_module_def = match language {
             Language::Python => def.range == SourceRange::new(0, 0, 0, 0),
             Language::Rust => {
-                let Some(source) = corpus.get(&def.document_path) else {
+                let Some(doc) = prepared.get(&def.document_path) else {
                     continue;
                 };
                 let Some(encoding) = index.encoding_for(&def.document_path) else {
                     continue;
                 };
-                let line_index = LineIndex::new(source);
-                let Some(span) = range_to_span(source, &line_index, def.range, encoding) else {
+                let source = doc.tree.source();
+                let Some(span) = range_to_span(source, &doc.line_index, def.range, encoding) else {
                     continue;
                 };
                 span.start == 0 && span.end == source.len()
@@ -376,28 +376,18 @@ pub fn module_by_document(
 /// document's own module.
 pub fn join(
     index: &ExtractedIndex,
-    corpus: &SourceCorpus,
+    corpus: &PreparedCorpus,
     identities: &[Option<CanonicalId>],
     language: Language,
     doc_module: &HashMap<String, usize>,
 ) -> JoinResult {
-    // Parse each referenced document once, as the index's language.
-    let mut prepared: HashMap<String, PreparedDocument> = HashMap::new();
-    for doc in &index.documents {
-        if let Some(source) = corpus.get(&doc.path)
-            && let Some(tree) = SyntaxTree::parse(source, language)
-        {
-            let alias_bindings = tree.alias_bindings();
-            prepared.insert(
-                doc.path.clone(),
-                PreparedDocument {
-                    tree,
-                    line_index: LineIndex::new(source),
-                    alias_bindings,
-                },
-            );
-        }
-    }
+    // The prepared documents the index references — the join reads syntax through the corpus's
+    // one-parse-per-document map rather than parsing anything itself.
+    let prepared: PreparedView<'_> = index
+        .documents
+        .iter()
+        .filter_map(|doc| corpus.get(&doc.path).map(|prepared| (doc.path.as_str(), prepared)))
+        .collect();
 
     let mut aligned = Vec::new();
     let mut unaligned = Vec::new();
@@ -427,7 +417,7 @@ pub fn join(
             // is inspectable.
             if is_duplicated && occ.role != OccurrenceRole::Definition {
                 accounting.duplicate_ambiguous += 1;
-                let span = prepared.get(&occ.document_path).and_then(|doc| {
+                let span = prepared.get(occ.document_path.as_str()).and_then(|doc| {
                     let encoding = index
                         .encoding_for(&occ.document_path)
                         .expect("document has an encoding");
@@ -444,7 +434,7 @@ pub fn join(
                 });
                 continue;
             }
-            let Some(doc) = prepared.get(&occ.document_path) else {
+            let Some(doc) = prepared.get(occ.document_path.as_str()) else {
                 // No source for the document: cannot reconcile, count as semantic-only.
                 accounting.semantic_only += 1;
                 unaligned.push(UnalignedOccurrence {
@@ -580,7 +570,7 @@ pub fn join(
         for occ in &group.occurrences {
             // Normalize the occurrence's location up front: the package-name check must read the
             // source token, and the alignment rules need the byte span.
-            let doc = prepared.get(&occ.document_path);
+            let doc = prepared.get(occ.document_path.as_str()).copied();
             let span = doc.and_then(|d| {
                 let encoding = index
                     .encoding_for(&occ.document_path)
@@ -728,7 +718,7 @@ pub fn join(
         }
         accounting.accept(AlignmentRule::ImportAlias);
         let enclosing = prepared
-            .get(&refusal.document_path)
+            .get(refusal.document_path.as_str())
             .map(|d| d.tree.enclosing_declarations(name_span.start))
             .unwrap_or_default();
         aligned_name_spans
@@ -749,8 +739,8 @@ pub fn join(
 
     // Syntax-only: declarations in a parsed document whose name node no aligned occurrence matched.
     for (path, doc) in &prepared {
-        let matched = aligned_name_spans.get(path).cloned().unwrap_or_default();
-        for decl in doc.tree.all_declarations() {
+        let matched = aligned_name_spans.get(*path).cloned().unwrap_or_default();
+        for decl in doc.declarations() {
             if !matched.contains(&decl.name_span) {
                 accounting.syntax_only += 1;
             }
@@ -773,14 +763,14 @@ pub fn join(
 /// bindings come from the refusal's own document — a binding declared elsewhere is never evidence.
 fn alias_acceptance(
     refusal: &UnalignedOccurrence,
-    prepared: &HashMap<String, PreparedDocument>,
+    prepared: &PreparedView<'_>,
     pass1_aligned_by_doc: &HashMap<String, Vec<(ByteSpan, CanonicalId)>>,
 ) -> Option<ByteSpan> {
     if refusal.role != OccurrenceRole::Reference {
         return None;
     }
     let span = refusal.span?;
-    let doc = prepared.get(&refusal.document_path)?;
+    let doc = prepared.get(refusal.document_path.as_str())?;
     let name_span = doc.tree.name_node_containing(span)?;
     let token = doc.tree.text_at(name_span)?;
     let aligned_here = pass1_aligned_by_doc.get(&refusal.document_path)?;
@@ -892,13 +882,13 @@ fn record_group_ambiguous(
     occ: &ExtractedOccurrence,
     group: &crate::semantic::model::DuplicateGroup,
     group_identity: &CanonicalId,
-    prepared: &HashMap<String, PreparedDocument>,
+    prepared: &PreparedView<'_>,
     index: &ExtractedIndex,
     accounting: &mut JoinAccounting,
     unaligned: &mut Vec<UnalignedOccurrence>,
 ) {
     accounting.duplicate_ambiguous += 1;
-    let span = prepared.get(&occ.document_path).and_then(|doc| {
+    let span = prepared.get(occ.document_path.as_str()).and_then(|doc| {
         let encoding = index
             .encoding_for(&occ.document_path)
             .expect("document has an encoding");
@@ -997,10 +987,7 @@ fn twin_symbols_by_descriptor<'a>(
 /// parent edge; zero (a crate root, declared by no one) or more than one (conflicting evidence)
 /// yields no entry — the chain stops there and the occurrence falls to duplicate-ambiguous, refusal
 /// over guessing.
-fn parent_document_map(
-    index: &ExtractedIndex,
-    prepared: &HashMap<String, PreparedDocument>,
-) -> HashMap<String, String> {
+fn parent_document_map(index: &ExtractedIndex, prepared: &PreparedView<'_>) -> HashMap<String, String> {
     // Every declaration-site document observed per definition document.
     let mut declared_from: HashMap<String, HashSet<String>> = HashMap::new();
     for symbol in &index.symbols {
@@ -1014,7 +1001,7 @@ fn parent_document_map(
             if occ.role != OccurrenceRole::Reference {
                 continue;
             }
-            let Some(doc) = prepared.get(&occ.document_path) else {
+            let Some(doc) = prepared.get(occ.document_path.as_str()) else {
                 continue;
             };
             let Some(encoding) = index.encoding_for(&occ.document_path) else {

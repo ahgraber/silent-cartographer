@@ -163,6 +163,51 @@ async def test_the_two_lifecycle_tools_do_not_read_each_other_s_confirmation(
     assert "c10r build" not in handler.prompts[0], handler.prompts
 
 
+async def test_a_forced_build_is_displayed_as_the_forced_command(fresh_server, fresh_workspace: Path) -> None:
+    """What the user is shown — and told to run in a shell — is the command that would run."""
+    result = await call(fresh_server, "build", {"force": True}, elicitation_handler=accept_elicitation)
+
+    assert result.is_error
+    assert untouched(fresh_workspace)
+    message = " ".join(block.text for block in result.content)
+    assert "c10r build --force" in message, message
+
+
+async def test_a_current_index_skips_and_force_rebuilds(fresh_server, fresh_workspace: Path) -> None:
+    """A repeat build passes the skip through, and `force` reaches the binary."""
+    first = await call(
+        fresh_server,
+        "build",
+        {"acknowledge": True},
+        era=MODERN_ERA,
+        elicitation_handler=accept_elicitation,
+    )
+    assert not first.is_error, first.content
+    assert first.structured_content["rebuilt"] is True, first.structured_content
+
+    # Nothing changed, so the second build reports the index already current.
+    second = await call(
+        fresh_server,
+        "build",
+        {"acknowledge": True},
+        era=MODERN_ERA,
+        elicitation_handler=accept_elicitation,
+    )
+    assert not second.is_error, second.content
+    assert second.structured_content["rebuilt"] is False, second.structured_content
+
+    # The forced build analyzes the same unchanged workspace: evidence `--force` was forwarded.
+    forced = await call(
+        fresh_server,
+        "build",
+        {"acknowledge": True, "force": True},
+        era=MODERN_ERA,
+        elicitation_handler=accept_elicitation,
+    )
+    assert not forced.is_error, forced.content
+    assert forced.structured_content["rebuilt"] is True, forced.structured_content
+
+
 async def test_the_handshake_era_asks_through_the_session(fresh_server, fresh_workspace: Path) -> None:
     """The handshake era's mechanism is used, and it reaches the client."""
     handler = RecordingElicitation()

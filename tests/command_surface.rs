@@ -409,6 +409,8 @@ fn clap_tree_matches_the_recorded_flag_vocabulary() {
         "rust-analyzer",
         "language",
         "environment",
+        // `build`'s override for a store that already describes the workspace.
+        "force",
         "discrepancies",
         "all",
         "duplicates",

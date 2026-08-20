@@ -438,4 +438,9 @@ pub struct BuildArgs {
     /// `$VIRTUAL_ENV` and the workspace's `.venv`/`venv` directories.
     #[arg(long)]
     pub environment: Option<PathBuf>,
+
+    /// Build even when the stored index already describes the workspace's sources, analyzer, and
+    /// environment. Without it, such a build analyzes nothing and leaves the store untouched.
+    #[arg(long)]
+    pub force: bool,
 }

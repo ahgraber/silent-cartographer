@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::exit::Failure;
 use crate::git::{GitError, GitRepo, SeedMode};
 use crate::graph::join::JoinAccounting;
-use crate::graph::store::{GraphStore, StoreOpenError};
+use crate::graph::store::{Freshness, GraphStore, StoreOpenError};
 use crate::graph::syntax::Language;
 use crate::graph::{content_hash, ingest};
 use crate::identity::WorkspaceId;
@@ -366,6 +366,7 @@ pub fn detect_language(explicit: Option<Language>, root: &Path) -> Result<Langua
 /// Every refusal — ambiguous or missing manifests, an unresolvable Python environment, an
 /// unavailable tool — happens before the store is opened, so a failed attempt leaves an existing
 /// store untouched.
+#[allow(clippy::too_many_arguments)] // the CLI's flat build-command surface travels together
 pub fn run_build(
     db: &Path,
     workspace: Option<&str>,
@@ -374,27 +375,53 @@ pub fn run_build(
     scip_python: &str,
     environment: Option<&Path>,
     language: Option<Language>,
-) -> Result<crate::graph::join::JoinAccounting> {
+    force: bool,
+) -> Result<BuildOutcome> {
     let workspace_id = resolve_workspace(workspace, root)?;
     let language = detect_language(language, root)?;
-    let (index, sources): (ExtractedIndex, Vec<(String, String)>) = match language {
-        Language::Rust => {
-            let adapter = RustAdapter::new(rust_analyzer)
-                .map_err(|e| Failure::IndexerSetup(format!("rust-analyzer unavailable: {e}")))?;
-            let index = adapter.analyze(root).map_err(|e| anyhow!("indexing failed: {e}"))?;
-            (index, collect_rust_sources(root)?)
-        }
+
+    // The analyzer is resolved before anything is analyzed, because its identity is one of the
+    // inputs the currency check compares — and resolving it once serves both the check and the
+    // analysis that may follow.
+    let engine: Box<dyn SemanticEngine> = match language {
+        Language::Rust => Box::new(
+            RustAdapter::new(rust_analyzer)
+                .map_err(|e| Failure::IndexerSetup(format!("rust-analyzer unavailable: {e}")))?,
+        ),
         Language::Python => {
             // $VIRTUAL_ENV is read here, at the outer edge; resolution itself is pure.
             let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
-            let environment = resolve_environment(environment, virtual_env.as_deref(), root)
+            let resolved = resolve_environment(environment, virtual_env.as_deref(), root)
                 .map_err(|e| Failure::IndexerSetup(format!("{e}")))?;
-            let adapter = PythonAdapter::new(scip_python, environment, workspace_id.as_str())
-                .map_err(|e| Failure::IndexerSetup(format!("{e}")))?;
-            let index = adapter.analyze(root).map_err(|e| anyhow!("indexing failed: {e}"))?;
-            (index, collect_python_sources(root)?)
+            Box::new(
+                PythonAdapter::new(scip_python, resolved, workspace_id.as_str())
+                    .map_err(|e| Failure::IndexerSetup(format!("{e}")))?,
+            )
         }
     };
+
+    let sources = match language {
+        Language::Rust => collect_rust_sources(root)?,
+        Language::Python => collect_python_sources(root)?,
+    };
+
+    // Nothing to do when the store already describes this workspace under this analyzer and
+    // environment: analyzing would reproduce the rows it already holds.
+    if !force
+        && let Some(accounting) = current_index_accounting(
+            db,
+            &workspace_id,
+            &sources,
+            engine.as_ref(),
+            language,
+            environment,
+            root,
+        )?
+    {
+        return Ok(BuildOutcome::AlreadyCurrent(accounting));
+    }
+
+    let index = engine.analyze(root).map_err(|e| anyhow!("indexing failed: {e}"))?;
     ensure_parent_dir(db)?;
     let workspace_root = canonical_root(root)?;
     // The write path replaces an incompatible store of its own outright: the index is derived,
@@ -403,7 +430,84 @@ pub fn run_build(
     disclose_workspace_handoff(&store, workspace_root.as_deref());
     let accounting = ingest(&mut store, &workspace_id, workspace_root.as_deref(), &index, &sources)
         .map_err(|e| anyhow!("ingest failed: {e}"))?;
-    Ok(accounting)
+    Ok(BuildOutcome::Rebuilt(accounting))
+}
+
+/// The outcome of a build request: the workspace was analyzed and the store rewritten, or the store
+/// already described the workspace and nothing was analyzed or written.
+///
+/// Both carry the same accounting — the freshly produced one, or the one the store recorded when it
+/// was built — so a caller renders one answer shape either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildOutcome {
+    /// The workspace was analyzed and the store rebuilt.
+    Rebuilt(crate::graph::join::JoinAccounting),
+    /// The stored index already described the workspace's sources, analyzer, and environment.
+    AlreadyCurrent(crate::graph::join::JoinAccounting),
+}
+
+impl BuildOutcome {
+    /// The join accounting the build produced, or the one the current store already recorded.
+    pub fn accounting(&self) -> crate::graph::join::JoinAccounting {
+        match self {
+            BuildOutcome::Rebuilt(accounting) | BuildOutcome::AlreadyCurrent(accounting) => *accounting,
+        }
+    }
+
+    /// Whether the workspace was analyzed and the store rewritten.
+    pub fn rebuilt(&self) -> bool {
+        matches!(self, BuildOutcome::Rebuilt(_))
+    }
+}
+
+/// The accounting recorded by a store that already describes `sources` under `engine`'s analyzer and
+/// the environment in effect, or `None` when a build is required.
+///
+/// A store that is absent, unreadable, carries no metadata, or was built at an incompatible schema
+/// version is not current — every one of those states means the build must run, so none of them is
+/// an error here.
+fn current_index_accounting(
+    db: &Path,
+    workspace: &WorkspaceId,
+    sources: &[(String, String)],
+    engine: &dyn SemanticEngine,
+    language: Language,
+    environment: Option<&Path>,
+    root: &Path,
+) -> Result<Option<crate::graph::join::JoinAccounting>> {
+    if !db.exists() {
+        return Ok(None);
+    }
+    let Ok(store) = GraphStore::open(db) else {
+        return Ok(None);
+    };
+    // One metadata read backs the whole check: ownership, the freshness comparison, and the
+    // returned accounting all describe the same recorded build, so a concurrent build committing
+    // mid-check cannot split the picture. Metadata that cannot be read — a corrupt row in a store
+    // `open` already recognized as the system's own — is not current: the rebuild re-records it,
+    // and a store the system must not replace was refused before this point.
+    let Ok(Some(metadata)) = store.read_metadata() else {
+        return Ok(None);
+    };
+    // A store recorded for another workspace describes different identities under the same source
+    // text, and taking it over is a disclosed, re-recording build — never a skip.
+    if &metadata.workspace_id != workspace || metadata.workspace_root != canonical_root(root)? {
+        return Ok(None);
+    }
+    // The declared environment is part of what a Python index resolves against, so a build compares
+    // it exactly as `status` does; the Rust backend declares none.
+    let environment_facts = match language {
+        Language::Rust => None,
+        Language::Python => {
+            let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
+            resolve_environment(environment, virtual_env.as_deref(), root)
+                .ok()
+                .and_then(|env| environment_facts(&env).ok())
+        }
+    };
+    let hash = content_hash(sources);
+    let fresh = crate::graph::store::freshness_of(&metadata, &hash, &engine.provenance(), environment_facts.as_ref());
+    Ok((fresh == Freshness::Fresh).then_some(metadata.accounting))
 }
 
 /// The canonicalized workspace root a build records and a query compares against, or `None` when the
@@ -475,6 +579,29 @@ pub fn build_accounting_line(accounting: &JoinAccounting) -> String {
         accounting.duplicate_ambiguous,
         accounting.syntax_only
     )
+}
+
+/// The human `build` answer: the accounting line for a build that ran, or a statement that the
+/// stored index already described the workspace and nothing was analyzed.
+pub fn build_outcome_line(outcome: &BuildOutcome) -> String {
+    match outcome {
+        BuildOutcome::Rebuilt(accounting) => build_accounting_line(accounting),
+        BuildOutcome::AlreadyCurrent(_) => {
+            "already current: sources, analyzer, and environment match the stored index; nothing built \
+             (use --force to build anyway)"
+                .to_string()
+        }
+    }
+}
+
+/// The structured `build` answer: the accounting projection, plus whether this invocation rebuilt
+/// the store or found it already current.
+pub fn build_outcome_json(outcome: &BuildOutcome) -> serde_json::Value {
+    let mut value = build_accounting_json(&outcome.accounting());
+    if let Some(object) = value.as_object_mut() {
+        object.insert("rebuilt".to_string(), serde_json::Value::Bool(outcome.rebuilt()));
+    }
+    value
 }
 
 /// The structured `build` accounting: the machine projection `--json build` emits, carrying every
