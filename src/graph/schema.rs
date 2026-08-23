@@ -17,12 +17,13 @@
 /// binary, and bumping this version makes every stale store refuse wholesale — no separate
 /// semantic-compatibility gate exists.
 ///
-/// Migration: version 14 added the semantic corpus (`semantic_corpus`, `semantic_lexical`,
-/// `semantic_vectors`), the clone-key columns on `symbols`, and the semantic-index identity in
-/// `index_metadata`. The index is derived, replayable
-/// data, so rebuild is the migration — a build replaces an older store of its own wholesale and a
-/// query refuses it with recovery guidance (the replace-or-refuse contract).
-pub const SCHEMA_VERSION: i64 = 14;
+/// Migration: version 15 reshaped `semantic_vectors` to one row per chunk (carrying its passage's
+/// identity and ordinal) and added the chunk parameters to `index_metadata`; version 14 added the
+/// semantic corpus (`semantic_corpus`, `semantic_lexical`, `semantic_vectors`), the clone-key
+/// columns on `symbols`, and the semantic-index identity in `index_metadata`. The index is derived,
+/// replayable data, so rebuild is the migration — a build replaces an older store of its own
+/// wholesale and a query refuses it with recovery guidance (the replace-or-refuse contract).
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -38,10 +39,12 @@ PRAGMA foreign_keys = ON;
 -- It is nullable: a root that is not valid UTF-8 cannot be recorded exactly, and a lossy rendering
 -- would let a different workspace compare equal, so it is recorded as absent instead.
 -- `workspace_id` stays a display name and is never compared.
--- `semantic_model_identity` and `corpus_definition_version` are the semantic-index identity in
--- effect at build time — the embedding model (compiled into the binary) and the corpus/render
--- definition that produced the build's semantic representations — retrievable as provenance and
--- carried on every semantic answer.
+-- `semantic_model_identity`, `corpus_definition_version`, `chunk_size`, and `chunk_overlap` are
+-- the semantic-index identity in effect at build time — the embedding model (compiled into the
+-- binary), the corpus/render definition, and the chunk parameters that produced the build's
+-- semantic representations — retrievable as provenance. The chunk parameters are the operator's
+-- values, so a build compares them when deciding whether stored vectors still describe the
+-- workspace.
 CREATE TABLE IF NOT EXISTS index_metadata (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version      INTEGER NOT NULL,
@@ -52,6 +55,8 @@ CREATE TABLE IF NOT EXISTS index_metadata (
     environment         TEXT,
     semantic_model_identity   TEXT    NOT NULL,
     corpus_definition_version INTEGER NOT NULL,
+    chunk_size                INTEGER NOT NULL,
+    chunk_overlap             INTEGER NOT NULL,
     content_hash                   TEXT    NOT NULL,
     aligned_exact_count            INTEGER NOT NULL DEFAULT 0,
     aligned_crate_root_count       INTEGER NOT NULL DEFAULT 0,
@@ -76,9 +81,10 @@ CREATE TABLE IF NOT EXISTS index_metadata (
 -- `duplicated` marks a true same-descriptor twin: an in-workspace definition whose identical
 -- resolved descriptor is shared by at least one other definition. Distinct descriptors whose
 -- canonical projections merely collide (and so carry a `#<rank>` disambiguator) are NOT duplicated.
--- `signature_text` and `interface_text` are the signature and interface tiers: the declaration form
--- without its body, and the signature together with the symbol's own documentation. Both are NULL
--- for externals and for in-workspace symbols carrying no definition span.
+-- `span_text`, `signature_text`, and `interface_text` are the three content tiers: the definition
+-- span's source verbatim, the declaration form without its body, and the signature together with the
+-- symbol's own documentation. The latter two are derived from the source; the body tier is the
+-- source. All three are NULL for externals and for in-workspace symbols carrying no definition span.
 -- `test_rule` is the per-symbol test classification: NULL means non-test; a rule name means the
 -- symbol is test code, with the convention rule that stamped it as provenance ('test_attribute',
 -- 'test_configuration', 'test_file', 'test_directory' — an open set a consumer must not treat as
@@ -162,23 +168,32 @@ CREATE TABLE IF NOT EXISTS join_discrepancies (
 );
 CREATE INDEX IF NOT EXISTS join_discrepancies_by_group ON join_discrepancies(outcome, expected_name);
 
--- The semantic corpus: one row per corpus-contributing symbol, holding the deterministic render its
--- representations derive from. A leaf's render carries its own source content; a container's its
--- interface tier. Wholly rewritten in the same transaction as each build. The rowid links each
--- entry to its vector row (`semantic_vectors`) and its lexical row (`semantic_lexical`).
+-- The semantic corpus: one row per corpus-contributing symbol — one passage — holding the
+-- deterministic render its representations derive from. A leaf's render carries its own source
+-- content; a container's its interface tier. Wholly rewritten in the same transaction as each
+-- build. The rowid links each passage to its vector row (`semantic_vectors`) and its lexical row
+-- (`semantic_lexical`).
 CREATE TABLE IF NOT EXISTS semantic_corpus (
     id        INTEGER PRIMARY KEY,
     symbol_id TEXT NOT NULL UNIQUE REFERENCES symbols(canonical_id),
     render    TEXT NOT NULL
 );
 
--- The lexical representation: FTS5/BM25 over the identifier-split words of each entry's render,
+-- The lexical representation: FTS5/BM25 over the identifier-split words of each passage's render,
 -- rowid-linked to `semantic_corpus`. The words are pre-split (camel-case and underscore compounds
 -- become plain words), so the default unicode61 tokenizer never mangles identifiers.
 CREATE VIRTUAL TABLE IF NOT EXISTS semantic_lexical USING fts5(words);
 
--- The vector representation: sqlite-vec KNN over the corpus embeddings, rowid-linked to
--- `semantic_corpus`. The embeddings are L2-normalized by the model, so the default L2 distance
--- orders identically to cosine similarity.
-CREATE VIRTUAL TABLE IF NOT EXISTS semantic_vectors USING vec0(embedding float[256]);
+-- The vector representation: sqlite-vec KNN over the chunk embeddings, one row per chunk. Each row
+-- carries its passage's identity (`passage_id`, the `semantic_corpus` rowid) and its ordinal within
+-- that passage as auxiliary columns. The embeddings are L2-normalized by the model, so the default
+-- L2 distance orders identically to cosine similarity. sqlite-vec names its own internal vector
+-- blocks "chunks" — hence its shadow tables `semantic_vectors_chunks` and
+-- `semantic_vectors_vector_chunks00` — a storage detail of the extension, unrelated to a chunk of
+-- passage text.
+CREATE VIRTUAL TABLE IF NOT EXISTS semantic_vectors USING vec0(
+    embedding float[256],
+    +passage_id INTEGER,
+    +ordinal INTEGER
+);
 "#;

@@ -8,6 +8,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::identity::{CanonicalId, WorkspaceId};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
 
+use super::chunk::ChunkParams;
 use super::join::JoinAccounting;
 use super::schema::{SCHEMA_SQL, SCHEMA_VERSION};
 
@@ -136,10 +137,10 @@ pub const DISCREPANCY_GROUP_CAP: usize = 50;
 /// corpus larger than this ranks the nearest `KNN_MAX_K` candidates rather than erroring.
 const KNN_MAX_K: usize = 4096;
 
-/// The widest frontier the dependents walk binds into a single query; a wider frontier is chunked
+/// The widest frontier the dependents walk binds into a single query; a wider frontier is batched
 /// across several queries within the same round. Held safely under SQLite's lowest historical
 /// bound-parameter limit (999) so the walk never fails on a hub symbol's frontier.
-const DEPENDENTS_FRONTIER_CHUNK: usize = 900;
+const DEPENDENTS_FRONTIER_BATCH: usize = 900;
 
 /// The maximum hop distance the dependents traversal walks.
 ///
@@ -258,27 +259,31 @@ pub struct IndexMetadata {
     /// The backend's declared interpreter-environment facts, if it declared any (`None` for the
     /// Rust adapter). Compared whole against the environment in effect by [`GraphStore::freshness`].
     pub environment: Option<EnvironmentFacts>,
+    /// The chunk parameters the build ran under, recorded as part of the semantic-index identity.
+    pub chunk_params: ChunkParams,
 }
 
-/// The semantic-index identity recorded with a build: the embedding model and the corpus/render
-/// definition that produced the build's semantic representations. Carried on every `search` and
-/// `similar` answer as provenance.
+/// The semantic-index identity recorded with a build: the embedding model, the corpus/render
+/// definition, and the chunk parameters that produced the build's semantic representations.
+/// Carried on every `search` and `similar` answer as provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticIndexIdentity {
     /// The embedding model identity (upstream repository at its vendored revision).
     pub model_identity: String,
     /// The corpus definition version the render derives under.
     pub corpus_definition_version: u32,
+    /// The chunk parameters the build ran under — the operator's values, not the release's.
+    pub chunk_params: ChunkParams,
 }
 
-/// One persisted semantic representation: a corpus entry's render together with its embedding
-/// bytes, keyed by its symbol identity.
+/// One persisted semantic representation: a passage's render together with the embedding bytes of
+/// its chunks in ordinal order, keyed by its symbol identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticRepresentation {
     /// The render text the representations derive from.
     pub render: String,
-    /// The embedding vector as little-endian `f32` bytes.
-    pub embedding: Vec<u8>,
+    /// The embedding vector of each chunk, ordinal order, as little-endian `f32` bytes.
+    pub embeddings: Vec<Vec<u8>>,
 }
 
 /// The freshness of the index relative to the sources, analyzer, and declared environment currently
@@ -701,9 +706,9 @@ impl GraphStore {
                  aligned_self_name_count, aligned_module_marker_count, aligned_import_alias_count,
                  aligned_range_literal_count, aligned_use_list_self_count, aligned_super_keyword_count,
                  text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count,
-                 semantic_model_identity, corpus_definition_version)
+                 semantic_model_identity, corpus_definition_version, chunk_size, chunk_overlap)
              VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                     ?22, ?23, ?24, ?25)",
+                     ?22, ?23, ?24, ?25, ?26, ?27)",
             params![
                 SCHEMA_VERSION,
                 meta.workspace_id.as_str(),
@@ -730,6 +735,8 @@ impl GraphStore {
                 meta.accounting.syntax_only as i64,
                 crate::graph::embed::MODEL_ID,
                 crate::graph::corpus::CORPUS_DEFINITION_VERSION as i64,
+                meta.chunk_params.chunk_size as i64,
+                meta.chunk_params.overlap as i64,
             ],
         )?;
         Ok(())
@@ -745,7 +752,7 @@ impl GraphStore {
                         aligned_self_name_count, aligned_module_marker_count, aligned_import_alias_count,
                         aligned_range_literal_count, aligned_use_list_self_count, aligned_super_keyword_count,
                         text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count,
-                        workspace_root
+                        workspace_root, chunk_size, chunk_overlap
                  FROM index_metadata WHERE id = 1",
                 [],
                 |r| {
@@ -763,6 +770,10 @@ impl GraphStore {
                     Ok(IndexMetadata {
                         workspace_id: WorkspaceId::new(r.get::<_, String>(0)?),
                         workspace_root: r.get(21)?,
+                        chunk_params: ChunkParams {
+                            chunk_size: r.get::<_, i64>(22)? as usize,
+                            overlap: r.get::<_, i64>(23)? as usize,
+                        },
                         provenance: AnalyzerProvenance {
                             analyzer_name: r.get(1)?,
                             analyzer_version: r.get(2)?,
@@ -797,50 +808,63 @@ impl GraphStore {
     pub fn semantic_index_identity(&self) -> rusqlite::Result<Option<SemanticIndexIdentity>> {
         self.conn
             .query_row(
-                "SELECT semantic_model_identity, corpus_definition_version FROM index_metadata WHERE id = 1",
+                "SELECT semantic_model_identity, corpus_definition_version, chunk_size, chunk_overlap
+                 FROM index_metadata WHERE id = 1",
                 [],
                 |r| {
                     Ok(SemanticIndexIdentity {
                         model_identity: r.get(0)?,
                         corpus_definition_version: r.get::<_, i64>(1)? as u32,
+                        chunk_params: ChunkParams {
+                            chunk_size: r.get::<_, i64>(2)? as usize,
+                            overlap: r.get::<_, i64>(3)? as usize,
+                        },
                     })
                 },
             )
             .optional()
     }
 
-    /// The persisted semantic representations, keyed by symbol identity.
+    /// The persisted semantic representations, keyed by symbol identity, each passage's chunk
+    /// embeddings in ordinal order.
     ///
-    /// The build reads this before [`Self::clear_derived`] so an entry whose render is unchanged
-    /// carries its embedding forward instead of re-embedding; tests read it to observe what a build
-    /// persisted.
+    /// The build reads this before [`Self::clear_derived`] so a passage whose render is unchanged
+    /// carries its embeddings forward instead of re-embedding; tests read it to observe what a
+    /// build persisted.
     pub fn semantic_representations(
         &self,
     ) -> rusqlite::Result<std::collections::HashMap<String, SemanticRepresentation>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.symbol_id, c.render, v.embedding
-             FROM semantic_corpus c JOIN semantic_vectors v ON v.rowid = c.id",
+             FROM semantic_corpus c JOIN semantic_vectors v ON v.passage_id = c.id
+             ORDER BY c.symbol_id, v.ordinal",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                SemanticRepresentation {
-                    render: r.get(1)?,
-                    embedding: r.get(2)?,
-                },
-            ))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?))
         })?;
-        rows.collect()
+        let mut out: std::collections::HashMap<String, SemanticRepresentation> = std::collections::HashMap::new();
+        for row in rows {
+            let (symbol, render, embedding) = row?;
+            out.entry(symbol)
+                .or_insert_with(|| SemanticRepresentation {
+                    render,
+                    embeddings: Vec::new(),
+                })
+                .embeddings
+                .push(embedding);
+        }
+        Ok(out)
     }
 
-    /// Insert one corpus entry with both its representations: the render row, the lexical row over
-    /// its identifier-split words, and the vector row, all sharing one rowid.
-    pub fn insert_corpus_entry(
+    /// Insert one passage with both its representations: the render row and the lexical row over
+    /// its identifier-split words sharing one rowid, and one vector row per chunk, each carrying
+    /// the passage's rowid and its ordinal within the passage.
+    pub fn insert_passage(
         &self,
         symbol_id: &CanonicalId,
         render: &str,
         words: &str,
-        embedding: &[u8],
+        chunk_embeddings: &[Vec<u8>],
     ) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO semantic_corpus (symbol_id, render) VALUES (?1, ?2)",
@@ -851,28 +875,29 @@ impl GraphStore {
             "INSERT INTO semantic_lexical (rowid, words) VALUES (?1, ?2)",
             params![rowid, words],
         )?;
-        self.conn.execute(
-            "INSERT INTO semantic_vectors (rowid, embedding) VALUES (?1, ?2)",
-            params![rowid, embedding],
-        )?;
+        for (ordinal, embedding) in chunk_embeddings.iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO semantic_vectors (embedding, passage_id, ordinal) VALUES (?1, ?2, ?3)",
+                params![embedding, rowid, ordinal as i64],
+            )?;
+        }
         Ok(())
     }
 
-    /// The persisted embedding of one corpus entry, as its stored bytes. `None` when the symbol
-    /// contributes no corpus entry.
-    pub fn semantic_vector_of(&self, id: &CanonicalId) -> rusqlite::Result<Option<Vec<u8>>> {
-        self.conn
-            .query_row(
-                "SELECT v.embedding FROM semantic_corpus c JOIN semantic_vectors v ON v.rowid = c.id
-                 WHERE c.symbol_id = ?1",
-                params![id.as_str()],
-                |r| r.get(0),
-            )
-            .optional()
+    /// The persisted embeddings of one passage's chunks, in ordinal order. Empty when the symbol
+    /// contributes no passage.
+    pub fn chunk_vectors_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<Vec<u8>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT v.embedding FROM semantic_corpus c JOIN semantic_vectors v ON v.passage_id = c.id
+             WHERE c.symbol_id = ?1
+             ORDER BY v.ordinal",
+        )?;
+        let rows = stmt.query_map(params![id.as_str()], |r| r.get(0))?;
+        rows.collect()
     }
 
-    /// The persisted render of one corpus entry — the text the lexical signal of a `similar` query
-    /// derives its word set from. `None` when the symbol contributes no corpus entry.
+    /// The persisted render of one passage — the text the lexical signal of a `similar` query
+    /// derives its word set from. `None` when the symbol contributes no passage.
     pub fn semantic_render_of(&self, id: &CanonicalId) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row(
@@ -883,15 +908,26 @@ impl GraphStore {
             .optional()
     }
 
-    /// The number of corpus entries in the persisted build.
+    /// The number of passages in the persisted build.
     pub fn corpus_size(&self) -> rusqlite::Result<u64> {
         self.conn
             .query_row("SELECT COUNT(*) FROM semantic_corpus", [], |r| r.get::<_, i64>(0))
             .map(|n| n as u64)
     }
 
-    /// The vector signal: the `k` nearest corpus entries to `query` (little-endian `f32` bytes), as
+    /// The number of chunk vectors in the persisted build — the dense candidate pool's full width.
+    pub fn chunk_count(&self) -> rusqlite::Result<u64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM semantic_vectors", [], |r| r.get::<_, i64>(0))
+            .map(|n| n as u64)
+    }
+
+    /// The vector signal: the nearest passages to `query` (little-endian `f32` bytes), as
     /// `(symbol, distance)` ordered nearest first, distance ties broken by canonical identity.
+    ///
+    /// The KNN pool is requested in chunks — `k` chunk rows — and deduplicated to symbols by best
+    /// chunk before returning, so a symbol scores as its most relevant part and gains nothing from
+    /// the number of chunks representing it.
     ///
     /// The embeddings are L2-normalized, so the L2 ordering is the cosine ordering. `k` is clamped
     /// to the extension's KNN ceiling: on a corpus larger than the ceiling the signal ranks the
@@ -899,20 +935,32 @@ impl GraphStore {
     /// candidates-not-completeness framing, never an error.
     pub fn vector_neighbors(&self, query: &[u8], k: usize) -> rusqlite::Result<Vec<(CanonicalId, f64)>> {
         let k = k.min(KNN_MAX_K);
+        // The KNN scan materializes first: sqlite-vec refuses any constraint on an auxiliary
+        // column inside a KNN query, and a plain join would push `passage_id` down into it.
         let mut stmt = self.conn.prepare(
-            "SELECT c.symbol_id, v.distance
-             FROM semantic_vectors v JOIN semantic_corpus c ON c.id = v.rowid
-             WHERE v.embedding MATCH ?1 AND k = ?2",
+            "WITH knn AS MATERIALIZED (
+                 SELECT passage_id, distance FROM semantic_vectors WHERE embedding MATCH ?1 AND k = ?2
+             )
+             SELECT c.symbol_id, knn.distance
+             FROM knn JOIN semantic_corpus c ON c.id = knn.passage_id",
         )?;
         let rows = stmt.query_map(params![query, k as i64], |r| {
             Ok((CanonicalId::from_raw(r.get::<_, String>(0)?), r.get::<_, f64>(1)?))
         })?;
-        let mut out: Vec<(CanonicalId, f64)> = rows.collect::<rusqlite::Result<_>>()?;
+        let mut best: std::collections::HashMap<CanonicalId, f64> = std::collections::HashMap::new();
+        for row in rows {
+            let (symbol, distance) = row?;
+            let entry = best.entry(symbol).or_insert(distance);
+            if distance < *entry {
+                *entry = distance;
+            }
+        }
+        let mut out: Vec<(CanonicalId, f64)> = best.into_iter().collect();
         out.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
         Ok(out)
     }
 
-    /// The lexical signal: the corpus entries matching an FTS5 `match_expr` over the identifier-split
+    /// The lexical signal: the passages matching an FTS5 `match_expr` over the identifier-split
     /// render words, as `(symbol, rank)` ordered best first (FTS5 `rank` ascends from best), rank
     /// ties broken by canonical identity.
     pub fn lexical_neighbors(&self, match_expr: &str, k: usize) -> rusqlite::Result<Vec<(CanonicalId, f64)>> {
@@ -1428,7 +1476,7 @@ impl GraphStore {
     /// nothing. Results are ordered by `(depth, kind order, identity)`.
     ///
     /// Each round expands the whole frontier level-at-a-time — one `IN`-list query over the
-    /// destination-keyed edge index, chunked at [`DEPENDENTS_FRONTIER_CHUNK`] bound parameters and
+    /// destination-keyed edge index, batched at [`DEPENDENTS_FRONTIER_BATCH`] bound parameters and
     /// merged before filtering, so a hub symbol's frontier cannot fail the query outright. Every
     /// symbol is expanded at most twice across the whole walk (once per distinct walk root it
     /// carries, see below) rather than once per depth or once per seed.
@@ -1469,17 +1517,17 @@ impl GraphStore {
             }
             let new_roots: HashMap<&str, RootPair> = frontier.iter().map(|(n, p)| (n.as_str(), *p)).collect();
 
-            // One level-at-a-time query per chunk: every dependency edge into the frontier.
+            // One level-at-a-time query per batch: every dependency edge into the frontier.
             let ids: Vec<&str> = frontier.iter().map(|(n, _)| n.as_str()).collect();
             let mut hops: Vec<(String, String, String)> = Vec::new();
-            for chunk in ids.chunks(DEPENDENTS_FRONTIER_CHUNK) {
-                let placeholders = vec!["?"; chunk.len()].join(", ");
+            for batch in ids.chunks(DEPENDENTS_FRONTIER_BATCH) {
+                let placeholders = vec!["?"; batch.len()].join(", ");
                 let sql = format!(
                     "SELECT src_id, kind, dst_id FROM edges \
                      WHERE kind IN ('uses', 'imports', 'type_hierarchy') AND dst_id IN ({placeholders})"
                 );
                 let mut stmt = self.conn.prepare(&sql)?;
-                let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter().copied()), |r| {
+                let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter().copied()), |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                 })?;
                 for row in rows {
@@ -2160,11 +2208,73 @@ mod tests {
                 content_hash: "hash".to_string(),
                 accounting: JoinAccounting::default(),
                 environment: None,
+                chunk_params: Default::default(),
             })
             .unwrap();
 
         let read = store.read_metadata().unwrap().expect("metadata present");
         assert_eq!(read.workspace_root.as_deref(), Some("/projects/ws"));
+    }
+
+    // The chunks of one passage round-trip with their ordinals, and the corpus table still holds
+    // exactly one row per symbol.
+    #[test]
+    fn chunk_vectors_round_trip_with_ordinals() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.insert_symbol(&symbol_at("ws::long", "doc.rs", 0, 10)).unwrap();
+        let id = CanonicalId::from_raw("ws::long".to_string());
+        let vector = |seed: f32| -> Vec<u8> {
+            let mut v = vec![0.0f32; 256];
+            v[0] = seed;
+            v.iter().flat_map(|x| x.to_le_bytes()).collect()
+        };
+        let chunks = vec![vector(1.0), vector(2.0), vector(3.0)];
+        store.insert_passage(&id, "render", "words", &chunks).unwrap();
+
+        assert_eq!(
+            store.chunk_vectors_of(&id).unwrap(),
+            chunks,
+            "ordinal order round-trips"
+        );
+        assert_eq!(store.corpus_size().unwrap(), 1, "one corpus row per symbol");
+        assert_eq!(store.chunk_count().unwrap(), 3, "one vector row per chunk");
+    }
+
+    // The recorded semantic-index identity carries the model identity, the corpus definition
+    // version, and the chunk parameters; two stores built under different parameters carry
+    // different identities.
+    #[test]
+    fn identity_carries_the_chunk_parameters() {
+        let metadata_with = |params: ChunkParams| IndexMetadata {
+            workspace_id: WorkspaceId::new("ws"),
+            workspace_root: Some("/ws".to_string()),
+            provenance: AnalyzerProvenance {
+                analyzer_name: "test".to_string(),
+                analyzer_version: "0".to_string(),
+            },
+            content_hash: "hash".to_string(),
+            accounting: JoinAccounting::default(),
+            environment: None,
+            chunk_params: params,
+        };
+        let params = ChunkParams {
+            chunk_size: 256,
+            overlap: 32,
+        };
+        let store = GraphStore::open_in_memory().unwrap();
+        store.write_metadata(&metadata_with(params)).unwrap();
+        let identity = store.semantic_index_identity().unwrap().expect("identity recorded");
+        assert_eq!(identity.model_identity, crate::graph::embed::MODEL_ID);
+        assert_eq!(
+            identity.corpus_definition_version,
+            crate::graph::corpus::CORPUS_DEFINITION_VERSION
+        );
+        assert_eq!(identity.chunk_params, params, "the operator's values are recorded");
+
+        let other = GraphStore::open_in_memory().unwrap();
+        other.write_metadata(&metadata_with(ChunkParams::default())).unwrap();
+        let other_identity = other.semantic_index_identity().unwrap().expect("identity recorded");
+        assert_ne!(identity, other_identity, "different parameters are distinguishable");
     }
 
     /// An in-workspace symbol row with a definition span, minimal in every other field.
@@ -2231,13 +2341,13 @@ mod tests {
         assert!(!store.holds_document("other.rs").unwrap());
     }
 
-    // A frontier wider than `DEPENDENTS_FRONTIER_CHUNK` is chunked across several queries within
+    // A frontier wider than `DEPENDENTS_FRONTIER_BATCH` is batched across several queries within
     // the same round, with results merged before filtering, and still answers correctly: a
-    // dependent reaching the frontier through every chunk is reported once at its shortest
+    // dependent reaching the frontier through every batch is reported once at its shortest
     // distance.
     #[test]
-    fn a_frontier_wider_than_the_chunk_limit_chunks_within_the_round() {
-        let n = DEPENDENTS_FRONTIER_CHUNK + 200;
+    fn a_frontier_wider_than_the_batch_limit_batches_within_the_round() {
+        let n = DEPENDENTS_FRONTIER_BATCH + 200;
         let store = GraphStore::open_in_memory().unwrap();
         let seed = CanonicalId::from_raw("ws::seed".to_string());
         let outer = CanonicalId::from_raw("ws::outer".to_string());

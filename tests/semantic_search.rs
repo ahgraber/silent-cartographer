@@ -29,6 +29,16 @@ fn engine_over<'a>(store: &'a GraphStore, srcs: &[(String, String)]) -> QueryEng
 /// A one-document store over Rust functions, each `(package-qualified name, whole source)` pair
 /// derived from `source` by locating each name's first occurrence.
 fn store_over(doc: &str, source: &str, names: &[&str]) -> (GraphStore, Vec<(String, String)>) {
+    store_over_with_params(doc, source, names, &Default::default())
+}
+
+/// [`store_over`] under explicit chunk parameters, for fixtures whose passages must split.
+fn store_over_with_params(
+    doc: &str,
+    source: &str,
+    names: &[&str],
+    params: &silent_cartographer::graph::chunk::ChunkParams,
+) -> (GraphStore, Vec<(String, String)>) {
     let symbols = names
         .iter()
         .map(|name| {
@@ -50,7 +60,7 @@ fn store_over(doc: &str, source: &str, names: &[&str]) -> (GraphStore, Vec<(Stri
     let index = one_doc_index(doc, symbols);
     let srcs = vec![(doc.to_string(), source.to_string())];
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &srcs).unwrap();
+    silent_cartographer::graph::ingest_with_params(&mut store, &ws(), Some(WS_ROOT), &index, &srcs, params).unwrap();
     (store, srcs)
 }
 
@@ -411,14 +421,24 @@ fn similar_order_is_the_fused_two_leg_ranking() {
     let (store, srcs) = clones_store();
     let subject = m1_alpha();
 
-    let subject_vector = store.semantic_vector_of(&subject).unwrap().unwrap();
+    let subject_vectors = store.chunk_vectors_of(&subject).unwrap();
+    assert!(!subject_vectors.is_empty(), "the subject is in the corpus");
     let corpus_size = store.corpus_size().unwrap() as usize;
-    let vector_ranks: Vec<CanonicalId> = store
-        .vector_neighbors(&subject_vector, corpus_size)
-        .unwrap()
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
+    let chunk_count = store.chunk_count().unwrap() as usize;
+    // The dense leg as the engine derives it: each subject chunk's neighbors (already best-chunk
+    // per candidate), min-merged across subject chunks — the best pair.
+    let mut best: std::collections::HashMap<CanonicalId, f64> = std::collections::HashMap::new();
+    for subject_vector in &subject_vectors {
+        for (id, distance) in store.vector_neighbors(subject_vector, chunk_count).unwrap() {
+            let entry = best.entry(id).or_insert(distance);
+            if distance < *entry {
+                *entry = distance;
+            }
+        }
+    }
+    let mut nearest: Vec<(CanonicalId, f64)> = best.into_iter().collect();
+    nearest.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+    let vector_ranks: Vec<CanonicalId> = nearest.into_iter().map(|(id, _)| id).collect();
     let render = store.semantic_render_of(&subject).unwrap().unwrap();
     let expr = subject_word_expr(&render).expect("a render spells words");
     let lexical_ranks: Vec<CanonicalId> = store
@@ -435,7 +455,7 @@ fn similar_order_is_the_fused_two_leg_ranking() {
 
     let rows = similar_rows(&store, &srcs, "m1::alpha");
     assert_eq!(rows.len(), expected.len(), "the answer spans the fused candidate set");
-    // The certainty tier reorders across classes but preserves the fused order within each class;
+    // The certainty class reorders across classes but preserves the fused order within each class;
     // restricted to the unmarked rows, the answer's order is exactly the fused order.
     let unmarked_in_answer: Vec<&String> = rows.iter().filter(|(_, m)| m.is_none()).map(|(id, _)| id).collect();
     let unmarked_ids: std::collections::HashSet<&String> = unmarked_in_answer.iter().copied().collect();
@@ -533,11 +553,11 @@ fn an_unresolved_position_subject_is_absent_with_no_marker() {
 }
 
 // _(A subject outside the corpus is typed absence with the marker)_ — a resolved subject that
-// contributes no corpus entry (an external symbol) has no representation to compare. The corpus
+// contributes no passage (an external symbol) has no representation to compare. The corpus
 // holds other symbols, so a ranking pass would have produced found rows: the empty answer can only
 // come from the no-representation return, and it carries the marker and provenance.
 #[test]
-fn a_subject_with_no_corpus_entry_is_typed_absence_with_the_marker() {
+fn a_subject_with_no_passage_is_typed_absence_with_the_marker() {
     let mut symbols = clone_symbols();
     symbols.push(one_occ_symbol(
         "depcrate",
@@ -609,12 +629,12 @@ fn a_corpus_larger_than_the_knn_cap_still_answers() {
                 test_rule: None,
             })
             .unwrap();
-        // A distinct unit vector per entry, varying in its first two components.
+        // A distinct unit vector per passage, varying in its first two components.
         let mut vector = vec![0.0f32; 256];
         vector[0] = (i as f32).cos();
         vector[1] = (i as f32).sin();
         let bytes = silent_cartographer::graph::embed::vector_bytes(&vector);
-        store.insert_corpus_entry(&id, "render", "words", &bytes).unwrap();
+        store.insert_passage(&id, "render", "words", &[bytes]).unwrap();
     }
 
     let query = silent_cartographer::graph::embed::vector_bytes(&{
@@ -665,6 +685,11 @@ fn the_machine_answer_carries_the_marker_and_provenance() {
     assert_eq!(answer["classification"], "estimation");
     assert_eq!(answer["semantic_index"]["model_identity"], MODEL_ID);
     assert!(answer["semantic_index"]["corpus_definition_version"].is_u64());
+    // The whole recorded identity rides the machine answer: the chunk parameters are the
+    // operator-variable part of the regime, so without them two stores built at different
+    // parameters would carry identical provenance.
+    assert!(answer["semantic_index"]["chunk_size"].is_u64());
+    assert!(answer["semantic_index"]["chunk_overlap"].is_u64());
     assert_eq!(answer["outcome"]["outcome"], "found");
 }
 
@@ -919,4 +944,119 @@ fn exit_codes_cover_success_empty_usage_and_no_index() {
     let missing = dir.path().join("missing.db");
     let no_index = c10r(&missing).args(["similar", "connect"]).output().unwrap();
     assert_eq!(no_index.status.code(), Some(3));
+}
+
+/// The multi-chunk fixture: long functions that split at a small chunk size. `alpha_walk` carries
+/// distinctive vocabulary only near its end; `beta_walk` and `gamma_walk` coincide in one region
+/// only; `plain_helper` is short and disjoint.
+const LONG_DOC: &str = "long.rs";
+
+fn long_source() -> String {
+    let filler = |tag: &str| -> String {
+        (0..40)
+            .map(|i| format!("    let {tag}_line_{i} = {i};\n"))
+            .collect::<String>()
+    };
+    let shared = "    let shared_quantile_sketch = merge_digest_centroids();\n    \
+                  let shared_rank_estimate = interpolate_quantile_rank();\n";
+    format!(
+        "pub fn alpha_walk() {{\n{a}    let glacier_melt_telemetry = 9;\n}}\n\n\
+         pub fn beta_walk() {{\n{b}{shared}}}\n\n\
+         pub fn gamma_walk() {{\n{g}{shared}}}\n\n\
+         pub fn plain_helper() {{ let tiny = 1; }}\n",
+        a = filler("alpha_step"),
+        b = filler("beta_hop"),
+        g = filler("gamma_leap"),
+    )
+}
+
+fn long_store() -> (GraphStore, Vec<(String, String)>) {
+    let source = long_source();
+    let (store, srcs) = store_over_with_params(
+        LONG_DOC,
+        &source,
+        &["alpha_walk", "beta_walk", "gamma_walk", "plain_helper"],
+        &silent_cartographer::graph::chunk::ChunkParams {
+            chunk_size: 64,
+            overlap: 0,
+        },
+    );
+    // The fixture only tests what it claims when the long passages actually split.
+    for name in ["alpha_walk", "beta_walk", "gamma_walk"] {
+        assert!(
+            store.chunk_vectors_of(&sem_id(name)).unwrap().len() > 1,
+            "{name} splits into several chunks under the small size"
+        );
+    }
+    (store, srcs)
+}
+
+// _(Scenario: Content late in a long symbol is findable)_ — distinctive content near the end of a
+// passage that exceeds the chunk size still surfaces the symbol, because a later chunk carries it.
+#[test]
+fn content_late_in_a_long_symbol_is_findable() {
+    let (store, srcs) = long_store();
+    let order = search_order(&store, &srcs, "glacier melt telemetry", Detail::Signature);
+    assert!(
+        order.contains(&sem_id("alpha_walk").as_str().to_string()),
+        "the long symbol surfaces for words drawn from its tail: {order:?}"
+    );
+}
+
+// _(Scenario: A multi-chunk symbol appears at most once)_ — a symbol whose several chunks all
+// match a query still contributes exactly one row.
+#[test]
+fn a_multi_chunk_symbol_appears_at_most_once() {
+    let (store, srcs) = long_store();
+    // "alpha step" words appear in every chunk of alpha_walk's body.
+    let order = search_order(&store, &srcs, "alpha step walk", Detail::Signature);
+    let alpha = sem_id("alpha_walk").as_str().to_string();
+    assert_eq!(
+        order.iter().filter(|id| **id == alpha).count(),
+        1,
+        "the multi-chunk symbol appears exactly once: {order:?}"
+    );
+    let mut unique = order.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), order.len(), "no symbol appears twice: {order:?}");
+}
+
+// _(Scenario: A multi-chunk subject excludes only itself)_ — the subject's own chunks contribute
+// no row of their own, and every other corpus symbol is still ranked.
+#[test]
+fn a_multi_chunk_subject_excludes_only_itself() {
+    let (store, srcs) = long_store();
+    let rows = similar_rows(&store, &srcs, "alpha_walk");
+    let ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        !ids.contains(&sem_id("alpha_walk").as_str()),
+        "the subject is not among its own neighbors: {ids:?}"
+    );
+    for other in ["beta_walk", "gamma_walk", "plain_helper"] {
+        assert!(
+            ids.contains(&sem_id(other).as_str()),
+            "{other} is still ranked: {ids:?}"
+        );
+    }
+}
+
+// _(Scenario: Symbols sharing one region rank as similar)_ — two passages that exceed the chunk
+// size and coincide in one region only rank as similar: the best pair is the shared region's
+// chunk pair, so the sharer ranks above a disjoint symbol.
+#[test]
+fn symbols_sharing_one_region_rank_as_similar() {
+    let (store, srcs) = long_store();
+    let rows = similar_rows(&store, &srcs, "beta_walk");
+    let ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+    let gamma = ids.iter().position(|id| *id == sem_id("gamma_walk").as_str());
+    let helper = ids.iter().position(|id| *id == sem_id("plain_helper").as_str());
+    let (gamma, helper) = (
+        gamma.expect("the region-sharer is among the rows"),
+        helper.expect("the disjoint symbol is among the rows"),
+    );
+    assert!(
+        gamma < helper,
+        "the symbol sharing a region ranks above the disjoint one: {ids:?}"
+    );
 }

@@ -3,7 +3,7 @@
 //!
 //! The renderer reads only fields already present on the answer — it never fetches new data, never
 //! reorders or filters results — so the human view and the JSON view can never disagree about
-//! membership or order. Content-bearing tiers (a signature, interface, or body) are printed as source
+//! membership or order. Content-bearing details (a signature, interface, or body) are printed as source
 //! text, never `Debug`-escaped, with only the terminal-injection / display-spoofing control class
 //! made visible as replacement characters ([`sanitize_content`]) so verbatim source cannot command
 //! the reader's terminal; the machine (`--json`) answer stays byte-exact. Styling is applied only to
@@ -42,12 +42,12 @@ pub fn sanitize(text: &str) -> String {
 /// Replace the terminal- and display-control characters [`sanitize`] does, but keep the source
 /// whitespace `\n`, `\t`, and `\r` intact.
 ///
-/// Content-bearing tier text (a signature, interface, or body, and the content projected onto a
+/// Content-bearing detail text (a signature, interface, or body, and the content projected onto a
 /// `trace`/`dependents` row) is rendered as source, so its own newlines, tabs, and carriage returns
 /// must survive — a CRLF file must not sprout replacement characters. Everything else in the
 /// injection-hazard class (ANSI/OSC escapes, C1 controls, bidirectional overrides) is still made
 /// visible as the replacement character: verbatim source text could otherwise command the reader's
-/// terminal, or later splice into a syntax-highlighter's control sequences. Applied to the tier value
+/// terminal, or later splice into a syntax-highlighter's control sequences. Applied to the content
 /// before any styling composition, the same discipline the structural [`sanitize`] follows.
 pub fn sanitize_content(text: &str) -> String {
     text.chars()
@@ -194,7 +194,7 @@ fn push_page(lines: &mut Vec<String>, page: &PageInfo, styled: bool) {
 /// answer type added later slots in by implementing this trait.
 pub trait HumanRender {
     /// Append the human rendering of a found result set to `lines`. `styled` gates structural styling
-    /// only; any source/tier text is appended verbatim.
+    /// only; any source text is appended verbatim.
     fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool)
     where
         Self: Sized;
@@ -310,7 +310,7 @@ impl HumanRender for SimilarItem {
     fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
         lines.push(results_header(results.len(), styled));
         for item in results {
-            // The clone marker renders on the row as deterministic fact — the certainty tier above
+            // The clone marker renders on the row as deterministic fact — the certainty class above
             // the estimated ranking — never as part of the estimation grade.
             let certainty = match item.clone_certainty {
                 Some(CloneCertainty::ExactClone) => "  [exact clone: identical token sequence]",
@@ -594,8 +594,8 @@ fn location_line(location: Option<&Location>) -> String {
     }
 }
 
-/// Append a content-bearing tier verbatim as a source block, or an honest "no content" line when the
-/// tier carries nothing (an external symbol, or a symbol with no persisted span).
+/// Append content verbatim as a source block, or an honest "no content" line when the row carries
+/// nothing at that detail (an external symbol, or a symbol with no persisted span).
 fn push_content(lines: &mut Vec<String>, content: Option<&str>) {
     match content {
         Some(text) => lines.push(sanitize_content(text)),
@@ -611,7 +611,7 @@ fn push_truncation(lines: &mut Vec<String>, truncated: bool) {
     }
 }
 
-/// Append a `get` content-window disclosure: which lines the window covers of the whole tier text,
+/// Append a `get` content-window disclosure: which lines the window covers of the whole content,
 /// and the literal recovery to name — the next window when more lines remain below, or the full-text
 /// recovery when the window already reaches the end (or was requested past it). Nothing is appended
 /// when the whole content is shown (`content_lines` is absent).

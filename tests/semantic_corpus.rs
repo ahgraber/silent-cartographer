@@ -4,10 +4,11 @@
 
 mod support;
 
+use silent_cartographer::graph::chunk::ChunkParams;
 use silent_cartographer::graph::corpus::CORPUS_DEFINITION_VERSION;
 use silent_cartographer::graph::embed::MODEL_ID;
-use silent_cartographer::graph::ingest;
 use silent_cartographer::graph::store::GraphStore;
+use silent_cartographer::graph::{ingest, ingest_with_params};
 use silent_cartographer::identity::{CanonicalId, Descriptor, DescriptorSegment, SegmentKind};
 
 use crate::support::{DOC, SOURCE, fixture_index, sources, ws};
@@ -53,11 +54,11 @@ fn open_id() -> CanonicalId {
     id_of(&[("net", SegmentKind::Module), ("open", SegmentKind::Method)])
 }
 
-// _(Every corpus entry is represented)_ — after a build, each in-workspace symbol with persisted
-// tier content contributes exactly one corpus entry, and each entry carries a vector representation
-// (256 little-endian f32s) and a lexical row its words are retrievable through.
+// _(Every passage is represented)_ — after a build, each in-workspace symbol with persisted tier
+// content contributes exactly one passage, and each passage carries at least one vector
+// representation (256 little-endian f32s each) and a lexical row its words are retrievable through.
 #[test]
-fn every_corpus_entry_carries_both_representations() {
+fn every_passage_carries_both_representations() {
     let store = ingest_fixture();
     let reps = store.semantic_representations().unwrap();
     let expected = [module_id(), client_id(), connect_id(), disconnect_id(), open_id()];
@@ -65,16 +66,19 @@ fn every_corpus_entry_carries_both_representations() {
     for id in &expected {
         let rep = reps
             .get(id.as_str())
-            .unwrap_or_else(|| panic!("{} contributes a corpus entry", id.as_str()));
+            .unwrap_or_else(|| panic!("{} contributes a passage", id.as_str()));
         assert!(!rep.render.is_empty());
-        assert_eq!(rep.embedding.len(), 256 * 4, "one f32 vector of the model's dimension");
+        assert!(!rep.embeddings.is_empty(), "at least one chunk vector per passage");
+        for embedding in &rep.embeddings {
+            assert_eq!(embedding.len(), 256 * 4, "one f32 vector of the model's dimension");
+        }
     }
     assert_eq!(store.corpus_size().unwrap(), expected.len() as u64);
     // The lexical representation is retrievable through an FTS match on a render word.
     let hits = store.lexical_neighbors("\"disconnect\"", 10).unwrap();
     assert!(
         hits.iter().any(|(id, _)| *id == disconnect_id()),
-        "the lexical signal indexes the entry's words"
+        "the lexical signal indexes the passage's words"
     );
 }
 
@@ -144,7 +148,10 @@ fn edited_symbol_reembeds_while_unchanged_sibling_carries_forward() {
         open_after.render.contains("reconnect_timeout"),
         "derived from the new content"
     );
-    assert_ne!(open_before.embedding, open_after.embedding, "re-embedded, not carried");
+    assert_ne!(
+        open_before.embeddings, open_after.embeddings,
+        "re-embedded, not carried"
+    );
 
     let connect_before = first.get(connect_id().as_str()).unwrap();
     let connect_after = second.get(connect_id().as_str()).unwrap();
@@ -207,8 +214,10 @@ fn failed_build_leaves_prior_representations_authoritative() {
     assert_eq!(store.semantic_representations().unwrap(), before);
 }
 
-// _(Identity recorded and retrievable)_ — after a build, the store's provenance carries the
-// embedding model identity and the corpus definition version that produced the representations.
+// _(Identity recorded and retrievable; defaults apply when unsupplied)_ — after a build, the
+// store's provenance carries the embedding model identity, the corpus definition version, and the
+// chunk parameters that produced the representations; a build run without explicit parameters
+// records the recommended defaults.
 #[test]
 fn semantic_index_identity_is_recorded() {
     let store = ingest_fixture();
@@ -218,13 +227,18 @@ fn semantic_index_identity_is_recorded() {
         .expect("a build records identity");
     assert_eq!(identity.model_identity, MODEL_ID);
     assert_eq!(identity.corpus_definition_version, CORPUS_DEFINITION_VERSION);
+    assert_eq!(
+        identity.chunk_params,
+        ChunkParams::default(),
+        "an unparameterized build records the recommended defaults"
+    );
 }
 
 // _(A name-only symbol contributes nothing)_ — a parameter-like symbol, whose name span matches no
-// declaration so every tier degrades to its bare name token, yields no corpus entry and no clone
+// declaration so every tier degrades to its bare name token, yields no passage and no clone
 // keys, while the real declaration beside it still contributes.
 #[test]
-fn a_name_only_symbol_contributes_no_entry_and_no_keys() {
+fn a_name_only_symbol_contributes_no_passage_and_no_keys() {
     use silent_cartographer::semantic::model::{OccurrenceRole, SourceRange, SymbolClass, SymbolKind};
 
     use crate::support::{id_of_pkg, line_col, one_doc_index, one_occ_symbol};
@@ -350,7 +364,7 @@ fn an_equal_span_module_still_contributes_interface_only() {
     let reps = store.semantic_representations().unwrap();
     let module_render = &reps
         .get(id_of_pkg("probecrate", &[("solo_mod", SegmentKind::Module)]).as_str())
-        .expect("the module contributes an entry")
+        .expect("the module contributes a passage")
         .render;
     assert!(
         !module_render.contains("leak_marker_body"),
@@ -364,10 +378,189 @@ fn an_equal_span_module_still_contributes_interface_only() {
             )
             .as_str(),
         )
-        .expect("the declaration contributes an entry")
+        .expect("the declaration contributes a passage")
         .render;
     assert!(
         child_render.contains("leak_marker_body"),
         "the declaration stays a leaf carrying its own body: {child_render}"
     );
+}
+
+/// A chunk size small enough that the fixture's `open` function splits into several chunks, yet
+/// large enough that its identity head fits the header budget untrimmed.
+fn small_params() -> ChunkParams {
+    ChunkParams {
+        chunk_size: 32,
+        overlap: 0,
+    }
+}
+
+// _(Parameters recorded with the build)_ — a build run with explicit chunk parameters records the
+// supplied values in the semantic-index identity, and its vectors derive from them: under a size
+// the long leaf exceeds, that passage is represented by several chunks.
+#[test]
+fn explicit_parameters_are_recorded_and_shape_the_vectors() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest_with_params(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &fixture_index(),
+        &sources(),
+        &small_params(),
+    )
+    .unwrap();
+
+    let identity = store.semantic_index_identity().unwrap().expect("identity recorded");
+    assert_eq!(
+        identity.chunk_params,
+        small_params(),
+        "the supplied values are recorded"
+    );
+    let open_vectors = store.chunk_vectors_of(&open_id()).unwrap();
+    assert!(open_vectors.len() > 1, "the long leaf splits under the small size");
+    assert!(
+        store.chunk_count().unwrap() > store.corpus_size().unwrap(),
+        "the vector table holds more chunks than passages"
+    );
+}
+
+// _(Changed parameters re-derive every vector)_ — rebuilding the same sources at a different chunk
+// size yields exactly the representations a fresh build at that size yields: no vector from the
+// prior regime survives, observable because a fresh store never held one.
+#[test]
+fn a_changed_chunk_size_rederives_every_vector() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &fixture_index(), &sources()).unwrap();
+    let before = store.semantic_representations().unwrap();
+    ingest_with_params(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &fixture_index(),
+        &sources(),
+        &small_params(),
+    )
+    .unwrap();
+    let after = store.semantic_representations().unwrap();
+
+    let mut fresh_store = GraphStore::open_in_memory().unwrap();
+    ingest_with_params(
+        &mut fresh_store,
+        &ws(),
+        Some(WS_ROOT),
+        &fixture_index(),
+        &sources(),
+        &small_params(),
+    )
+    .unwrap();
+    let fresh = fresh_store.semantic_representations().unwrap();
+
+    assert_eq!(after, fresh, "the rebuild equals a from-scratch build at the new size");
+    let open_after = after.get(open_id().as_str()).unwrap();
+    let open_before = before.get(open_id().as_str()).unwrap();
+    assert!(
+        open_after.embeddings.len() > 1,
+        "the long leaf splits under the new size"
+    );
+    assert_ne!(
+        open_before.embeddings, open_after.embeddings,
+        "the passage's vectors derive from the new chunk size"
+    );
+}
+
+// _(Rebuild over unchanged sources is idempotent — explicit-parameter arm)_ — a second build under
+// the same explicit parameters yields byte-identical representations through carry-forward.
+#[test]
+fn rebuild_under_unchanged_explicit_parameters_is_identical() {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest_with_params(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &fixture_index(),
+        &sources(),
+        &small_params(),
+    )
+    .unwrap();
+    let first = store.semantic_representations().unwrap();
+    ingest_with_params(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &fixture_index(),
+        &sources(),
+        &small_params(),
+    )
+    .unwrap();
+    let second = store.semantic_representations().unwrap();
+    assert_eq!(first, second);
+}
+
+// _(Every chunk carries its passage's header)_ — the persisted vectors of a split passage are
+// exactly the embeddings of the header-carrying chunks the splitter derives from the same tiers,
+// and each of those chunks opens with the passage's identity head.
+#[test]
+fn persisted_chunk_vectors_match_the_header_carrying_chunks() {
+    use silent_cartographer::graph::chunk::{PassageHeader, split_passage};
+    use silent_cartographer::graph::corpus::{CorpusSource, assemble};
+    use silent_cartographer::graph::embed::{embed, vector_bytes};
+    use silent_cartographer::graph::range::ByteSpan;
+    use silent_cartographer::graph::syntax::{Language, SyntaxTree};
+
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest_with_params(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &fixture_index(),
+        &sources(),
+        &small_params(),
+    )
+    .unwrap();
+
+    // Recompute the passage from the persisted tiers, exactly as the build assembles it.
+    let row = store.symbol(&open_id()).unwrap().expect("the leaf is persisted");
+    let source = CorpusSource {
+        canonical_id: &row.canonical_id,
+        display_name: &row.display_name,
+        kind: &row.kind,
+        document_path: row.document_path.as_deref(),
+        span: row.span.map(|(start, end)| ByteSpan { start, end }),
+        signature_text: row.signature_text.as_deref(),
+        interface_text: row.interface_text.as_deref(),
+        span_text: row.span_text.as_deref(),
+        contains_persisted: false,
+    };
+    let passages = assemble(&[source]);
+    let passage = &passages[0];
+    let tree = SyntaxTree::parse(SOURCE, Language::Rust).unwrap();
+    let (_, span) = passage
+        .content_location
+        .clone()
+        .expect("a leaf's content has a location");
+    let header = PassageHeader {
+        identity: &passage.header_identity,
+        documentation: passage.documentation.as_deref(),
+    };
+    let chunks = split_passage(&header, &passage.content, Some((&tree, span)), &small_params());
+
+    let stored = store.chunk_vectors_of(&open_id()).unwrap();
+    assert!(chunks.len() > 1, "the passage splits");
+    assert_eq!(stored.len(), chunks.len(), "one persisted vector per chunk");
+    for (chunk, stored_bytes) in chunks.iter().zip(&stored) {
+        assert!(
+            chunk.text.starts_with(&passage.header_identity),
+            "every chunk opens with the passage's identity head"
+        );
+        assert!(
+            silent_cartographer::graph::embed::count_tokens(&chunk.text) <= small_params().chunk_size,
+            "no chunk the build embeds exceeds the supplied size, header included"
+        );
+        assert_eq!(
+            *stored_bytes,
+            vector_bytes(&embed(&chunk.text)),
+            "the persisted vector is the embedding of the header-carrying chunk"
+        );
+    }
 }

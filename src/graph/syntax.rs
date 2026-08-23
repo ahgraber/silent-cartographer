@@ -306,6 +306,25 @@ impl SyntaxTree {
             .is_some()
     }
 
+    /// The byte spans of the named direct children of the smallest named node that covers `span`,
+    /// in source order, restricted to children lying wholly inside `span`.
+    ///
+    /// Empty when the covering node has no such children — the signal that the span offers no
+    /// syntax boundary within it. The chunk splitter descends through this accessor instead of
+    /// parsing, so splitting never re-parses a document the build already holds.
+    pub fn child_spans_within(&self, span: ByteSpan) -> Vec<ByteSpan> {
+        let root = self.tree.root_node();
+        let end = span.end.clamp(span.start, root.end_byte());
+        let Some(node) = root.named_descendant_for_byte_range(span.start, end) else {
+            return Vec::new();
+        };
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .map(span_of)
+            .filter(|child| span.contains(child))
+            .collect()
+    }
+
     /// The chain of persisted declarations enclosing `offset`, innermost first.
     ///
     /// Closures are not declaration kinds, so they never appear — a reference inside a closure

@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::exit::Failure;
 use crate::git::{GitError, GitRepo, SeedMode};
+use crate::graph::chunk::ChunkParams;
 use crate::graph::join::JoinAccounting;
 use crate::graph::store::{Freshness, GraphStore, StoreOpenError};
 use crate::graph::syntax::Language;
@@ -376,7 +377,25 @@ pub fn run_build(
     environment: Option<&Path>,
     language: Option<Language>,
     force: bool,
+    chunk_params: &ChunkParams,
 ) -> Result<BuildOutcome> {
+    // The chunk parameters are validated before anything is resolved or analyzed: a malformed pair
+    // is a usage error, and no build begins from it.
+    if chunk_params.chunk_size < crate::graph::chunk::MIN_CHUNK_SIZE {
+        return Err(Failure::Usage(format!(
+            "--chunk-size {} leaves no room for content beside a passage's header; the minimum is {}",
+            chunk_params.chunk_size,
+            crate::graph::chunk::MIN_CHUNK_SIZE
+        ))
+        .into());
+    }
+    if chunk_params.overlap >= chunk_params.chunk_size {
+        return Err(Failure::Usage(format!(
+            "--chunk-overlap {} must be smaller than --chunk-size {}",
+            chunk_params.overlap, chunk_params.chunk_size
+        ))
+        .into());
+    }
     let workspace_id = resolve_workspace(workspace, root)?;
     let language = detect_language(language, root)?;
 
@@ -405,8 +424,8 @@ pub fn run_build(
         Language::Python => collect_python_sources(root)?,
     };
 
-    // Nothing to do when the store already describes this workspace under this analyzer and
-    // environment: analyzing would reproduce the rows it already holds.
+    // Nothing to do when the store already describes this workspace under this analyzer,
+    // environment, and chunk parameters: analyzing would reproduce the rows it already holds.
     if !force
         && let Some(accounting) = current_index_accounting(
             db,
@@ -416,6 +435,7 @@ pub fn run_build(
             language,
             environment,
             root,
+            chunk_params,
         )?
     {
         return Ok(BuildOutcome::AlreadyCurrent(accounting));
@@ -428,8 +448,15 @@ pub fn run_build(
     // replayable data, so rebuild is the migration. A file c10r did not create is refused instead.
     let mut store = GraphStore::open_or_replace(db).context("opening index database")?;
     disclose_workspace_handoff(&store, workspace_root.as_deref());
-    let accounting = ingest(&mut store, &workspace_id, workspace_root.as_deref(), &index, &sources)
-        .map_err(|e| anyhow!("ingest failed: {e}"))?;
+    let accounting = crate::graph::ingest_with_params(
+        &mut store,
+        &workspace_id,
+        workspace_root.as_deref(),
+        &index,
+        &sources,
+        chunk_params,
+    )
+    .map_err(|e| anyhow!("ingest failed: {e}"))?;
     Ok(BuildOutcome::Rebuilt(accounting))
 }
 
@@ -460,12 +487,14 @@ impl BuildOutcome {
     }
 }
 
-/// The accounting recorded by a store that already describes `sources` under `engine`'s analyzer and
-/// the environment in effect, or `None` when a build is required.
+/// The accounting recorded by a store that already describes `sources` under `engine`'s analyzer,
+/// the environment in effect, and the chunk parameters in effect, or `None` when a build is
+/// required.
 ///
 /// A store that is absent, unreadable, carries no metadata, or was built at an incompatible schema
 /// version is not current — every one of those states means the build must run, so none of them is
 /// an error here.
+#[allow(clippy::too_many_arguments)] // the currency inputs travel together with the build's
 fn current_index_accounting(
     db: &Path,
     workspace: &WorkspaceId,
@@ -474,6 +503,7 @@ fn current_index_accounting(
     language: Language,
     environment: Option<&Path>,
     root: &Path,
+    chunk_params: &ChunkParams,
 ) -> Result<Option<crate::graph::join::JoinAccounting>> {
     if !db.exists() {
         return Ok(None);
@@ -505,6 +535,11 @@ fn current_index_accounting(
                 .and_then(|env| environment_facts(&env).ok())
         }
     };
+    // The chunk parameters are part of the semantic-index identity: a store built under different
+    // parameters holds vectors from a regime the requested build would not produce.
+    if metadata.chunk_params != *chunk_params {
+        return Ok(None);
+    }
     let hash = content_hash(sources);
     let fresh = crate::graph::store::freshness_of(&metadata, &hash, &engine.provenance(), environment_facts.as_ref());
     Ok((fresh == Freshness::Fresh).then_some(metadata.accounting))
@@ -723,6 +758,17 @@ pub fn run_status(
             "group_count": duplicated_groups.len(),
         },
     });
+
+    // The semantic-index identity in effect at build time, the chunk parameters included, rides
+    // status as provenance beside the analyzer's.
+    if let Some(identity) = store.semantic_index_identity()? {
+        report["semantic_index"] = serde_json::json!({
+            "model_identity": identity.model_identity,
+            "corpus_definition_version": identity.corpus_definition_version,
+            "chunk_size": identity.chunk_params.chunk_size,
+            "chunk_overlap": identity.chunk_params.overlap,
+        });
+    }
 
     // The workspace-relationship disclosure rides beside freshness, exactly as it does on a query
     // answer: absent on a match, present otherwise. `workspace` above is the store's display
@@ -1855,6 +1901,7 @@ mod tests {
                 content_hash: "hash".to_string(),
                 accounting: JoinAccounting::default(),
                 environment: None,
+                chunk_params: Default::default(),
             })
             .unwrap();
         store

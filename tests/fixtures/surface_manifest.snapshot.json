@@ -1,5 +1,5 @@
 {
-  "surface_version": 8,
+  "surface_version": 9,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -477,6 +477,18 @@
         {
           "name": "force",
           "takes_value": false,
+          "global": false
+        },
+        {
+          "name": "chunk-size",
+          "takes_value": true,
+          "default": "512",
+          "global": false
+        },
+        {
+          "name": "chunk-overlap",
+          "takes_value": true,
+          "default": "64",
           "global": false
         },
         {

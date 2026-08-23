@@ -1,23 +1,26 @@
-//! The semantic corpus: which symbols contribute an entry, and the deterministic per-symbol render
-//! that becomes the entry's content.
+//! The semantic corpus: which symbols contribute a passage, and the deterministic per-symbol render
+//! that becomes the passage's content.
 //!
 //! The corpus covers non-nested content only: a leaf (a symbol containing no other persisted
-//! symbol) contributes its own source content; a container contributes its interface tier. No entry
-//! derives from a container's full body — enclosure duplicates content at every level, so indexing
-//! nested bodies would double-count lexical statistics and return duplicate hits.
+//! symbol) contributes its own source content; a container contributes its interface tier. No
+//! passage derives from a container's full body — enclosure duplicates content at every level, so
+//! indexing nested bodies would double-count lexical statistics and return duplicate hits.
 //!
 //! The render front-loads retrieval evidence the raw source spells poorly: the symbol's name split
 //! into words (a compound name like `withBackoff` is findable as "with backoff" only if split), its
-//! kind, its module-path words, its signature, and its own documentation, followed by the entry's
+//! kind, its module-path words, its signature, and its own documentation, followed by the passage's
 //! content text. The same render feeds both the embedding and the lexical index, so both retrieval
 //! signals see the same evidence.
 
 use crate::identity::CanonicalId;
 
-/// The corpus definition version: the second half of the semantic-index identity, alongside the
-/// embedding model identity. Bumped whenever corpus membership or the render changes, and any bump
-/// ships with a schema-version bump so stores built under the old definition refuse wholesale.
-pub const CORPUS_DEFINITION_VERSION: u32 = 1;
+use super::range::ByteSpan;
+
+/// The corpus definition version: part of the semantic-index identity, alongside the embedding
+/// model identity and the chunk parameters. Bumped whenever corpus membership or the render
+/// changes, and any bump ships with a schema-version bump so stores built under the old definition
+/// refuse wholesale.
+pub const CORPUS_DEFINITION_VERSION: u32 = 2;
 
 /// The corpus-relevant view of one persisted in-workspace symbol.
 pub struct CorpusSource<'a> {
@@ -27,6 +30,10 @@ pub struct CorpusSource<'a> {
     pub display_name: &'a str,
     /// The persisted kind tag (`function`, `type`, `module`, …).
     pub kind: &'a str,
+    /// The document the definition sits in, if any — with `span`, where a leaf's content lives.
+    pub document_path: Option<&'a str>,
+    /// The definition span within that document, if any.
+    pub span: Option<ByteSpan>,
     /// The signature tier, when persisted.
     pub signature_text: Option<&'a str>,
     /// The interface tier, when persisted.
@@ -39,7 +46,7 @@ pub struct CorpusSource<'a> {
 }
 
 impl CorpusSource<'_> {
-    /// Whether this symbol contributes a corpus entry: its tier content is persisted, and that
+    /// Whether this symbol contributes a passage: its tier content is persisted, and that
     /// content is more than its own bare name token.
     ///
     /// A symbol whose every tier degraded to its name (a function parameter, an assignment name —
@@ -76,65 +83,90 @@ pub fn content_contributes(
     !name_only
 }
 
-/// One corpus entry: a symbol identity and the render text its representations derive from.
+/// One passage — the corpus's per-symbol unit: a symbol identity, the render text its
+/// representations derive from, and the render's parts as the chunk splitter consumes them.
+///
+/// The render is the parts joined by newlines: the header identity, the documentation, then the
+/// content. A passage whose whole render fits the chunk size embeds as exactly one chunk equal to
+/// its render.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CorpusEntry {
+pub struct Passage {
     /// The contributing symbol.
     pub symbol_id: CanonicalId,
-    /// The deterministic render text.
+    /// The deterministic render text — what the lexical index reads, whole.
     pub render: String,
+    /// The identity-bearing header head: name words, kind, module-path words, and signature.
+    pub header_identity: String,
+    /// The symbol's own documentation, when its tiers carry any.
+    pub documentation: Option<String>,
+    /// The content part: a leaf's own source, a container's interface tier.
+    pub content: String,
+    /// Where the content lives — document path and byte span — when it is exactly the symbol's
+    /// definition span (a leaf), so the splitter can read the document's syntax tree. `None` for
+    /// synthesized content, which divides on prose boundaries.
+    pub content_location: Option<(String, ByteSpan)>,
 }
 
-/// Assemble the corpus over the given symbols: one entry per eligible symbol, ordered by canonical
-/// identity so identical inputs always yield identical corpora regardless of input order.
+/// Assemble the corpus over the given symbols: one passage per eligible symbol, ordered by
+/// canonical identity so identical inputs always yield identical corpora regardless of input order.
 ///
 /// Eligibility is [`CorpusSource::contributes`]: tier content persisted, and more than the bare
-/// name token. A leaf's entry content is its own source; a container's is its interface tier, so
-/// no entry ever derives from a container's full body.
-pub fn assemble(sources: &[CorpusSource<'_>]) -> Vec<CorpusEntry> {
-    let mut entries: Vec<CorpusEntry> = sources
-        .iter()
-        .filter(|s| s.contributes())
-        .map(|s| CorpusEntry {
-            symbol_id: s.canonical_id.clone(),
-            render: render(s),
-        })
-        .collect();
-    entries.sort_by(|a, b| a.symbol_id.as_str().cmp(b.symbol_id.as_str()));
-    entries.dedup_by(|a, b| a.symbol_id == b.symbol_id);
-    entries
+/// name token. A leaf's passage content is its own source; a container's is its interface tier, so
+/// no passage ever derives from a container's full body.
+pub fn assemble(sources: &[CorpusSource<'_>]) -> Vec<Passage> {
+    let mut passages: Vec<Passage> = sources.iter().filter(|s| s.contributes()).map(passage_of).collect();
+    passages.sort_by(|a, b| a.symbol_id.as_str().cmp(b.symbol_id.as_str()));
+    passages.dedup_by(|a, b| a.symbol_id == b.symbol_id);
+    passages
 }
 
-/// The deterministic render for one symbol: name words, kind, module-path words, signature, own
-/// documentation, then the entry's content text (leaf body or container interface).
-fn render(source: &CorpusSource<'_>) -> String {
-    let mut parts: Vec<String> = Vec::new();
+/// The deterministic passage for one symbol. The render is name words, kind, module-path words,
+/// signature, own documentation, then the content text (leaf body or container interface), joined
+/// by newlines; the same parts are carried separately for the chunk splitter.
+fn passage_of(source: &CorpusSource<'_>) -> Passage {
+    let mut head: Vec<String> = Vec::new();
     let name_words = split_words(source.display_name);
     if !name_words.is_empty() {
-        parts.push(name_words.join(" "));
+        head.push(name_words.join(" "));
     }
-    parts.push(source.kind.to_string());
+    head.push(source.kind.to_string());
     let path_words = module_path_words(source.canonical_id);
     if !path_words.is_empty() {
-        parts.push(path_words.join(" "));
+        head.push(path_words.join(" "));
     }
     if let Some(sig) = source.signature_text {
-        parts.push(sig.to_string());
+        head.push(sig.to_string());
     }
-    if let Some(docs) = own_documentation(source.signature_text, source.interface_text) {
-        parts.push(docs);
-    }
-    let content = if source.contains_persisted {
+    let header_identity = head.join("\n");
+    let documentation = own_documentation(source.signature_text, source.interface_text);
+    let (content, content_location) = if source.contains_persisted {
         // A container's content is its interface tier; its signature tier is the fallback for the
-        // degenerate shapes whose tiers collapsed to the same text.
-        source.interface_text.or(source.signature_text)
+        // degenerate shapes whose tiers collapsed to the same text. Synthesized text, so no
+        // document location.
+        (source.interface_text.or(source.signature_text), None)
     } else {
-        source.span_text
+        let location = source
+            .document_path
+            .zip(source.span)
+            .map(|(path, span)| (path.to_string(), span));
+        (source.span_text, source.span_text.and(location))
     };
-    if let Some(content) = content {
-        parts.push(content.to_string());
+    let content = content.unwrap_or_default().to_string();
+    let mut render_parts: Vec<&str> = vec![&header_identity];
+    if let Some(docs) = &documentation {
+        render_parts.push(docs);
     }
-    parts.join("\n")
+    if !content.is_empty() {
+        render_parts.push(&content);
+    }
+    Passage {
+        symbol_id: source.canonical_id.clone(),
+        render: render_parts.join("\n"),
+        header_identity,
+        documentation,
+        content,
+        content_location,
+    }
 }
 
 /// The symbol's own documentation, recovered from its tier pair.
@@ -215,12 +247,14 @@ mod tests {
         CanonicalId::from_raw(raw)
     }
 
-    /// A leaf declaration's entry derives from its own source content and identity.
+    /// A leaf declaration's passage derives from its own source content and identity.
     #[test]
     fn leaf_contributes_its_own_content() {
         let leaf_id = id("ws::app::retry::with_backoff");
         let sources = [CorpusSource {
             canonical_id: &leaf_id,
+            document_path: None,
+            span: None,
             display_name: "with_backoff",
             kind: "function",
             signature_text: Some("fn with_backoff(tries: u32)"),
@@ -240,8 +274,8 @@ mod tests {
         assert!(corpus[0].render.contains("Retry a call with exponential backoff."));
     }
 
-    /// A container's entry derives from its interface tier; no entry carries its members' bodies
-    /// through it, so nothing in the corpus derives from a container's full body.
+    /// A container's passage derives from its interface tier; no passage carries its members'
+    /// bodies through it, so nothing in the corpus derives from a container's full body.
     #[test]
     fn container_contributes_interface_only() {
         let type_id = id("ws::app::Client");
@@ -249,6 +283,8 @@ mod tests {
         let sources = [
             CorpusSource {
                 canonical_id: &type_id,
+                document_path: None,
+                span: None,
                 display_name: "Client",
                 kind: "type",
                 signature_text: Some("struct Client"),
@@ -258,6 +294,8 @@ mod tests {
             },
             CorpusSource {
                 canonical_id: &method_id,
+                document_path: None,
+                span: None,
                 display_name: "send",
                 kind: "method",
                 signature_text: Some("fn send(&self)"),
@@ -273,13 +311,15 @@ mod tests {
         assert!(!container.render.contains("wire_bytes_out"));
     }
 
-    /// A module's entry derives from its interface tier (qualified name plus module documentation),
-    /// never from the whole document.
+    /// A module's passage derives from its interface tier (qualified name plus module
+    /// documentation), never from the whole document.
     #[test]
-    fn module_entry_excludes_member_bodies() {
+    fn module_passage_excludes_member_bodies() {
         let module_id = id("ws::app::retry");
         let sources = [CorpusSource {
             canonical_id: &module_id,
+            document_path: None,
+            span: None,
             display_name: "retry",
             kind: "module",
             signature_text: Some("app::retry"),
@@ -304,6 +344,8 @@ mod tests {
         let sources = [
             CorpusSource {
                 canonical_id: &external_id,
+                document_path: None,
+                span: None,
                 display_name: "Serialize",
                 kind: "trait",
                 signature_text: None,
@@ -313,6 +355,8 @@ mod tests {
             },
             CorpusSource {
                 canonical_id: &leaf_id,
+                document_path: None,
+                span: None,
                 display_name: "main",
                 kind: "function",
                 signature_text: Some("fn main()"),
@@ -334,6 +378,8 @@ mod tests {
         let param_id = id("ws::app::shout::word");
         let sources = [CorpusSource {
             canonical_id: &param_id,
+            document_path: None,
+            span: None,
             display_name: "word",
             kind: "other",
             signature_text: Some("word"),
@@ -352,6 +398,8 @@ mod tests {
         let b_id = id("ws::app::beta");
         let make = |canonical_id, name| CorpusSource {
             canonical_id,
+            document_path: None,
+            span: None,
             display_name: name,
             kind: "function",
             signature_text: Some("fn x()"),

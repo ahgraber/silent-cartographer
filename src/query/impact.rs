@@ -597,6 +597,7 @@ mod tests {
                 content_hash: content_hash.to_string(),
                 accounting: JoinAccounting::default(),
                 environment: None,
+                chunk_params: Default::default(),
             })
             .unwrap();
     }

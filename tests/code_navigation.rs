@@ -1,4 +1,4 @@
-//! Code-navigation tests: reference resolution across tiers, `get` at each detail, `trace` over the
+//! Code-navigation tests: reference resolution across its forms, `get` at each detail, `trace` over the
 //! supported relations, and the calibrated output contract.
 
 mod support;
@@ -724,7 +724,7 @@ fn trace_default_detail_carries_no_content() {
 }
 
 // _(Scenario: Trace at signature detail)_ — `trace` over `references` at signature detail carries
-// each row's tier content.
+// each row's signature tier.
 #[test]
 fn trace_signature_detail_carries_tier_content() {
     use silent_cartographer::query::TraceItem;

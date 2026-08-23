@@ -1257,8 +1257,8 @@ fn syntax_only_construct_is_counted_without_fabricated_identity() {
     assert!(store.symbols_by_shortname("disconnect").unwrap().is_empty());
 }
 
-// _(Lossless symbol persistence)_ — a persisted symbol returns the same identity, occurrence set, and
-// exact span text.
+// _(Scenario: The body tier is the definition span verbatim)_ — a persisted symbol returns the same
+// identity, occurrence set, and exact span text: the body tier is the source, unaltered.
 #[test]
 fn symbol_round_trips_with_exact_span_text() {
     let store = ingest_fixture();
@@ -1273,7 +1273,8 @@ fn symbol_round_trips_with_exact_span_text() {
 }
 
 // _(Tier content round-trips)_ — a symbol inserted with signature and interface tier content reads
-// both back unchanged; a symbol inserted with no tier content reads both back as absent.
+// both back unchanged; a symbol inserted with neither reads both back as absent. The body tier is
+// covered by the span-text round-trip above.
 #[test]
 fn tier_content_round_trips_and_nulls_read_back_as_absent() {
     let store = GraphStore::open_in_memory().unwrap();
@@ -1469,6 +1470,7 @@ fn environment_provenance_round_trips_through_metadata() {
         content_hash: "hash".to_string(),
         accounting: Default::default(),
         environment: Some(env_facts("fp-a")),
+        chunk_params: Default::default(),
     };
     store.write_metadata(&meta).unwrap();
     let read = store.read_metadata().unwrap().expect("metadata present");
@@ -1519,6 +1521,7 @@ fn module_name_count_rides_metadata() {
         content_hash: "hash".to_string(),
         accounting,
         environment: None,
+        chunk_params: Default::default(),
     };
     store.write_metadata(&meta).unwrap();
     let read = store.read_metadata().unwrap().expect("metadata present");
@@ -1563,6 +1566,7 @@ fn new_rule_counts_ride_metadata() {
         content_hash: "hash".to_string(),
         accounting,
         environment: None,
+        chunk_params: Default::default(),
     };
     store.write_metadata(&meta).unwrap();
     let read = store.read_metadata().unwrap().expect("metadata present");

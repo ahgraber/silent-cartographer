@@ -15,7 +15,7 @@ use serde::Serialize;
 /// A snapshot test (`tests/surface_manifest.rs`) pins the derived structure to a checked-in fixture
 /// and fails when it changes; the documented remedy is to regenerate the fixture and bump this
 /// constant in the same change, so the surface can never drift silently.
-pub const SURFACE_VERSION: u32 = 8;
+pub const SURFACE_VERSION: u32 = 9;
 
 /// Where the prose `manifest` omits actually lives, so a caller reading the structural index knows
 /// where to find it.

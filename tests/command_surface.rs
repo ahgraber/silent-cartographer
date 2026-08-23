@@ -168,6 +168,60 @@ fn usage_error_takes_precedence_over_a_missing_index() {
     assert!(!db.exists(), "the rejected invocation created no index");
 }
 
+// _(Scenario: An overlap that is not smaller than the chunk size is refused)_ — the pair is
+// validated before anything is resolved or analyzed, so the refusal is a usage error and no build
+// is performed.
+#[test]
+fn an_overlap_not_smaller_than_the_chunk_size_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+
+    let out = c10r()
+        .current_dir(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .args(["build", "--chunk-size", "128", "--chunk-overlap", "128"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an overlap equal to the chunk size is a usage error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--chunk-overlap"),
+        "the refusal names the malformed pair: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!db.exists(), "the rejected invocation performed no build");
+}
+
+// _(Scenario: A chunk size leaving no room for content is refused)_ — a size that cannot admit
+// content beside a passage's header is rejected as a usage error before any build begins.
+#[test]
+fn a_chunk_size_leaving_no_room_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+
+    let out = c10r()
+        .current_dir(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .args(["build", "--chunk-size", "1"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a chunk size leaving no room for content is a usage error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!db.exists(), "the rejected invocation performed no build");
+}
+
 // _(Exit-code taxonomy: absent index is distinct)_ — a query against a directory with no built index
 // exits with the no-index code, and creates no index as a side effect.
 #[test]
@@ -411,6 +465,10 @@ fn clap_tree_matches_the_recorded_flag_vocabulary() {
         "environment",
         // `build`'s override for a store that already describes the workspace.
         "force",
+        // `build`'s chunk parameters: the bound on each embedded chunk, and the overlap between
+        // adjacent chunks of one passage.
+        "chunk-size",
+        "chunk-overlap",
         "discrepancies",
         "all",
         "duplicates",

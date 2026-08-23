@@ -244,8 +244,8 @@ pub struct TraceArgs {
     #[arg(long)]
     pub depth: Option<u32>,
 
-    /// Project each result row's tier content at this detail, in addition to its identity and
-    /// location. Omitted, rows carry no tier content and the output shape is unchanged; the flag
+    /// Project each result row's content at this detail, in addition to its identity and
+    /// location. Omitted, rows carry no content and the output shape is unchanged; the flag
     /// never changes which rows are returned or their order.
     #[arg(long, value_enum)]
     pub detail: Option<DetailArg>,
@@ -258,7 +258,7 @@ pub struct TraceArgs {
     pub order: OrderArg,
 
     /// Cap the lines of content projected onto each row, for a content-bearing detail. Defaults to
-    /// 10; `0` means unbounded. Applies only when `--detail` selects a content-bearing tier.
+    /// 10; `0` means unbounded. Applies only when `--detail` selects a content-bearing level.
     #[arg(long, default_value_t = 10)]
     pub max_lines: usize,
 
@@ -282,7 +282,7 @@ pub struct SearchArgs {
     /// The natural-language query describing what the code does.
     pub query: String,
 
-    /// Project each result row's tier content at this detail. Never changes which symbols are
+    /// Project each result row's content at this detail. Never changes which symbols are
     /// returned or their order.
     #[arg(long, value_enum, default_value = "signature")]
     pub detail: DetailArg,
@@ -309,7 +309,7 @@ pub struct SimilarArgs {
     #[arg(long)]
     pub at: Option<String>,
 
-    /// Project each result row's tier content at this detail. Never changes which symbols are
+    /// Project each result row's content at this detail. Never changes which symbols are
     /// returned or their order.
     #[arg(long, value_enum, default_value = "signature")]
     pub detail: DetailArg,
@@ -325,7 +325,7 @@ pub struct SimilarArgs {
 
 /// Arguments for `impact`.
 ///
-/// `impact` carries no `--detail`/`--max-lines`: it projects no tier content onto its rows.
+/// `impact` carries no `--detail`/`--max-lines`: it projects no content onto its rows.
 #[derive(Debug, Args)]
 pub struct ImpactArgs {
     /// The revision or revision range to seed from (`A..B`, `A...B`, or a single revision, which
@@ -443,4 +443,14 @@ pub struct BuildArgs {
     /// environment. Without it, such a build analyzes nothing and leaves the store untouched.
     #[arg(long)]
     pub force: bool,
+
+    /// The chunk size in model tokens: the bound on the whole text embedded per chunk, the
+    /// passage's header included. A passage exceeding it is represented by several chunks.
+    #[arg(long, default_value_t = crate::graph::chunk::DEFAULT_CHUNK_SIZE)]
+    pub chunk_size: usize,
+
+    /// The overlap between adjacent chunks of one passage, in model tokens. Must be smaller than
+    /// the chunk size.
+    #[arg(long, default_value_t = crate::graph::chunk::DEFAULT_CHUNK_OVERLAP)]
+    pub chunk_overlap: usize,
 }

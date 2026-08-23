@@ -37,7 +37,7 @@ pub enum CloneCertainty {
     VariantClone,
 }
 
-/// One `search` result row: a corpus symbol at its estimated-relevance position, carrying tier
+/// One `search` result row: a corpus symbol at its estimated-relevance position, carrying its
 /// content at the requested detail.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SearchItem {
@@ -46,7 +46,7 @@ pub struct SearchItem {
     /// The symbol's definition location.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
-    /// The symbol's tier content at the requested detail; absent at location detail.
+    /// The symbol's content at the requested detail; absent at location detail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Whether that content was truncated by the `--max-lines` bound.
@@ -67,7 +67,7 @@ pub struct SimilarItem {
     /// The symbol's definition location.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
-    /// The symbol's tier content at the requested detail; absent at location detail.
+    /// The symbol's content at the requested detail; absent at location detail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Whether that content was truncated by the `--max-lines` bound.
@@ -95,10 +95,12 @@ impl QueryEngine<'_> {
         }
 
         // Both signals rank the full corpus; RRF needs whole rank lists, and the corpus is repo-scale.
+        // The dense pool is requested in chunks — the store deduplicates to symbols by best chunk.
+        let chunk_count = self.store.chunk_count()? as usize;
         let query_vector = embed::vector_bytes(&embed::embed(query));
         let vector_ranks: Vec<CanonicalId> = self
             .store
-            .vector_neighbors(&query_vector, corpus_size)?
+            .vector_neighbors(&query_vector, chunk_count)?
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -126,7 +128,7 @@ impl QueryEngine<'_> {
 
     /// `similar`: the corpus symbols most similar in content to a subject symbol, most similar
     /// first — the same two-signal RRF hybrid `search` uses (the subject's vector neighbors fused
-    /// with BM25 over the subject's render words), beneath the deterministic clone-certainty tier.
+    /// with BM25 over the subject's render words), beneath the deterministic clone-certainty class.
     ///
     /// The subject never appears in its own answer. An ambiguous subject reference yields the typed
     /// candidate set; a corpus offering no other symbol is a typed-empty answer.
@@ -182,16 +184,28 @@ impl QueryEngine<'_> {
         let semantic_index = self.semantic_index_view()?;
         // A subject outside the corpus (an external, or a symbol with no persisted content) has no
         // representation to compare — a definite empty, not a failure.
-        let Some(subject_vector) = self.store.semantic_vector_of(&subject.canonical_id)? else {
+        let subject_vectors = self.store.chunk_vectors_of(&subject.canonical_id)?;
+        if subject_vectors.is_empty() {
             return Ok(Answer::empty(provenance, freshness).estimated(semantic_index));
-        };
+        }
         let corpus_size = self.store.corpus_size()? as usize;
-        let vector_ranks: Vec<CanonicalId> = self
-            .store
-            .vector_neighbors(&subject_vector, corpus_size)?
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        // Similarity is the best pair over the subject's chunks and each candidate's: each subject
+        // chunk's neighbor list arrives deduplicated to candidates by best chunk, and merging by
+        // minimum distance across subject chunks completes the maximum over pairs. Neither side
+        // gains from the number of chunks representing it.
+        let chunk_count = self.store.chunk_count()? as usize;
+        let mut best: std::collections::HashMap<CanonicalId, f64> = std::collections::HashMap::new();
+        for subject_vector in &subject_vectors {
+            for (id, distance) in self.store.vector_neighbors(subject_vector, chunk_count)? {
+                let entry = best.entry(id).or_insert(distance);
+                if distance < *entry {
+                    *entry = distance;
+                }
+            }
+        }
+        let mut nearest: Vec<(CanonicalId, f64)> = best.into_iter().collect();
+        nearest.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+        let vector_ranks: Vec<CanonicalId> = nearest.into_iter().map(|(id, _)| id).collect();
         let lexical_ranks: Vec<CanonicalId> = match self
             .store
             .semantic_render_of(&subject.canonical_id)?
@@ -256,11 +270,13 @@ impl QueryEngine<'_> {
         Ok(self.store.semantic_index_identity()?.map(|identity| SemanticIndexView {
             model_identity: identity.model_identity,
             corpus_definition_version: identity.corpus_definition_version,
+            chunk_size: identity.chunk_params.chunk_size,
+            chunk_overlap: identity.chunk_params.overlap,
         }))
     }
 }
 
-/// Build one `search` row: identity, location, and tier content at the requested detail.
+/// Build one `search` row: identity, location, and content at the requested detail.
 fn search_item(row: &SymbolRow, detail: Detail, max_lines: Option<usize>) -> SearchItem {
     let (content, content_truncated) = projected_row_content(row, detail, max_lines);
     SearchItem {
@@ -271,8 +287,8 @@ fn search_item(row: &SymbolRow, detail: Detail, max_lines: Option<usize>) -> Sea
     }
 }
 
-/// The tier content a `search`/`similar` row carries at `detail`: none at location detail (the
-/// location is already on every row), the row's persisted tier text otherwise, capped at
+/// The content a `search`/`similar` row carries at `detail`: none at location detail (the
+/// location is already on every row), the row's persisted text at that detail otherwise, capped at
 /// `max_lines` through the shared cap point.
 fn projected_row_content(row: &SymbolRow, detail: Detail, max_lines: Option<usize>) -> (Option<String>, bool) {
     match detail {

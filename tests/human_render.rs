@@ -1,5 +1,5 @@
 //! Human-render contract tests: the default rendering is a faithful projection of the same answer the
-//! `--json` path serializes — same results in the same order — content-bearing tiers render as
+//! `--json` path serializes — same results in the same order — content-bearing details render as
 //! multi-line source text, and no styling ever reaches a redirected stream or the machine answer.
 //!
 //! These drive the built `c10r` binary so the rendered bytes are observed exactly as a caller sees
@@ -137,7 +137,7 @@ fn piped_output_carries_no_styling() {
 
 // _(Source-faithful content rendering: styling is structural only)_ — under `--color=always`, which
 // forces styling even piped, ANSI escapes land on structural lines (the header, the symbol identity
-// line) and never inside the tier/source text: the source block always stays plain.
+// line) and never inside the source text: the source block always stays plain.
 #[test]
 fn forced_styling_marks_structure_but_never_source_text() {
     let dir = tempfile::tempdir().unwrap();
@@ -222,7 +222,7 @@ const HOSTILE_DOC: &str = "src/evil\x1b[31m\ninjected.rs";
 const HOSTILE_BODY: &str = "line one\x1b[31m\u{9b}31m\u{202e}\nline two";
 
 /// A store at `dir/index.db` holding one in-workspace symbol whose `display_name`, `document_path`,
-/// and tier text all carry terminal-control bytes, inserted directly through the store API (bypassing
+/// and content text all carry terminal-control bytes, inserted directly through the store API (bypassing
 /// ingest/join, which is irrelevant to rendering), plus a clean container symbol that `contains` it —
 /// so a `trace --relation contains` row projects the hostile fields too.
 fn build_hostile_db(dir: &Path) -> PathBuf {
@@ -267,7 +267,7 @@ fn build_hostile_db(dir: &Path) -> PathBuf {
         .unwrap();
     // A reference site of the hostile symbol itself, attributed to the hostile symbol's own
     // declaration — so a `trace --relation references` row projects both the hostile structural
-    // fields (subject identity, location) and, at a content-bearing detail, the hostile tier text.
+    // fields (subject identity, location) and, at a content-bearing detail, the hostile content text.
     store
         .insert_occurrence(&OccurrenceRow {
             symbol_id: CanonicalId::from_raw(HOSTILE_ID.to_string()),

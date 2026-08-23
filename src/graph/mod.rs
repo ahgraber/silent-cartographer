@@ -1,6 +1,7 @@
 //! The code graph: the guarded join, the SQLite-core store, and the ingest that unifies the two
 //! oracles into one persisted graph.
 
+pub mod chunk;
 pub mod clone;
 pub mod corpus;
 pub mod embed;
@@ -145,6 +146,26 @@ pub fn ingest(
     index: &ExtractedIndex,
     sources: &[(String, String)],
 ) -> Result<JoinAccounting, IngestError> {
+    ingest_with_params(
+        store,
+        workspace,
+        workspace_root,
+        index,
+        sources,
+        &chunk::ChunkParams::default(),
+    )
+}
+
+/// [`ingest`] under explicit chunk parameters: the parameters shape every chunk the build embeds
+/// and are recorded with the store as part of the semantic-index identity.
+pub fn ingest_with_params(
+    store: &mut GraphStore,
+    workspace: &WorkspaceId,
+    workspace_root: Option<&str>,
+    index: &ExtractedIndex,
+    sources: &[(String, String)],
+    chunk_params: &chunk::ChunkParams,
+) -> Result<JoinAccounting, IngestError> {
     let identities = project_identities(workspace, index);
     let language = index_language(index);
     let corpus = SourceCorpus::new(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
@@ -269,9 +290,14 @@ pub fn ingest(
     // superseded (a same-version rebuild never accumulates or leaves stale rows), and the guard
     // rolls everything back on a failed build, so the store always holds exactly one whole build.
     let tx = store.begin_build()?;
-    // The prior build's semantic representations, read before the clear so an entry whose render is
-    // unchanged carries its embedding forward instead of re-embedding.
+    // The prior build's semantic representations, read before the clear so a passage whose render
+    // is unchanged carries its embeddings forward instead of re-embedding — but only under the
+    // same chunk parameters: a different size or overlap makes different chunks of the same
+    // render, so nothing carries across a parameter change.
     let prior_semantic = store.semantic_representations()?;
+    let params_unchanged = store
+        .semantic_index_identity()?
+        .is_some_and(|identity| identity.chunk_params == *chunk_params);
     store.clear_derived()?;
 
     // The rows are retained after insertion: the semantic-corpus pass below reads their tier
@@ -309,7 +335,7 @@ pub fn ingest(
     for row in &symbol_rows {
         store.insert_symbol(row)?;
     }
-    // Which symbols contribute corpus entries, decided from tier content alone. Containment for
+    // Which symbols contribute passages, decided from tier content alone. Containment for
     // corpus purposes counts contributing children only — a symbol enclosing nothing but name-only
     // symbols (a Python function over its parameter symbols) stays a leaf — so both containment
     // signals below filter through this set.
@@ -532,6 +558,8 @@ pub fn ingest(
             canonical_id: &row.canonical_id,
             display_name: &row.display_name,
             kind: &row.kind,
+            document_path: row.document_path.as_deref(),
+            span: row.span.map(|(start, end)| ByteSpan { start, end }),
             signature_text: row.signature_text.as_deref(),
             interface_text: row.interface_text.as_deref(),
             span_text: row.span_text.as_deref(),
@@ -539,29 +567,57 @@ pub fn ingest(
                 || span_containers.contains(&row.canonical_id),
         })
         .collect();
-    let entries = corpus::assemble(&corpus_sources);
+    let passages = corpus::assemble(&corpus_sources);
 
-    // Each entry's vector: carried forward when the render is byte-identical to the prior build's
-    // (the model is deterministic and pinned, so the carried and recomputed vectors are identical
-    // by construction), embedded in one batch otherwise.
-    let mut vectors: Vec<Option<Vec<u8>>> = vec![None; entries.len()];
+    // Each passage's chunk vectors: carried forward when the render is byte-identical to the prior
+    // build's and the chunk parameters are unchanged (the model is deterministic and pinned, so
+    // the carried and recomputed vectors are identical by construction); split into chunks and
+    // embedded in one batch otherwise. The lexical row stays one per passage over the whole render.
+    let mut vectors: Vec<Option<Vec<Vec<u8>>>> = vec![None; passages.len()];
     let mut pending: Vec<usize> = Vec::new();
-    for (i, entry) in entries.iter().enumerate() {
-        match prior_semantic.get(entry.symbol_id.as_str()) {
-            Some(prior) if prior.render == entry.render => vectors[i] = Some(prior.embedding.clone()),
+    for (i, passage) in passages.iter().enumerate() {
+        match prior_semantic.get(passage.symbol_id.as_str()) {
+            Some(prior) if params_unchanged && prior.render == passage.render => {
+                vectors[i] = Some(prior.embeddings.clone())
+            }
             _ => pending.push(i),
         }
     }
     if !pending.is_empty() {
-        let texts: Vec<String> = pending.iter().map(|&i| entries[i].render.clone()).collect();
-        for (&i, vector) in pending.iter().zip(embed::embed_batch(&texts)) {
-            vectors[i] = Some(embed::vector_bytes(&vector));
+        // Split every pending passage — reading the prepared tree, never parsing — then embed all
+        // chunks in one batch and distribute the vectors back by count.
+        let mut chunk_counts: Vec<usize> = Vec::with_capacity(pending.len());
+        let mut texts: Vec<String> = Vec::new();
+        for &i in &pending {
+            let passage = &passages[i];
+            let tree = passage
+                .content_location
+                .as_ref()
+                .and_then(|(path, span)| prepared.get(path).map(|doc| (&doc.tree, *span)));
+            let header = chunk::PassageHeader {
+                identity: &passage.header_identity,
+                documentation: passage.documentation.as_deref(),
+            };
+            let chunks = chunk::split_passage(&header, &passage.content, tree, chunk_params);
+            chunk_counts.push(chunks.len());
+            texts.extend(chunks.into_iter().map(|c| c.text));
+        }
+        let embedded = embed::embed_batch(&texts);
+        let mut cursor = 0;
+        for (&i, count) in pending.iter().zip(chunk_counts) {
+            vectors[i] = Some(
+                embedded[cursor..cursor + count]
+                    .iter()
+                    .map(|vector| embed::vector_bytes(vector))
+                    .collect(),
+            );
+            cursor += count;
         }
     }
-    for (entry, vector) in entries.iter().zip(&vectors) {
-        let vector = vector.as_ref().expect("every corpus entry embeds or carries forward");
-        let words = corpus::split_words(&entry.render).join(" ");
-        store.insert_corpus_entry(&entry.symbol_id, &entry.render, &words, vector)?;
+    for (passage, chunk_vectors) in passages.iter().zip(&vectors) {
+        let chunk_vectors = chunk_vectors.as_ref().expect("every passage embeds or carries forward");
+        let words = corpus::split_words(&passage.render).join(" ");
+        store.insert_passage(&passage.symbol_id, &passage.render, &words, chunk_vectors)?;
     }
 
     // Clone-equivalence keys for the corpus's leaves, from each leaf's spelled token sequence.
@@ -594,6 +650,7 @@ pub fn ingest(
         content_hash: content,
         accounting: join_result.accounting,
         environment: index.environment.clone(),
+        chunk_params: *chunk_params,
     })?;
 
     // The single commit publishes the whole build atomically: a crash anywhere above rolls back to
@@ -702,7 +759,7 @@ fn definition_content(
     }
 }
 
-/// The qualified-name portion of a canonical identity: the identity with its leading workspace
+/// The qualified-name part of a canonical identity: the identity with its leading workspace
 /// segment stripped (`<workspace>::<qualified>` → `<qualified>`). A trailing `#<rank>`
 /// disambiguator, when the identity carries one, stays — it is part of the identity, not decoration.
 fn qualified_name(id: &CanonicalId) -> &str {

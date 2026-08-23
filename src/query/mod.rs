@@ -150,7 +150,7 @@ impl<'a> QueryEngine<'a> {
         Ok(resolve(self.store, reference)?)
     }
 
-    /// `get`: retrieve the symbol denoted by `reference` at `detail`, returning a window of its tier
+    /// `get`: retrieve the symbol denoted by `reference` at `detail`, returning a window of its
     /// content — the lines `[from, from + max_lines)`, 1-based — with a `None` `max_lines` meaning "to
     /// the end of the content."
     ///
@@ -177,7 +177,7 @@ impl<'a> QueryEngine<'a> {
     }
 
     /// `get` by source position: retrieve the symbol enclosing `(document, byte_offset)`, returning a
-    /// window of its tier content as [`QueryEngine::get`] does.
+    /// window of its content as [`QueryEngine::get`] does.
     pub fn get_by_position(
         &self,
         document: &str,
@@ -197,11 +197,11 @@ impl<'a> QueryEngine<'a> {
     }
 
     /// `trace`: return the symbols standing in `relation` to the subject `reference`, each optionally
-    /// carrying its tier content at `detail`.
+    /// carrying its content at `detail`.
     ///
     /// `detail` never changes which results are returned or their order — `None` and
     /// `Some(Detail::Location)` both mean "no content field" (the location is already on every row);
-    /// any other detail projects tier content onto each row, as described on [`TraceItem`].
+    /// any other detail projects content onto each row, as described on [`TraceItem`].
     pub fn trace(
         &self,
         reference: &str,
@@ -318,8 +318,8 @@ impl<'a> QueryEngine<'a> {
     ///
     /// Detailed results run to the requested depth; each carries the dependent symbol, the connecting
     /// edge kind, its hop distance, its location, and (when `detail` requests it) the dependent's own
-    /// tier content. Dependents deeper than the bound are reported in aggregate — counts by edge kind
-    /// and distance, never carrying tier content — up to the internal horizon, and the answer always
+    /// content. Dependents deeper than the bound are reported in aggregate — counts by edge kind
+    /// and distance, never carrying content — up to the internal horizon, and the answer always
     /// discloses whether reach ends within the bound, extends beyond it, or is itself cut off at the
     /// horizon. A subject with no dependents is typed absence (`Empty`), not a failure.
     pub fn dependents(
@@ -368,8 +368,8 @@ impl<'a> QueryEngine<'a> {
         Ok(Answer::found(items, provenance, freshness))
     }
 
-    /// Render a symbol at a detail level, returning the tier content windowed to the lines
-    /// `[from, from + max_lines)` (1-based). Every content-bearing tier passes through the single
+    /// Render a symbol at a detail level, returning the content windowed to the lines
+    /// `[from, from + max_lines)` (1-based). Every content-bearing detail passes through the single
     /// [`window_content`] cap point; a `location` detail carries no content, so the window is
     /// irrelevant to it.
     fn detail_of(&self, row: &SymbolRow, detail: Detail, max_lines: Option<usize>, from: usize) -> SymbolDetail {
@@ -415,9 +415,9 @@ impl<'a> QueryEngine<'a> {
         Ok(row.and_then(|r| r.test_rule))
     }
 
-    /// The tier content for a `references` row at `detail`, capped at `max_lines`: the tiers of the
+    /// The content for a `references` row at `detail`, capped at `max_lines`: the content of the
     /// declaration the reference site is attributed to (`enclosing_id`), or, when the site attributes
-    /// to the module/file itself (`enclosing_id` is `None`), the tiers of that document's module
+    /// to the module/file itself (`enclosing_id` is `None`), the content of that document's module
     /// symbol. The `bool` reports whether the content was truncated by the cap.
     fn reference_content(
         &self,
@@ -485,7 +485,7 @@ impl<'a> QueryEngine<'a> {
     /// regardless of whether that row is detailed or aggregated, so it must not depend on
     /// `depth < DEPENDENTS_HORIZON` to be observed.
     ///
-    /// `detail` requests the dependent's own tier content on the detailed rows; passing `None`
+    /// `detail` requests the dependent's own content on the detailed rows; passing `None`
     /// projects location-only rows, which is what a multi-seed walk answers with.
     fn dependents_report(
         &self,
@@ -556,10 +556,10 @@ pub struct SymbolDetail {
     /// The detail payload.
     pub payload: DetailPayload,
     /// The line window the content covers, disclosed only when the content is windowed or truncated
-    /// (i.e. it is not the whole tier text); absent when the whole content is returned.
+    /// (i.e. it is not the whole text at that detail); absent when the whole content is returned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_lines: Option<ContentLines>,
-    /// Whether the payload's content is a proper subset of the whole tier text — the window did not
+    /// Whether the payload's content is a proper subset of the whole text at that detail — the window did not
     /// cover it end to end (`--from` past line 1, or `--max-lines` cut the tail).
     #[serde(skip_serializing_if = "is_false")]
     pub content_truncated: bool,
@@ -592,11 +592,11 @@ pub enum DetailPayload {
 }
 
 /// An item returned by `trace`: either a related symbol or a reference occurrence, each optionally
-/// carrying tier content projected at the requested detail (`None` when no detail was requested, or
-/// when the projected tier itself carries no content).
+/// carrying content projected at the requested detail (`None` when no detail was requested, or
+/// when the row carries no content at that detail).
 ///
-/// A `Symbol` row projects its own tiers; a `Reference` row projects the tiers of the declaration its
-/// site is attributed to.
+/// A `Symbol` row projects its own content; a `Reference` row projects the content of the declaration
+/// its site is attributed to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "item", rename_all = "snake_case")]
 pub enum TraceItem {
@@ -609,7 +609,7 @@ pub enum TraceItem {
         /// this workspace.
         #[serde(skip_serializing_if = "Option::is_none")]
         location: Option<Location>,
-        /// The symbol's own tier content at the requested detail.
+        /// The symbol's own content at the requested detail.
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
         /// Whether that content was truncated by the `--max-lines` bound.
@@ -629,7 +629,7 @@ pub enum TraceItem {
         /// unchanged.
         #[serde(skip_serializing_if = "Option::is_none")]
         test_rule: Option<String>,
-        /// The tier content of the declaration the site is attributed to, at the requested detail.
+        /// The content of the declaration the site is attributed to, at the requested detail.
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
         /// Whether that content was truncated by the `--max-lines` bound.
@@ -683,7 +683,7 @@ pub struct FindItem {
 
 /// One detailed dependent in an impact answer: the depending symbol, the kind of dependency edge
 /// that connected it, its hop distance from the subject, its definition location, and (when
-/// requested) its own tier content at the requested detail.
+/// requested) its own content at the requested detail.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DependentItem {
     /// The dependent symbol's identity and name.
@@ -694,7 +694,7 @@ pub struct DependentItem {
     pub distance: u32,
     /// The dependent's definition location, or `None` for an external symbol with no source here.
     pub location: Option<Location>,
-    /// The dependent's own tier content at the requested detail, absent when no detail was requested.
+    /// The dependent's own content at the requested detail, absent when no detail was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Whether that content was truncated by the `--max-lines` bound.
@@ -767,10 +767,10 @@ fn location_of(row: &SymbolRow) -> Option<Location> {
     }
 }
 
-/// The tier content a `trace`/`dependents` row projects at `detail`, capped to its first `max_lines`
+/// The content a `trace`/`dependents` row projects at `detail`, capped to its first `max_lines`
 /// lines: `None` when no detail was requested or the requested detail is `Location` (the location is
-/// already on every row), otherwise the row's persisted tier text at that detail — itself `None` for a
-/// tier the row carries no content for (e.g. an external symbol). The `bool` reports whether the cap
+/// already on every row), otherwise the row's persisted text at that detail — itself `None` for a
+/// detail the row carries no content for (e.g. an external symbol). The `bool` reports whether the cap
 /// truncated the content. Trace rows are never windowed (they start at line 1); every content-bearing
 /// path routes through the single [`cap_lines`] cap point.
 fn projected_content(row: &SymbolRow, detail: Option<Detail>, max_lines: Option<usize>) -> (Option<String>, bool) {

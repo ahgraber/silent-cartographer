@@ -98,6 +98,23 @@ fn status_reports_provenance_freshness_and_alignment() {
         report.contains("freshness"),
         "status reports the freshness state: {report}"
     );
+    // The recorded semantic-index identity rides status, the chunk parameters included.
+    let parsed: serde_json::Value = serde_json::from_str(&report).expect("status emits JSON");
+    let semantic = &parsed["semantic_index"];
+    assert!(
+        semantic["model_identity"].as_str().is_some_and(|m| !m.is_empty()),
+        "status discloses the embedding model identity: {report}"
+    );
+    assert_eq!(
+        semantic["chunk_size"].as_u64(),
+        Some(silent_cartographer::graph::chunk::DEFAULT_CHUNK_SIZE as u64),
+        "status discloses the recorded chunk size: {report}"
+    );
+    assert_eq!(
+        semantic["chunk_overlap"].as_u64(),
+        Some(silent_cartographer::graph::chunk::DEFAULT_CHUNK_OVERLAP as u64),
+        "status discloses the recorded overlap: {report}"
+    );
 }
 
 // _(Derived default workspace identity)_ — with no workspace supplied, the identity is derived from
@@ -818,6 +835,7 @@ fn python_manifest_selects_python_backend() {
         None,
         None,
         false,
+        &Default::default(),
     )
     .expect_err("the indexer is absent");
     assert!(
@@ -844,6 +862,7 @@ fn two_manifests_without_selection_refuse() {
         None,
         None,
         false,
+        &Default::default(),
     )
     .expect_err("two manifests are ambiguous");
     assert!(
@@ -908,6 +927,7 @@ fn failed_build_leaves_existing_store_untouched() {
         None,
         None,
         false,
+        &Default::default(),
     )
     .expect_err("the analyzer is absent");
     assert_eq!(
@@ -929,6 +949,7 @@ fn failed_build_leaves_existing_store_untouched() {
         None,
         Some(Language::Python),
         false,
+        &Default::default(),
     )
     .expect_err("the indexer is absent");
     assert_eq!(
@@ -961,6 +982,7 @@ fn explicit_environment_refusal_precedes_tool_lookup() {
         Some(missing_env.as_path()),
         None,
         false,
+        &Default::default(),
     )
     .expect_err("the explicit environment does not exist");
     let message = err.to_string();
@@ -1341,11 +1363,56 @@ fn a_build_over_an_unchanged_workspace_analyzes_nothing() {
         None,
         Some(Language::Rust),
         false,
+        &Default::default(),
     )
     .expect("an already-current index is not an error");
 
     assert!(!outcome.rebuilt(), "the build reports the index already current");
     assert_eq!(std::fs::read(&db).unwrap(), before, "the store is byte-identical");
+}
+
+// _(Scenario: A changed chunk parameter rebuilds)_ — the same workspace, sources, analyzer, and
+// environment under a different chunk size is not current: the build analyzes (which the stub
+// refuses, surfacing as an indexing failure), while the unchanged-parameter arm still skips.
+#[test]
+fn a_changed_chunk_parameter_rebuilds() {
+    use silent_cartographer::graph::chunk::ChunkParams;
+
+    let (dir, db, stub) = already_built_workspace();
+
+    let outcome = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+        &Default::default(),
+    )
+    .expect("unchanged parameters remain current");
+    assert!(!outcome.rebuilt(), "the unchanged-parameter arm skips");
+
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+        &ChunkParams {
+            chunk_size: 256,
+            overlap: 0,
+        },
+    )
+    .expect_err("a changed chunk size drives the build to analyze, which the stub refuses");
+    assert!(
+        err.to_string().contains("indexing failed"),
+        "the changed-parameter build attempted analysis: {err}"
+    );
 }
 
 // _(Scenario: An explicit rebuild ignores currency)_ — with the explicit option the same workspace is
@@ -1364,6 +1431,7 @@ fn an_explicit_rebuild_analyzes_an_unchanged_workspace() {
         None,
         Some(Language::Rust),
         true,
+        &Default::default(),
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -1393,6 +1461,7 @@ fn corrupt_metadata_in_a_recognized_store_rebuilds() {
         None,
         Some(Language::Rust),
         false,
+        &Default::default(),
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -1421,6 +1490,7 @@ fn an_edited_source_rebuilds() {
         None,
         Some(Language::Rust),
         false,
+        &Default::default(),
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -1445,6 +1515,7 @@ fn a_changed_analyzer_version_rebuilds() {
         None,
         Some(Language::Rust),
         false,
+        &Default::default(),
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -1505,6 +1576,7 @@ fn a_changed_declared_environment_rebuilds() {
         Some(venv.as_path()),
         None,
         false,
+        &Default::default(),
     )
     .expect("an unchanged environment is current");
     assert!(
@@ -1530,6 +1602,7 @@ fn a_changed_declared_environment_rebuilds() {
         Some(venv.as_path()),
         None,
         false,
+        &Default::default(),
     )
     .expect_err("the stub indexer refuses to analyze");
     assert!(
@@ -1557,6 +1630,7 @@ fn an_absent_index_builds() {
         None,
         Some(Language::Rust),
         false,
+        &Default::default(),
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -1589,6 +1663,7 @@ fn an_incompatible_store_builds_rather_than_reporting_it_current() {
         None,
         Some(Language::Rust),
         false,
+        &Default::default(),
     )
     .expect("an incompatible store is c10r's own to replace, not a refusal");
 
@@ -1618,6 +1693,7 @@ fn a_store_recorded_for_another_workspace_is_not_current() {
         None,
         Some(Language::Rust),
         false,
+        &Default::default(),
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(

@@ -64,13 +64,19 @@ pub enum WorkspaceRelation {
 }
 
 /// The semantic-index identity a `search`/`similar` answer carries as provenance: the embedding
-/// model and the corpus definition the store's semantic representations were built under.
+/// model, the corpus definition, and the chunk parameters the store's semantic representations
+/// were built under — the whole recorded identity, so an answer attributes its ranking to the
+/// regime that produced it even when the operator varies the parameters between builds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticIndexView {
     /// The embedding model identity (upstream repository at its vendored revision).
     pub model_identity: String,
     /// The corpus definition version the render derives under.
     pub corpus_definition_version: u32,
+    /// The chunk size the build ran under, in model tokens.
+    pub chunk_size: usize,
+    /// The overlap between adjacent chunks the build ran under, in model tokens.
+    pub chunk_overlap: usize,
 }
 
 /// The identity+name view of a symbol carried in every answer.
@@ -98,7 +104,7 @@ pub struct Location {
 }
 
 /// The 1-based line window a windowed `get` content answer covers, disclosed whenever the returned
-/// content is not the whole tier text so a caller knows which slice it holds and how much text
+/// content is not the whole text at that detail so a caller knows which slice it holds and how much
 /// exists. Absent when the answer carries the whole content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ContentLines {
@@ -107,7 +113,7 @@ pub struct ContentLines {
     /// The 1-based line the window ends at (inclusive); one less than `start` for an empty window
     /// requested past the end of the content.
     pub end: usize,
-    /// The total number of lines in the full tier text.
+    /// The total number of lines in the full text at that detail.
     pub total: usize,
 }
 

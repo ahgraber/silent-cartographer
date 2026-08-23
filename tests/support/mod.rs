@@ -32,6 +32,7 @@ pub fn stamp_metadata(store: &GraphStore, workspace: &str, root: &std::path::Pat
             content_hash: String::new(),
             accounting: JoinAccounting::default(),
             environment: None,
+            chunk_params: Default::default(),
         })
         .unwrap();
 }

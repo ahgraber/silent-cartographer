@@ -216,6 +216,10 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
                 args.environment.as_deref(),
                 args.language.map(Into::into),
                 args.force,
+                &silent_cartographer::graph::chunk::ChunkParams {
+                    chunk_size: args.chunk_size,
+                    overlap: args.chunk_overlap,
+                },
             )?;
             // Under `--json` the standard-output answer is the structured machine projection of the
             // same accounting the human line renders, carrying whether the store was rewritten.

@@ -322,8 +322,8 @@ type PreparedView<'a> = HashMap<&'a str, &'a PreparedDocument>;
 /// Derived from index symbols before the join runs, so the join's self-name and super-keyword rules
 /// and ingest's module bookkeeping (`imports`-edge sourcing) read one derivation. Only persisted
 /// symbols (those with an identity) participate; a document whose module definition does not
-/// normalize onto its source (no corpus entry, or coordinates that don't reconcile) contributes no
-/// entry for that document — refusal over a guessed module.
+/// normalize onto its source (no prepared document for its path, or coordinates that don't
+/// reconcile) contributes no entry for that document — refusal over a guessed module.
 pub fn module_by_document(
     index: &ExtractedIndex,
     identities: &[Option<CanonicalId>],
