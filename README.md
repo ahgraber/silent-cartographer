@@ -89,13 +89,16 @@ This installs a post-commit hook that reruns `c10r build`, resolved through git 
 It refuses rather than overwrites when a hook is already present at that path; add the `c10r build` line to your existing hook by hand instead.
 
 A build that has nothing to do costs nothing.
-Before analyzing anything, `build` compares the stored index against the workspace's current sources, analyzer, and declared environment; when all of them match, it analyzes nothing, leaves the store untouched, and reports the index already current.
+Before analyzing anything, `build` compares the stored index against the workspace's current sources, analyzer, declared environment, and chunk parameters; when all of them match, it analyzes nothing, leaves the store untouched, and reports the index already current.
 So rerunning `c10r build` is safe to do freely, and a commit that changes no indexed source returns in a fraction of a second instead of reindexing the repository.
 
 ```sh
 c10r build                        # nothing analyzed when the index is already current
 c10r build --force                # build regardless of that check
 ```
+
+`build` takes two chunk parameters, each with a recommended default: `--chunk-size` (default 512 tokens) bounds the whole text embedded per chunk, the passage's header included, and `--chunk-overlap` (default 64) carries the trailing content of each chunk's predecessor.
+The values a build ran with are recorded with the store, disclosed by `status`, and compared by the currency check above — a rebuild under different parameters re-derives every vector.
 
 Under `--json`, the build answer carries `"rebuilt"`: `true` when the workspace was analyzed and the store rewritten, `false` when the stored index was already current.
 Anything the check cannot confirm drives a build rather than a skip — an absent index, a store built under an older schema version, a store recorded for a different workspace or workspace root, or metadata it cannot read.
@@ -136,6 +139,7 @@ c10r search "retry a request with exponential backoff"
 
 The answer is the indexed symbols nearest the query by estimated relevance, most relevant first.
 A symbol's name (split into its words, so `withBackoff` is findable as "with backoff"), its documentation, and its source all count as evidence, and sharing exact words with the query is not required — the ranking fuses a semantic-embedding signal with a lexical signal, so paraphrases and exact identifiers both land.
+The semantic index holds three levels: a **document** is a source file, a **passage** is what one indexed symbol contributes (its own content for a leaf, its interface for a container), and a **chunk** is a bounded run of a passage handed to the embedding model — a long passage is represented by several chunks, so content anywhere in it can match.
 Rows carry the signature tier by default; `--detail` changes what each row shows without changing which symbols are returned or their order.
 
 Because the ranking is model-derived estimation, every `search` answer is structurally labeled `"classification": "estimation"` and carries the semantic index's identity as provenance.
