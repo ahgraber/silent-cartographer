@@ -6,6 +6,7 @@
 //! bounding-agnostic. Only a found result set is paged; typed absence, an empty relation, and an
 //! ambiguity refusal carry no result set to bound.
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::exit::Failure;
@@ -20,6 +21,11 @@ use super::{DependentItem, DependentsReport};
 /// identity (content-hash plus analyzer provenance). A token resumes only against the exact same
 /// identity — a different query, an index rebuilt underneath (changed sources or a changed analyzer
 /// version), or a changed ranking model, changes the hash and is rejected.
+///
+/// The identity is serialized to produce that hash, so every field it carries is bound by
+/// construction: a parameter added here cannot be left out of the comparison, which is the one way a
+/// token could otherwise resume against a result sequence it was not issued for.
+#[derive(Serialize)]
 pub struct PageIdentity {
     /// The command name (`get`, `trace`, `find`, `search`, `similar`, or `impact`).
     pub command: &'static str,
@@ -60,7 +66,7 @@ pub struct PageIdentity {
 /// discipline every identity-building site must remember. Within one binary the constant cannot
 /// vary, so no runtime test can catch a site that binds the mode but not the version; sealing the
 /// pair is what closes that untestable gap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct OrderingIdentity {
     mode: &'static str,
     rank_version: u32,
@@ -84,27 +90,20 @@ impl OrderingIdentity {
 }
 
 impl PageIdentity {
-    /// The parameter-identity hash: a hex digest over every field that must match for a token to
-    /// resume. It is deliberately not the token itself — the token additionally carries the page
-    /// index and is opaque.
+    /// The parameter-identity hash: a hex digest over the whole identity. It is deliberately not the
+    /// token itself — the token additionally carries the page index and is opaque.
+    ///
+    /// Digesting the serialized struct rather than a hand-listed set of fields is what makes "every
+    /// query parameter is bound" a property of the type. It also keeps an absent optional parameter
+    /// distinct from a present one carrying an empty value, which a rendering of both to `""` would
+    /// have collapsed.
     fn hash(&self) -> String {
         let mut hasher = Sha256::new();
-        for field in [
-            self.command,
-            self.reference.as_str(),
-            self.relation.unwrap_or(""),
-            self.detail.unwrap_or(""),
-            &self.depth.map(|n| n.to_string()).unwrap_or_default(),
-            self.ordering.map(|o| o.mode).unwrap_or(""),
-            &self.ordering.map(|o| o.rank_version.to_string()).unwrap_or_default(),
-            &self.limit.map(|n| n.to_string()).unwrap_or_default(),
-            &self.max_lines.map(|n| n.to_string()).unwrap_or_default(),
-            &self.from.map(|n| n.to_string()).unwrap_or_default(),
-            self.index_hash.as_str(),
-        ] {
-            hasher.update(field.as_bytes());
-            hasher.update([0u8]);
-        }
+        hasher.update(
+            serde_json::to_vec(self)
+                .expect("the query identity serializes")
+                .as_slice(),
+        );
         to_hex(&hasher.finalize())
     }
 }
@@ -154,7 +153,6 @@ pub fn apply_pagination<T>(
         freshness,
         stale,
         classification,
-        semantic_index,
         workspace_relation,
         ordering,
         outcome,
@@ -181,7 +179,6 @@ pub fn apply_pagination<T>(
             freshness,
             stale,
             classification,
-            semantic_index,
             workspace_relation,
             ordering,
             outcome: Outcome::Ambiguous {
@@ -203,7 +200,6 @@ pub fn apply_pagination<T>(
             freshness,
             stale,
             classification,
-            semantic_index,
             workspace_relation,
             ordering,
             outcome,
@@ -218,7 +214,6 @@ pub fn apply_pagination<T>(
             freshness,
             stale,
             classification,
-            semantic_index,
             workspace_relation,
             ordering,
             outcome: Outcome::Found { results },
@@ -254,7 +249,6 @@ pub fn apply_pagination<T>(
         freshness,
         stale,
         classification,
-        semantic_index,
         workspace_relation,
         ordering,
         outcome: Outcome::Found { results: page_results },
@@ -291,7 +285,6 @@ pub fn apply_report_pagination<T>(
         freshness,
         stale,
         classification,
-        semantic_index,
         workspace_relation,
         ordering,
         outcome,
@@ -308,7 +301,6 @@ pub fn apply_report_pagination<T>(
             freshness,
             stale,
             classification,
-            semantic_index,
             workspace_relation,
             ordering,
             outcome: Outcome::Found { results },
@@ -350,7 +342,6 @@ pub fn apply_report_pagination<T>(
         freshness,
         stale,
         classification,
-        semantic_index,
         workspace_relation,
         ordering,
         outcome: Outcome::Found { results: vec![report] },
@@ -516,7 +507,7 @@ mod tests {
                     kind: "function".to_string(),
                     external: false,
                 },
-                kind: "uses".to_string(),
+                kind: crate::graph::store::DependencyKind::Uses,
                 distance: 1,
                 location: None,
                 content: None,
@@ -564,6 +555,72 @@ mod tests {
         assert_ne!(old.hash(), new.hash());
     }
 
+    // _(Bounded and resumable answers: mismatched continuation token refused)_ — every field of the
+    // query identity affects the parameter hash, so a token issued under one value of any parameter
+    // is refused rather than resumed under another.
+    //
+    // The exhaustive struct literal is deliberate: a field added to `PageIdentity` fails compilation
+    // here until it is populated, which is what puts a new parameter in front of the author. The
+    // hash covering it is then structural — `hash` serializes the whole struct — so this test guards
+    // the property against a return to hand-listed fields or a stray `#[serde(skip)]`.
+    #[test]
+    fn every_query_identity_field_affects_the_hash() {
+        let base = || PageIdentity {
+            command: "get",
+            reference: "subject".to_string(),
+            relation: Some("references"),
+            detail: Some("body"),
+            depth: Some(1),
+            ordering: Some(OrderingIdentity::with_version("ranked", 1)),
+            limit: Some(10),
+            max_lines: Some(20),
+            from: Some(3),
+            index_hash: "index-hash".to_string(),
+        };
+
+        /// A named single-field change to a query identity.
+        type Variation = (&'static str, fn(&mut PageIdentity));
+
+        let variations: [Variation; 10] = [
+            ("command", |id| id.command = "find"),
+            ("reference", |id| id.reference = "other".to_string()),
+            ("relation", |id| id.relation = Some("contains")),
+            ("detail", |id| id.detail = Some("signature")),
+            ("depth", |id| id.depth = Some(2)),
+            ("ordering", |id| {
+                id.ordering = Some(OrderingIdentity::with_version("unranked", 1))
+            }),
+            ("limit", |id| id.limit = Some(11)),
+            ("max_lines", |id| id.max_lines = Some(21)),
+            ("from", |id| id.from = Some(4)),
+            ("index_hash", |id| id.index_hash = "rebuilt".to_string()),
+        ];
+
+        let baseline = base().hash();
+        for (field, vary) in variations {
+            let mut varied = base();
+            vary(&mut varied);
+            assert_ne!(
+                baseline,
+                varied.hash(),
+                "changing `{field}` must change the parameter hash, or a token issued under one \
+                 value resumes against results produced under another"
+            );
+        }
+    }
+
+    // _(Bounded and resumable answers: mismatched continuation token refused)_ — an absent optional
+    // parameter and a present one spelled as the empty string are distinct query identities, so a
+    // token issued for one is refused for the other.
+    #[test]
+    fn an_absent_parameter_and_an_empty_one_hash_differently() {
+        let mut absent = identity(1);
+        absent.relation = None;
+        let mut empty = identity(1);
+        empty.relation = Some("");
+        assert_ne!(absent.hash(), empty.hash());
+    }
+
     // _(Bounded and resumable answers: mismatched continuation token refused — out-of-range page)_ —
     // a token whose parameter hash matches but whose page index names a page past the last is
     // refused as a usage error naming the valid range, not silently clamped or served out of bounds.
@@ -601,7 +658,7 @@ mod tests {
                     kind: "function".to_string(),
                     external: false,
                 },
-                kind: "uses".to_string(),
+                kind: crate::graph::store::DependencyKind::Uses,
                 distance: 1,
                 location: None,
                 content: None,
@@ -644,7 +701,7 @@ mod tests {
                     kind: "function".to_string(),
                     external: false,
                 },
-                kind: "uses".to_string(),
+                kind: crate::graph::store::DependencyKind::Uses,
                 distance: 1,
                 location: None,
                 content: None,
@@ -656,7 +713,6 @@ mod tests {
             base_revision: "abc123".to_string(),
             exactness: Exactness::Exact,
             seed_outcome: SeedOutcome::Seeded,
-            recovery: None,
             seeds: Vec::new(),
             unmappable: Vec::new(),
             dependents_snapshot: "current_index",

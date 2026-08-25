@@ -34,6 +34,11 @@ tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 # Content-hash gate over analyzed sources.
 sha2 = "0.11"
+# Derived variant lists for the closed vocabularies (the alignment rules). The list is generated
+# from the enum, so a variant added to one cannot go missing from the accounting, the persisted
+# counts, or any render site. Only the list is derived: each rule's stored tag stays a hand-written
+# match, because those tags are persisted values and a Rust rename must not silently rewrite them.
+strum = { version = "0.27", features = ["derive"] }
 # Static code-embedding runtime for the semantic corpus. `local-only` removes the network path
 # (the model is compiled into the binary); `fancy-regex` keeps the tokenizer pure Rust.
 model2vec-rs = { version = "=0.2.1", default-features = false, features = ["local-only", "fancy-regex"] }

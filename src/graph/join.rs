@@ -27,6 +27,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use strum::{EnumCount as _, VariantArray as _};
+
 use crate::identity::{CanonicalId, Descriptor, SegmentKind};
 use crate::semantic::model::{ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, SymbolKind};
 
@@ -36,7 +38,15 @@ use super::syntax::{ConstructAt, Language, RangeShape, SyntaxDeclaration, Syntax
 
 /// The named alignment rule that accepted an attribution. Stored as provenance on every aligned
 /// occurrence; each rule also carries its own acceptance bucket in the accounting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The variant list is derived ([`strum::VariantArray`] supplies `VARIANTS`, [`strum::EnumCount`]
+/// supplies `COUNT`), so a rule added here reaches the accounting, the persisted counts, and every
+/// render site without a second edit. Variant order is the order every one of those presents its
+/// buckets in.
+///
+/// [`AlignmentRule::tag`] is deliberately *not* derived. The tags are persisted values and appear in
+/// `--json` answers, so renaming a Rust variant must not silently rewrite what is in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::VariantArray, strum::EnumCount)]
 pub enum AlignmentRule {
     /// The default rule: the source text at the matched name node equals the expected name token.
     Exact,
@@ -91,6 +101,23 @@ impl AlignmentRule {
             AlignmentRule::UseListSelf => "use_list_self",
             AlignmentRule::SuperKeyword => "super_keyword",
         }
+    }
+
+    /// Read a stored tag as a rule, refusing anything outside the closed vocabulary.
+    ///
+    /// The inverse of [`AlignmentRule::tag`], used when reading persisted counts back. A tag this
+    /// refuses names a rule the binary does not have, which is a store the binary cannot describe —
+    /// surfaced rather than dropped, because dropping it would under-report the build's alignment.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        AlignmentRule::VARIANTS.iter().copied().find(|rule| rule.tag() == tag)
+    }
+
+    /// This rule's position in [`AlignmentRule::VARIANTS`] — its bucket index in the accounting.
+    ///
+    /// The cast is the declaration index of a fieldless enum, which is exactly the order
+    /// `VARIANTS` is generated in; `every_rule_indexes_its_own_slot` holds the two together.
+    fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -201,30 +228,10 @@ pub struct UnalignedOccurrence {
 /// counts unresolved syntactic constructs separately.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JoinAccounting {
-    /// Occurrences accepted by the default name-token-equality rule.
-    pub aligned_exact: u64,
-    /// Occurrences accepted by the crate-root rule.
-    pub aligned_crate_root: u64,
-    /// Occurrences accepted by the operator-desugar rule.
-    pub aligned_operator_desugar: u64,
-    /// Occurrences accepted by the module-span rule.
-    pub aligned_module_span: u64,
-    /// Occurrences accepted by the self-keyword rule.
-    pub aligned_self_keyword: u64,
-    /// Occurrences accepted by the module-name rule.
-    pub aligned_module_name: u64,
-    /// Occurrences accepted by the self-name rule.
-    pub aligned_self_name: u64,
-    /// Occurrences accepted by the module-marker rule.
-    pub aligned_module_marker: u64,
-    /// Occurrences accepted by the import-alias rule.
-    pub aligned_import_alias: u64,
-    /// Occurrences accepted by the range-literal rule.
-    pub aligned_range_literal: u64,
-    /// Occurrences accepted by the use-list-self rule.
-    pub aligned_use_list_self: u64,
-    /// Occurrences accepted by the super-keyword rule.
-    pub aligned_super_keyword: u64,
+    /// One acceptance count per alignment rule, indexed by the rule's position in
+    /// [`AlignmentRule::VARIANTS`]. Private so every reader goes through
+    /// [`JoinAccounting::by_rule`] or [`JoinAccounting::accepted`] and sees the whole closed set.
+    aligned: [u64; AlignmentRule::COUNT],
     /// Occurrences whose location satisfied no alignment rule's expectation.
     pub text_mismatch: u64,
     /// Occurrences with no syntactic construct at their location.
@@ -236,38 +243,74 @@ pub struct JoinAccounting {
 }
 
 impl JoinAccounting {
+    /// An accounting carrying the given per-rule acceptance counts, in
+    /// [`AlignmentRule::VARIANTS`] order, alongside the refusal counts.
+    ///
+    /// The array length is the rule count, so a literal written against one vocabulary fails to
+    /// compile against a larger one — which is how a test stating "every bucket" keeps meaning it.
+    pub fn with_counts(
+        aligned: [u64; AlignmentRule::COUNT],
+        text_mismatch: u64,
+        semantic_only: u64,
+        duplicate_ambiguous: u64,
+        syntax_only: u64,
+    ) -> Self {
+        Self {
+            aligned,
+            text_mismatch,
+            semantic_only,
+            duplicate_ambiguous,
+            syntax_only,
+        }
+    }
+
+    /// An accounting built from `(rule, count)` pairs — the shape a keyed store reads back.
+    ///
+    /// A rule absent from `counts` carries zero. Keeping this here rather than exposing the bucket
+    /// array means the rule vocabulary's ordering and width stay inside this module, and a reader
+    /// only has to name rules.
+    pub fn from_rule_counts(
+        counts: impl IntoIterator<Item = (AlignmentRule, u64)>,
+        text_mismatch: u64,
+        semantic_only: u64,
+        duplicate_ambiguous: u64,
+        syntax_only: u64,
+    ) -> Self {
+        let mut aligned = [0u64; AlignmentRule::COUNT];
+        for (rule, count) in counts {
+            aligned[rule.index()] = count;
+        }
+        Self {
+            aligned,
+            text_mismatch,
+            semantic_only,
+            duplicate_ambiguous,
+            syntax_only,
+        }
+    }
+
     /// Count one acceptance under `rule`.
     fn accept(&mut self, rule: AlignmentRule) {
-        match rule {
-            AlignmentRule::Exact => self.aligned_exact += 1,
-            AlignmentRule::CrateRoot => self.aligned_crate_root += 1,
-            AlignmentRule::OperatorDesugar => self.aligned_operator_desugar += 1,
-            AlignmentRule::ModuleSpan => self.aligned_module_span += 1,
-            AlignmentRule::SelfKeyword => self.aligned_self_keyword += 1,
-            AlignmentRule::ModuleName => self.aligned_module_name += 1,
-            AlignmentRule::SelfName => self.aligned_self_name += 1,
-            AlignmentRule::ModuleMarker => self.aligned_module_marker += 1,
-            AlignmentRule::ImportAlias => self.aligned_import_alias += 1,
-            AlignmentRule::RangeLiteral => self.aligned_range_literal += 1,
-            AlignmentRule::UseListSelf => self.aligned_use_list_self += 1,
-            AlignmentRule::SuperKeyword => self.aligned_super_keyword += 1,
-        }
+        self.aligned[rule.index()] += 1;
+    }
+
+    /// The occurrences accepted under one rule.
+    pub fn accepted(&self, rule: AlignmentRule) -> u64 {
+        self.aligned[rule.index()]
+    }
+
+    /// Every rule paired with its acceptance count, in [`AlignmentRule::VARIANTS`] order.
+    ///
+    /// The single reading order every presentation of the accounting follows — the build line, the
+    /// `--json build` projection, `status`, and the persisted counts — so none of them can omit a
+    /// rule the vocabulary holds.
+    pub fn by_rule(&self) -> impl Iterator<Item = (AlignmentRule, u64)> + '_ {
+        AlignmentRule::VARIANTS.iter().map(|rule| (*rule, self.accepted(*rule)))
     }
 
     /// The total occurrences accepted across all alignment rules.
     pub fn aligned_total(&self) -> u64 {
-        self.aligned_exact
-            + self.aligned_crate_root
-            + self.aligned_operator_desugar
-            + self.aligned_module_span
-            + self.aligned_self_keyword
-            + self.aligned_module_name
-            + self.aligned_self_name
-            + self.aligned_module_marker
-            + self.aligned_import_alias
-            + self.aligned_range_literal
-            + self.aligned_use_list_self
-            + self.aligned_super_keyword
+        self.aligned.iter().sum()
     }
 
     /// The total semantic occurrences processed (all acceptance buckets plus all refusal outcomes).
@@ -1666,4 +1709,74 @@ fn duplicated_descriptor_symbols(index: &ExtractedIndex, identities: &[Option<Ca
         }
     }
     duplicated
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+
+    // Each rule indexes its own slot in the derived variant list.
+    //
+    // The bucket index is `self as usize`, the declaration index of a fieldless enum; `VARIANTS` is
+    // generated in that same declaration order. Nothing in the language ties the two together, so
+    // this holds them: were they to diverge, every count would land in the wrong bucket.
+    #[test]
+    fn every_rule_indexes_its_own_slot() {
+        for (position, rule) in AlignmentRule::VARIANTS.iter().enumerate() {
+            assert_eq!(rule.index(), position, "{rule:?} indexes the slot it is listed at");
+        }
+        assert_eq!(
+            AlignmentRule::VARIANTS.len(),
+            AlignmentRule::COUNT,
+            "the derived list and the derived count describe the same vocabulary"
+        );
+    }
+
+    // Every rule's tag is distinct and round-trips through `from_tag`.
+    //
+    // The tags are persisted values and appear in `--json` answers. A duplicate would make two
+    // rules indistinguishable in the store and collapse their buckets into one JSON key.
+    #[test]
+    fn every_rule_tag_is_distinct_and_round_trips() {
+        let mut seen = std::collections::BTreeSet::new();
+        for rule in AlignmentRule::VARIANTS {
+            assert!(seen.insert(rule.tag()), "tag {:?} is used by two rules", rule.tag());
+            assert_eq!(
+                AlignmentRule::from_tag(rule.tag()),
+                Some(*rule),
+                "{rule:?} reads back from its own tag"
+            );
+        }
+        assert_eq!(AlignmentRule::from_tag("no_such_rule"), None);
+    }
+
+    // An acceptance lands in its own rule's bucket and nowhere else, and the total is their sum.
+    #[test]
+    fn an_acceptance_lands_in_its_own_bucket() {
+        let mut accounting = JoinAccounting::default();
+        accounting.accept(AlignmentRule::ModuleName);
+        accounting.accept(AlignmentRule::ModuleName);
+        accounting.accept(AlignmentRule::SuperKeyword);
+
+        assert_eq!(accounting.accepted(AlignmentRule::ModuleName), 2);
+        assert_eq!(accounting.accepted(AlignmentRule::SuperKeyword), 1);
+        assert_eq!(accounting.aligned_total(), 3);
+        for (rule, count) in accounting.by_rule() {
+            let expected = match rule {
+                AlignmentRule::ModuleName => 2,
+                AlignmentRule::SuperKeyword => 1,
+                _ => 0,
+            };
+            assert_eq!(count, expected, "{rule:?} carries only its own acceptances");
+        }
+    }
+
+    // `by_rule` walks the whole vocabulary, in the listed order — the single reading order the
+    // build line, both machine views, and the persisted counts all follow.
+    #[test]
+    fn by_rule_walks_the_whole_vocabulary_in_order() {
+        let accounting = JoinAccounting::default();
+        let walked: Vec<AlignmentRule> = accounting.by_rule().map(|(rule, _)| rule).collect();
+        assert_eq!(walked, AlignmentRule::VARIANTS.to_vec());
+    }
 }

@@ -5,14 +5,14 @@ mod support;
 
 use silent_cartographer::graph::ingest;
 use silent_cartographer::graph::store::{
-    DEPENDENTS_HORIZON, EdgeKind, GraphStore, OccurrenceRow, PersistedClass, SymbolRow,
+    DEPENDENTS_HORIZON, DependencyKind, EdgeKind, GraphStore, OccurrenceRow, PersistedClass, SymbolRow,
 };
 use silent_cartographer::identity::{
     CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one,
 };
 use silent_cartographer::query::output::Outcome;
 use silent_cartographer::query::resolve::Resolution;
-use silent_cartographer::query::{Detail, OrderMode, QueryEngine, Relation};
+use silent_cartographer::query::{Detail, OrderMode, QueryEngine, Relation, TraceRelation};
 use silent_cartographer::semantic::model::{
     AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
@@ -531,7 +531,9 @@ fn get_by_position_returns_enclosing_symbol() {
 fn trace_contains_returns_direct_members() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.trace("net::Client", Relation::Contains, None, None).unwrap();
+    let answer = engine
+        .trace("net::Client", TraceRelation::Contains, None, None)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -595,7 +597,7 @@ fn trace_contains_symbol_rows_carry_definition_location() {
     let engine = dep_engine(&store);
 
     let answer = engine
-        .trace("test-ws::subject", Relation::Contains, None, None)
+        .trace("test-ws::subject", TraceRelation::Contains, None, None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -653,7 +655,7 @@ fn trace_containers_returns_enclosing_type() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     let answer = engine
-        .trace("net::Client::connect", Relation::Containers, None, None)
+        .trace("net::Client::connect", TraceRelation::Containers, None, None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
@@ -671,7 +673,9 @@ fn trace_references_returns_all_sites() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     // Client is referenced at three sites in the fixture (impl, return type, let binding).
-    let answer = engine.trace("net::Client", Relation::References, None, None).unwrap();
+    let answer = engine
+        .trace("net::Client", TraceRelation::References, None, None)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -684,7 +688,9 @@ fn trace_references_returns_all_sites() {
 fn trace_type_references_returns_use_sites_with_locations() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.trace("net::Client", Relation::References, None, None).unwrap();
+    let answer = engine
+        .trace("net::Client", TraceRelation::References, None, None)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found");
     };
@@ -706,7 +712,9 @@ fn trace_default_detail_carries_no_content() {
     use silent_cartographer::query::TraceItem;
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let answer = engine.trace("net::Client", Relation::References, None, None).unwrap();
+    let answer = engine
+        .trace("net::Client", TraceRelation::References, None, None)
+        .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -731,7 +739,7 @@ fn trace_signature_detail_carries_tier_content() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     let answer = engine
-        .trace("net::Client", Relation::References, Some(Detail::Signature), None)
+        .trace("net::Client", TraceRelation::References, Some(Detail::Signature), None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -772,9 +780,11 @@ fn trace_detail_does_not_change_the_result_set() {
     use silent_cartographer::query::TraceItem;
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let location = engine.trace("net::Client", Relation::References, None, None).unwrap();
+    let location = engine
+        .trace("net::Client", TraceRelation::References, None, None)
+        .unwrap();
     let signature = engine
-        .trace("net::Client", Relation::References, Some(Detail::Signature), None)
+        .trace("net::Client", TraceRelation::References, Some(Detail::Signature), None)
         .unwrap();
 
     let sites = |a: &silent_cartographer::query::output::Answer<TraceItem>| {
@@ -809,7 +819,12 @@ fn trace_reference_site_projects_enclosing_declaration_signature() {
     let engine = dep_engine(&store);
 
     let answer = engine
-        .trace(offset_id.as_str(), Relation::References, Some(Detail::Signature), None)
+        .trace(
+            offset_id.as_str(),
+            TraceRelation::References,
+            Some(Detail::Signature),
+            None,
+        )
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -896,7 +911,12 @@ fn module_scope_site_projects_the_file_module_over_a_reexport_twin() {
 
     let engine = dep_engine(&store);
     let answer = engine
-        .trace("test-ws::target", Relation::References, Some(Detail::Signature), None)
+        .trace(
+            "test-ws::target",
+            TraceRelation::References,
+            Some(Detail::Signature),
+            None,
+        )
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -940,7 +960,7 @@ fn trace_containers_at_body_detail_carries_the_container_body() {
 
     let engine = dep_engine(&store);
     let answer = engine
-        .trace("test-ws::member", Relation::Containers, Some(Detail::Body), None)
+        .trace("test-ws::member", TraceRelation::Containers, Some(Detail::Body), None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -966,7 +986,7 @@ fn trace_explicit_location_detail_carries_no_content() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
     let answer = engine
-        .trace("net::Client", Relation::References, Some(Detail::Location), None)
+        .trace("net::Client", TraceRelation::References, Some(Detail::Location), None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -993,7 +1013,7 @@ fn trace_empty_relation_is_typed_absence() {
     let engine = engine_over(&store, support::provenance());
     // disconnect has no references in the fixture.
     let answer = engine
-        .trace("net::Client::disconnect", Relation::References, None, None)
+        .trace("net::Client::disconnect", TraceRelation::References, None, None)
         .unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Empty),
@@ -1130,7 +1150,9 @@ fn stale_result_flagged_through_get_and_trace() {
     let get_answer = engine.get("net::Client::connect", Detail::Location, None, 1).unwrap();
     assert!(get_answer.stale, "get result over changed sources is stale");
 
-    let trace_answer = engine.trace("net::Client", Relation::Contains, None, None).unwrap();
+    let trace_answer = engine
+        .trace("net::Client", TraceRelation::Contains, None, None)
+        .unwrap();
     assert!(trace_answer.stale, "trace result over changed sources is stale");
 }
 
@@ -1213,7 +1235,7 @@ fn get_unknown_reference_returns_typed_absence_in_json() {
     // Absent is distinct from an empty relation: a subject with no instances of a relation yields
     // Empty, and the two render with different outcome tags.
     let empty = engine
-        .trace("net::Client::disconnect", Relation::References, None, None)
+        .trace("net::Client::disconnect", TraceRelation::References, None, None)
         .unwrap();
     assert!(matches!(empty.outcome, Outcome::Empty));
 
@@ -1315,7 +1337,11 @@ fn dependents_reports_kind_and_distance() {
     let report: &DependentsReport = &results[0];
     assert_eq!(report.detail.len(), 1);
     assert_eq!(report.detail[0].symbol.canonical_id, dep_id("caller"));
-    assert_eq!(report.detail[0].kind, "uses", "detail carries the connecting kind");
+    assert_eq!(
+        report.detail[0].kind,
+        DependencyKind::Uses,
+        "detail carries the connecting kind"
+    );
     assert_eq!(report.detail[0].distance, 1, "detail carries the hop distance");
 }
 
@@ -1365,9 +1391,49 @@ fn dependents_beyond_bound_aggregates_by_kind_and_distance() {
     assert_eq!(report.detail[0].symbol.canonical_id, dep_id("mid"));
     assert_eq!(report.beyond_bound.len(), 1, "the deeper dependent is aggregated");
     let agg = &report.beyond_bound[0];
-    assert_eq!(agg.kind, "uses");
+    assert_eq!(agg.kind, DependencyKind::Uses);
     assert_eq!(agg.distance, 2);
     assert_eq!(agg.count, 1);
+}
+
+// _(Reach extends beyond the bound)_ — the aggregate rows order by the same key the detailed rows
+// break ties on: distance first, then the fixed dependency-kind order (uses, imports,
+// type_hierarchy). A dependents answer never presents its detail and its aggregate under two
+// different orderings.
+#[test]
+fn dependents_aggregate_orders_by_distance_then_the_fixed_kind_order() {
+    use silent_cartographer::query::{DependentsReport, HorizonDisclosure};
+    // seed <- mid (depth 1); three dependents of mid at depth 2, one per dependency kind, so the
+    // aggregate holds three rows at the same distance and only the kind order can separate them.
+    let store = dep_graph(
+        &["seed", "mid", "by_uses", "by_imports", "by_hierarchy"],
+        &[
+            (EdgeKind::Uses, "mid", "seed"),
+            (EdgeKind::Uses, "by_uses", "mid"),
+            (EdgeKind::Imports, "by_imports", "mid"),
+            (EdgeKind::TypeHierarchy, "by_hierarchy", "mid"),
+        ],
+    );
+    let engine = dep_engine(&store);
+    let answer = engine
+        .dependents("test-ws::seed", 1, None, None, OrderMode::Unranked)
+        .unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found");
+    };
+    let report: &DependentsReport = &results[0];
+    assert_eq!(report.disclosure, HorizonDisclosure::BeyondBound);
+
+    let ordered: Vec<(u32, DependencyKind)> = report.beyond_bound.iter().map(|a| (a.distance, a.kind)).collect();
+    assert_eq!(
+        ordered,
+        vec![
+            (2, DependencyKind::Uses),
+            (2, DependencyKind::Imports),
+            (2, DependencyKind::TypeHierarchy),
+        ],
+        "the aggregate follows the detailed rows' tie-break, not an incidental ordering"
+    );
 }
 
 // _(Aggregate discloses its own horizon)_ — a dependency network extending past the internal horizon
@@ -1549,7 +1615,11 @@ fn trace_dependents_interface_detail_carries_dependent_interface() {
     };
     let report: &DependentsReport = &results[0];
     assert_eq!(report.detail.len(), 1);
-    assert_eq!(report.detail[0].kind, "uses", "detail carries the connecting kind");
+    assert_eq!(
+        report.detail[0].kind,
+        DependencyKind::Uses,
+        "detail carries the connecting kind"
+    );
     assert_eq!(report.detail[0].distance, 1, "detail carries the hop distance");
     assert_eq!(
         report.detail[0].content.as_deref(),
@@ -1587,28 +1657,52 @@ fn trace_json_with_detail_carries_content_and_aggregates_carry_none() {
         detail_rows[0]["content"], "fn mid()",
         "the detailed row carries mid's signature: {detail_rows:?}"
     );
+    // The connecting kind reaches the machine answer as its plain stored tag, on the detailed row
+    // and the aggregate alike — a closed vocabulary a caller can branch on without unwrapping.
+    assert_eq!(
+        detail_rows[0]["kind"], "uses",
+        "the detailed row names the connecting kind: {detail_rows:?}"
+    );
 
     let beyond_bound = report["beyond_bound"].as_array().unwrap();
     assert_eq!(beyond_bound.len(), 1, "outer is aggregated beyond the bound");
+    assert_eq!(
+        beyond_bound[0]["kind"], "uses",
+        "the aggregate row names the connecting kind: {beyond_bound:?}"
+    );
     assert!(
         beyond_bound[0].get("content").is_none(),
         "aggregate rows never carry a content field: {beyond_bound:?}"
     );
 }
 
-// _(`trace` refuses the dependents relation)_ — `trace` cannot express the depth-bounded, horizon
-// aggregated dependents payload, so it errors rather than returning a confident but misleading empty
-// answer for a subject that may have many dependents.
+// _(`trace` cannot express the dependents relation)_ — `dependents` is the one command-surface
+// relation that yields no trace relation, so it can only be answered by the dependents path; every
+// other relation yields one and is answerable by `trace`.
+//
+// `trace` cannot express the depth-bounded, horizon-aggregated dependents payload. That used to be
+// a run-time refusal from a call the types permitted; the split makes the call unwritable, so what
+// remains to check is the routing decision itself. That `trace --relation dependents` still answers
+// as a dependents assessment is covered end to end through the binary in `output_bounding.rs`.
 #[test]
-fn trace_with_dependents_relation_errors_instead_of_empty() {
-    let store = dep_graph(&["seed", "caller"], &[(EdgeKind::Uses, "caller", "seed")]);
-    let engine = dep_engine(&store);
-    let err = engine
-        .trace("test-ws::seed", Relation::Dependents, None, None)
-        .expect_err("trace must refuse the dependents relation, not answer empty");
+fn only_the_dependents_relation_yields_no_trace_relation() {
+    let relations = [
+        Relation::Containers,
+        Relation::Contains,
+        Relation::References,
+        Relation::Importers,
+        Relation::Implementers,
+        Relation::Tests,
+    ];
+    for relation in relations {
+        assert!(
+            relation.as_trace().is_some(),
+            "{relation:?} is answerable by trace and must yield a trace relation"
+        );
+    }
     assert!(
-        matches!(err, silent_cartographer::query::QueryError::DependentsNotTraceable),
-        "expected DependentsNotTraceable, got {err:?}"
+        Relation::Dependents.as_trace().is_none(),
+        "dependents carries a depth bound and horizon aggregate a flat item list cannot hold"
     );
 }
 
@@ -1625,7 +1719,7 @@ fn trace_importers_returns_modules_that_import_the_subject() {
     );
     let engine = dep_engine(&store);
     let answer = engine
-        .trace("test-ws::subject", Relation::Importers, None, None)
+        .trace("test-ws::subject", TraceRelation::Importers, None, None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -1657,7 +1751,7 @@ fn trace_implementers_returns_types_declaring_the_subject_as_supertype() {
     );
     let engine = dep_engine(&store);
     let answer = engine
-        .trace("test-ws::subject", Relation::Implementers, None, None)
+        .trace("test-ws::subject", TraceRelation::Implementers, None, None)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -1696,7 +1790,7 @@ fn trace_implementers_signature_detail_is_projected_and_capped() {
     let full = engine
         .trace(
             "test-ws::subject",
-            Relation::Implementers,
+            TraceRelation::Implementers,
             Some(Detail::Signature),
             None,
         )
@@ -1720,7 +1814,7 @@ fn trace_implementers_signature_detail_is_projected_and_capped() {
     let capped = engine
         .trace(
             "test-ws::subject",
-            Relation::Implementers,
+            TraceRelation::Implementers,
             Some(Detail::Signature),
             Some(2),
         )
@@ -1752,7 +1846,7 @@ fn trace_importers_with_none_is_typed_absence() {
     let store = dep_graph(&["subject"], &[]);
     let engine = dep_engine(&store);
     let answer = engine
-        .trace("test-ws::subject", Relation::Importers, None, None)
+        .trace("test-ws::subject", TraceRelation::Importers, None, None)
         .unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Empty),
@@ -1768,7 +1862,7 @@ fn trace_implementers_with_none_is_typed_absence() {
     let store = dep_graph(&["subject"], &[]);
     let engine = dep_engine(&store);
     let answer = engine
-        .trace("test-ws::subject", Relation::Implementers, None, None)
+        .trace("test-ws::subject", TraceRelation::Implementers, None, None)
         .unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Empty),
@@ -1911,11 +2005,11 @@ fn ranked_and_unranked_return_the_same_answer_set() {
     let ranked = report_under(OrderMode::Ranked);
     let unranked = report_under(OrderMode::Unranked);
 
-    let row_set = |report: &DependentsReport| -> std::collections::BTreeSet<(String, u32, String)> {
+    let row_set = |report: &DependentsReport| -> std::collections::BTreeSet<(String, u32, DependencyKind)> {
         report
             .detail
             .iter()
-            .map(|d| (d.symbol.canonical_id.as_str().to_string(), d.distance, d.kind.clone()))
+            .map(|d| (d.symbol.canonical_id.as_str().to_string(), d.distance, d.kind))
             .collect()
     };
     assert_eq!(row_set(&ranked), row_set(&unranked), "the answer set never changes");
@@ -2032,8 +2126,12 @@ fn trace_self_description_frames_dependents_as_impact() {
 fn deterministic_ordering_across_repeated_queries() {
     let store = built_store();
     let engine = engine_over(&store, support::provenance());
-    let first = engine.trace("net::Client", Relation::References, None, None).unwrap();
-    let second = engine.trace("net::Client", Relation::References, None, None).unwrap();
+    let first = engine
+        .trace("net::Client", TraceRelation::References, None, None)
+        .unwrap();
+    let second = engine
+        .trace("net::Client", TraceRelation::References, None, None)
+        .unwrap();
     let locs = |a: &silent_cartographer::query::output::Answer<silent_cartographer::query::TraceItem>| {
         if let Outcome::Found { results } = &a.outcome {
             results
@@ -2177,7 +2275,11 @@ fn python_dependents_trace_carries_kind_and_distance() {
         .iter()
         .find(|d| d.symbol.canonical_id == py_build_id())
         .unwrap_or_else(|| panic!("build is a dependent: {:?}", report.detail));
-    assert_eq!(uses.kind, "uses", "the function that calls Widget is a uses dependent");
+    assert_eq!(
+        uses.kind,
+        DependencyKind::Uses,
+        "the function that calls Widget is a uses dependent"
+    );
     assert_eq!(uses.distance, 1);
 
     let imports = report
@@ -2185,7 +2287,11 @@ fn python_dependents_trace_carries_kind_and_distance() {
         .iter()
         .find(|d| d.symbol.canonical_id == py_consumer_module_id())
         .unwrap_or_else(|| panic!("the importing module is a dependent: {:?}", report.detail));
-    assert_eq!(imports.kind, "imports", "the importing module is an imports dependent");
+    assert_eq!(
+        imports.kind,
+        DependencyKind::Imports,
+        "the importing module is an imports dependent"
+    );
     assert_eq!(imports.distance, 1);
 }
 
@@ -2459,7 +2565,7 @@ fn tr_locations(
 fn trace_tests_returns_exactly_test_classified_sites() {
     let store = tr_store();
     let engine = tr_engine(&store);
-    let answer = engine.trace("subject_a", Relation::Tests, None, None).unwrap();
+    let answer = engine.trace("subject_a", TraceRelation::Tests, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -2484,7 +2590,7 @@ fn trace_tests_returns_exactly_test_classified_sites() {
 fn trace_tests_reaches_through_a_shared_helper() {
     let store = tr_store();
     let engine = tr_engine(&store);
-    let answer = engine.trace("subject_b", Relation::Tests, None, None).unwrap();
+    let answer = engine.trace("subject_b", TraceRelation::Tests, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -2507,7 +2613,7 @@ fn trace_tests_reaches_through_a_shared_helper() {
 fn trace_tests_module_scope_reference_counts() {
     let store = tr_store();
     let engine = tr_engine(&store);
-    let answer = engine.trace("subject_c", Relation::Tests, None, None).unwrap();
+    let answer = engine.trace("subject_c", TraceRelation::Tests, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -2529,7 +2635,7 @@ fn trace_tests_module_scope_reference_counts() {
 fn trace_tests_only_production_references_is_typed_absence() {
     let store = tr_store();
     let engine = tr_engine(&store);
-    let answer = engine.trace("subject_d", Relation::Tests, None, None).unwrap();
+    let answer = engine.trace("subject_d", TraceRelation::Tests, None, None).unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Empty),
         "a definite empty set: {:?}",
@@ -2616,7 +2722,7 @@ fn trace_tests_python_site_returned() {
     let hash = silent_cartographer::graph::content_hash(&sources);
     let engine = QueryEngine::new(&store, provenance, hash, None);
 
-    let answer = engine.trace("subject", Relation::Tests, None, None).unwrap();
+    let answer = engine.trace("subject", TraceRelation::Tests, None, None).unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
     };
@@ -2640,7 +2746,7 @@ fn tests_json_carries_marker_and_per_site_rules_references_carries_neither() {
     let store = tr_store();
     let engine = tr_engine(&store);
     let tests_json = engine
-        .trace("subject_e", Relation::Tests, None, None)
+        .trace("subject_e", TraceRelation::Tests, None, None)
         .unwrap()
         .to_json();
     assert!(
@@ -2657,7 +2763,7 @@ fn tests_json_carries_marker_and_per_site_rules_references_carries_neither() {
     );
 
     let refs_json = engine
-        .trace("subject_e", Relation::References, None, None)
+        .trace("subject_e", TraceRelation::References, None, None)
         .unwrap()
         .to_json();
     assert!(
@@ -2677,7 +2783,7 @@ fn tests_json_carries_marker_and_per_site_rules_references_carries_neither() {
 fn empty_tests_json_keeps_the_marker() {
     let store = tr_store();
     let engine = tr_engine(&store);
-    let answer = engine.trace("subject_d", Relation::Tests, None, None).unwrap();
+    let answer = engine.trace("subject_d", TraceRelation::Tests, None, None).unwrap();
     assert!(matches!(answer.outcome, Outcome::Empty), "{:?}", answer.outcome);
     let json = answer.to_json();
     assert!(
@@ -2693,7 +2799,9 @@ fn empty_tests_json_keeps_the_marker() {
 fn unresolved_tests_subject_carries_no_marker() {
     let store = tr_store();
     let engine = tr_engine(&store);
-    let answer = engine.trace("no_such_symbol", Relation::Tests, None, None).unwrap();
+    let answer = engine
+        .trace("no_such_symbol", TraceRelation::Tests, None, None)
+        .unwrap();
     assert!(matches!(answer.outcome, Outcome::Absent), "{:?}", answer.outcome);
     assert!(
         !answer.to_json().contains("classification"),
@@ -2732,7 +2840,7 @@ fn ambiguous_tests_subject_carries_no_marker() {
     ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources()).unwrap();
     let engine = engine_over(&store, support::provenance());
 
-    let answer = engine.trace("connect", Relation::Tests, None, None).unwrap();
+    let answer = engine.trace("connect", TraceRelation::Tests, None, None).unwrap();
     assert!(
         matches!(answer.outcome, Outcome::Ambiguous { .. }),
         "{:?}",
@@ -2751,7 +2859,7 @@ fn ambiguous_tests_subject_carries_no_marker() {
 fn tests_marker_composes_with_staleness() {
     let store = tr_store();
     let engine = QueryEngine::new(&store, support::provenance(), "drifted-hash".to_string(), None);
-    let answer = engine.trace("subject_a", Relation::Tests, None, None).unwrap();
+    let answer = engine.trace("subject_a", TraceRelation::Tests, None, None).unwrap();
     assert!(answer.stale, "the changed sources flag the answer stale");
     let json = answer.to_json();
     assert!(json.contains("\"stale\": true"), "{json}");
@@ -2789,11 +2897,15 @@ fn trace_self_description_frames_tests_as_convention_based() {
 fn trace_tests_ordering_is_deterministic_and_matches_references() {
     let store = tr_store();
     let engine = tr_engine(&store);
-    let first = tr_locations(&engine.trace("subject_a", Relation::Tests, None, None).unwrap());
-    let second = tr_locations(&engine.trace("subject_a", Relation::Tests, None, None).unwrap());
+    let first = tr_locations(&engine.trace("subject_a", TraceRelation::Tests, None, None).unwrap());
+    let second = tr_locations(&engine.trace("subject_a", TraceRelation::Tests, None, None).unwrap());
     assert_eq!(first, second, "repeated queries return identical ordering");
 
-    let references = tr_locations(&engine.trace("subject_a", Relation::References, None, None).unwrap());
+    let references = tr_locations(
+        &engine
+            .trace("subject_a", TraceRelation::References, None, None)
+            .unwrap(),
+    );
     let filtered: Vec<_> = references.into_iter().filter(|loc| first.contains(loc)).collect();
     assert_eq!(first, filtered, "the tests answer preserves the references ordering");
 }
@@ -2804,9 +2916,9 @@ fn trace_tests_ordering_is_deterministic_and_matches_references() {
 fn trace_tests_signature_detail_projects_without_changing_results() {
     let store = tr_store();
     let engine = tr_engine(&store);
-    let plain = tr_locations(&engine.trace("subject_b", Relation::Tests, None, None).unwrap());
+    let plain = tr_locations(&engine.trace("subject_b", TraceRelation::Tests, None, None).unwrap());
     let answer = engine
-        .trace("subject_b", Relation::Tests, Some(Detail::Signature), None)
+        .trace("subject_b", TraceRelation::Tests, Some(Detail::Signature), None)
         .unwrap();
     assert_eq!(tr_locations(&answer), plain, "detail never changes the result set");
     let Outcome::Found { results } = &answer.outcome else {

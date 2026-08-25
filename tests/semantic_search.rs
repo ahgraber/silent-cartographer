@@ -11,7 +11,7 @@ use silent_cartographer::graph::embed::MODEL_ID;
 use silent_cartographer::graph::ingest;
 use silent_cartographer::graph::store::GraphStore;
 use silent_cartographer::identity::{CanonicalId, SegmentKind};
-use silent_cartographer::query::output::Outcome;
+use silent_cartographer::query::output::{Classification, Outcome};
 use silent_cartographer::query::search::{CloneCertainty, SimilarItem};
 use silent_cartographer::query::{Detail, QueryEngine};
 use silent_cartographer::semantic::model::{OccurrenceRole, SourceRange, SymbolClass, SymbolKind};
@@ -167,9 +167,10 @@ fn an_empty_corpus_is_typed_absence_with_marker_and_provenance() {
     let engine = engine_over(&store, &srcs);
     let answer = engine.search("anything", Detail::Signature, None).unwrap();
     assert!(matches!(answer.outcome, Outcome::Empty));
-    assert_eq!(answer.classification, Some("estimation"));
-    let semantic = answer.semantic_index.expect("the empty answer carries provenance");
-    assert_eq!(semantic.model_identity, MODEL_ID);
+    let Some(Classification::Estimation { semantic_index }) = answer.classification else {
+        panic!("the empty answer carries the estimation marker");
+    };
+    assert_eq!(semantic_index.model_identity, MODEL_ID);
 }
 
 // _(The marker composes with staleness)_ — an engine told a different current hash grades the
@@ -180,7 +181,10 @@ fn the_estimation_marker_composes_with_staleness() {
     let engine = QueryEngine::new(&store, provenance(), "a-different-hash".to_string(), None);
     let answer = engine.similar("m1::alpha", Detail::Signature, None).unwrap();
     assert!(answer.stale, "a changed hash grades the answer stale");
-    assert_eq!(answer.classification, Some("estimation"));
+    assert!(
+        matches!(answer.classification, Some(Classification::Estimation { .. })),
+        "the estimation marker rides independently beside staleness"
+    );
 }
 
 /// The clone fixture: `m1::alpha` with a same-named copy in another module differing only in
@@ -497,10 +501,10 @@ pub fn dup(y: u32) -> u32 {
     ingest(&mut store, &ws(), Some(WS_ROOT), &index, &srcs).unwrap();
     let engine = engine_over(&store, &srcs);
     let answer = engine.similar("dup", Detail::Signature, None).unwrap();
-    // The refusal terminates before any ranking is derived: no estimation marker, no
-    // semantic-index provenance — the marker asserts a derivation, never the command invoked.
+    // The refusal terminates before any ranking is derived: no estimation marker, and so no
+    // semantic-index provenance either — the marker asserts a derivation, never the command
+    // invoked, and the provenance rides inside the marker rather than beside it.
     assert_eq!(answer.classification, None);
-    assert!(answer.semantic_index.is_none());
     let Outcome::Ambiguous { candidates, .. } = answer.outcome else {
         panic!("a shared shortname is ambiguous");
     };
@@ -518,7 +522,6 @@ fn an_unresolved_subject_carries_no_marker() {
         .unwrap();
     assert!(matches!(answer.outcome, Outcome::Absent));
     assert_eq!(answer.classification, None);
-    assert!(answer.semantic_index.is_none());
 }
 
 // _(An unresolved subject carries no marker — position arm)_ — a source position enclosed by no
@@ -577,8 +580,12 @@ fn a_subject_with_no_passage_is_typed_absence_with_the_marker() {
     let engine = engine_over(&store, &srcs);
     let answer = engine.similar("Widget", Detail::Signature, None).unwrap();
     assert!(matches!(answer.outcome, Outcome::Empty));
-    assert_eq!(answer.classification, Some("estimation"));
-    assert!(answer.semantic_index.is_some(), "the empty answer carries provenance");
+    // The marker and its provenance are one value, so carrying the marker is carrying the
+    // provenance — there is no longer a second thing to assert.
+    assert!(
+        matches!(answer.classification, Some(Classification::Estimation { .. })),
+        "the empty answer carries the marker and its provenance"
+    );
 }
 
 // _(Token overlap is not a precondition)_ — a query sharing no token with any render still
@@ -600,7 +607,10 @@ fn a_corpus_with_only_the_subject_is_typed_absence() {
     let engine = engine_over(&store, &srcs);
     let answer = engine.similar("lonely", Detail::Signature, None).unwrap();
     assert!(matches!(answer.outcome, Outcome::Empty));
-    assert_eq!(answer.classification, Some("estimation"));
+    assert!(
+        matches!(answer.classification, Some(Classification::Estimation { .. })),
+        "a definite empty still carries the estimation marker"
+    );
 }
 
 // A corpus larger than the vector extension's KNN ceiling (4096) still answers: the vector signal

@@ -236,9 +236,14 @@ fn current_state(
     rust_analyzer: &str,
 ) -> Result<(AnalyzerProvenance, String, Option<EnvironmentFacts>)> {
     let recorded = store.read_metadata()?;
-    let is_python = recorded
-        .as_ref()
-        .is_some_and(|m| m.provenance.analyzer_name == PythonAdapter::analyzer_name());
+    // A recorded analyzer decides the language through the one dispatch, so an unrecognized one is
+    // refused here as it is at build time. No recorded index at all is not that case: there is no
+    // analyzer to read, and the Rust collection is the default a first build assumes.
+    let recorded_language = match recorded.as_ref() {
+        Some(m) => Some(crate::graph::backend_language(&m.provenance.analyzer_name)?),
+        None => None,
+    };
+    let is_python = recorded_language == Some(Language::Python);
 
     if is_python {
         let sources = collect_python_sources(root)?;
@@ -587,33 +592,33 @@ fn disclose_workspace_handoff(store: &GraphStore, workspace_root: Option<&str>) 
 /// The one-line `build` accounting summary: every per-rule acceptance bucket inside the
 /// parentheses (their sum is the `aligned=` total), followed by the refusal and syntax-only counts.
 ///
-/// Every [`crate::graph::join::AlignmentRule`] bucket MUST render here:
-/// `accounting_line_renders_every_bucket` sums the parenthesized buckets against
-/// [`JoinAccounting::aligned_total`], so a bucket added to the accounting without a render site
-/// fails that test instead of silently vanishing from the build output.
+/// The buckets are read from [`JoinAccounting::by_rule`], which walks the whole rule vocabulary, so
+/// a rule added to that vocabulary appears here with no edit and none can be left out.
 pub fn build_accounting_line(accounting: &JoinAccounting) -> String {
+    let buckets: Vec<String> = accounting
+        .by_rule()
+        .map(|(rule, count)| format!("{}={count}", rule.tag()))
+        .collect();
     format!(
-        "built: aligned={} (exact={} crate_root={} operator_desugar={} module_span={} self_keyword={} \
-         module_name={} self_name={} module_marker={} import_alias={} range_literal={} use_list_self={} \
-         super_keyword={}) text_mismatch={} semantic_only={} duplicate_ambiguous={} syntax_only={}",
+        "built: aligned={} ({}) text_mismatch={} semantic_only={} duplicate_ambiguous={} syntax_only={}",
         accounting.aligned_total(),
-        accounting.aligned_exact,
-        accounting.aligned_crate_root,
-        accounting.aligned_operator_desugar,
-        accounting.aligned_module_span,
-        accounting.aligned_self_keyword,
-        accounting.aligned_module_name,
-        accounting.aligned_self_name,
-        accounting.aligned_module_marker,
-        accounting.aligned_import_alias,
-        accounting.aligned_range_literal,
-        accounting.aligned_use_list_self,
-        accounting.aligned_super_keyword,
+        buckets.join(" "),
         accounting.text_mismatch,
         accounting.semantic_only,
         accounting.duplicate_ambiguous,
         accounting.syntax_only
     )
+}
+
+/// The per-rule acceptance buckets as a JSON object keyed by each rule's stored tag, with the
+/// derived `total` alongside — the `aligned` block both machine views carry.
+fn aligned_buckets_json(accounting: &JoinAccounting) -> serde_json::Value {
+    let mut aligned = serde_json::Map::new();
+    for (rule, count) in accounting.by_rule() {
+        aligned.insert(rule.tag().to_string(), serde_json::json!(count));
+    }
+    aligned.insert("total".to_string(), serde_json::json!(accounting.aligned_total()));
+    serde_json::Value::Object(aligned)
 }
 
 /// The human `build` answer: the accounting line for a build that ran, or a statement that the
@@ -646,21 +651,7 @@ pub fn build_outcome_json(outcome: &BuildOutcome) -> serde_json::Value {
 /// the bucket names `run_status` uses in its `join_alignment` block so the two machine views agree.
 pub fn build_accounting_json(accounting: &JoinAccounting) -> serde_json::Value {
     serde_json::json!({
-        "aligned": {
-            "exact": accounting.aligned_exact,
-            "crate_root": accounting.aligned_crate_root,
-            "operator_desugar": accounting.aligned_operator_desugar,
-            "module_span": accounting.aligned_module_span,
-            "self_keyword": accounting.aligned_self_keyword,
-            "module_name": accounting.aligned_module_name,
-            "self_name": accounting.aligned_self_name,
-            "module_marker": accounting.aligned_module_marker,
-            "import_alias": accounting.aligned_import_alias,
-            "range_literal": accounting.aligned_range_literal,
-            "use_list_self": accounting.aligned_use_list_self,
-            "super_keyword": accounting.aligned_super_keyword,
-            "total": accounting.aligned_total(),
-        },
+        "aligned": aligned_buckets_json(accounting),
         "text_mismatch": accounting.text_mismatch,
         "semantic_only": accounting.semantic_only,
         "duplicate_ambiguous": accounting.duplicate_ambiguous,
@@ -733,22 +724,9 @@ pub fn run_status(
         },
         "stale": freshness.is_stale(),
         "join_alignment": {
-            // Per-rule acceptance buckets alongside the refusal counts.
-            "aligned": {
-                "exact": meta.accounting.aligned_exact,
-                "crate_root": meta.accounting.aligned_crate_root,
-                "operator_desugar": meta.accounting.aligned_operator_desugar,
-                "module_span": meta.accounting.aligned_module_span,
-                "self_keyword": meta.accounting.aligned_self_keyword,
-                "module_name": meta.accounting.aligned_module_name,
-                "self_name": meta.accounting.aligned_self_name,
-                "module_marker": meta.accounting.aligned_module_marker,
-                "import_alias": meta.accounting.aligned_import_alias,
-                "range_literal": meta.accounting.aligned_range_literal,
-                "use_list_self": meta.accounting.aligned_use_list_self,
-                "super_keyword": meta.accounting.aligned_super_keyword,
-                "total": meta.accounting.aligned_total(),
-            },
+            // Per-rule acceptance buckets alongside the refusal counts, from the same walk over the
+            // rule vocabulary `--json build` uses, so the two machine views cannot disagree.
+            "aligned": aligned_buckets_json(&meta.accounting),
             "text_mismatch": meta.accounting.text_mismatch,
             "semantic_only": meta.accounting.semantic_only,
             "duplicate_ambiguous": meta.accounting.duplicate_ambiguous,
@@ -1084,17 +1062,20 @@ pub fn run_trace(
         from: None,
         index_hash,
     };
-    if matches!(relation, Relation::Dependents) {
+    // The relation decides which engine method answers it. `dependents` is the one whose answer does
+    // not fit a flat item list, so it is the one `as_trace` declines; every other relation yields the
+    // trace relation `trace` accepts, and no run-time refusal stands between them.
+    let Some(trace_relation) = relation.as_trace() else {
         let answer = engine.dependents(reference, depth.unwrap_or(1), detail, effective_max_lines, order)?;
         // Dependents pages its detailed rows under the limit; the depth/horizon/disclosure/beyond-bound
         // summary is repeated on every page as context. Every dependents answer — typed-empty
         // included — carries the ordering disclosure.
         let answer = apply_dependents_pagination(answer, effective_limit, cursor, &identity)?
             .with_workspace_relation(relation_disclosure)
-            .with_ordering(order.label());
+            .with_ordering(order);
         return Ok(render(&answer, json, styled));
-    }
-    let answer = engine.trace(reference, relation, detail, effective_max_lines)?;
+    };
+    let answer = engine.trace(reference, trace_relation, detail, effective_max_lines)?;
     let answer =
         apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation_disclosure);
     Ok(render(&answer, json, styled))
@@ -1334,12 +1315,9 @@ pub fn run_impact(
         .expect("open_query_store guarantees a completed build's metadata");
 
     // The language the recorded metadata's analyzer decides, which is also what source discovery
-    // would have collected.
-    let language = if meta.provenance.analyzer_name == PythonAdapter::analyzer_name() {
-        Language::Python
-    } else {
-        Language::Rust
-    };
+    // would have collected. Read through the one dispatch a build uses, so the two can never
+    // disagree about what an index's documents are.
+    let language = crate::graph::backend_language(&meta.provenance.analyzer_name)?;
 
     // Only a path source discovery would have collected can carry a seed or an unmappable region. A
     // change to a README, a lockfile, or a JSON fixture is not something the graph would ever track,
@@ -1494,7 +1472,7 @@ pub fn run_impact(
     // Every impact answer carries the ordering disclosure, whatever its outcome.
     let answer = apply_impact_pagination(answer, effective_limit, cursor, &identity)?
         .with_workspace_relation(relation)
-        .with_ordering(order.label());
+        .with_ordering(order);
     Ok(render(&answer, json, styled))
 }
 

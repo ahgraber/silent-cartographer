@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::identity::{CanonicalId, DefinitionSite, ProjectionInput, WorkspaceId, project_all};
 use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SymbolClass, SymbolKind};
 use crate::semantic::python_adapter::PythonAdapter;
+use crate::semantic::rust_adapter::RustAdapter;
 
 use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join, module_by_document};
 use prepared::PreparedCorpus;
@@ -38,6 +39,9 @@ pub enum IngestError {
     /// The syntax tree could not be reconciled with the index because of a content-hash mismatch.
     #[error("content-hash mismatch: sources do not match the index being joined")]
     ContentHashMismatch,
+    /// The analyzer name names no backend this binary knows, so no syntax language follows from it.
+    #[error("analyzer {0:?} names no known language backend; this index cannot be parsed")]
+    UnknownAnalyzer(String),
 }
 
 /// Compute the content hash over the analyzed sources.
@@ -116,15 +120,20 @@ fn occurrence_site(occ: &crate::semantic::model::ExtractedOccurrence) -> Definit
     }
 }
 
-/// The syntax language an index's documents parse as.
+/// The syntax language a backend's indexes parse as, from the analyzer's recorded name.
 ///
-/// The recorded analyzer identity is the language marker (the design records no separate language
-/// column or flag): a scip-python index is Python source, anything else is Rust.
-fn index_language(index: &ExtractedIndex) -> Language {
-    if index.provenance.analyzer_name == PythonAdapter::analyzer_name() {
-        Language::Python
+/// The recorded analyzer identity is the language marker — the design records no separate language
+/// column or flag — so this is the single place that reading is done, for a build and for a query
+/// alike. An unrecognized name is refused rather than defaulted: parsing a third backend's documents
+/// with the Rust grammar would produce a silently wrong graph, where a refusal names the analyzer
+/// nobody taught the system about.
+pub fn backend_language(analyzer_name: &str) -> Result<Language, IngestError> {
+    if analyzer_name == PythonAdapter::analyzer_name() {
+        Ok(Language::Python)
+    } else if analyzer_name == RustAdapter::analyzer_name() {
+        Ok(Language::Rust)
     } else {
-        Language::Rust
+        Err(IngestError::UnknownAnalyzer(analyzer_name.to_string()))
     }
 }
 
@@ -167,7 +176,7 @@ pub fn ingest_with_params(
     chunk_params: &chunk::ChunkParams,
 ) -> Result<JoinAccounting, IngestError> {
     let identities = project_identities(workspace, index);
-    let language = index_language(index);
+    let language = backend_language(&index.provenance.analyzer_name)?;
     let corpus = SourceCorpus::new(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
     // One parse per document: every syntax-reading derivation below borrows this corpus rather
     // than parsing anything itself.
@@ -308,9 +317,15 @@ pub fn ingest_with_params(
             continue;
         };
         let display_name = sym.terminal_name().unwrap_or_default().to_string();
+        // Exhaustive over `SymbolClass`, so a class the backend model gains later cannot default
+        // into `in_workspace` and be persisted as a workspace symbol without anyone noticing.
         let class = match sym.class {
             SymbolClass::External => PersistedClass::External,
-            _ => PersistedClass::InWorkspace,
+            SymbolClass::InWorkspace => PersistedClass::InWorkspace,
+            // A local symbol is outside the persisted base and carries no identity, so the identity
+            // filter has already skipped it. Stating the exclusion again here keeps the decision
+            // beside the classification rather than only in `project_identities`.
+            SymbolClass::Local => continue,
         };
         let duplicated = sym.definition().is_some()
             && sym
@@ -1092,6 +1107,26 @@ mod tests {
     use super::work_bound_fixture::{fn_symbol, index_over};
     use super::*;
     use crate::semantic::model::{ExtractedOccurrence, SourceRange};
+
+    // Each known analyzer names its own language, and an analyzer no backend claims is refused.
+    //
+    // A default here would parse a third backend's documents with the Rust grammar and persist a
+    // silently wrong graph — every span, every declaration, and every join outcome derived from the
+    // wrong tree, with nothing to indicate it.
+    #[test]
+    fn the_language_dispatch_refuses_an_analyzer_no_backend_claims() {
+        assert_eq!(backend_language(RustAdapter::analyzer_name()).unwrap(), Language::Rust);
+        assert_eq!(
+            backend_language(PythonAdapter::analyzer_name()).unwrap(),
+            Language::Python
+        );
+
+        let refused = backend_language("scip-typescript").expect_err("an unclaimed analyzer is refused");
+        assert!(
+            matches!(&refused, IngestError::UnknownAnalyzer(name) if name == "scip-typescript"),
+            "the refusal names the analyzer: {refused}"
+        );
+    }
 
     /// A workspace of one document holding `callee_count` callee functions plus one caller whose
     /// body references the first callee: `fn f0() {} … fn caller() { f0(); }`.

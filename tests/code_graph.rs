@@ -3,8 +3,9 @@
 
 mod support;
 
+use silent_cartographer::graph::join::AlignmentRule;
 use silent_cartographer::graph::store::{
-    DEPENDENTS_HORIZON, EdgeKind, Freshness, GraphStore, PersistedClass, SymbolRow,
+    DEPENDENTS_HORIZON, DependencyKind, EdgeKind, Freshness, GraphStore, PersistedClass, SymbolRow,
 };
 use silent_cartographer::graph::{content_hash, freshness, ingest, join_guarded};
 use silent_cartographer::identity::{CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId};
@@ -755,7 +756,7 @@ fn dependent_direct_is_distance_one_uses() {
     assert_eq!(deps.len(), 1);
     assert_eq!(deps[0].id, sid("caller"));
     assert_eq!(deps[0].depth, 1);
-    assert_eq!(deps[0].kind, "uses");
+    assert_eq!(deps[0].kind, DependencyKind::Uses);
 }
 
 // _(Dependents traversal — transitive branch)_ — a function two hops away appears at distance 2.
@@ -777,7 +778,7 @@ fn dependent_via_imports_carries_imports_kind() {
     let store = graph(&["seed", "mod_a"], &[(EdgeKind::Imports, "mod_a", "seed")]);
     let deps = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
     assert_eq!(deps.len(), 1);
-    assert_eq!(deps[0].kind, "imports");
+    assert_eq!(deps[0].kind, DependencyKind::Imports);
 }
 
 // _(Dependents traversal — type_hierarchy branch)_ — a type implementing the seed trait appears with
@@ -790,7 +791,7 @@ fn dependent_via_type_hierarchy_carries_that_kind() {
     );
     let deps = store.dependents(&sid("seed_trait"), DEPENDENTS_HORIZON).unwrap();
     assert_eq!(deps.len(), 1);
-    assert_eq!(deps[0].kind, "type_hierarchy");
+    assert_eq!(deps[0].kind, DependencyKind::TypeHierarchy);
 }
 
 // _(Dependents traversal — enclosure excluded)_ — the seed's containing module is not a dependent by
@@ -855,7 +856,7 @@ fn dependents_ordering_is_deterministic() {
     let second = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
     assert_eq!(first, second, "identical queries return identical ordering");
     // All at depth 1, so ordering falls to the fixed kind order: uses, imports, type_hierarchy.
-    let kinds: Vec<&str> = first.iter().map(|d| d.kind.as_str()).collect();
+    let kinds: Vec<&str> = first.iter().map(|d| d.kind.tag()).collect();
     assert_eq!(
         kinds,
         vec!["uses", "imports", "type_hierarchy"],
@@ -887,7 +888,11 @@ fn same_depth_arrivals_choose_the_lowest_ordered_kind() {
     );
     let deps = store.dependents(&sid("seed"), DEPENDENTS_HORIZON).unwrap();
     assert_eq!(deps.len(), 1, "{deps:?}");
-    assert_eq!(deps[0].kind, "uses", "lowest-ordered kind among same-depth arrivals");
+    assert_eq!(
+        deps[0].kind,
+        DependencyKind::Uses,
+        "lowest-ordered kind among same-depth arrivals"
+    );
 }
 
 // _(Dependents traversal — same-depth kind tie-break across seeds)_ — a dependent reaching two seeds
@@ -904,7 +909,11 @@ fn same_depth_arrivals_from_different_seeds_choose_the_lowest_ordered_kind() {
     assert_eq!(deps.len(), 1, "{deps:?}");
     assert_eq!(deps[0].id, sid("x"));
     assert_eq!(deps[0].depth, 1);
-    assert_eq!(deps[0].kind, "uses", "lowest-ordered kind across both seeds' edges");
+    assert_eq!(
+        deps[0].kind,
+        DependencyKind::Uses,
+        "lowest-ordered kind across both seeds' edges"
+    );
 }
 
 // _(Dependents traversal — seed report kind tie-break)_ — a seed reported as another seed's
@@ -920,7 +929,11 @@ fn a_reported_seed_chooses_the_lowest_ordered_kind() {
         .unwrap();
     assert_eq!(deps.len(), 1, "{deps:?}");
     assert_eq!(deps[0].id, sid("a"));
-    assert_eq!(deps[0].kind, "uses", "lowest-ordered kind among the qualifying edges");
+    assert_eq!(
+        deps[0].kind,
+        DependencyKind::Uses,
+        "lowest-ordered kind among the qualifying edges"
+    );
 }
 
 // _(Dependents traversal — closure)_ — a reachable set closed at some distance yields an identical
@@ -977,7 +990,7 @@ fn closed_reachable_set_does_not_pay_for_the_remaining_bound() {
     let elapsed = start.elapsed();
     assert_eq!(deps.len(), n, "every node reaches the seed");
     assert!(
-        deps.iter().all(|d| d.depth == 1 && d.kind == "uses"),
+        deps.iter().all(|d| d.depth == 1 && d.kind == DependencyKind::Uses),
         "all reach the seed directly via uses: {deps:?}"
     );
     assert!(
@@ -1100,7 +1113,7 @@ fn a_seed_reached_through_a_saturated_intermediate_is_reported_at_its_distance()
     let c: Vec<_> = deps.iter().filter(|d| d.id == sid("c")).collect();
     assert_eq!(c.len(), 1, "c reported exactly once: {deps:?}");
     assert_eq!(c[0].depth, 2, "c's distance to the nearest other seed, through x");
-    assert_eq!(c[0].kind, "uses");
+    assert_eq!(c[0].kind, DependencyKind::Uses);
     let x: Vec<_> = deps.iter().filter(|d| d.id == sid("x")).collect();
     assert_eq!(
         (x.len(), x[0].depth),
@@ -1491,29 +1504,17 @@ fn environment_provenance_round_trips_through_metadata() {
     assert_eq!(read.environment, None, "absence is typed, not defaulted");
 }
 
-// _(Join alignment accounting — the module-name bucket rides metadata)_ — a metadata round-trip
-// preserves the `aligned_module_name` count alongside every other per-rule count.
+// _(Join alignment accounting — a sparse accounting rides metadata)_ — a build that accepted under
+// only some rules round-trips whole: the rules it never accepted under read back as zero, not as
+// absent buckets. The counts persist keyed by rule tag, so this is the shape where a key could go
+// missing on the way out.
 #[test]
-fn module_name_count_rides_metadata() {
+fn a_sparse_accounting_rides_metadata() {
     use silent_cartographer::graph::join::JoinAccounting;
     use silent_cartographer::graph::store::IndexMetadata;
 
     let store = GraphStore::open_in_memory().unwrap();
-    let accounting = JoinAccounting {
-        aligned_exact: 1,
-        aligned_crate_root: 2,
-        aligned_operator_desugar: 3,
-        aligned_module_span: 4,
-        aligned_self_keyword: 5,
-        aligned_module_name: 6,
-        text_mismatch: 7,
-        semantic_only: 8,
-        duplicate_ambiguous: 9,
-        syntax_only: 10,
-        // Zero-valued here; the non-zero round-trip of the self-name/module-marker/import-alias
-        // buckets is `new_rule_counts_ride_metadata`.
-        ..JoinAccounting::default()
-    };
+    let accounting = JoinAccounting::with_counts([1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0], 7, 8, 9, 10);
     let meta = IndexMetadata {
         workspace_id: ws(),
         workspace_root: Some(WS_ROOT.to_string()),
@@ -1527,38 +1528,23 @@ fn module_name_count_rides_metadata() {
     let read = store.read_metadata().unwrap().expect("metadata present");
     assert_eq!(
         read.accounting, accounting,
-        "every per-rule count, the module-name bucket included, round-trips whole"
+        "a rule with no acceptances round-trips as zero, not as a missing bucket"
     );
 }
 
-// _(Join alignment accounting — every per-rule bucket rides metadata)_ — a metadata round-trip
-// with every field non-zero preserves all twelve per-rule counts alongside the refusal counts. The
-// exhaustive struct literal (no `..default()`) is deliberate: adding a `JoinAccounting` field
-// without persisting it fails compilation here.
+// _(Join alignment accounting — every per-rule bucket rides metadata)_ — a metadata round-trip with
+// every bucket non-zero and distinct preserves all of them alongside the refusal counts.
+//
+// The array literal's length is the rule count, so a rule joining the vocabulary stops this
+// compiling until the literal covers it — the same forcing the exhaustive struct literal used to
+// give, now over one value instead of sixteen fields.
 #[test]
 fn new_rule_counts_ride_metadata() {
     use silent_cartographer::graph::join::JoinAccounting;
     use silent_cartographer::graph::store::IndexMetadata;
 
     let store = GraphStore::open_in_memory().unwrap();
-    let accounting = JoinAccounting {
-        aligned_exact: 1,
-        aligned_crate_root: 2,
-        aligned_operator_desugar: 3,
-        aligned_module_span: 4,
-        aligned_self_keyword: 5,
-        aligned_module_name: 6,
-        aligned_self_name: 7,
-        aligned_module_marker: 8,
-        aligned_import_alias: 9,
-        aligned_range_literal: 10,
-        aligned_use_list_self: 11,
-        aligned_super_keyword: 12,
-        text_mismatch: 13,
-        semantic_only: 14,
-        duplicate_ambiguous: 15,
-        syntax_only: 16,
-    };
+    let accounting = JoinAccounting::with_counts([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 13, 14, 15, 16);
     let meta = IndexMetadata {
         workspace_id: ws(),
         workspace_root: Some(WS_ROOT.to_string()),
@@ -2052,11 +2038,11 @@ fn accounting_conserves_occurrence_total() {
     ingest(&mut py_store, &ws(), Some(WS_ROOT), &py_index, &py_src).unwrap();
     let py_acc = py_store.read_metadata().unwrap().unwrap().accounting;
     for (bucket, count) in [
-        ("aligned_module_name", py_acc.aligned_module_name),
-        ("aligned_self_name", py_acc.aligned_self_name),
-        ("aligned_module_marker", py_acc.aligned_module_marker),
-        ("aligned_import_alias", py_acc.aligned_import_alias),
-        ("aligned_exact", py_acc.aligned_exact),
+        ("aligned_module_name", py_acc.accepted(AlignmentRule::ModuleName)),
+        ("aligned_self_name", py_acc.accepted(AlignmentRule::SelfName)),
+        ("aligned_module_marker", py_acc.accepted(AlignmentRule::ModuleMarker)),
+        ("aligned_import_alias", py_acc.accepted(AlignmentRule::ImportAlias)),
+        ("aligned_exact", py_acc.accepted(AlignmentRule::Exact)),
         ("text_mismatch", py_acc.text_mismatch),
     ] {
         assert!(count > 0, "{bucket} contributes a non-zero term: {py_acc:?}");
@@ -2617,7 +2603,11 @@ fn crate_root_reference_aligns_on_package_name() {
     )
     .unwrap();
 
-    assert_eq!(acc.aligned_crate_root, 1, "package-name token accepted by crate-root");
+    assert_eq!(
+        acc.accepted(AlignmentRule::CrateRoot),
+        1,
+        "package-name token accepted by crate-root"
+    );
     assert_eq!(acc.text_mismatch, 0, "not refused as a mismatch");
     let id = silent_cartographer::identity::project_one(
         &ws(),
@@ -2661,7 +2651,8 @@ fn crate_keyword_reference_aligns_under_crate_root() {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_crate_root, 1,
+        acc.accepted(AlignmentRule::CrateRoot),
+        1,
         "the `crate` keyword is accepted by crate-root"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -2697,7 +2688,11 @@ fn try_expression_aligns_for_branch() {
         &src,
     )
     .unwrap();
-    assert_eq!(acc.aligned_operator_desugar, 1, "`?` accepted for `branch`");
+    assert_eq!(
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`?` accepted for `branch`"
+    );
     assert_eq!(acc.text_mismatch, 0);
 }
 
@@ -2732,7 +2727,11 @@ fn operator_span_adjacent_to_sigil_aligns() {
         &src,
     )
     .unwrap();
-    assert_eq!(acc.aligned_operator_desugar, 1, "adjacent span matched by construct");
+    assert_eq!(
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "adjacent span matched by construct"
+    );
     assert_eq!(
         acc.text_mismatch, 0,
         "byte-equality against the sigil would have refused this"
@@ -2768,7 +2767,8 @@ fn method_outside_correspondence_stays_refused() {
     assert_eq!(acc.text_mismatch, 1, "no rule accepts a name-shaped drift");
     assert_eq!(acc.aligned_total(), 0);
     assert_eq!(
-        acc.aligned_operator_desugar, 0,
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        0,
         "`compute` is not in the correspondence"
     );
 }
@@ -2798,7 +2798,11 @@ fn module_definition_spanning_whole_document_aligns() {
         &src,
     )
     .unwrap();
-    assert_eq!(acc.aligned_module_span, 1, "whole-document module definition accepted");
+    assert_eq!(
+        acc.accepted(AlignmentRule::ModuleSpan),
+        1,
+        "whole-document module definition accepted"
+    );
     assert_eq!(acc.text_mismatch, 0);
 }
 
@@ -2826,7 +2830,11 @@ fn whole_document_span_on_non_module_stays_refused() {
         &src,
     )
     .unwrap();
-    assert_eq!(acc.aligned_module_span, 0, "module-span is gated on the module kind");
+    assert_eq!(
+        acc.accepted(AlignmentRule::ModuleSpan),
+        0,
+        "module-span is gated on the module kind"
+    );
     assert_eq!(acc.aligned_total(), 0);
     assert_eq!(acc.text_mismatch, 1, "the non-module whole-document span is refused");
 }
@@ -3255,7 +3263,7 @@ fn attributions_carry_their_accepting_rule() {
 #[test]
 fn trace_references_includes_operator_aligned_site() {
     use silent_cartographer::query::output::Outcome;
-    use silent_cartographer::query::{QueryEngine, Relation, TraceItem};
+    use silent_cartographer::query::{QueryEngine, TraceItem, TraceRelation};
 
     let source = "fn f(a: u8, b: u8) -> u8 { a + b }\n";
     let plus = source.find('+').unwrap();
@@ -3285,7 +3293,9 @@ fn trace_references_includes_operator_aligned_site() {
     .unwrap();
 
     let engine = QueryEngine::new(&store, support::provenance(), content_hash(&src), None);
-    let answer = engine.trace("ops::Add::add", Relation::References, None, None).unwrap();
+    let answer = engine
+        .trace("ops::Add::add", TraceRelation::References, None, None)
+        .unwrap();
     match answer.outcome {
         Outcome::Found { results } => {
             assert_eq!(results.len(), 1, "the operator-aligned reference is reported");
@@ -3498,14 +3508,32 @@ fn r(a: u8, b: u8) -> u8 { for _i in a..b {} a }
     ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     let acc = store.read_metadata().unwrap().unwrap().accounting;
-    assert!(acc.aligned_exact > 0, "exact bucket non-zero");
-    assert!(acc.aligned_crate_root > 0, "crate-root bucket non-zero");
-    assert!(acc.aligned_operator_desugar > 0, "operator bucket non-zero");
-    assert!(acc.aligned_module_span > 0, "module-span bucket non-zero");
-    assert!(acc.aligned_self_keyword > 0, "self-keyword bucket non-zero");
-    assert!(acc.aligned_range_literal > 0, "range-literal bucket non-zero");
-    assert!(acc.aligned_use_list_self > 0, "use-list-self bucket non-zero");
-    assert!(acc.aligned_super_keyword > 0, "super-keyword bucket non-zero");
+    assert!(acc.accepted(AlignmentRule::Exact) > 0, "exact bucket non-zero");
+    assert!(acc.accepted(AlignmentRule::CrateRoot) > 0, "crate-root bucket non-zero");
+    assert!(
+        acc.accepted(AlignmentRule::OperatorDesugar) > 0,
+        "operator bucket non-zero"
+    );
+    assert!(
+        acc.accepted(AlignmentRule::ModuleSpan) > 0,
+        "module-span bucket non-zero"
+    );
+    assert!(
+        acc.accepted(AlignmentRule::SelfKeyword) > 0,
+        "self-keyword bucket non-zero"
+    );
+    assert!(
+        acc.accepted(AlignmentRule::RangeLiteral) > 0,
+        "range-literal bucket non-zero"
+    );
+    assert!(
+        acc.accepted(AlignmentRule::UseListSelf) > 0,
+        "use-list-self bucket non-zero"
+    );
+    assert!(
+        acc.accepted(AlignmentRule::SuperKeyword) > 0,
+        "super-keyword bucket non-zero"
+    );
     assert!(acc.text_mismatch > 0, "text-mismatch bucket non-zero");
     assert!(acc.semantic_only > 0, "semantic-only bucket non-zero");
     assert!(acc.duplicate_ambiguous > 0, "duplicate-ambiguous bucket non-zero");
@@ -3548,7 +3576,11 @@ impl GraphStore {
     )
     .unwrap();
 
-    assert_eq!(acc.aligned_self_keyword, 1, "`Self` in its own impl accepted");
+    assert_eq!(
+        acc.accepted(AlignmentRule::SelfKeyword),
+        1,
+        "`Self` in its own impl accepted"
+    );
     assert_eq!(acc.text_mismatch, 0);
     let id = silent_cartographer::identity::project_one(
         &ws(),
@@ -3591,7 +3623,11 @@ impl Widget2 {
         &src,
     )
     .unwrap();
-    assert_eq!(acc.aligned_self_keyword, 1, "`Self::` path segment accepted");
+    assert_eq!(
+        acc.accepted(AlignmentRule::SelfKeyword),
+        1,
+        "`Self::` path segment accepted"
+    );
     assert_eq!(acc.text_mismatch, 0);
 }
 
@@ -3632,7 +3668,11 @@ impl<T> Answer<T> {
         &src,
     )
     .unwrap();
-    assert_eq!(acc.aligned_self_keyword, 1, "generic self type accepted by base name");
+    assert_eq!(
+        acc.accepted(AlignmentRule::SelfKeyword),
+        1,
+        "generic self type accepted by base name"
+    );
     assert_eq!(acc.text_mismatch, 0);
 }
 
@@ -3671,7 +3711,11 @@ impl Tr for A {
         &src,
     )
     .unwrap();
-    assert_eq!(acc.aligned_self_keyword, 0, "a foreign impl's Self is never accepted");
+    assert_eq!(
+        acc.accepted(AlignmentRule::SelfKeyword),
+        0,
+        "a foreign impl's Self is never accepted"
+    );
     assert_eq!(acc.aligned_total(), 0);
     assert_eq!(acc.text_mismatch, 1, "the drifted occurrence is refused and surfaced");
 }
@@ -3721,7 +3765,8 @@ impl<T> Answer<T> {
     .unwrap();
 
     assert_eq!(
-        acc.aligned_self_keyword, 1,
+        acc.accepted(AlignmentRule::SelfKeyword),
+        1,
         "the impl-symbol resolution is accepted by the self-keyword rule"
     );
     assert_eq!(
@@ -3780,7 +3825,8 @@ impl From<X> for Y {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_self_keyword, 1,
+        acc.accepted(AlignmentRule::SelfKeyword),
+        1,
         "the trait reference at `Self` accepted by the self-keyword rule"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -3825,7 +3871,8 @@ fn range_literal_accepted_under_shape_correspondence() {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_range_literal, 2,
+        acc.accepted(AlignmentRule::RangeLiteral),
+        2,
         "`Range` at `a..b` and `RangeFrom` at `a..` both accepted"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -3858,7 +3905,8 @@ fn range_occurrence_with_mismatched_shape_stays_refused() {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_range_literal, 0,
+        acc.accepted(AlignmentRule::RangeLiteral),
+        0,
         "`RangeInclusive` does not match the exclusive `a..b` shape"
     );
     assert_eq!(acc.aligned_total(), 0);
@@ -3896,7 +3944,8 @@ fn use_list_self_token_accepted_for_path_module() {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_use_list_self, 1,
+        acc.accepted(AlignmentRule::UseListSelf),
+        1,
         "the use-list `self` token accepted for the path module `walk`"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -3929,7 +3978,8 @@ fn use_list_self_for_different_module_stays_refused() {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_use_list_self, 0,
+        acc.accepted(AlignmentRule::UseListSelf),
+        0,
         "a module occurrence naming a different module is not accepted"
     );
     assert_eq!(acc.aligned_total(), 0);
@@ -3980,11 +4030,13 @@ fn f() { w::go(); }
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_use_list_self, 1,
+        acc.accepted(AlignmentRule::UseListSelf),
+        1,
         "the `self` target token aligns under the use-list-self rule"
     );
     assert_eq!(
-        acc.aligned_import_alias, 1,
+        acc.accepted(AlignmentRule::ImportAlias),
+        1,
         "the aliased `w` token verifies against the pass-1 alignment at the binding target"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -4047,7 +4099,8 @@ mod m {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_self_name, 2,
+        acc.accepted(AlignmentRule::SelfName),
+        2,
         "file-level and inline-module path-start `self` both accept under the self-name bucket"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -4090,7 +4143,8 @@ fn path_start_self_for_foreign_module_stays_refused() {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_self_name, 0,
+        acc.accepted(AlignmentRule::SelfName),
+        0,
         "a foreign module is never accepted at a path-start `self`"
     );
     assert_eq!(
@@ -4162,7 +4216,8 @@ use super::super::y;
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_super_keyword, 2,
+        acc.accepted(AlignmentRule::SuperKeyword),
+        2,
         "both `super` (depth 1) and `super::super` (depth 2) accepted"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -4209,7 +4264,8 @@ fn super_token_for_non_parent_module_stays_refused() {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_super_keyword, 0,
+        acc.accepted(AlignmentRule::SuperKeyword),
+        0,
         "a sibling module is never accepted as an ancestor"
     );
     assert_eq!(
@@ -4272,7 +4328,8 @@ mod tests {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_super_keyword, 2,
+        acc.accepted(AlignmentRule::SuperKeyword),
+        2,
         "depth 1 resolves to the document module, depth 2 to its parent, through the inline chain"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -4313,7 +4370,11 @@ fn desugar_case(source: &str, token: &str, method: &str) -> silent_cartographer:
 #[test]
 fn equality_operator_aligns_for_eq() {
     let acc = desugar_case("fn f(a: u8, b: u8) -> bool { a == b }\n", "==", "eq");
-    assert_eq!(acc.aligned_operator_desugar, 1, "`==` accepted for `eq`");
+    assert_eq!(
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`==` accepted for `eq`"
+    );
     assert_eq!(acc.text_mismatch, 0);
 }
 
@@ -4321,7 +4382,7 @@ fn equality_operator_aligns_for_eq() {
 #[test]
 fn ordered_comparison_aligns_for_lt() {
     let acc = desugar_case("fn f(a: u8, b: u8) -> bool { a < b }\n", "<", "lt");
-    assert_eq!(acc.aligned_operator_desugar, 1, "`<` accepted for `lt`");
+    assert_eq!(acc.accepted(AlignmentRule::OperatorDesugar), 1, "`<` accepted for `lt`");
     assert_eq!(acc.text_mismatch, 0);
 }
 
@@ -4329,7 +4390,11 @@ fn ordered_comparison_aligns_for_lt() {
 #[test]
 fn compound_assignment_aligns_for_add_assign() {
     let acc = desugar_case("fn f(mut a: u8) { a += 1; }\n", "+=", "add_assign");
-    assert_eq!(acc.aligned_operator_desugar, 1, "`+=` accepted for `add_assign`");
+    assert_eq!(
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`+=` accepted for `add_assign`"
+    );
     assert_eq!(acc.text_mismatch, 0);
 }
 
@@ -4338,11 +4403,19 @@ fn compound_assignment_aligns_for_add_assign() {
 #[test]
 fn bitwise_and_shift_align_for_bitand_and_shl() {
     let bitand = desugar_case("fn f(a: u8, b: u8) -> u8 { a & b }\n", "&", "bitand");
-    assert_eq!(bitand.aligned_operator_desugar, 1, "`&` accepted for `bitand`");
+    assert_eq!(
+        bitand.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`&` accepted for `bitand`"
+    );
     assert_eq!(bitand.text_mismatch, 0);
 
     let shl = desugar_case("fn f(a: u8) -> u8 { a << 1 }\n", "<<", "shl");
-    assert_eq!(shl.aligned_operator_desugar, 1, "`<<` accepted for `shl`");
+    assert_eq!(
+        shl.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`<<` accepted for `shl`"
+    );
     assert_eq!(shl.text_mismatch, 0);
 }
 
@@ -4350,7 +4423,11 @@ fn bitwise_and_shift_align_for_bitand_and_shl() {
 #[test]
 fn unary_not_aligns_for_not() {
     let acc = desugar_case("fn f(a: bool) -> bool { !a }\n", "!", "not");
-    assert_eq!(acc.aligned_operator_desugar, 1, "`!` accepted for `not`");
+    assert_eq!(
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`!` accepted for `not`"
+    );
     assert_eq!(acc.text_mismatch, 0);
 }
 
@@ -4359,7 +4436,8 @@ fn unary_not_aligns_for_not() {
 fn index_expression_aligns_for_index() {
     let acc = desugar_case("fn f(v: &[u8]) -> u8 { v[0] }\n", "[0]", "index");
     assert_eq!(
-        acc.aligned_operator_desugar, 1,
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
         "the index expression accepted for `index`"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -4369,7 +4447,11 @@ fn index_expression_aligns_for_index() {
 #[test]
 fn explicit_deref_aligns_for_deref() {
     let acc = desugar_case("fn f(p: &u8) -> u8 { *p }\n", "*", "deref");
-    assert_eq!(acc.aligned_operator_desugar, 1, "explicit `*` accepted for `deref`");
+    assert_eq!(
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "explicit `*` accepted for `deref`"
+    );
     assert_eq!(acc.text_mismatch, 0);
 }
 
@@ -4379,7 +4461,8 @@ fn explicit_deref_aligns_for_deref() {
 fn call_expression_aligns_for_call() {
     let acc = desugar_case("fn f(g: fn(u8) -> u8) -> u8 { g(1) }\n", "g(1)", "call");
     assert_eq!(
-        acc.aligned_operator_desugar, 1,
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
         "the call expression accepted for `call`"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -4391,7 +4474,8 @@ fn call_expression_aligns_for_call() {
 fn for_loop_aligns_for_into_iter() {
     let acc = desugar_case("fn f(v: Vec<u8>) { for _x in v {} }\n", "for", "into_iter");
     assert_eq!(
-        acc.aligned_operator_desugar, 1,
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
         "the `for` construct accepted for `into_iter`"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -4443,7 +4527,8 @@ fn indexing_occurrences_accepted_at_both_brackets() {
     .unwrap();
 
     assert_eq!(
-        acc.aligned_operator_desugar, 2,
+        acc.accepted(AlignmentRule::OperatorDesugar),
+        2,
         "both bracket occurrences accepted independently, no dedup"
     );
     assert_eq!(acc.text_mismatch, 1, "the off-index occurrence stays refused");
@@ -4455,18 +4540,34 @@ fn indexing_occurrences_accepted_at_both_brackets() {
 #[test]
 fn extended_operators_accepted_under_desugar_rule() {
     let not_acc = desugar_case("fn f(a: bool) -> bool { !a }\n", "!", "not");
-    assert_eq!(not_acc.aligned_operator_desugar, 1, "`!` accepted for `not`");
+    assert_eq!(
+        not_acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`!` accepted for `not`"
+    );
 
     // `desugar_case` locates the token by `find`, and the function signature's own `->` contains a
     // `>`; anchoring on `" > "` (with surrounding spaces) skips past it to the comparison operator.
     let gt_acc = desugar_case("fn f(a: u8, b: u8) -> bool { a > b }\n", " > ", "gt");
-    assert_eq!(gt_acc.aligned_operator_desugar, 1, "`>` accepted for `gt`");
+    assert_eq!(
+        gt_acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`>` accepted for `gt`"
+    );
 
     let add_acc = desugar_case("fn f(a: u8, b: u8) -> u8 { a + b }\n", "+", "add");
-    assert_eq!(add_acc.aligned_operator_desugar, 1, "`+` accepted for `add`");
+    assert_eq!(
+        add_acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`+` accepted for `add`"
+    );
 
     let deref_acc = desugar_case("fn f(p: &u8) -> u8 { *p }\n", "*", "deref");
-    assert_eq!(deref_acc.aligned_operator_desugar, 1, "`*` accepted for `deref`");
+    assert_eq!(
+        deref_acc.accepted(AlignmentRule::OperatorDesugar),
+        1,
+        "`*` accepted for `deref`"
+    );
 }
 
 // _(Guarded positional join — default rule, tuple-field branch)_ — a field occurrence named `0` at
@@ -4497,7 +4598,8 @@ fn tuple_field_index_accepted_under_default_rule() {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_exact, 1,
+        acc.accepted(AlignmentRule::Exact),
+        1,
         "the tuple-field index accepted under the default rule"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -4539,7 +4641,8 @@ impl output::Answer {
     )
     .unwrap();
     assert_eq!(
-        acc.aligned_self_keyword, 1,
+        acc.accepted(AlignmentRule::SelfKeyword),
+        1,
         "the qualified impl header compares by base name"
     );
     assert_eq!(acc.text_mismatch, 0);
@@ -4640,7 +4743,8 @@ fn reference_in_twins_defining_document_attributes_via_defining_document_localit
 
     assert_eq!(acc.duplicate_ambiguous, 0, "the reference is settled, not ambiguous");
     assert_eq!(
-        acc.aligned_exact, 3,
+        acc.accepted(AlignmentRule::Exact),
+        3,
         "two definitions plus the settled reference align exactly"
     );
 
@@ -5002,7 +5106,8 @@ fn package_name_reference_among_duplicated_crate_roots_is_ambiguous_while_crate_
         "the package-name token is refused to duplicate-ambiguous, never attributed by locality"
     );
     assert_eq!(
-        acc.aligned_crate_root, 1,
+        acc.accepted(AlignmentRule::CrateRoot),
+        1,
         "the crate-keyword token still attributes under the crate-root rule"
     );
 
@@ -5104,7 +5209,8 @@ fn package_name_reference_resolves_to_the_library_twin_via_target_metadata() {
         "both reference forms resolve — nothing is left ambiguous"
     );
     assert_eq!(
-        acc.aligned_crate_root, 2,
+        acc.accepted(AlignmentRule::CrateRoot),
+        2,
         "package-name and crate-keyword tokens both align under the crate-root rule"
     );
 
@@ -5660,7 +5766,8 @@ fn conservation_holds_with_locality_attributed_and_ambiguous_group_references() 
 
     assert_eq!(acc.duplicate_ambiguous, 1, "the unsettled reference is ambiguous");
     assert_eq!(
-        acc.aligned_exact, 3,
+        acc.accepted(AlignmentRule::Exact),
+        3,
         "two definitions plus the locality-settled reference align"
     );
     assert_eq!(
@@ -6230,7 +6337,8 @@ fn nested_module_bare_terminal_aligns_and_prefix_refused() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_module_name, 1,
+        acc.accepted(AlignmentRule::ModuleName),
+        1,
         "exactly the terminal-component token aligns"
     );
     assert_eq!(acc.text_mismatch, 1, "the non-terminal-component token is refused");
@@ -6264,7 +6372,8 @@ fn module_kind_without_init_terminal_is_outside_module_name_rule() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_module_name, 0,
+        acc.accepted(AlignmentRule::ModuleName),
+        0,
         "the module-name rule refuses a descriptor without the __init__ terminal"
     );
     assert_eq!(acc.aligned_total(), 0, "no rule accepts the occurrence");
@@ -6293,7 +6402,8 @@ fn non_module_occurrence_is_outside_module_name_rule() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_module_name, 0,
+        acc.accepted(AlignmentRule::ModuleName),
+        0,
         "the module-name rule never fires for a non-module symbol"
     );
     assert_eq!(acc.aligned_total(), 0, "no rule accepts the mismatched token");
@@ -6328,11 +6438,13 @@ fn rust_kind_scoped_rules_do_not_fire_for_python() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_module_span, 0,
+        acc.accepted(AlignmentRule::ModuleSpan),
+        0,
         "the Rust module-span rule never accepts a Python occurrence"
     );
     assert_eq!(
-        acc.aligned_module_marker, 1,
+        acc.accepted(AlignmentRule::ModuleMarker),
+        1,
         "the marker aligns under Python's own module-marker rule"
     );
     assert_eq!(acc.aligned_total(), 1, "exactly the module-marker acceptance");
@@ -6364,7 +6476,8 @@ fn python_module_relative_import_aligns_under_module_name_rule() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_module_name, 1,
+        acc.accepted(AlignmentRule::ModuleName),
+        1,
         "the relative-import token aligns under the module-name rule"
     );
     assert_eq!(acc.text_mismatch, 0, "nothing refused");
@@ -6413,7 +6526,8 @@ fn python_module_prefix_token_stays_refused() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_module_name, 0,
+        acc.accepted(AlignmentRule::ModuleName),
+        0,
         "a leading-component token is not evidence for the module"
     );
     assert_eq!(acc.aligned_total(), 0, "no rule accepts the prefix token");
@@ -6451,7 +6565,8 @@ fn module_reference_accepted_through_enclosing_dotted_construct() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_module_name, 1,
+        acc.accepted(AlignmentRule::ModuleName),
+        1,
         "the prefix token inside the dotted construct aligns under the module-name rule"
     );
     assert_eq!(
@@ -6520,12 +6635,14 @@ fn self_name_token_for_foreign_module_stays_refused() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_self_name, 0,
+        acc.accepted(AlignmentRule::SelfName),
+        0,
         "a foreign module's __name__ occurrence fails the own-module equality"
     );
     assert_eq!(acc.text_mismatch, 1, "the foreign occurrence is refused");
     assert_eq!(
-        acc.aligned_module_marker, 1,
+        acc.accepted(AlignmentRule::ModuleMarker),
+        1,
         "only the document's own marker aligns (under the marker rule)"
     );
 }
@@ -6586,7 +6703,8 @@ fn zero_width_non_module_stays_refused() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_module_marker, 0,
+        acc.accepted(AlignmentRule::ModuleMarker),
+        0,
         "the module-marker rule never accepts a non-module symbol"
     );
     assert_eq!(acc.aligned_total(), 0, "no rule accepts the zero-width occurrence");
@@ -6825,7 +6943,8 @@ fn alias_bound_to_different_symbol_stays_refused() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_import_alias, 0,
+        acc.accepted(AlignmentRule::ImportAlias),
+        0,
         "the alias binds a different symbol, so the verification fails"
     );
     assert_eq!(acc.text_mismatch, 1, "the alias-token occurrence stays refused");
@@ -6883,7 +7002,8 @@ fn alias_binding_outside_document_is_not_evidence() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_import_alias, 0,
+        acc.accepted(AlignmentRule::ImportAlias),
+        0,
         "a binding in another document is not evidence"
     );
     assert_eq!(acc.text_mismatch, 1, "the foreign-document alias token stays refused");
@@ -6921,7 +7041,8 @@ fn alias_of_alias_stays_refused() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
     assert_eq!(
-        acc.aligned_import_alias, 0,
+        acc.accepted(AlignmentRule::ImportAlias),
+        0,
         "an unverified binding chain contributes nothing"
     );
     assert_eq!(acc.aligned_total(), 0, "no rule accepts either occurrence");
@@ -6972,9 +7093,14 @@ fn rust_use_alias_accepted_under_document_binding() {
     let src = vec![("m.rs".to_string(), source.to_string())];
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
-    assert_eq!(acc.aligned_exact, 1, "the binding target token aligns exact");
     assert_eq!(
-        acc.aligned_import_alias, 1,
+        acc.accepted(AlignmentRule::Exact),
+        1,
+        "the binding target token aligns exact"
+    );
+    assert_eq!(
+        acc.accepted(AlignmentRule::ImportAlias),
+        1,
         "the alias use aligns under the import-alias rule"
     );
     assert_eq!(

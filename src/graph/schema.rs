@@ -17,20 +17,35 @@
 /// binary, and bumping this version makes every stale store refuse wholesale — no separate
 /// semantic-compatibility gate exists.
 ///
-/// Migration: version 15 reshaped `semantic_vectors` to one row per chunk (carrying its passage's
+/// A change to the alignment-rule vocabulary bumps this version like any other schema-affecting
+/// change. Which rules the join applies decides which occurrences align, so a new rule yields a
+/// different graph from the same sources; a store built under the old vocabulary is stale, not
+/// merely missing a count. The keyed `aligned_counts` column spares that change any DDL and any
+/// per-rule read/write edit — it does not spare it the version bump.
+///
+/// Migration: version 16 replaced the twelve `aligned_*_count` columns with a single keyed
+/// `aligned_counts` JSON object, retiring the per-rule column, read, and write edits a new rule
+/// used to require;
+/// version 15 reshaped `semantic_vectors` to one row per chunk (carrying its passage's
 /// identity and ordinal) and added the chunk parameters to `index_metadata`; version 14 added the
 /// semantic corpus (`semantic_corpus`, `semantic_lexical`, `semantic_vectors`), the clone-key
 /// columns on `symbols`, and the semantic-index identity in `index_metadata`. The index is derived,
 /// replayable data, so rebuild is the migration — a build replaces an older store of its own
 /// wholesale and a query refuses it with recovery guidance (the replace-or-refuse contract).
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
 
 -- One row per indexed workspace build. Holds provenance, the content-hash gate, and the
--- join-alignment accounting: one acceptance count per alignment rule, plus the refusal counts.
+-- join-alignment accounting: `aligned_counts` is a JSON object mapping each alignment rule's stored
+-- tag to its acceptance count, alongside the refusal counts. The rule vocabulary is keyed rather
+-- than columnar so a rule joining it costs no DDL and no per-rule read/write edit; it still bumps
+-- the schema version, because a new rule changes which occurrences align and so changes the graph.
+-- Every rule the writing binary knows is emitted, zero-valued ones included, and the read requires
+-- exactly that key set: a missing or unknown key means the store was built under a different
+-- vocabulary, which is a different graph, not a differing count.
 -- `environment` is the backend's declared interpreter-environment facts as JSON (nullable — absent
 -- for backends, like Rust's, that declare none); staleness compares it against the environment in
 -- effect.
@@ -58,18 +73,7 @@ CREATE TABLE IF NOT EXISTS index_metadata (
     chunk_size                INTEGER NOT NULL,
     chunk_overlap             INTEGER NOT NULL,
     content_hash                   TEXT    NOT NULL,
-    aligned_exact_count            INTEGER NOT NULL DEFAULT 0,
-    aligned_crate_root_count       INTEGER NOT NULL DEFAULT 0,
-    aligned_operator_desugar_count INTEGER NOT NULL DEFAULT 0,
-    aligned_module_span_count      INTEGER NOT NULL DEFAULT 0,
-    aligned_self_keyword_count     INTEGER NOT NULL DEFAULT 0,
-    aligned_module_name_count      INTEGER NOT NULL DEFAULT 0,
-    aligned_self_name_count        INTEGER NOT NULL DEFAULT 0,
-    aligned_module_marker_count    INTEGER NOT NULL DEFAULT 0,
-    aligned_import_alias_count     INTEGER NOT NULL DEFAULT 0,
-    aligned_range_literal_count    INTEGER NOT NULL DEFAULT 0,
-    aligned_use_list_self_count    INTEGER NOT NULL DEFAULT 0,
-    aligned_super_keyword_count    INTEGER NOT NULL DEFAULT 0,
+    aligned_counts                 TEXT    NOT NULL DEFAULT '{}',
     text_mismatch_count            INTEGER NOT NULL DEFAULT 0,
     semantic_only_count            INTEGER NOT NULL DEFAULT 0,
     duplicate_ambiguous_count      INTEGER NOT NULL DEFAULT 0,

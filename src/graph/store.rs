@@ -4,12 +4,13 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::Serialize;
 
 use crate::identity::{CanonicalId, WorkspaceId};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
 
 use super::chunk::ChunkParams;
-use super::join::JoinAccounting;
+use super::join::{AlignmentRule, JoinAccounting};
 use super::schema::{SCHEMA_SQL, SCHEMA_VERSION};
 
 /// An edge kind in the graph. All four kinds are contracted: `Contains` is enclosure; the three
@@ -39,6 +40,69 @@ impl EdgeKind {
     }
 }
 
+/// A dependency edge kind: the three [`EdgeKind`]s the dependents traversal walks.
+///
+/// Held apart from [`EdgeKind`] because `Contains` is enclosure, not dependency, and can never
+/// connect a symbol to a dependent. A dependents answer that could carry it would oblige every
+/// consumer to rule it out.
+///
+/// Variant order is the tie-break order — see the `order` method — so the derived `Ord` a
+/// sorted collection keys on and the tie-break the detailed rows sort by are the same order, and a
+/// dependents answer cannot present its detail and its aggregate under two different ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyKind {
+    /// A declaration references a symbol in its body.
+    Uses,
+    /// A module references a symbol at module scope.
+    Imports,
+    /// A type implements a trait.
+    TypeHierarchy,
+}
+
+impl DependencyKind {
+    /// The stored tag for this kind — the same spelling [`EdgeKind::tag`] writes.
+    pub fn tag(&self) -> &'static str {
+        self.as_edge_kind().tag()
+    }
+
+    /// The edge kind this dependency kind is, so the two vocabularies cannot drift apart.
+    pub fn as_edge_kind(&self) -> EdgeKind {
+        match self {
+            DependencyKind::Uses => EdgeKind::Uses,
+            DependencyKind::Imports => EdgeKind::Imports,
+            DependencyKind::TypeHierarchy => EdgeKind::TypeHierarchy,
+        }
+    }
+
+    /// Read a stored tag as a dependency kind, refusing anything outside the closed set.
+    ///
+    /// Strict by design: the dependents query filters to these three kinds, so a `contains` tag —
+    /// or any other — reaching here means the query and this vocabulary disagree, which is a defect
+    /// to surface rather than a fourth ordering bucket to absorb it.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "uses" => Some(DependencyKind::Uses),
+            "imports" => Some(DependencyKind::Imports),
+            "type_hierarchy" => Some(DependencyKind::TypeHierarchy),
+            _ => None,
+        }
+    }
+
+    /// The fixed order equal-depth hops break ties by, so results order reproducibly.
+    ///
+    /// Exhaustive over the closed set: a kind added to the traversal takes a position here or the
+    /// code does not compile. It agrees with the derived `Ord` by construction, since both follow
+    /// variant order.
+    pub(crate) fn order(&self) -> u8 {
+        match self {
+            DependencyKind::Uses => 0,
+            DependencyKind::Imports => 1,
+            DependencyKind::TypeHierarchy => 2,
+        }
+    }
+}
+
 /// The class a persisted symbol belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistedClass {
@@ -56,15 +120,31 @@ impl PersistedClass {
         }
     }
 
-    fn from_tag(tag: &str) -> Self {
+    /// Read a stored tag as a class, refusing anything outside the persisted vocabulary.
+    ///
+    /// Strict rather than defaulting: the store is a persistence boundary, and a damaged or
+    /// hand-edited `class` value absorbed into `in_workspace` would report a third-party symbol as
+    /// one with source in this workspace. Same policy the environment-facts read follows.
+    fn from_tag(tag: &str) -> Option<Self> {
         match tag {
-            "external" => PersistedClass::External,
-            _ => PersistedClass::InWorkspace,
+            "in_workspace" => Some(PersistedClass::InWorkspace),
+            "external" => Some(PersistedClass::External),
+            _ => None,
         }
     }
 }
 
 /// A symbol row as persisted.
+///
+/// TODO: when a change already needs to redesign this type, make the class own its definition data
+/// — `External | InWorkspace(Option<Definition>)`, where `Definition` guarantees only
+/// `document_path`. Today `class` and the five definition-bearing fields below are independent, so
+/// an external symbol carrying a span is representable; `persistence_violation` rules
+/// it out at the store boundary instead, which protects the persisted answer without committing
+/// every consumer to a new representation. Not worth doing on its own account: the sum type removes
+/// that one state and leaves the inner combinations as they are, because they are real — a known
+/// definition document can carry no usable span, and a span can carry no tier text (see
+/// `crate::graph::definition_content`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolRow {
     /// The canonical identity.
@@ -96,6 +176,50 @@ pub struct SymbolRow {
     /// test code, carrying the convention rule that stamped it as provenance. The rule vocabulary is
     /// open — an unrecognized name is a valid classification, never an error.
     pub test_rule: Option<String>,
+}
+
+impl SymbolRow {
+    /// The definition-bearing fields this row carries, by name — empty for a row carrying none.
+    ///
+    /// An external symbol is resolved outside the workspace and has no definition here, so it must
+    /// carry none of these. The type permits it to; the persistence boundary does not (see
+    /// [`GraphStore::insert_symbol`] and the row read). Naming the offending fields rather than
+    /// reporting a bare violation is what makes the refusal actionable.
+    fn definition_fields_present(&self) -> Vec<&'static str> {
+        let carried: [(&'static str, bool); 5] = [
+            ("document_path", self.document_path.is_some()),
+            ("span", self.span.is_some()),
+            ("span_text", self.span_text.is_some()),
+            ("signature_text", self.signature_text.is_some()),
+            ("interface_text", self.interface_text.is_some()),
+        ];
+        carried
+            .into_iter()
+            .filter(|(_, present)| *present)
+            .map(|(n, _)| n)
+            .collect()
+    }
+
+    /// The reason this row is not a valid persisted symbol, or `None` when it is.
+    ///
+    /// One rule today: an external symbol carries no definition. Kept as a single check both
+    /// boundary crossings call, so the write and the read cannot come to disagree about what a
+    /// storable symbol is.
+    fn persistence_violation(&self) -> Option<String> {
+        if self.class != PersistedClass::External {
+            return None;
+        }
+        let carried = self.definition_fields_present();
+        if carried.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "external symbol {} carries definition data ({}); an external symbol is defined outside \
+             this workspace and has none",
+            self.canonical_id,
+            carried.join(", ")
+        ))
+    }
 }
 
 /// A persisted occurrence row.
@@ -157,8 +281,8 @@ pub struct DependentRow {
     pub id: CanonicalId,
     /// The shortest hop distance from the seed.
     pub depth: u32,
-    /// The connecting edge kind, chosen from a shortest-depth hop under the fixed tie-break.
-    pub kind: String,
+    /// The connecting dependency kind, chosen from a shortest-depth hop under the fixed tie-break.
+    pub kind: DependencyKind,
 }
 
 /// The rank graph projection [`GraphStore::rank_projection`] loads: the node universe and the
@@ -697,18 +821,22 @@ impl GraphStore {
             .environment
             .as_ref()
             .map(|facts| serde_json::to_string(facts).expect("environment facts serialize"));
+        // The per-rule acceptance counts persist as one keyed object, written from the same walk
+        // over the rule vocabulary every render uses, so the store carries exactly the buckets the
+        // binary knows about.
+        let aligned_counts: serde_json::Map<String, serde_json::Value> = meta
+            .accounting
+            .by_rule()
+            .map(|(rule, count)| (rule.tag().to_string(), serde_json::json!(count)))
+            .collect();
+        let aligned_counts = serde_json::Value::Object(aligned_counts).to_string();
         self.conn.execute(
             "INSERT OR REPLACE INTO index_metadata
                 (id, schema_version, workspace_id, workspace_root, analyzer_name, analyzer_version, environment,
-                 content_hash,
-                 aligned_exact_count, aligned_crate_root_count, aligned_operator_desugar_count,
-                 aligned_module_span_count, aligned_self_keyword_count, aligned_module_name_count,
-                 aligned_self_name_count, aligned_module_marker_count, aligned_import_alias_count,
-                 aligned_range_literal_count, aligned_use_list_self_count, aligned_super_keyword_count,
+                 content_hash, aligned_counts,
                  text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count,
                  semantic_model_identity, corpus_definition_version, chunk_size, chunk_overlap)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                     ?22, ?23, ?24, ?25, ?26, ?27)",
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 SCHEMA_VERSION,
                 meta.workspace_id.as_str(),
@@ -717,18 +845,7 @@ impl GraphStore {
                 meta.provenance.analyzer_version,
                 environment,
                 meta.content_hash,
-                meta.accounting.aligned_exact as i64,
-                meta.accounting.aligned_crate_root as i64,
-                meta.accounting.aligned_operator_desugar as i64,
-                meta.accounting.aligned_module_span as i64,
-                meta.accounting.aligned_self_keyword as i64,
-                meta.accounting.aligned_module_name as i64,
-                meta.accounting.aligned_self_name as i64,
-                meta.accounting.aligned_module_marker as i64,
-                meta.accounting.aligned_import_alias as i64,
-                meta.accounting.aligned_range_literal as i64,
-                meta.accounting.aligned_use_list_self as i64,
-                meta.accounting.aligned_super_keyword as i64,
+                aligned_counts,
                 meta.accounting.text_mismatch as i64,
                 meta.accounting.semantic_only as i64,
                 meta.accounting.duplicate_ambiguous as i64,
@@ -747,10 +864,7 @@ impl GraphStore {
         self.conn
             .query_row(
                 "SELECT workspace_id, analyzer_name, analyzer_version, environment, content_hash,
-                        aligned_exact_count, aligned_crate_root_count, aligned_operator_desugar_count,
-                        aligned_module_span_count, aligned_self_keyword_count, aligned_module_name_count,
-                        aligned_self_name_count, aligned_module_marker_count, aligned_import_alias_count,
-                        aligned_range_literal_count, aligned_use_list_self_count, aligned_super_keyword_count,
+                        aligned_counts,
                         text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count,
                         workspace_root, chunk_size, chunk_overlap
                  FROM index_metadata WHERE id = 1",
@@ -767,12 +881,19 @@ impl GraphStore {
                             })
                         })
                         .transpose()?;
+                    let accounting = read_aligned_counts(
+                        &r.get::<_, String>(5)?,
+                        r.get::<_, i64>(6)? as u64,
+                        r.get::<_, i64>(7)? as u64,
+                        r.get::<_, i64>(8)? as u64,
+                        r.get::<_, i64>(9)? as u64,
+                    )?;
                     Ok(IndexMetadata {
                         workspace_id: WorkspaceId::new(r.get::<_, String>(0)?),
-                        workspace_root: r.get(21)?,
+                        workspace_root: r.get(10)?,
                         chunk_params: ChunkParams {
-                            chunk_size: r.get::<_, i64>(22)? as usize,
-                            overlap: r.get::<_, i64>(23)? as usize,
+                            chunk_size: r.get::<_, i64>(11)? as usize,
+                            overlap: r.get::<_, i64>(12)? as usize,
                         },
                         provenance: AnalyzerProvenance {
                             analyzer_name: r.get(1)?,
@@ -780,24 +901,7 @@ impl GraphStore {
                         },
                         environment,
                         content_hash: r.get(4)?,
-                        accounting: JoinAccounting {
-                            aligned_exact: r.get::<_, i64>(5)? as u64,
-                            aligned_crate_root: r.get::<_, i64>(6)? as u64,
-                            aligned_operator_desugar: r.get::<_, i64>(7)? as u64,
-                            aligned_module_span: r.get::<_, i64>(8)? as u64,
-                            aligned_self_keyword: r.get::<_, i64>(9)? as u64,
-                            aligned_module_name: r.get::<_, i64>(10)? as u64,
-                            aligned_self_name: r.get::<_, i64>(11)? as u64,
-                            aligned_module_marker: r.get::<_, i64>(12)? as u64,
-                            aligned_import_alias: r.get::<_, i64>(13)? as u64,
-                            aligned_range_literal: r.get::<_, i64>(14)? as u64,
-                            aligned_use_list_self: r.get::<_, i64>(15)? as u64,
-                            aligned_super_keyword: r.get::<_, i64>(16)? as u64,
-                            text_mismatch: r.get::<_, i64>(17)? as u64,
-                            semantic_only: r.get::<_, i64>(18)? as u64,
-                            duplicate_ambiguous: r.get::<_, i64>(19)? as u64,
-                            syntax_only: r.get::<_, i64>(20)? as u64,
-                        },
+                        accounting,
                     })
                 },
             )
@@ -1010,6 +1114,14 @@ impl GraphStore {
 
     /// Insert a symbol row.
     pub fn insert_symbol(&self, row: &SymbolRow) -> rusqlite::Result<()> {
+        // Refused at the boundary rather than stored: a persisted external symbol carrying a span
+        // would answer `get --detail body` with source for a symbol every answer discloses as
+        // having none here.
+        if let Some(violation) = row.persistence_violation() {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(violation),
+            )));
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO symbols
                 (canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
@@ -1198,11 +1310,24 @@ impl GraphStore {
             (Some(s), Some(e)) => Some((s as usize, e as usize)),
             _ => None,
         };
-        Ok(SymbolRow {
+        // An unrecognized class is a corrupt row surfaced as a typed conversion error, never
+        // silently read as in-workspace — that would report a third-party symbol as having source
+        // here, and every downstream `external` disclosure would be wrong about it.
+        let class_tag: String = r.get(3)?;
+        let class = PersistedClass::from_tag(&class_tag).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(format!(
+                    "symbol class {class_tag:?} is not a persisted class"
+                ))),
+            )
+        })?;
+        let row = SymbolRow {
             canonical_id: CanonicalId::from_raw(r.get::<_, String>(0)?),
             display_name: r.get(1)?,
             kind: r.get(2)?,
-            class: PersistedClass::from_tag(&r.get::<_, String>(3)?),
+            class,
             document_path: r.get(4)?,
             span,
             span_text: r.get(7)?,
@@ -1210,7 +1335,18 @@ impl GraphStore {
             interface_text: r.get(9)?,
             duplicated: r.get::<_, i64>(10)? != 0,
             test_rule: r.get(11)?,
-        })
+        };
+        // The same rule the write applies, applied again on the way out. The write cannot store this
+        // row, so reaching it means the row predates the guard or was edited underneath — a corrupt
+        // row surfaced, never an external symbol silently answering with a body.
+        if let Some(violation) = row.persistence_violation() {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(violation)),
+            ));
+        }
+        Ok(row)
     }
 
     /// All symbols whose display name equals `shortname`.
@@ -1501,7 +1637,7 @@ impl GraphStore {
             m
         };
         let mut roots_of: HashMap<String, RootPair> = HashMap::new();
-        let mut reported: HashMap<String, (u32, String)> = HashMap::new();
+        let mut reported: HashMap<String, (u32, DependencyKind)> = HashMap::new();
         // The frontier: nodes that gained roots last round, with exactly the roots they gained.
         let mut frontier: Vec<(String, RootPair)> = Vec::with_capacity(seeds.len());
         for (id, root) in &seed_root {
@@ -1535,12 +1671,21 @@ impl GraphStore {
                 }
             }
 
-            let mut by_src: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+            // The stored tag becomes a dependency kind here, at the boundary. The query above
+            // filters to the three dependency kinds, so a tag this refuses means the query and the
+            // vocabulary have drifted apart — surfaced as a conversion failure rather than absorbed.
+            let mut by_src: HashMap<&str, Vec<(DependencyKind, &str)>> = HashMap::new();
             for (src, kind, dst) in &hops {
-                by_src
-                    .entry(src.as_str())
-                    .or_default()
-                    .push((kind.as_str(), dst.as_str()));
+                let kind = DependencyKind::from_tag(kind).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::other(format!(
+                            "edge kind {kind:?} is not a dependency kind the traversal walks"
+                        ))),
+                    )
+                })?;
+                by_src.entry(src.as_str()).or_default().push((kind, dst.as_str()));
             }
 
             let mut next: Vec<(String, RootPair)> = Vec::new();
@@ -1572,9 +1717,9 @@ impl GraphStore {
                     let kind = edges_in
                         .iter()
                         .map(|(k, _)| *k)
-                        .min_by_key(|k| kind_order(k))
+                        .min_by_key(|k| k.order())
                         .expect("a grouped source has at least one edge");
-                    reported.insert(src.to_string(), (depth, kind.to_string()));
+                    reported.insert(src.to_string(), (depth, kind));
                 } else if seed_root.contains_key(src) && !reported.contains_key(src) {
                     // A seed reached by another walk root: its shortest distance to a seed other
                     // than itself, so it is reported as that seed's dependent. Only the edges
@@ -1587,9 +1732,9 @@ impl GraphStore {
                             gained.iter().any(|root| !existing.contains(root))
                         })
                         .map(|(k, _)| *k)
-                        .min_by_key(|k| kind_order(k))
+                        .min_by_key(|k| k.order())
                         .expect("a candidate root arrived on some edge");
-                    reported.insert(src.to_string(), (depth, kind.to_string()));
+                    reported.insert(src.to_string(), (depth, kind));
                 }
 
                 let mut pair = existing;
@@ -1618,7 +1763,7 @@ impl GraphStore {
         out.sort_by(|a, b| {
             a.depth
                 .cmp(&b.depth)
-                .then_with(|| kind_order(&a.kind).cmp(&kind_order(&b.kind)))
+                .then_with(|| a.kind.order().cmp(&b.kind.order()))
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(out)
@@ -1814,19 +1959,59 @@ impl RootPair {
     }
 }
 
-/// The fixed order dependency edge kinds break ties by, so equal-depth hops choose a connecting kind
-/// deterministically and results order reproducibly. Non-dependency tags sort last.
+/// Read the persisted `aligned_counts` object into an accounting, alongside the refusal counts.
 ///
-/// The fallback bucket is unreachable while `EdgeKind` stays closed to the three dependency kinds
-/// above; adding a new edge kind to the dependents walk requires adding it here too, or it will
-/// silently sort last instead of taking its intended tie-break position.
-pub(crate) fn kind_order(tag: &str) -> u8 {
-    match tag {
-        "uses" => 0,
-        "imports" => 1,
-        "type_hierarchy" => 2,
-        _ => 3,
+/// The stored key set must be exactly this binary's rule vocabulary — no more, no fewer.
+///
+/// A writer at this schema version emits every rule it knows, zero-valued ones included, so a
+/// missing key never means "no acceptances under that rule"; it means the store was written by a
+/// producer with a different vocabulary. That matters beyond the count itself: which rules the join
+/// applies decides which occurrences align, so a differing vocabulary is a differing graph. Reading
+/// the absent bucket as zero would present that store as a current index of this workspace, when it
+/// describes a build this binary would not produce. An unknown key is the same disagreement seen
+/// from the other side.
+fn read_aligned_counts(
+    json: &str,
+    text_mismatch: u64,
+    semantic_only: u64,
+    duplicate_ambiguous: u64,
+    syntax_only: u64,
+) -> rusqlite::Result<JoinAccounting> {
+    let conversion_failure = |detail: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(detail)),
+        )
+    };
+    let stored: std::collections::BTreeMap<String, u64> =
+        serde_json::from_str(json).map_err(|e| conversion_failure(format!("aligned counts did not parse: {e}")))?;
+
+    let mut counts: Vec<(AlignmentRule, u64)> = Vec::with_capacity(stored.len());
+    for (tag, count) in &stored {
+        let rule = AlignmentRule::from_tag(tag)
+            .ok_or_else(|| conversion_failure(format!("stored alignment rule {tag:?} is not one this binary has")))?;
+        counts.push((rule, *count));
     }
+    let missing: Vec<&str> = JoinAccounting::default()
+        .by_rule()
+        .map(|(rule, _)| rule.tag())
+        .filter(|tag| !stored.contains_key(*tag))
+        .collect();
+    if !missing.is_empty() {
+        return Err(conversion_failure(format!(
+            "stored alignment counts name no bucket for {}; the store was built under a different \
+             rule vocabulary and describes a different graph — rebuild it",
+            missing.join(", ")
+        )));
+    }
+    Ok(JoinAccounting::from_rule_counts(
+        counts,
+        text_mismatch,
+        semantic_only,
+        duplicate_ambiguous,
+        syntax_only,
+    ))
 }
 
 /// Escape LIKE wildcards in a literal fragment (using `\` as the escape char).
@@ -2292,6 +2477,163 @@ mod tests {
             duplicated: false,
             test_rule: None,
         }
+    }
+
+    // A stored class outside the persisted vocabulary is refused as a corrupt row, not absorbed.
+    //
+    // Reading it as `in_workspace` — what a defaulting read does — would report a symbol as having
+    // source in this workspace on every answer that discloses `external`. The store is a
+    // persistence boundary, so a damaged or hand-edited value is exactly what this guards; the
+    // schema-version stamp cannot, since it validates the file header and never a row.
+    #[test]
+    fn a_symbol_class_outside_the_vocabulary_is_refused_not_defaulted() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.insert_symbol(&symbol_at("ws::a", "doc.rs", 0, 10)).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE symbols SET class = 'somewhere_else' WHERE canonical_id = 'ws::a'",
+                [],
+            )
+            .unwrap();
+
+        let error = store
+            .symbol(&CanonicalId::from_raw("ws::a".to_string()))
+            .expect_err("a class outside the vocabulary is refused");
+        assert!(
+            error.to_string().contains("somewhere_else"),
+            "the refusal names the value it could not read: {error}"
+        );
+    }
+
+    // An external symbol carrying definition data never crosses the persistence boundary, in either
+    // direction.
+    //
+    // The type permits the state — `class` and the five definition-bearing fields are independent —
+    // so the boundary is where it is ruled out. Stored, it would answer `get --detail body` with
+    // source for a symbol every answer discloses as `external: true`, having none here. The refusal
+    // names the offending fields so the caller can see which ones to drop.
+    #[test]
+    fn an_external_symbol_carrying_definition_data_is_refused_at_both_crossings() {
+        let store = GraphStore::open_in_memory().unwrap();
+
+        let mut bogus = external_symbol("ext::x");
+        bogus.document_path = Some("doc.rs".to_string());
+        bogus.span = Some((0, 10));
+        let write_error = store
+            .insert_symbol(&bogus)
+            .expect_err("an external symbol carrying a definition is not storable");
+        let described = write_error.to_string();
+        assert!(
+            described.contains("document_path") && described.contains("span"),
+            "the refusal names the definition fields carried: {described}"
+        );
+
+        // A row that reached the table another way — an older binary, a hand edit — is refused on
+        // the way out too, rather than answering as an external symbol with a body.
+        store.insert_symbol(&external_symbol("ext::y")).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE symbols SET span_text = 'fn y() {}' WHERE canonical_id = 'ext::y'",
+                [],
+            )
+            .unwrap();
+        let read_error = store
+            .symbol(&CanonicalId::from_raw("ext::y".to_string()))
+            .expect_err("a stored external symbol carrying a definition is refused on read");
+        assert!(
+            read_error.to_string().contains("span_text"),
+            "the read refusal names the field too: {read_error}"
+        );
+    }
+
+    /// Metadata carrying a default accounting, for tests that overwrite one recorded column and
+    /// read the row back.
+    fn plain_metadata() -> IndexMetadata {
+        IndexMetadata {
+            workspace_id: WorkspaceId::new("ws"),
+            workspace_root: Some("/ws".to_string()),
+            provenance: AnalyzerProvenance {
+                analyzer_name: "test".to_string(),
+                analyzer_version: "0".to_string(),
+            },
+            content_hash: "hash".to_string(),
+            accounting: JoinAccounting::default(),
+            environment: None,
+            chunk_params: ChunkParams::default(),
+        }
+    }
+
+    // A stored alignment rule this binary does not have is refused, not dropped.
+    //
+    // The counts persist keyed by rule tag precisely so the vocabulary can grow without a schema
+    // change. The cost of that is a store can name a rule the reader lacks. Dropping the key would
+    // under-report the build's alignment while every total still looked internally consistent, so
+    // the read refuses and names the tag.
+    #[test]
+    fn a_stored_rule_the_binary_lacks_is_refused() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.write_metadata(&plain_metadata()).unwrap();
+        store
+            .conn
+            .execute(
+                r#"UPDATE index_metadata SET aligned_counts = '{"exact":3,"from_the_future":9}' WHERE id = 1"#,
+                [],
+            )
+            .unwrap();
+
+        let error = store
+            .read_metadata()
+            .expect_err("a rule the binary lacks is refused rather than dropped");
+        assert!(
+            error.to_string().contains("from_the_future"),
+            "the refusal names the rule it could not place: {error}"
+        );
+    }
+
+    // A rule missing from the stored object is refused, not filled in as zero.
+    //
+    // A writer at this schema version emits every rule it knows, zero-valued ones included, so a
+    // missing bucket never means "no acceptances". It means the store came from a producer with a
+    // different rule vocabulary — and which rules the join applies decides which occurrences align,
+    // so that store describes a different graph. Reading the gap as zero would present it as a
+    // current index of this workspace and let a stale graph answer queries as fresh.
+    #[test]
+    fn a_rule_missing_from_the_stored_counts_is_refused() {
+        let store = GraphStore::open_in_memory().unwrap();
+        store.write_metadata(&plain_metadata()).unwrap();
+        store
+            .conn
+            .execute(
+                r#"UPDATE index_metadata SET aligned_counts = '{"exact":3}' WHERE id = 1"#,
+                [],
+            )
+            .unwrap();
+
+        let error = store
+            .read_metadata()
+            .expect_err("a store missing rule buckets is refused rather than zero-filled");
+        let described = error.to_string();
+        assert!(
+            described.contains("super_keyword") && described.contains("crate_root"),
+            "the refusal names the buckets the store carried no value for: {described}"
+        );
+    }
+
+    // A store carrying exactly this binary's rule vocabulary round-trips, zero-valued buckets
+    // included — the writer emits every rule, so a complete key set is the ordinary case.
+    #[test]
+    fn a_complete_stored_key_set_round_trips() {
+        let store = GraphStore::open_in_memory().unwrap();
+        let mut meta = plain_metadata();
+        meta.accounting = JoinAccounting::with_counts([7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 1, 2, 3, 4);
+        store.write_metadata(&meta).unwrap();
+
+        let read = store.read_metadata().unwrap().expect("metadata present");
+        assert_eq!(read.accounting, meta.accounting);
+        assert_eq!(read.accounting.accepted(AlignmentRule::Exact), 7);
+        assert_eq!(read.accounting.accepted(AlignmentRule::SuperKeyword), 0);
     }
 
     // A range overlapping two symbols' spans returns both, ordered by span start.

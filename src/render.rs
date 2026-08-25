@@ -12,9 +12,11 @@
 
 use crate::cli::ColorArg;
 use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
-use crate::query::output::{Answer, ContentLines, Location, Outcome, PageInfo, SymbolView, WorkspaceRelation};
+use crate::query::output::{
+    Answer, Classification, ContentLines, Location, Outcome, PageInfo, SymbolView, WorkspaceRelation,
+};
 use crate::query::search::{CloneCertainty, SearchItem, SimilarItem};
-use crate::query::{DependentsReport, FindItem, HorizonDisclosure, SymbolDetail, TraceItem};
+use crate::query::{DependentsReport, FindItem, HorizonDisclosure, OrderMode, SymbolDetail, TraceItem};
 
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
@@ -103,7 +105,10 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
     }
     // The semantic-index provenance a `search`/`similar` answer carries, rendered with the header
     // block so the human view names the same identity the machine answer does.
-    if let Some(semantic) = &answer.semantic_index {
+    if let Some(Classification::Estimation {
+        semantic_index: semantic,
+    }) = &answer.classification
+    {
         lines.push(format!(
             "semantic index: {} · corpus definition v{}",
             sanitize(&semantic.model_identity),
@@ -115,19 +120,19 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
             // The heuristic-grade marker renders above the results, so a human consumer cannot
             // miss what the structural field tells a machine consumer. Each marker names its own
             // grade: estimation for a model-derived ranking, convention for classified test code.
-            match answer.classification {
-                Some("estimation") => lines.push(
+            match &answer.classification {
+                Some(Classification::Estimation { .. }) => lines.push(
                     "note: rows are the nearest candidates by model-derived estimation — not the complete set of \
                      relevant code"
                         .to_string(),
                 ),
-                Some(_) => lines
+                Some(Classification::Convention) => lines
                     .push("note: results are convention-classified test code, not resolved semantic fact".to_string()),
                 None => {}
             }
             // The ordering disclosure's heuristic note, likewise: only a ranked answer is presented
             // as heuristic — an unranked ordering derives from stable structural keys alone.
-            if answer.ordering == Some("ranked") {
+            if answer.ordering == Some(OrderMode::Ranked) {
                 lines.push(
                     "note: rows within a distance layer are ordered by a structural importance heuristic".to_string(),
                 );
@@ -154,11 +159,11 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
         // corpus offered no candidates — never that no relevant code exists; a convention-marked
         // empty says no convention-classified site was found — never that nothing tests the subject.
         Outcome::Absent => lines.push("absent: nothing resolved (a definite none, not a failure)".to_string()),
-        Outcome::Empty => lines.push(match answer.classification {
-            Some("estimation") => {
+        Outcome::Empty => lines.push(match &answer.classification {
+            Some(Classification::Estimation { .. }) => {
                 "empty: the semantic corpus offered no candidates (not proof that no relevant code exists)".to_string()
             }
-            Some(_) => {
+            Some(Classification::Convention) => {
                 "empty: no convention-classified test reference found (not proof that nothing tests the subject)"
                     .to_string()
             }
@@ -357,7 +362,7 @@ impl HumanRender for DependentsReport {
                     sanitize(&item.symbol.name),
                     location_at(item.location.as_ref()),
                     item.distance,
-                    sanitize(&item.kind)
+                    item.kind.tag()
                 ));
                 if let Some(text) = &item.content {
                     push_content(lines, Some(text));
@@ -371,7 +376,7 @@ impl HumanRender for DependentsReport {
                         "  {} at distance {} via {}",
                         aggregate.count,
                         aggregate.distance,
-                        sanitize(&aggregate.kind)
+                        aggregate.kind.tag()
                     ));
                 }
             }
@@ -387,7 +392,7 @@ impl HumanRender for ImpactReport {
                     "impact: mode={} base={} exactness={}",
                     sanitize(report.seed_mode),
                     sanitize(&report.base_revision),
-                    exactness_label(report.exactness)
+                    exactness_label(&report.exactness)
                 ),
                 styled,
             ));
@@ -442,7 +447,7 @@ impl HumanRender for ImpactReport {
             if report.seed_outcome != SeedOutcome::NoIndexedSymbolTouched {
                 DependentsReport::render_found(std::slice::from_ref(&report.dependents), lines, styled);
             }
-            if let Some(recovery) = &report.recovery {
+            if let Exactness::Approximate { recovery } = &report.exactness {
                 lines.push(bold("approximate: run these steps to produce an exact answer", styled));
                 // The residual an approximate answer cannot rule out: unmappability is witnessed at
                 // the document level, so a declaration this index never recorded reads as a region
@@ -673,10 +678,10 @@ fn freshness_label(freshness: crate::query::output::FreshnessLabel) -> &'static 
     }
 }
 
-fn exactness_label(exactness: Exactness) -> &'static str {
+fn exactness_label(exactness: &Exactness) -> &'static str {
     match exactness {
         Exactness::Exact => "exact",
-        Exactness::Approximate => "approximate",
+        Exactness::Approximate { .. } => "approximate",
     }
 }
 
@@ -742,7 +747,6 @@ mod tests {
             base_revision: "abc123".to_string(),
             exactness: Exactness::Exact,
             seed_outcome: SeedOutcome::NoIndexedSymbolTouched,
-            recovery: None,
             seeds: Vec::new(),
             unmappable: Vec::new(),
             dependents_snapshot: "current_index",
@@ -771,23 +775,21 @@ mod tests {
         );
     }
 
-    /// An `ImpactReport` fixture with everything but `seed_mode`, `recovery`, and `unmappable` held
-    /// constant, so a test can vary just the field under scrutiny.
+    /// An `ImpactReport` fixture with everything but `seed_mode`, `exactness`, and `unmappable`
+    /// held constant, so a test can vary just the field under scrutiny.
+    ///
+    /// The exactness is supplied whole rather than derived from a separate recipe: the recipe now
+    /// rides inside the approximate variant, so the fixture cannot state the pairing at all.
     fn impact_report_fixture(
         seed_mode: &'static str,
-        recovery: Option<RecoveryRecipe>,
+        exactness: Exactness,
         unmappable: Vec<UnmappableRegion>,
     ) -> ImpactReport {
         ImpactReport {
             seed_mode,
             base_revision: "abc123".to_string(),
-            exactness: if recovery.is_some() {
-                Exactness::Approximate
-            } else {
-                Exactness::Exact
-            },
+            exactness,
             seed_outcome: SeedOutcome::NoIndexedSymbolTouched,
-            recovery,
             seeds: Vec::new(),
             unmappable,
             dependents_snapshot: "current_index",
@@ -806,7 +808,7 @@ mod tests {
     // since its base revision already is the snapshot the dependents come from.
     #[test]
     fn range_mode_discloses_the_dependents_snapshot_and_other_modes_do_not() {
-        let range_report = impact_report_fixture("range", None, Vec::new());
+        let range_report = impact_report_fixture("range", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
         ImpactReport::render_found(std::slice::from_ref(&range_report), &mut lines, false);
         let rendered = lines.join("\n");
@@ -815,7 +817,7 @@ mod tests {
             "a range answer discloses the dependents snapshot: {rendered}"
         );
 
-        let working_tree_report = impact_report_fixture("working_tree", None, Vec::new());
+        let working_tree_report = impact_report_fixture("working_tree", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
         ImpactReport::render_found(std::slice::from_ref(&working_tree_report), &mut lines, false);
         let rendered = lines.join("\n");
@@ -835,7 +837,8 @@ mod tests {
             workspace: "ws".to_string(),
             steps: vec!["echo rebuild".to_string()],
         };
-        let approximate_report = impact_report_fixture("working_tree", Some(recovery), Vec::new());
+        let approximate_report =
+            impact_report_fixture("working_tree", Exactness::Approximate { recovery }, Vec::new());
         let mut lines = Vec::new();
         ImpactReport::render_found(std::slice::from_ref(&approximate_report), &mut lines, false);
         let rendered = lines.join("\n");
@@ -844,7 +847,7 @@ mod tests {
             "an approximate answer discloses that declarations may be missing: {rendered}"
         );
 
-        let exact_report = impact_report_fixture("working_tree", None, Vec::new());
+        let exact_report = impact_report_fixture("working_tree", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
         ImpactReport::render_found(std::slice::from_ref(&exact_report), &mut lines, false);
         let rendered = lines.join("\n");
@@ -858,7 +861,7 @@ mod tests {
     // `approximate` — the label a regression could invert without any other assertion catching it.
     #[test]
     fn exactness_label_reflects_exact_or_approximate() {
-        let exact_report = impact_report_fixture("working_tree", None, Vec::new());
+        let exact_report = impact_report_fixture("working_tree", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
         ImpactReport::render_found(std::slice::from_ref(&exact_report), &mut lines, false);
         let rendered = lines.join("\n");
@@ -871,7 +874,8 @@ mod tests {
             workspace: "ws".to_string(),
             steps: vec!["echo rebuild".to_string()],
         };
-        let approximate_report = impact_report_fixture("working_tree", Some(recovery), Vec::new());
+        let approximate_report =
+            impact_report_fixture("working_tree", Exactness::Approximate { recovery }, Vec::new());
         let mut lines = Vec::new();
         ImpactReport::render_found(std::slice::from_ref(&approximate_report), &mut lines, false);
         let rendered = lines.join("\n");
@@ -893,7 +897,7 @@ mod tests {
                 "c10r build /tmp/c10r-wt --db /tmp/c10r-exact.db --workspace my-workspace".to_string(),
             ],
         };
-        let report = impact_report_fixture("working_tree", Some(recovery), Vec::new());
+        let report = impact_report_fixture("working_tree", Exactness::Approximate { recovery }, Vec::new());
         let mut lines = Vec::new();
         ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false);
         let rendered = lines.join("\n");
@@ -928,7 +932,7 @@ mod tests {
             span_start: 10,
             span_end: 20,
         }];
-        let report = impact_report_fixture("working_tree", None, unmappable);
+        let report = impact_report_fixture("working_tree", Exactness::Exact, unmappable);
         let mut lines = Vec::new();
         ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false);
         let rendered = lines.join("\n");
@@ -941,7 +945,7 @@ mod tests {
             "the block names the region's document: {rendered}"
         );
 
-        let report_without = impact_report_fixture("working_tree", None, Vec::new());
+        let report_without = impact_report_fixture("working_tree", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
         ImpactReport::render_found(std::slice::from_ref(&report_without), &mut lines, false);
         let rendered = lines.join("\n");

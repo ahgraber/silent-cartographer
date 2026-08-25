@@ -266,13 +266,22 @@ impl QueryEngine<'_> {
     }
 
     /// The semantic-index provenance view of the persisted build, if one exists.
-    fn semantic_index_view(&self) -> Result<Option<SemanticIndexView>, QueryError> {
-        Ok(self.store.semantic_index_identity()?.map(|identity| SemanticIndexView {
+    /// The semantic-index identity every estimation-graded answer carries.
+    ///
+    /// A store recording none is refused here rather than answered without provenance: the marker
+    /// asserts a ranking derived under a particular regime, and an answer that cannot name the
+    /// regime is not one this surface will produce.
+    fn semantic_index_view(&self) -> Result<SemanticIndexView, QueryError> {
+        let identity = self
+            .store
+            .semantic_index_identity()?
+            .ok_or(QueryError::MissingSemanticIndex)?;
+        Ok(SemanticIndexView {
             model_identity: identity.model_identity,
             corpus_definition_version: identity.corpus_definition_version,
             chunk_size: identity.chunk_params.chunk_size,
             chunk_overlap: identity.chunk_params.overlap,
-        }))
+        })
     }
 }
 

@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::graph::store::Freshness;
 use crate::identity::CanonicalId;
+use crate::query::OrderMode;
 
 /// The analyzer provenance carried on every answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -77,6 +78,34 @@ pub struct SemanticIndexView {
     pub chunk_size: usize,
     /// The overlap between adjacent chunks the build ran under, in model tokens.
     pub chunk_overlap: usize,
+}
+
+/// The heuristic grade an answer's content carries, together with the provenance that grade obliges.
+///
+/// Absent on an answer derived only from resolved semantic fact, so its shape is unchanged. The
+/// grade and its provenance are one value rather than two fields because they are one decision: an
+/// estimation-graded answer must carry the semantic-index identity that produced its ranking
+/// (`.specs/specs/code-navigation/spec.md:871`), and a convention-graded answer has no such identity
+/// to carry. Held apart, either could appear without the other.
+///
+/// Flattened into the answer, so `classification` and `semantic_index` remain sibling keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "classification", rename_all = "snake_case")]
+pub enum Classification {
+    /// The answer derives from convention-based classification rather than resolved semantic fact —
+    /// the `tests` relation.
+    Convention,
+    /// The answer's ranking is model-derived estimation — `search` and `similar` — carrying the
+    /// semantic-index identity in effect.
+    Estimation {
+        /// The semantic-index provenance the ranking derives under.
+        ///
+        /// Not optional: the spec obliges an estimation-graded answer to carry the recorded
+        /// identity, so an answer that could not name one is not an answer this type can express.
+        /// A store with no recorded identity is refused before an answer is built, rather than
+        /// yielding a marker with nothing behind it.
+        semantic_index: SemanticIndexView,
+    },
 }
 
 /// The identity+name view of a symbol carried in every answer.
@@ -172,17 +201,11 @@ pub struct Answer<T> {
     pub freshness: FreshnessLabel,
     /// Whether the answer is stale (either reason).
     pub stale: bool,
-    /// The heuristic-grade marker: `Some("convention")` when the answer derives from
-    /// convention-based classification rather than resolved semantic fact (the `tests` relation),
-    /// `Some("estimation")` when its ranking is model-derived estimation (`search`/`similar`).
+    /// The heuristic grade the answer's content carries, with the provenance that grade obliges.
     /// Absent for relations derived only from resolved reference evidence, so their shape is
     /// unchanged. Rides independently of provenance and freshness, never replacing either.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub classification: Option<&'static str>,
-    /// The semantic-index provenance every `search`/`similar` answer carries — a typed-empty answer
-    /// included. Absent on every other answer, so their shape is unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantic_index: Option<SemanticIndexView>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<Classification>,
     /// The workspace-relationship disclosure: present when the store describes a different workspace
     /// than the one queried, or when that comparison could not be evaluated; absent on a match, so a
     /// matched answer's shape is unchanged. Rides independently of freshness — a store can be current
@@ -197,7 +220,7 @@ pub struct Answer<T> {
     /// never replacing either — and distinct from the heuristic-grade `classification` marker,
     /// which speaks to answer content, not ordering.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ordering: Option<&'static str>,
+    pub ordering: Option<OrderMode>,
     /// The outcome.
     pub outcome: Outcome<T>,
     /// The result-set paging disclosure, present only when a result limit was applied.
@@ -240,7 +263,6 @@ impl<T> Answer<T> {
             freshness: freshness.into(),
             stale: freshness.is_stale(),
             classification: None,
-            semantic_index: None,
             workspace_relation: None,
             ordering: None,
             outcome,
@@ -251,7 +273,7 @@ impl<T> Answer<T> {
     /// Mark the answer as derived from convention-based classification — the structural
     /// heuristic-grade marker every `tests` answer carries, found and empty alike.
     pub fn convention_classified(mut self) -> Self {
-        self.classification = Some("convention");
+        self.classification = Some(Classification::Convention);
         self
     }
 
@@ -259,12 +281,10 @@ impl<T> Answer<T> {
     /// provenance — the pair every `search`/`similar` answer carries, found and empty alike. The
     /// marker accompanies provenance, freshness, and staleness, never replacing any of them.
     ///
-    /// The parameter is optional because it mirrors the store's optional read: a `None` arises
-    /// only for a store recorded without a completed build, which the query surface refuses before
-    /// any engine answers — it is not a reachable answer shape.
-    pub fn estimated(mut self, semantic_index: Option<SemanticIndexView>) -> Self {
-        self.classification = Some("estimation");
-        self.semantic_index = semantic_index;
+    /// The identity is required: the marker asserts a ranking derived under a particular regime, so
+    /// an answer carrying the marker always names it.
+    pub fn estimated(mut self, semantic_index: SemanticIndexView) -> Self {
+        self.classification = Some(Classification::Estimation { semantic_index });
         self
     }
 
@@ -277,7 +297,7 @@ impl<T> Answer<T> {
 
     /// Attach the ordering disclosure — the single structural field every `dependents`/`impact`
     /// answer carries, whatever its outcome, naming the ordering in effect.
-    pub fn with_ordering(mut self, ordering: &'static str) -> Self {
+    pub fn with_ordering(mut self, ordering: OrderMode) -> Self {
         self.ordering = Some(ordering);
         self
     }

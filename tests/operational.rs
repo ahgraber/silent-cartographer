@@ -10,7 +10,7 @@ use silent_cartographer::commands::{
     resolve_workspace, run_build, run_status,
 };
 use silent_cartographer::graph::content_hash;
-use silent_cartographer::graph::join::JoinAccounting;
+use silent_cartographer::graph::join::{AlignmentRule, JoinAccounting};
 use silent_cartographer::graph::store::{DISCREPANCY_GROUP_CAP, GraphStore};
 use silent_cartographer::graph::syntax::Language;
 use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one};
@@ -21,6 +21,7 @@ use silent_cartographer::semantic::model::{
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
 };
 use silent_cartographer::semantic::python_adapter::{PythonAdapter, environment_facts};
+use strum::VariantArray as _;
 
 use crate::support::sources;
 
@@ -450,54 +451,34 @@ fn status_reports_per_rule_acceptance_buckets() {
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
     let alignment = &v["join_alignment"];
 
-    // Each rule's acceptance bucket is present; the all-exact fixture fills only the default rule.
-    let aligned = &alignment["aligned"];
+    // Every rule in the vocabulary is reported, keyed by its stored tag — checked against the
+    // vocabulary itself rather than a hand-copied list, so a rule added to it is reported here or
+    // this fails. The all-exact fixture fills only the default rule; the rest report zero.
+    let aligned = alignment["aligned"].as_object().expect("an aligned block");
+    for rule in AlignmentRule::VARIANTS {
+        assert!(
+            aligned.contains_key(rule.tag()),
+            "the {} bucket is reported: {report}",
+            rule.tag()
+        );
+    }
+    assert_eq!(
+        aligned.len(),
+        AlignmentRule::VARIANTS.len() + 1,
+        "the block carries exactly the rule buckets plus the derived total: {report}"
+    );
     assert!(
         aligned["exact"].as_u64().unwrap() > 0,
-        "exact bucket reported: {report}"
+        "the all-exact fixture fills the default rule: {report}"
     );
-    assert_eq!(aligned["crate_root"].as_u64(), Some(0), "crate-root bucket reported");
-    assert_eq!(
-        aligned["operator_desugar"].as_u64(),
-        Some(0),
-        "operator bucket reported"
-    );
-    assert_eq!(aligned["module_span"].as_u64(), Some(0), "module-span bucket reported");
-    assert_eq!(
-        aligned["self_keyword"].as_u64(),
-        Some(0),
-        "self-keyword bucket reported"
-    );
-    assert_eq!(aligned["module_name"].as_u64(), Some(0), "module-name bucket reported");
-    assert_eq!(aligned["self_name"].as_u64(), Some(0), "self-name bucket reported");
-    assert_eq!(
-        aligned["module_marker"].as_u64(),
-        Some(0),
-        "module-marker bucket reported"
-    );
-    assert_eq!(
-        aligned["import_alias"].as_u64(),
-        Some(0),
-        "import-alias bucket reported"
-    );
-    assert_eq!(
-        aligned["range_literal"].as_u64(),
-        Some(0),
-        "range-literal bucket reported"
-    );
-    assert_eq!(
-        aligned["use_list_self"].as_u64(),
-        Some(0),
-        "use-list-self bucket reported"
-    );
-    assert_eq!(
-        aligned["super_keyword"].as_u64(),
-        Some(0),
-        "super-keyword bucket reported"
-    );
+    let bucket_sum: u64 = aligned
+        .iter()
+        .filter(|(name, _)| name.as_str() != "total")
+        .map(|(_, value)| value.as_u64().expect("a count"))
+        .sum();
     assert_eq!(
         aligned["total"].as_u64().unwrap(),
-        aligned["exact"].as_u64().unwrap(),
+        bucket_sum,
         "the total is the sum of the rule buckets"
     );
 
@@ -513,25 +494,20 @@ fn status_reports_per_rule_acceptance_buckets() {
 // vanish from the build output.
 #[test]
 fn accounting_line_renders_every_bucket() {
-    let accounting = JoinAccounting {
-        aligned_exact: 1,
-        aligned_crate_root: 2,
-        aligned_operator_desugar: 3,
-        aligned_module_span: 4,
-        aligned_self_keyword: 5,
-        aligned_module_name: 6,
-        aligned_self_name: 7,
-        aligned_module_marker: 8,
-        aligned_import_alias: 9,
-        aligned_range_literal: 10,
-        aligned_use_list_self: 11,
-        aligned_super_keyword: 12,
-        text_mismatch: 13,
-        semantic_only: 14,
-        duplicate_ambiguous: 15,
-        syntax_only: 16,
-    };
+    // Every bucket non-zero and distinct, in rule order. The array length is the rule count, so
+    // this literal stops compiling when the vocabulary grows — which is what keeps "every bucket"
+    // meaning every bucket.
+    let accounting = JoinAccounting::with_counts([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 13, 14, 15, 16);
     let line = build_accounting_line(&accounting);
+
+    // The rendered line in full. Pinned because `build` prints it to a human on every invocation:
+    // the bucket order, the parenthesisation, and each label are the output's shape, not incidental.
+    assert_eq!(
+        line,
+        "built: aligned=78 (exact=1 crate_root=2 operator_desugar=3 module_span=4 self_keyword=5 \
+         module_name=6 self_name=7 module_marker=8 import_alias=9 range_literal=10 use_list_self=11 \
+         super_keyword=12) text_mismatch=13 semantic_only=14 duplicate_ambiguous=15 syntax_only=16"
+    );
 
     let aligned_total: u64 = line
         .split_whitespace()
@@ -577,24 +553,10 @@ fn accounting_line_renders_every_bucket() {
 // a new rule can never silently vanish from `--json build`.
 #[test]
 fn build_json_projection_carries_every_bucket() {
-    let accounting = JoinAccounting {
-        aligned_exact: 1,
-        aligned_crate_root: 2,
-        aligned_operator_desugar: 3,
-        aligned_module_span: 4,
-        aligned_self_keyword: 5,
-        aligned_module_name: 6,
-        aligned_self_name: 7,
-        aligned_module_marker: 8,
-        aligned_import_alias: 9,
-        aligned_range_literal: 10,
-        aligned_use_list_self: 11,
-        aligned_super_keyword: 12,
-        text_mismatch: 13,
-        semantic_only: 14,
-        duplicate_ambiguous: 15,
-        syntax_only: 16,
-    };
+    // Every bucket non-zero and distinct, in rule order. The array length is the rule count, so
+    // this literal stops compiling when the vocabulary grows — which is what keeps "every bucket"
+    // meaning every bucket.
+    let accounting = JoinAccounting::with_counts([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 13, 14, 15, 16);
     let json = build_accounting_json(&accounting);
 
     let aligned = json["aligned"]

@@ -15,9 +15,17 @@ use super::diff::{FileChange, LineIndex};
 use super::output::{Answer, Location, SymbolView};
 use super::{DependentsReport, OrderMode, QueryEngine, QueryError};
 
-/// Whether the index the answer was drawn from matches the change's pre-change state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+/// Whether the index the answer was drawn from matches the change's pre-change state, and — when it
+/// does not — the recovery procedure that obligation carries.
+///
+/// The label and the recipe are one value because they are one decision:
+/// `.specs/specs/code-navigation/spec.md:489` requires every approximate answer to carry a runnable
+/// recovery procedure, and an exact answer has none to carry. Held as two fields, either could
+/// appear without the other.
+///
+/// Flattened into the report, so `exactness` and `recovery` remain sibling keys.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "exactness", rename_all = "snake_case")]
 pub enum Exactness {
     /// The index's recorded content hash matches the change's pre-change side exactly, and that
     /// pre-change side is one this workspace can actually reconstruct — a hash match produced by a
@@ -26,7 +34,18 @@ pub enum Exactness {
     /// The index was built from a source state that differs from the change's pre-change side, or
     /// that pre-change side could not be reconstructed from this workspace in the first place, so
     /// the impact answer may not reflect the change actually being asked about.
-    Approximate,
+    Approximate {
+        /// The runnable procedure that produces an exact answer.
+        recovery: RecoveryRecipe,
+    },
+}
+
+impl Exactness {
+    /// Whether the answer is approximate — the label alone, for a caller that needs the grade
+    /// without the recipe.
+    pub fn is_approximate(&self) -> bool {
+        matches!(self, Exactness::Approximate { .. })
+    }
 }
 
 /// Whether the change's regions resolved to indexed declarations, and — when they did not — which
@@ -99,13 +118,12 @@ pub struct ImpactReport {
     pub seed_mode: &'static str,
     /// The resolved pre-change revision the diff was taken against.
     pub base_revision: String,
-    /// Whether the index matches the change's pre-change state.
+    /// Whether the index matches the change's pre-change state, with the recovery procedure an
+    /// approximate answer carries.
+    #[serde(flatten)]
     pub exactness: Exactness,
     /// Whether the change's regions resolved to indexed declarations.
     pub seed_outcome: SeedOutcome,
-    /// The recovery recipe, present only when `exactness` is `Approximate`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recovery: Option<RecoveryRecipe>,
     /// The seed declarations the change's regions resolved to, ordered by canonical identity.
     pub seeds: Vec<SeedView>,
     /// The changed regions that sat in a document the index does not hold, present only when any
@@ -193,9 +211,10 @@ impl QueryEngine<'_> {
         let exactness = if request.pre_change_hash == request.index_hash && request.reconstructible {
             Exactness::Exact
         } else {
-            Exactness::Approximate
+            Exactness::Approximate {
+                recovery: recovery_recipe(request),
+            }
         };
-        let recovery = matches!(exactness, Exactness::Approximate).then(|| recovery_recipe(request));
 
         let seed_outcome = if !seed_views.is_empty() {
             SeedOutcome::Seeded
@@ -210,7 +229,6 @@ impl QueryEngine<'_> {
             base_revision: request.base_revision.to_string(),
             exactness,
             seed_outcome,
-            recovery,
             seeds: seed_views,
             unmappable,
             dependents_snapshot: "current_index",
@@ -1223,7 +1241,7 @@ mod tests {
         let ordered: Vec<(&str, u32, &str)> = report
             .detail
             .iter()
-            .map(|d| (d.symbol.canonical_id.as_str(), d.distance, d.kind.as_str()))
+            .map(|d| (d.symbol.canonical_id.as_str(), d.distance, d.kind.tag()))
             .collect();
         assert_eq!(
             ordered,
@@ -1298,16 +1316,19 @@ mod tests {
         let Outcome::Found { results } = answer.outcome else {
             panic!("expected found");
         };
+        // An exact answer carries the label and no recipe; the type admits no other pairing, so the
+        // label alone is the whole assertion.
         assert_eq!(results[0].exactness, Exactness::Exact);
-        assert!(results[0].recovery.is_none());
 
         let approx_req = request(&changes, &pre_contents, "different", hash);
         let answer = engine.impact(&approx_req).unwrap();
         let Outcome::Found { results } = answer.outcome else {
             panic!("expected found");
         };
-        assert_eq!(results[0].exactness, Exactness::Approximate);
-        assert!(results[0].recovery.is_some());
+        assert!(
+            results[0].exactness.is_approximate(),
+            "an approximate answer carries the label and its recipe together"
+        );
     }
 
     // `Exactness::Exact` requires reconstructibility too: a hash match produced by a lossy
@@ -1329,8 +1350,10 @@ mod tests {
         let Outcome::Found { results } = answer.outcome else {
             panic!("expected found");
         };
-        assert_eq!(results[0].exactness, Exactness::Approximate);
-        assert!(results[0].recovery.is_some());
+        assert!(
+            results[0].exactness.is_approximate(),
+            "a hash match alone does not certify reconstructibility"
+        );
     }
 
     // _(Dependents order selector: the recovery re-run reproduces the selected order)_ — the

@@ -10,8 +10,8 @@ pub mod search;
 
 use crate::graph::rank;
 use crate::graph::store::{
-    DEPENDENTS_HORIZON, DependentRow, EdgeKind, Freshness, GraphStore, OccurrenceRow, PersistedClass, SymbolRow,
-    kind_order,
+    DEPENDENTS_HORIZON, DependencyKind, DependentRow, EdgeKind, Freshness, GraphStore, OccurrenceRow, PersistedClass,
+    SymbolRow,
 };
 use crate::identity::CanonicalId;
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
@@ -32,7 +32,37 @@ pub enum Detail {
     Body,
 }
 
-/// A relation `trace` walks from a subject symbol.
+/// A relation `trace` walks from a subject symbol: the relations whose answer is a flat list of
+/// items.
+///
+/// This is [`Relation`] less `Dependents`. The dependents relation carries a depth bound and a
+/// horizon aggregate that a flat `Vec<TraceItem>` has nowhere to put, so it is answered by
+/// [`QueryEngine::dependents`]. Keeping it out of this type is what makes `trace(dependents)`
+/// impossible to write, rather than possible to write and refused at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceRelation {
+    /// The declaration that directly encloses the subject (upward).
+    Containers,
+    /// The symbols the subject directly contains (downward).
+    Contains,
+    /// The sites that reference the subject (type-occurrences for a type subject).
+    References,
+    /// The modules that import the subject.
+    Importers,
+    /// The types that declare the subject as a supertype — a trait's implementors or a base type's
+    /// subtypes.
+    Implementers,
+    /// The reference sites of the subject whose enclosing declaration is classified test code.
+    /// Convention-based classification, not resolved semantic fact; every answer carries the
+    /// heuristic-grade marker.
+    Tests,
+}
+
+/// A relation the command surface accepts, the full set the spec enumerates.
+///
+/// `dependents` is one of them — `.specs/specs/code-navigation/spec.md:81` lists it among `trace`'s
+/// relations, and the CLI keeps `--relation dependents` — but it is served by a different engine
+/// method. [`Relation::as_trace`] is the one place that split is decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Relation {
     /// The declaration that directly encloses the subject (upward).
@@ -54,9 +84,26 @@ pub enum Relation {
     Tests,
 }
 
+impl Relation {
+    /// The trace relation this is, or `None` for `dependents` — the one relation `trace` cannot
+    /// express, which the command surface routes to [`QueryEngine::dependents`] instead.
+    pub fn as_trace(self) -> Option<TraceRelation> {
+        match self {
+            Relation::Containers => Some(TraceRelation::Containers),
+            Relation::Contains => Some(TraceRelation::Contains),
+            Relation::References => Some(TraceRelation::References),
+            Relation::Importers => Some(TraceRelation::Importers),
+            Relation::Implementers => Some(TraceRelation::Implementers),
+            Relation::Tests => Some(TraceRelation::Tests),
+            Relation::Dependents => None,
+        }
+    }
+}
+
 /// How the detailed rows of a `dependents`/`impact` answer are ordered. Distance is always the
 /// primary key; the mode decides what breaks ties within a distance layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrderMode {
     /// Within each distance layer, order by codebase-wide structural importance (a heuristic),
     /// most important first: `(distance, rank desc, kind order, identity)`.
@@ -86,13 +133,11 @@ pub enum QueryError {
     /// edges carry NOT NULL foreign keys to symbols.
     #[error("store corruption: dependency edge references missing symbol {0}")]
     MissingSymbol(CanonicalId),
-    /// `trace` was called with `Relation::Dependents`, which carries a depth bound and horizon
-    /// aggregate that do not fit the plain relation payload.
-    #[error(
-        "the `dependents` relation carries a depth bound and horizon aggregate that `trace` cannot \
-         express; call `QueryEngine::dependents` instead"
-    )]
-    DependentsNotTraceable,
+    /// A `search` or `similar` was asked of a store recording no semantic-index identity. Every
+    /// estimation-graded answer must name the regime its ranking derives under, so there is no
+    /// honest answer to give — an invariant violation, since a completed build always records one.
+    #[error("store corruption: no semantic-index identity recorded; rebuild the index")]
+    MissingSemanticIndex,
 }
 
 /// The query engine over a store, carrying the analyzer provenance, content hash, and declared
@@ -205,18 +250,10 @@ impl<'a> QueryEngine<'a> {
     pub fn trace(
         &self,
         reference: &str,
-        relation: Relation,
+        relation: TraceRelation,
         detail: Option<Detail>,
         max_lines: Option<usize>,
     ) -> Result<Answer<TraceItem>, QueryError> {
-        // The dependents relation carries a depth bound and a horizon aggregate that do not fit the
-        // plain relation payload; it is answered by `dependents()`, not `trace`. A confident empty
-        // answer here would misrepresent a subject that may have many dependents, so this is an error
-        // rather than a typed absence.
-        if relation == Relation::Dependents {
-            return Err(QueryError::DependentsNotTraceable);
-        }
-
         let (provenance, freshness) = self.provenance_and_freshness()?;
         let subject = match self.resolve(reference)? {
             Resolution::Unique(row) => row,
@@ -228,7 +265,7 @@ impl<'a> QueryEngine<'a> {
         };
 
         let items: Vec<TraceItem> = match relation {
-            Relation::Contains => self
+            TraceRelation::Contains => self
                 .store
                 .contains(&subject.canonical_id)?
                 .into_iter()
@@ -238,7 +275,7 @@ impl<'a> QueryEngine<'a> {
                     TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
                 })
                 .collect(),
-            Relation::Containers => self
+            TraceRelation::Containers => self
                 .store
                 .containers(&subject.canonical_id)?
                 .into_iter()
@@ -248,7 +285,7 @@ impl<'a> QueryEngine<'a> {
                     TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
                 })
                 .collect(),
-            Relation::References => {
+            TraceRelation::References => {
                 let occs = self.store.references_of(&subject.canonical_id)?;
                 let mut items = Vec::with_capacity(occs.len());
                 for occ in occs {
@@ -262,7 +299,7 @@ impl<'a> QueryEngine<'a> {
             // enclosing-declaration grain, preserving the `references` ordering: a site counts
             // exactly when the declaration it is attributed to is classified test code, and each
             // kept site carries that classification's rule as provenance.
-            Relation::Tests => {
+            TraceRelation::Tests => {
                 let occs = self.store.references_of(&subject.canonical_id)?;
                 let mut items = Vec::with_capacity(occs.len());
                 for occ in occs {
@@ -275,7 +312,7 @@ impl<'a> QueryEngine<'a> {
                 }
                 items
             }
-            Relation::Importers => self
+            TraceRelation::Importers => self
                 .store
                 .edge_sources(EdgeKind::Imports, &subject.canonical_id)?
                 .into_iter()
@@ -285,7 +322,7 @@ impl<'a> QueryEngine<'a> {
                     TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
                 })
                 .collect(),
-            Relation::Implementers => self
+            TraceRelation::Implementers => self
                 .store
                 .edge_sources(EdgeKind::TypeHierarchy, &subject.canonical_id)?
                 .into_iter()
@@ -295,7 +332,6 @@ impl<'a> QueryEngine<'a> {
                     TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
                 })
                 .collect(),
-            Relation::Dependents => unreachable!("returned above"),
         };
 
         let answer = if items.is_empty() {
@@ -306,7 +342,7 @@ impl<'a> QueryEngine<'a> {
         // Every `tests` answer — found and empty alike — carries the structural heuristic-grade
         // marker: an empty answer asserts only that no convention-classified site was found, never
         // that nothing tests the subject.
-        if relation == Relation::Tests {
+        if relation == TraceRelation::Tests {
             Ok(answer.convention_classified())
         } else {
             Ok(answer)
@@ -471,7 +507,7 @@ impl<'a> QueryEngine<'a> {
             a.depth
                 .cmp(&b.depth)
                 .then_with(|| rank_b.total_cmp(&rank_a))
-                .then_with(|| kind_order(&a.kind).cmp(&kind_order(&b.kind)))
+                .then_with(|| a.kind.order().cmp(&b.kind.order()))
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(())
@@ -495,7 +531,7 @@ impl<'a> QueryEngine<'a> {
         max_lines: Option<usize>,
     ) -> Result<DependentsReport, QueryError> {
         let mut detailed = Vec::new();
-        let mut aggregate: std::collections::BTreeMap<(u32, String), u64> = std::collections::BTreeMap::new();
+        let mut aggregate: std::collections::BTreeMap<(u32, DependencyKind), u64> = std::collections::BTreeMap::new();
         let mut beyond_exists = false;
         let mut cut_at_horizon = false;
         for r in rows {
@@ -513,13 +549,13 @@ impl<'a> QueryEngine<'a> {
                     content,
                     content_truncated,
                     symbol: symbol_view(&row),
-                    kind: r.kind.clone(),
+                    kind: r.kind,
                     distance: r.depth,
                     location: location_of(&row),
                 });
             } else {
                 beyond_exists = true;
-                *aggregate.entry((r.depth, r.kind.clone())).or_insert(0) += 1;
+                *aggregate.entry((r.depth, r.kind)).or_insert(0) += 1;
             }
         }
 
@@ -689,7 +725,7 @@ pub struct DependentItem {
     /// The dependent symbol's identity and name.
     pub symbol: SymbolView,
     /// The connecting dependency edge kind (`uses`, `imports`, or `type_hierarchy`).
-    pub kind: String,
+    pub kind: DependencyKind,
     /// The hop distance from the subject (the shortest, when several paths exist).
     pub distance: u32,
     /// The dependent's definition location, or `None` for an external symbol with no source here.
@@ -707,7 +743,7 @@ pub struct DependentItem {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AggregateCount {
     /// The connecting dependency edge kind.
-    pub kind: String,
+    pub kind: DependencyKind,
     /// The hop distance the count is for.
     pub distance: u32,
     /// How many dependents were reached at that distance through that kind.
