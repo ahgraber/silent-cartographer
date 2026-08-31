@@ -6,8 +6,8 @@ mod support;
 use std::path::Path;
 
 use silent_cartographer::commands::{
-    build_accounting_json, build_accounting_line, build_from_index, collect_python_sources, detect_language,
-    resolve_workspace, run_build, run_status,
+    build_accounting_json, build_accounting_line, build_from_index, collect_python_sources, collect_rust_sources,
+    detect_language, resolve_workspace, run_build, run_status,
 };
 use silent_cartographer::graph::content_hash;
 use silent_cartographer::graph::join::{AlignmentRule, JoinAccounting};
@@ -1636,6 +1636,74 @@ fn an_incompatible_store_builds_rather_than_reporting_it_current() {
         stamped,
         silent_cartographer::graph::schema::SCHEMA_VERSION,
         "the replaced store carries the current schema version"
+    );
+}
+
+// _(Source discovery excludes undecodable files — build completes and stays queryable)_ — a
+// workspace holding a source file whose bytes are not valid UTF-8, alongside the fixture's decodable
+// document, still builds to a queryable index: `collect_rust_sources` (the same discovery `run_build`
+// calls) excludes the undecodable file rather than failing, and the fixture's symbol is retrievable
+// exactly as it is from a workspace holding no undecodable file.
+#[test]
+fn a_build_completes_and_stays_queryable_with_an_undecodable_file_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+    // A CP-1251 encoding of a Cyrillic comment: bytes that are not valid UTF-8.
+    std::fs::write(dir.path().join("src/undecodable.rs"), [b'/', b'/', 0xCF, 0xF0, b'\n']).unwrap();
+
+    let collected = collect_rust_sources(dir.path()).expect("discovery excludes the bad file, not fails");
+    assert!(
+        collected.iter().all(|(path, _)| path != "src/undecodable.rs"),
+        "the undecodable file is excluded from what a build would ingest"
+    );
+
+    let db = dir.path().join("index.db");
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &collected).unwrap();
+
+    let store = GraphStore::open(&db).unwrap();
+    let engine = QueryEngine::new(&store, support::provenance(), content_hash(&collected), None);
+    let answer = engine.get("net::Client::connect", Detail::Body, None, 1).unwrap();
+    assert!(
+        matches!(answer.outcome, Outcome::Found { .. }),
+        "a symbol from the decodable sibling is retrievable: {answer:?}"
+    );
+}
+
+// _(Source discovery excludes undecodable files — build and currency check agree)_ — the store is
+// seeded exactly as `build_from_index` above seeds it, over sources `collect_rust_sources` has
+// already excluded the undecodable file from. `run_build`'s currency check recollects and rehashes
+// through the same discovery, so the index it just built reports current: the build side and the
+// currency-check side exclude the same file.
+#[test]
+fn a_build_and_the_currency_check_agree_on_an_undecodable_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "Cargo.toml");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+    std::fs::write(dir.path().join("src/undecodable.rs"), [b'/', b'/', 0xCF, 0xF0, b'\n']).unwrap();
+
+    let collected = collect_rust_sources(dir.path()).unwrap();
+    let db = dir.path().join("index.db");
+    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &collected).unwrap();
+
+    let stub = write_version_only_stub(dir.path(), "rust-analyzer", &support::provenance().analyzer_version);
+    let outcome = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        "scip-python",
+        None,
+        Some(Language::Rust),
+        false,
+        &Default::default(),
+    )
+    .expect("the seeded index is current");
+
+    assert!(
+        !outcome.rebuilt(),
+        "the currency check sees the same discovered set the seeding build did"
     );
 }
 

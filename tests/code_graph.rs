@@ -1245,12 +1245,19 @@ fn semantic_only_occurrence_is_unaligned() {
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     assert_eq!(acc.semantic_only, 1, "occurrence with no syntax is semantic-only");
     assert_eq!(acc.aligned_total(), 0);
-    // Not misattributed: the ghost symbol has no aligned occurrence persisted.
+    // Not misattributed: the ghost symbol has no aligned occurrence persisted. Its package is "c"
+    // (not the file's default "mycrate"), so the identity is built explicitly rather than through
+    // `id_of` — using `id_of` here would silently check a symbol that was never declared at all,
+    // and every assertion below would pass vacuously regardless of the real ghost symbol's state.
+    let ghost_id = id_of_pkg("c", &[("ghost", SegmentKind::Method)]);
+    assert!(store.occurrences_of(&ghost_id).unwrap().is_empty());
+    // Its row survives, though, because its document ("m.rs") *is* in the corpus — only the
+    // occurrence's location fell outside it. This is the carved-out arm
+    // `OmitSymbolRowsWithNoSurvivingDocument` leaves alone: a symbol keeps its row whenever at
+    // least one occurrence names a document the corpus holds, aligned or not.
     assert!(
-        store
-            .occurrences_of(&id_of(&[("ghost", SegmentKind::Method)]))
-            .unwrap()
-            .is_empty()
+        store.symbol(&ghost_id).unwrap().is_some(),
+        "a symbol whose document is present keeps its row even when its occurrence didn't align"
     );
 }
 
@@ -2051,6 +2058,78 @@ fn accounting_conserves_occurrence_total() {
         py_acc.total_semantic(),
         py_total,
         "the sum including every Python-rule bucket conserves the occurrence total"
+    );
+}
+
+// _(Source discovery excludes undecodable files — join-side)_ — an occurrence in a document that
+// source discovery excluded (its bytes not valid UTF-8) has no entry in the sources passed to
+// `ingest`, exactly as an undecodable file leaves no entry once discovery skips it. The join counts
+// such an occurrence semantic-only rather than aligning or dropping it, and the occurrence total
+// still conserves across the fixture's aligned occurrences plus the excluded one.
+#[test]
+fn an_excluded_documents_occurrence_is_semantic_only() {
+    let mut index = support::fixture_index();
+    index.documents.push(SourceDocument {
+        path: "excluded.rs".to_string(),
+        encoding: PositionEncoding::Utf8,
+    });
+    index.symbols.push(ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "mycrate",
+            vec![DescriptorSegment::new("undecodable", SegmentKind::Term)],
+        )),
+        kind: SymbolKind::Function,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: "excluded.rs".to_string(),
+            range: SourceRange::new(0, 0, 0, 5),
+            role: OccurrenceRole::Definition,
+        }],
+    });
+    let total_occurrences: u64 = index.symbols.iter().map(|s| s.occurrences.len() as u64).sum();
+
+    // `sources()` supplies the fixture's decodable documents only — "excluded.rs" is absent, exactly
+    // as discovery leaves it once the file is skipped.
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources()).unwrap();
+
+    assert_eq!(
+        acc.semantic_only, 1,
+        "the excluded document's occurrence has no source to align against"
+    );
+    assert!(acc.aligned_total() > 0, "the fixture's other documents still align");
+    assert_eq!(
+        acc.total_semantic(),
+        total_occurrences,
+        "the excluded occurrence still counts toward the conserved total"
+    );
+    let undecodable_id = id_of(&[("undecodable", SegmentKind::Term)]);
+    assert!(
+        store.occurrences_of(&undecodable_id).unwrap().is_empty(),
+        "no occurrence is persisted for a symbol whose only location is in an excluded document"
+    );
+    assert!(
+        store.symbol(&undecodable_id).unwrap().is_none(),
+        "no row is persisted either: a symbol found only in an excluded document has nothing to be \
+         found by, and must not answer as a hollow, contentless `Found`"
+    );
+
+    // The query surface agrees: `get` and `find` both report absence rather than a contentless
+    // `Found`, which is the shape a caller would otherwise mistake for a real answer.
+    use silent_cartographer::query::output::Outcome;
+    use silent_cartographer::query::{Detail, QueryEngine};
+    let engine = QueryEngine::new(&store, support::provenance(), content_hash(&sources()), None);
+    let get_answer = engine.get("mycrate::undecodable", Detail::Signature, None, 1).unwrap();
+    assert!(
+        matches!(get_answer.outcome, Outcome::Absent),
+        "get reports absence for a symbol only ever seen in an excluded document: {:?}",
+        get_answer.outcome
+    );
+    let find_answer = engine.find("undecodable").unwrap();
+    assert!(
+        matches!(find_answer.outcome, Outcome::Absent),
+        "find reports absence too: {:?}",
+        find_answer.outcome
     );
 }
 

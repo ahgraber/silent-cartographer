@@ -45,7 +45,8 @@ fn language_discovery_rules(language: Language) -> (&'static str, &'static [&'st
 /// Collect `(workspace_relative_path, source_text)` for every `.rs` file under `root`.
 ///
 /// Paths are relative to `root` and use `/` separators to match SCIP document paths. `target/` and
-/// hidden directories are skipped.
+/// hidden directories are skipped. A file whose bytes are not valid UTF-8, or whose path is not
+/// valid Unicode, is excluded and reported on standard error rather than failing the collection.
 pub fn collect_rust_sources(root: &Path) -> Result<Vec<(String, String)>> {
     let (extension, skip_dirs) = language_discovery_rules(Language::Rust);
     collect_sources(root, extension, skip_dirs)
@@ -55,12 +56,16 @@ pub fn collect_rust_sources(root: &Path) -> Result<Vec<(String, String)>> {
 ///
 /// Paths are relative to `root` and use `/` separators to match SCIP document paths. `venv/` and
 /// hidden directories (`.venv/` included) are skipped — the environment's own sources are not the
-/// workspace's.
+/// workspace's. A file whose bytes are not valid UTF-8, or whose path is not valid Unicode, is
+/// excluded and reported on standard error rather than failing the collection.
 pub fn collect_python_sources(root: &Path) -> Result<Vec<(String, String)>> {
     let (extension, skip_dirs) = language_discovery_rules(Language::Python);
     collect_sources(root, extension, skip_dirs)
 }
 
+/// Walk `root` for every file matching `extension`, skipping `skip_dirs` and hidden directories, and
+/// delegate the per-file read (and its undecodable-content and non-Unicode-path exclusions) to
+/// [`collect_dir`].
 fn collect_sources(root: &Path, extension: &str, skip_dirs: &[&str]) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     collect_dir(root, root, extension, skip_dirs, &mut out)?;
@@ -86,13 +91,35 @@ fn collect_dir(
             }
             collect_dir(root, &path, extension, skip_dirs, out)?;
         } else if path.extension().is_some_and(|e| e == extension) {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-            out.push((rel, text));
+            let rel_path = path.strip_prefix(root).unwrap_or(&path);
+            // A path that is not valid Unicode cannot be used as a document-path key at all — the
+            // lossy conversion below would replace its invalid bytes with a placeholder character,
+            // and two distinct such paths can collide onto the same placeholder text, making the key
+            // ambiguous. Excluded outright rather than risking that collision; the warning still
+            // identifies the path on a best-effort basis for a human to locate it.
+            let Some(rel) = rel_path.to_str() else {
+                eprintln!(
+                    "{}",
+                    crate::render::sanitize(&format!(
+                        "warning: {} has a path that is not valid Unicode; excluded from the build",
+                        rel_path.to_string_lossy()
+                    ))
+                );
+                continue;
+            };
+            let rel = rel.replace('\\', "/");
+            match std::fs::read_to_string(&path) {
+                Ok(text) => out.push((rel, text)),
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    eprintln!(
+                        "{}",
+                        crate::render::sanitize(&format!(
+                            "warning: {rel} is not valid UTF-8; excluded from the build"
+                        ))
+                    );
+                }
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            }
         }
     }
     Ok(())
@@ -1963,6 +1990,94 @@ mod tests {
             );
         }
         assert_eq!(collected_paths, ["src/a.rs"].into_iter().collect());
+    }
+
+    // A file whose bytes are not valid UTF-8 is excluded rather than failing the whole collection;
+    // its decodable siblings are still collected.
+    #[test]
+    fn a_file_not_valid_utf8_is_excluded_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        // A CP-1251 encoding of a Cyrillic comment: bytes that are not valid UTF-8.
+        std::fs::write(dir.path().join("bad.rs"), [b'/', b'/', 0xCF, 0xF0, b'\n']).unwrap();
+        std::fs::write(dir.path().join("c.rs"), "fn c() {}").unwrap();
+
+        let collected = collect_rust_sources(dir.path()).expect("collection succeeds despite the bad file");
+        let collected_paths: std::collections::BTreeSet<&str> = collected.iter().map(|(p, _)| p.as_str()).collect();
+
+        assert_eq!(
+            collected_paths,
+            ["a.rs", "c.rs"].into_iter().collect(),
+            "the undecodable file is excluded; its decodable siblings are not"
+        );
+    }
+
+    // A file whose path (not content) is not valid Unicode is excluded rather than risking a
+    // collision with another such path once both are lossily rendered to the same placeholder text.
+    //
+    // The fixture itself gates the test, at runtime rather than by platform: unlike Linux, macOS's
+    // filesystem (APFS/HFS+) enforces valid-UTF-8 file names at the OS level and refuses to create
+    // one, so this probes the actual capability (can this filesystem hold such a name at all) instead
+    // of assuming it from `target_os` — the same shape as the permission probe just above, and it
+    // means the test compiles and its skip reason is visible everywhere, rather than the function not
+    // existing at all on a platform that can't exercise it.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_path_is_excluded_not_fatal() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        // A file name that is not valid Unicode: a lone continuation byte cannot start a UTF-8
+        // sequence, so no `.rs`-suffixed decoding of these bytes is valid Unicode.
+        let bad_name = OsStr::from_bytes(&[0x80, b'.', b'r', b's']);
+        if let Err(e) = std::fs::write(dir.path().join(bad_name), "fn bad() {}") {
+            eprintln!(
+                "skipped a_non_unicode_path_is_excluded_not_fatal: this filesystem refuses a \
+                 non-Unicode file name outright ({e}), so the exclusion this test targets cannot \
+                 be constructed here — expected on macOS (APFS/HFS+); run on Linux to exercise it"
+            );
+            return;
+        }
+
+        let collected = collect_rust_sources(dir.path()).expect("collection succeeds despite the bad path");
+        let collected_paths: std::collections::BTreeSet<&str> = collected.iter().map(|(p, _)| p.as_str()).collect();
+
+        assert_eq!(
+            collected_paths,
+            ["a.rs"].into_iter().collect(),
+            "the non-Unicode-path file is excluded; its decodable sibling is not"
+        );
+    }
+
+    // A discovered file that cannot be read for a reason other than its encoding still fails
+    // collection outright, naming the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_unreadable_for_a_non_encoding_reason_still_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("locked.rs");
+        std::fs::write(&unreadable, "fn locked() {}").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = std::fs::read_to_string(&unreadable);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if result.is_ok() {
+            // Running with privileges that ignore the permission bits (e.g. root) — the read
+            // succeeded despite the denied mode, so this environment cannot exercise the case.
+            return;
+        }
+
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = collect_rust_sources(dir.path()).expect_err("an unreadable file fails the collection");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            err.to_string().contains("locked.rs"),
+            "the error names the unreadable file: {err}"
+        );
     }
 
     // A modified file takes its pre-change content; an added file is dropped; a deleted source is

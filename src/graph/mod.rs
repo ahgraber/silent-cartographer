@@ -327,6 +327,24 @@ pub fn ingest_with_params(
             // beside the classification rather than only in `project_identities`.
             SymbolClass::Local => continue,
         };
+        // An in-workspace symbol every one of whose occurrences names a document source discovery
+        // never supplied (excluded for an undecodable encoding, most commonly) has no corpus content
+        // to be found by. Persisting it would round-trip as a queryable row with every content field
+        // empty — a `Found` answer with nothing found, the confidently-wrong shape the calibrated
+        // output contract exists to rule out. Its occurrences are already recorded as the join's
+        // semantic-only refusal; the row itself is simply not written. A symbol carrying at least one
+        // occurrence in a document the corpus does hold keeps its existing row, even when that
+        // occurrence did not itself align — that is the pre-existing unaligned-content case, untouched
+        // here.
+        if class == PersistedClass::InWorkspace
+            && !sym.occurrences.is_empty()
+            && sym
+                .occurrences
+                .iter()
+                .all(|occ| prepared.get(occ.document_path.as_str()).is_none())
+        {
+            continue;
+        }
         let duplicated = sym.definition().is_some()
             && sym
                 .descriptor

@@ -701,3 +701,90 @@ fn cache_removal_os_error_names_the_path() {
     );
     assert!(db.exists(), "the store the unlink failed on is still there");
 }
+
+/// Write an executable stub `rust-analyzer` that answers `--version` on standard output and, for a
+/// `scip <root> --output <path>` invocation, writes an empty SCIP index to `<path>` and exits
+/// successfully — so a `build` invocation runs to completion without a real analyzer.
+#[cfg(unix)]
+fn write_rust_analyzer_stub(dir: &Path, version_line: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("rust-analyzer-stub");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n  echo \"{version_line}\"\n  exit 0\nfi\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 if [ \"$1\" = \"--output\" ]; then\n    : > \"$2\"\n    exit 0\n  fi\n\
+             \x20 shift\n\
+             done\n\
+             exit 1\n"
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+// _(Source discovery excludes undecodable files — process level)_ — `build`, driven through the
+// built binary over a workspace holding a source file whose bytes are not valid UTF-8, exits with
+// the success code and names the excluded file on standard error, never on standard output.
+//
+// The stub analyzer writes nothing itself, so standard output here is exactly `build`'s own
+// `--json` answer — this test's narrow claim is that the exclusion diagnostic does not corrupt it,
+// not that `--json build` output always parses. A real analyzer's own progress output can land on
+// the same stream (`rust_adapter.rs`/`python_adapter.rs` run their child processes without
+// redirecting standard output), a pre-existing gap this change neither introduces nor fixes.
+#[cfg(unix)]
+#[test]
+fn build_excludes_an_undecodable_file_and_still_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "# fixture manifest\n").unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    std::fs::write(dir.path().join("src/undecodable.rs"), [b'/', b'/', 0xCF, 0xF0, b'\n']).unwrap();
+
+    let stub = write_rust_analyzer_stub(dir.path(), "rust-analyzer 1.99.0-stub");
+    let db = dir.path().join("index.db");
+
+    let out = c10r()
+        .args(["--db"])
+        .arg(&db)
+        .arg("--json")
+        .arg("build")
+        .arg(dir.path())
+        .args(["--language", "rust", "--rust-analyzer"])
+        .arg(&stub)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an undecodable file does not stop the build; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("undecodable.rs"),
+        "the diagnostic names the excluded file: {stderr}"
+    );
+
+    // With this stub, standard output is exactly the `--json` answer: the exclusion diagnostic
+    // never leaks onto it, so it parses undisturbed.
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "with a silent stub analyzer, stdout is the --json answer undisturbed by the \
+             exclusion diagnostic: {e}\nstdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("undecodable.rs"),
+        "the exclusion diagnostic appears only on standard error, never standard output: {report}"
+    );
+    assert_eq!(report["rebuilt"], true, "the build actually ran: {report}");
+}
