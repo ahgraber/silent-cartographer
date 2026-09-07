@@ -130,6 +130,8 @@ data/
 # Temp, logs, & working files
 # -------------------------------------------------------
 *.bak
+# QEMU writes these to the bind-mounted repo root when an emulated build container dies.
+*.core
 *.log
 *.zip
 *.swp
