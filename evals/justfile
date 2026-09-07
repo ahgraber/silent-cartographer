@@ -1,0 +1,198 @@
+# c10r-evals runbook. Every recipe runs from this directory; `just` lists them by group.
+# Configuration comes from the environment (see .env.example); direnv loads .env
+# on cd, and this fallback picks it up in shells where direnv is not active.
+#
+# Shared arguments keep one order wherever they appear: cfg, subset, arch, out.
+
+set dotenv-load := true
+
+instructions := 'c10r-first'
+dev_config := 'dev'
+tracking_uri := env('MLFLOW_TRACKING_URI', 'sqlite:///mlflow.db')
+
+dataset_revision := `python3 -c "import json,pathlib; p=pathlib.Path('tasks/dataset-manifest.json'); print(json.loads(p.read_text())['revision'] if p.is_file() else 'no tasks generated')"`
+
+# List the available recipes.
+default:
+    @just --list
+
+# --- project -----------------------------------------------------------------
+
+# Install the project environment.
+[group('project')]
+sync:
+    uv sync
+
+# Run the test suite.
+[group('project')]
+test:
+    uv run pytest
+
+# Lint the Python sources and the shell scripts.
+[group('project')]
+lint:
+    uv run ruff check .
+    shellcheck scripts/*.sh
+
+# Report which run variables are set, without printing the secret.
+[group('project')]
+env-check:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    status=0
+    for var in EVAL_PROXY_BASE_URL EVAL_MODEL_NAME EVAL_PROXY_TOKEN; do
+        if [ -z "${!var:-}" ]; then
+            echo "unset  ${var}"
+            status=1
+        elif [ "${var}" = "EVAL_PROXY_TOKEN" ]; then
+            echo "set    ${var} (${#EVAL_PROXY_TOKEN} chars)"
+        else
+            echo "set    ${var}=${!var}"
+        fi
+    done
+    for var in EVAL_MAX_TURNS EVAL_MAX_BUDGET_USD EVAL_CONCURRENCY EVAL_AGENT_TIMEOUT_SEC EVAL_MAX_OUTPUT_TOKENS; do
+        echo "opt    ${var}=${!var:-<default>}"
+    done
+    echo "opt    MLFLOW_TRACKING_URI={{ tracking_uri }}"
+    for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN; do
+        if [ -n "${!var:-}" ]; then
+            echo "LEAK   ${var} is set on this host; Pier copies it into the trial container ahead of the proxy — unset it"
+            status=1
+        fi
+    done
+    echo "tasks  dataset revision {{ dataset_revision }}"
+    docker info > /dev/null 2>&1 && echo "docker daemon reachable" || { echo "docker daemon unreachable — start the podman machine"; status=1; }
+    exit "${status}"
+
+# --- prepare -----------------------------------------------------------------
+
+# Fetch the dataset at a pinned revision and generate one task tree per arm.
+[group('prepare')]
+generate revision subset='dev':
+    uv run c10r-evals generate --revision {{ revision }} --seed 0 --subset {{ subset }} --out tasks/
+
+# Cross-compile the static c10r binary the treatment arm installs.
+[group('prepare')]
+binary arch='aarch64':
+    scripts/build-c10r-musl.sh {{ arch }}
+
+# Copy the binary into every treatment task and append its index build step.
+[group('prepare')]
+inject subset='dev' arch='aarch64':
+    uv run python -c "from pathlib import Path; from c10r_evals.armtree import inject_c10r; print(len(inject_c10r(Path('tasks/{{ subset }}/treatment'), Path('vendor/c10r/{{ arch }}/c10r'))), 'tasks injected')"
+
+# Build every treatment image and record its index cost. Rerun after `inject` reports a non-zero count.
+[group('prepare')]
+images subset='dev' arch='aarch64':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    platform=$([ "{{ arch }}" = "aarch64" ] && echo linux/arm64 || echo linux/amd64)
+    scripts/build-treatment-images.sh tasks/{{ subset }}/treatment build-manifest.json "${platform}"
+
+# Render both arms' Pier job configs for one instruction set.
+[group('prepare')]
+config prompt=instructions out=dev_config subset='dev' arch='aarch64':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    platform=$([ "{{ arch }}" = "aarch64" ] && echo linux/arm64 || echo linux/amd64)
+    uv run python scripts/render-arm-config.py \
+        --prompt prompts/{{ prompt }}.md \
+        --out configs/{{ out }} \
+        --tasks-root tasks/{{ subset }} \
+        --platform "${platform}"
+
+# --- run ---------------------------------------------------------------------
+
+# `-i` filters a dataset given by `-p`, so the arm tree is named explicitly; `-o` keeps the
+# throwaway trial out of the sweep directory the importer reads.
+# Run one instance of one arm: the cheap check that auth, routing, and token accounting work.
+[group('run')]
+smoke instance which='baseline' cfg=dev_config subset='dev':
+    uv run pier run -c configs/{{ cfg }}/{{ which }}.yaml \
+        -p tasks/{{ subset }}/{{ which }} \
+        -i {{ instance }} \
+        -o jobs/smoke
+
+# Run one arm over its whole task tree.
+[group('run')]
+arm which cfg=dev_config:
+    uv run pier run -c configs/{{ cfg }}/{{ which }}.yaml
+
+# Run both arms, baseline first.
+[group('run')]
+sweep cfg=dev_config: (arm 'baseline' cfg) (arm 'treatment' cfg)
+
+# Both arms, then ingest, then the report, then serve it for reading.
+[group('run')]
+experiment criteria cfg=dev_config: (sweep cfg) (ingest cfg) (analyze criteria) mlflow
+
+# --- results -----------------------------------------------------------------
+
+# Load both arms' trials into the experiment store. Re-running skips what is already recorded.
+[group('results')]
+ingest cfg=dev_config:
+    uv run c10r-evals import configs/{{ cfg }}/baseline configs/{{ cfg }}/treatment
+
+# Run the paired analysis and write the report.
+[group('results')]
+analyze criteria prompt=instructions out='report.md':
+    uv run c10r-evals analyze \
+        --criteria {{ criteria }} \
+        --split-manifest tasks/split-manifest.json \
+        --instruction-version {{ prompt }} \
+        --build-manifest build-manifest.json \
+        --out {{ out }}
+
+# Ingest and analysis do not need this — they open a sqlite store directly — it is for reading results.
+# Idempotent: a server already answering on the port is left alone.
+# Serve the experiment store for browsing.
+[group('results')]
+mlflow port='5000':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ port }}" in
+        '' | *[!0-9]*)
+            echo "port must be a number, got '{{ port }}' — to stop the server run: just mlflow-stop" >&2
+            exit 2
+            ;;
+    esac
+    if curl -sf "http://127.0.0.1:{{ port }}/health" > /dev/null 2>&1; then
+        echo "mlflow already serving {{ tracking_uri }} on http://127.0.0.1:{{ port }}"
+        exit 0
+    fi
+    nohup uv run mlflow ui --backend-store-uri "{{ tracking_uri }}" --port {{ port }} \
+        > mlflow-ui.log 2>&1 &
+    for _ in $(seq 1 40); do
+        if curl -sf "http://127.0.0.1:{{ port }}/health" > /dev/null 2>&1; then
+            echo "mlflow serving {{ tracking_uri }} on http://127.0.0.1:{{ port }}"
+            exit 0
+        fi
+        sleep 0.5
+    done
+    echo "mlflow did not answer on {{ port }} within 20s; see mlflow-ui.log" >&2
+    exit 1
+
+# The health check runs first so this never kills an unrelated process that happens to
+# hold the port — on macOS the AirPlay receiver claims 5000.
+# Stop the server serving the experiment store.
+[group('results')]
+mlflow-stop port='5000':
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! curl -sf "http://127.0.0.1:{{ port }}/health" > /dev/null 2>&1; then
+        echo "no mlflow answering on {{ port }}"
+        exit 0
+    fi
+    pids=$(lsof -ti "tcp:{{ port }}" 2> /dev/null || true)
+    if [ -z "${pids}" ]; then
+        echo "mlflow answers on {{ port }} but no listener is visible; stop it where you started it" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC2086
+    kill ${pids} 2> /dev/null || true
+    for _ in $(seq 1 20); do
+        curl -sf "http://127.0.0.1:{{ port }}/health" > /dev/null 2>&1 || { echo "stopped mlflow on {{ port }}"; exit 0; }
+        sleep 0.5
+    done
+    echo "mlflow still answering on {{ port }} after 10s" >&2
+    exit 1

@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Generated evaluation artifacts (replayable from manifests)
+tasks/
+vendor/
+configs/
+jobs/
+mlflow.db
+mlruns/
+report.md
+build-manifest.json
+
+# MLflow UI started by `just mlflow`
+mlflow-ui.log
