@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
-use silent_cartographer::cli::{Cli, Command, CompletionsArgs, HookAction};
+use silent_cartographer::cli::{CacheAction, Cli, Command, CompletionsArgs, HookAction};
 use silent_cartographer::commands;
 use silent_cartographer::exit::{ExitCode, classify};
 use silent_cartographer::manifest;
@@ -240,10 +240,20 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
         ),
         Command::Doctor => unreachable!("doctor is dispatched before run() in main"),
         Command::Completions(_) => unreachable!("completions is dispatched before run() in main"),
-        Command::Cache => {
-            let outcome = commands::run_cache(&cli.db)?;
-            Ok(commands::render_cache_report(&outcome, cli.json))
-        }
+        Command::Cache(args) => match args.action {
+            CacheAction::Clear => {
+                let outcome = commands::run_cache(&cli.db)?;
+                Ok(commands::render_cache_report(&outcome, cli.json))
+            }
+            CacheAction::Dir => {
+                let outcome = commands::run_cache_dir(&cli.db);
+                Ok(commands::render_cache_dir_report(&outcome, cli.json))
+            }
+            CacheAction::Size => {
+                let outcome = commands::run_cache_size(&cli.db)?;
+                Ok(commands::render_cache_size_report(&outcome, cli.json))
+            }
+        },
         Command::Hooks(args) => {
             let outcome = match args.action {
                 HookAction::Install => commands::run_hooks_install(&root, &cli.db, cli.workspace.as_deref())?,

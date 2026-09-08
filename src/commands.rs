@@ -871,25 +871,20 @@ pub fn run_status(
 /// index and from each other, because their remedies are opposite (build here, versus point `--db`
 /// somewhere else) and collapsing them would invite an agent to build over data that is not c10r's.
 pub fn index_state(db: &Path, root: &Path, rust_analyzer: &str) -> serde_json::Value {
-    match crate::graph::store::recognize_store(db) {
-        Ok(crate::graph::store::StoreRecognition::Absent) => return serde_json::json!({ "built": false }),
-        Ok(crate::graph::store::StoreRecognition::Unrecognized) => {
-            return serde_json::json!({ "built": false, "store": "unrecognized" });
-        }
-        Ok(crate::graph::store::StoreRecognition::Recognized) => {}
-        // A path that cannot be examined is its own reading: neither absent nor refused by marker.
-        // Collapsing it onto absent would answer with the one remedy the guard exists to withhold —
-        // build here — against something orientation never established the nature of.
-        Err(_) => return serde_json::json!({ "built": false, "store": "unreadable" }),
-    }
-    match read_index_state(db, root, rust_analyzer) {
-        Ok(state) => state,
-        // A store that cleared recognition but carries a schema version this binary does not read is
-        // its own reading too. An index does exist at the path, which "absent" denies: every query
-        // against it names the version mismatch and refuses, so orientation reporting nothing there
-        // would disagree with the rest of the surface about the same file.
-        Err(error) if version_mismatched(&error) => serde_json::json!({ "built": false, "store": "incompatible" }),
-        Err(_) => serde_json::json!({ "built": false }),
+    match store_state(db) {
+        StoreState::Absent => serde_json::json!({ "built": false }),
+        StoreState::Unrecognized => serde_json::json!({ "built": false, "store": "unrecognized" }),
+        StoreState::Unreadable => serde_json::json!({ "built": false, "store": "unreadable" }),
+        StoreState::Incompatible => serde_json::json!({ "built": false, "store": "incompatible" }),
+        StoreState::Recognized => match read_index_state(db, root, rust_analyzer) {
+            Ok(state) => state,
+            // Classification and this read open the store separately, so a store replaced between the
+            // two refuses here on its version instead. That refusal reports the incompatible reading,
+            // the same one a store found incompatible at classification time gets, rather than the
+            // absent reading, which would tell the caller to build over a store that is present.
+            Err(error) if version_mismatched(&error) => serde_json::json!({ "built": false, "store": "incompatible" }),
+            Err(_) => serde_json::json!({ "built": false }),
+        },
     }
 }
 
@@ -899,6 +894,52 @@ fn version_mismatched(error: &anyhow::Error) -> bool {
         error.chain().find_map(|e| e.downcast_ref::<StoreOpenError>()),
         Some(StoreOpenError::SchemaVersionMismatch { .. })
     )
+}
+
+/// What sits at `db`: `manifest`'s orientation report (through [`index_state`]) and `cache size` both
+/// classify a target through this one test, so the two apply the same reading to the same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreState {
+    /// No file exists at the path.
+    Absent,
+    /// A file exists, but it carries no ownership marker this binary recognizes.
+    Unrecognized,
+    /// A path whose contents could not be examined at all — neither absent nor refused by marker.
+    Unreadable,
+    /// A store carrying this binary's ownership marker, recorded under a schema version this binary
+    /// does not read.
+    Incompatible,
+    /// A store carrying this binary's ownership marker, at a schema version this binary does not
+    /// refuse. `cache clear` removes such a store, so `cache size` reports its bytes.
+    Recognized,
+}
+
+/// Classify the target at `db`. A recognized header costs one extra store open, to read the
+/// schema-version pragma that separates [`StoreState::Incompatible`] from [`StoreState::Recognized`].
+fn store_state(db: &Path) -> StoreState {
+    match crate::graph::store::recognize_store(db) {
+        Ok(crate::graph::store::StoreRecognition::Absent) => return StoreState::Absent,
+        Ok(crate::graph::store::StoreRecognition::Unrecognized) => return StoreState::Unrecognized,
+        Ok(crate::graph::store::StoreRecognition::Recognized) => {}
+        // A path that cannot be examined is its own reading: neither absent nor refused by marker.
+        // Collapsing it onto absent would answer with the one remedy the guard exists to withhold —
+        // build here — against something orientation never established the nature of.
+        Err(_) => return StoreState::Unreadable,
+    }
+    match GraphStore::open(db) {
+        Ok(_) => StoreState::Recognized,
+        // A store that cleared recognition but carries a schema version this binary does not read is
+        // its own reading too. An index does exist at the path, which "absent" denies: every query
+        // against it names the version mismatch and refuses, so reporting nothing distinct here would
+        // disagree with the rest of the surface about the same file.
+        Err(StoreOpenError::SchemaVersionMismatch { .. }) => StoreState::Incompatible,
+        // Any other open failure over a header this binary already recognized — a corrupt body, a
+        // storage error — leaves the marker as the verdict, so the target stays recognized. The
+        // remedy for a damaged store of c10r's own is to rebuild it, which is what the recognized
+        // reading offers; `unreadable` would instead direct the caller to point `--db` elsewhere.
+        Err(_) => StoreState::Recognized,
+    }
 }
 
 fn read_index_state(db: &Path, root: &Path, rust_analyzer: &str) -> Result<serde_json::Value> {
@@ -1641,6 +1682,10 @@ pub struct CacheOutcome {
     pub path: String,
     /// Whether an index was removed (`false` when there was nothing to remove).
     pub removed: bool,
+    /// Whether the removed path was a symbolic link. When it was, the link is gone and the store it
+    /// named is still on disk, so a caller deciding whether any index survives reads this alongside
+    /// `removed`.
+    pub symlink: bool,
 }
 
 /// `cache`: remove the stored index at `db`. An already-absent index is success with `removed:
@@ -1652,13 +1697,23 @@ pub struct CacheOutcome {
 /// best-effort basis — their absence or removal failure never fails the command, since the primary
 /// database file is the index's identity. An OS error removing the primary file is surfaced to the
 /// caller, naming the path.
+///
+/// A `--db` that is itself a symbolic link is removed as the link it is: unlinking a symlink never
+/// reaches the file it names, so the store survives. The answer discloses that, because reporting a
+/// bare removal for a path whose store is still on disk would be a success message for work that did
+/// not happen.
 pub fn run_cache(db: &Path) -> Result<CacheOutcome> {
     if !db.exists() {
         return Ok(CacheOutcome {
             path: db.display().to_string(),
             removed: false,
+            symlink: false,
         });
     }
+    // `symlink_metadata` does not follow the link, so this asks what sits at the path itself while
+    // the ownership test below asks what the path resolves to. A path that cannot be examined here is
+    // not treated as a link; the ownership test is what refuses it, with its own typed error.
+    let symlink = std::fs::symlink_metadata(db).is_ok_and(|meta| meta.file_type().is_symlink());
     if !is_removable_index(db)? {
         // The ownership category, the same one a build or a query reaches over this file: what the
         // caller must do next is decided by the target, not by which command met it. The message
@@ -1670,6 +1725,18 @@ pub fn run_cache(db: &Path) -> Result<CacheOutcome> {
             path = db.display()
         ))
         .into());
+    }
+    if symlink {
+        // The warning goes to standard error so it reaches an operator watching a terminal even when
+        // the answer on standard output is being consumed as JSON by something else.
+        eprintln!(
+            "{}",
+            crate::render::sanitize(&format!(
+                "warning: {path} is a symbolic link, so c10r removed the link and left the index it \
+                 names in place",
+                path = db.display()
+            ))
+        );
     }
     std::fs::remove_file(db).with_context(|| format!("failed to remove index at {}", db.display()))?;
     // Build the WAL/SHM sidecar paths by pushing the suffix onto the primary path's os-string, so a
@@ -1683,6 +1750,7 @@ pub fn run_cache(db: &Path) -> Result<CacheOutcome> {
     Ok(CacheOutcome {
         path: db.display().to_string(),
         removed: true,
+        symlink,
     })
 }
 
@@ -1706,10 +1774,135 @@ fn is_removable_index(db: &Path) -> Result<bool> {
 pub fn render_cache_report(outcome: &CacheOutcome, json: bool) -> String {
     if json {
         serde_json::to_string_pretty(outcome).unwrap_or_else(|_| "{}".to_string())
+    } else if outcome.symlink {
+        format!(
+            "removed the symbolic link at {}; the index it names is still there",
+            crate::render::sanitize(&outcome.path)
+        )
     } else if outcome.removed {
         format!("removed index at {}", crate::render::sanitize(&outcome.path))
     } else {
         format!("nothing to remove at {}", crate::render::sanitize(&outcome.path))
+    }
+}
+
+/// The outcome of `cache dir`: the directory holding the index store, and the `--db` path it was
+/// derived from.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheDirOutcome {
+    /// The directory holding the index store.
+    pub dir: String,
+    /// The `--db` path examined.
+    pub db: String,
+}
+
+/// `cache dir`: report the directory `db` names as its parent, exactly as given — never
+/// canonicalized, never resolved against the workspace root — and touch no file. A `--db` naming no
+/// parent component (a bare filename) reports the working directory, `.`, rather than an empty
+/// string.
+pub fn run_cache_dir(db: &Path) -> CacheDirOutcome {
+    let dir = match db.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.display().to_string(),
+        _ => ".".to_string(),
+    };
+    CacheDirOutcome {
+        dir,
+        db: db.display().to_string(),
+    }
+}
+
+/// The rendering of a `cache dir` report: the JSON structured answer under `--json` (the directory
+/// alongside the `--db` path), or the directory alone in the human rendering.
+pub fn render_cache_dir_report(outcome: &CacheDirOutcome, json: bool) -> String {
+    if json {
+        serde_json::to_string_pretty(outcome).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        crate::render::sanitize(&outcome.dir)
+    }
+}
+
+/// The outcome of `cache size`: the target's classified state, the `--db` path examined, and — for a
+/// store c10r recognizes as its own, current schema version or not — the total on-disk bytes across
+/// the store file and its `-wal`/`-shm` sidecars. Every other state omits the byte total, so a caller
+/// reading it never gets a number for a file c10r does not own.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheSizeOutcome {
+    /// The target's classified state.
+    pub state: StoreState,
+    /// The `--db` path examined.
+    pub path: String,
+    /// The total bytes across the store file and its present sidecars. Present only when `state` is
+    /// [`StoreState::Recognized`] or [`StoreState::Incompatible`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+}
+
+/// `cache size`: classify the target through [`store_state`] and, for a store c10r recognizes as its
+/// own, sum the bytes of the store file and its `-wal`/`-shm` sidecars — the same files `cache clear`
+/// unlinks. Every other state reports the classification with no byte total. Never fails: reading a
+/// size writes nothing, so every state is a success.
+pub fn run_cache_size(db: &Path) -> Result<CacheSizeOutcome> {
+    let state = store_state(db);
+    let bytes = match state {
+        StoreState::Recognized | StoreState::Incompatible => store_size_bytes(db),
+        StoreState::Absent | StoreState::Unrecognized | StoreState::Unreadable => None,
+    };
+    Ok(CacheSizeOutcome {
+        state,
+        path: db.display().to_string(),
+        bytes,
+    })
+}
+
+/// The total size of the store file at `db` plus its `-wal` and `-shm` sidecars, built by pushing
+/// each suffix onto the primary path's os-string exactly as `run_cache` does, so a non-UTF-8 `--db`
+/// path is preserved byte-for-byte.
+///
+/// The figure is the size the filesystem reports for each file, which is what a store on an ordinary
+/// filesystem occupies; a sparse or compressed file would report more than deleting it frees.
+///
+/// Returns `None` when any part of the total cannot be established, so the caller reports no figure
+/// rather than one that understates what is there.
+///
+/// A store classified moments earlier can be gone by the time it is measured, and reporting zero
+/// bytes for it would state a size no store has. An absent sidecar is the one measurement failure
+/// that is not a gap: no sidecar is the store's resting state, so it contributes nothing. A sidecar
+/// that exists but cannot be examined — a permission refusal, a symlink loop — is a gap, because
+/// something is there whose size the total would otherwise omit in silence.
+fn store_size_bytes(db: &Path) -> Option<u64> {
+    let mut total = std::fs::metadata(db).ok()?.len();
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let measured = match std::fs::metadata(PathBuf::from(sidecar)) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return None,
+        };
+        total = total.checked_add(measured)?;
+    }
+    Some(total)
+}
+
+/// The rendering of a `cache size` report: the JSON structured answer under `--json` (state, path,
+/// and the byte total where one applies), or a one-line human summary — the byte total for a
+/// recognized or incompatible store, a state-naming line for every other state.
+pub fn render_cache_size_report(outcome: &CacheSizeOutcome, json: bool) -> String {
+    if json {
+        return serde_json::to_string_pretty(outcome).unwrap_or_else(|_| "{}".to_string());
+    }
+    let path = crate::render::sanitize(&outcome.path);
+    match (outcome.state, outcome.bytes) {
+        // A store classified as c10r's own but no longer measurable was removed between the two
+        // reads. The line names the path without a figure, because no figure describes it.
+        (StoreState::Recognized | StoreState::Incompatible, None) => format!("cannot measure the store at {path}"),
+        (StoreState::Recognized, Some(bytes)) => format!("{bytes} bytes at {path}"),
+        (StoreState::Incompatible, Some(bytes)) => {
+            format!("{bytes} bytes at {path} (incompatible schema version)")
+        }
+        (StoreState::Absent, _) => format!("no index at {path}"),
+        (StoreState::Unrecognized, _) => format!("{path} is not a c10r index store"),
+        (StoreState::Unreadable, _) => format!("{path} cannot be examined"),
     }
 }
 
@@ -2162,6 +2355,37 @@ mod tests {
             script,
             "#!/bin/sh\nc10r build '/home/dev/my project' --db '/home/dev/my project/.c10r/index.db' \
              --workspace 'my project'\n"
+        );
+    }
+
+    // A store that cannot be measured yields no total, so `cache size` reports no byte count rather
+    // than zero. Zero is a size no store has: the smallest one carries a SQLite header.
+    #[test]
+    fn store_size_bytes_is_absent_rather_than_zero_when_the_store_cannot_be_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("index.db");
+
+        assert_eq!(store_size_bytes(&gone), None, "an unmeasurable store yields no total");
+
+        std::fs::write(&gone, b"0123456789").unwrap();
+        assert_eq!(
+            store_size_bytes(&gone),
+            Some(10),
+            "a measurable store yields its size, with no sidecars present to add"
+        );
+    }
+
+    // `cache dir` reports the parent of a nested `--db` path as given, and reports the working
+    // directory rather than an empty string for a `--db` naming no parent at all.
+    #[test]
+    fn run_cache_dir_reports_the_parent_or_the_working_directory() {
+        let nested = run_cache_dir(Path::new(".c10r/index.db"));
+        assert_eq!(nested.dir, ".c10r");
+
+        let bare = run_cache_dir(Path::new("index.db"));
+        assert_eq!(
+            bare.dir, ".",
+            "a bare filename has no parent, so it reports the working directory"
         );
     }
 }

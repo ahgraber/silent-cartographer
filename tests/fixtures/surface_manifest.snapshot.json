@@ -1,5 +1,5 @@
 {
-  "surface_version": 9,
+  "surface_version": 10,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -605,8 +605,18 @@
     },
     {
       "name": "cache",
-      "about": "Remove the stored index at the discovered `--db` path",
-      "args": [],
+      "about": "The index store: the action decides whether it is removed, located, or measured",
+      "args": [
+        {
+          "name": "action",
+          "required": true,
+          "values": [
+            "clear",
+            "dir",
+            "size"
+          ]
+        }
+      ],
       "flags": [
         {
           "name": "db",

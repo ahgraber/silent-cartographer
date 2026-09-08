@@ -551,6 +551,7 @@ fn cache_rejects_bounding_flags_and_removes_nothing() {
             .arg("--db")
             .arg(&db)
             .arg("cache")
+            .arg("clear")
             .args(bounding)
             .output()
             .unwrap();
@@ -771,7 +772,7 @@ fn a_db_path_spelled_like_a_uri_names_the_file_with_that_literal_name() {
     // The same spelling on the write path: `cache` removes the literal store and nothing else.
     let removed = c10r()
         .current_dir(dir.path())
-        .args(["--db", "file:target.db", "cache"])
+        .args(["--db", "file:target.db", "cache", "clear"])
         .output()
         .unwrap();
     assert_eq!(

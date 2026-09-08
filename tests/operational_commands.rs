@@ -1,4 +1,5 @@
-//! Operational-command contract tests: `doctor`'s indexer readiness report and `cache`'s index reset.
+//! Operational-command contract tests: `doctor`'s indexer readiness report and `cache clear`'s index
+//! reset.
 //!
 //! These drive the built `c10r` binary through `std::process::Command` so the process-level contract
 //! (exit codes, stdout/stderr separation) is observed as a caller would. `doctor` probes tools by
@@ -453,6 +454,71 @@ fn write_foreign_store(path: &Path, user_version: i64) {
     drop(conn);
 }
 
+// _(Index reset: a symbolic link at the store path is removed and disclosed)_ — unlinking a symlink
+// never reaches the file it names, so `cache clear` over one removes the link and leaves the store on
+// disk. The answer says so on both renderings, because a bare "removed index" would report success
+// for an index that is still there.
+#[cfg(unix)]
+#[test]
+fn cache_clear_over_a_symlink_removes_the_link_and_discloses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("real-store.db");
+    write_c10r_store(&store, silent_cartographer::graph::schema::SCHEMA_VERSION);
+    let link = dir.path().join("index.db");
+    std::os::unix::fs::symlink(&store, &link).unwrap();
+
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&link)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "removing a symlinked store path succeeds; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        store.exists(),
+        "the store the link named is left in place, because only the link was unlinked"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "the link itself is gone from the store path"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("symbolic link"),
+        "standard error warns that a link, not the index, was removed: {stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(
+        report["symlink"], true,
+        "the machine answer discloses the link, so a caller reading it alone still learns the index survives: {report}"
+    );
+
+    // The human rendering carries the same disclosure, on a fresh link over the surviving store.
+    std::os::unix::fs::symlink(&store, &link).unwrap();
+    let human = c10r()
+        .args(["--db"])
+        .arg(&link)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&human.stdout).trim(),
+        format!(
+            "removed the symbolic link at {}; the index it names is still there",
+            link.display()
+        ),
+        "the human line says a link went, not the index"
+    );
+}
+
 // _(Index reset: existing index removed)_ — `cache` removes a recognizable index store (a SQLite
 // database carrying a nonzero `user_version` stamp) and reports the affected path, exiting with the
 // success code.
@@ -462,7 +528,13 @@ fn cache_removes_a_valid_index_store() {
     let db = dir.path().join("index.db");
     write_c10r_store(&db, 11);
 
-    let out = c10r().args(["--json", "--db"]).arg(&db).arg("cache").output().unwrap();
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
 
     assert_eq!(
         out.status.code(),
@@ -488,7 +560,13 @@ fn cache_human_success_line_names_the_removed_path() {
     let db = dir.path().join("index.db");
     write_c10r_store(&db, 11);
 
-    let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
+    let out = c10r()
+        .args(["--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
 
     assert_eq!(
         out.status.code(),
@@ -513,7 +591,13 @@ fn cache_removes_a_store_with_an_older_user_version() {
     let db = dir.path().join("index.db");
     write_c10r_store(&db, 999);
 
-    let out = c10r().args(["--json", "--db"]).arg(&db).arg("cache").output().unwrap();
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
 
     assert_eq!(
         out.status.code(),
@@ -534,7 +618,13 @@ fn cache_refuses_a_foreign_versioned_database() {
     let db = dir.path().join("index.db");
     write_foreign_store(&db, 7);
 
-    let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
+    let out = c10r()
+        .args(["--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
 
     assert_eq!(
         out.status.code(),
@@ -563,7 +653,13 @@ fn cache_refuses_a_non_sqlite_text_file_naming_the_rm_alternative() {
     let db = dir.path().join("index.db");
     std::fs::write(&db, b"not a real sqlite file, cache must not remove it").unwrap();
 
-    let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
+    let out = c10r()
+        .args(["--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
 
     assert_eq!(
         out.status.code(),
@@ -593,7 +689,13 @@ fn cache_refuses_a_path_it_cannot_examine() {
     let db = dir.path().join(".c10r");
     std::fs::create_dir(&db).unwrap();
 
-    let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
+    let out = c10r()
+        .args(["--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
 
     assert_eq!(
         out.status.code(),
@@ -622,7 +724,13 @@ fn cache_refuses_an_empty_file() {
     let db = dir.path().join("index.db");
     std::fs::write(&db, b"").unwrap();
 
-    let out = c10r().args(["--json", "--db"]).arg(&db).arg("cache").output().unwrap();
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
 
     assert_eq!(
         out.status.code(),
@@ -645,7 +753,13 @@ fn cache_is_success_when_there_is_nothing_to_remove() {
     let db = dir.path().join("index.db");
     assert!(!db.exists());
 
-    let out = c10r().args(["--json", "--db"]).arg(&db).arg("cache").output().unwrap();
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
 
     assert_eq!(
         out.status.code(),
@@ -676,7 +790,13 @@ fn cache_removal_os_error_names_the_path() {
     write_c10r_store(&db, 11);
     std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
+    let out = c10r()
+        .args(["--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("clear")
+        .output()
+        .unwrap();
 
     // Root unlinks straight through the directory's write bit, so the failure is unobservable there.
     let unlinked = !db.exists();
@@ -787,4 +907,386 @@ fn build_excludes_an_undecodable_file_and_still_succeeds() {
         "the exclusion diagnostic appears only on standard error, never standard output: {report}"
     );
     assert_eq!(report["rebuilt"], true, "the build actually ran: {report}");
+}
+
+// _(Naming no action removes nothing)_ — `cache` invoked without an action is rejected as a usage
+// error naming all three valid actions, and the index at `--db` is left in place.
+#[test]
+fn cache_with_no_action_is_a_usage_error_and_removes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    write_c10r_store(&db, silent_cartographer::graph::schema::SCHEMA_VERSION);
+
+    let out = c10r().args(["--db"]).arg(&db).arg("cache").output().unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "no action named is the usage code");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for action in ["clear", "dir", "size"] {
+        assert!(stderr.contains(action), "the usage error names {action}: {stderr}");
+    }
+    assert!(db.exists(), "the index is untouched when no action is named");
+}
+
+// _(Index store location report: directory reported for an existing store)_ — `cache dir` over a
+// workspace holding a stored index reports the directory containing it and exits with the success
+// code; the machine-readable answer also carries the `--db` path alongside the directory.
+#[test]
+fn cache_dir_reports_the_containing_directory_of_an_existing_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    write_c10r_store(&db, silent_cartographer::graph::schema::SCHEMA_VERSION);
+
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("dir")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(
+        report["dir"].as_str().map(PathBuf::from).as_deref(),
+        Some(dir.path()),
+        "the report names the containing directory: {report}"
+    );
+    assert_eq!(
+        report["db"].as_str().map(PathBuf::from).as_deref(),
+        Some(db.as_path()),
+        "the report also carries the --db path: {report}"
+    );
+}
+
+// _(Index store location report: directory reported when no store exists)_ — `cache dir` against a
+// `--db` path where no store exists still reports the directory the store would occupy, and exits
+// with the success code.
+#[test]
+fn cache_dir_reports_the_directory_when_no_store_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    assert!(!db.exists());
+
+    let out = c10r().args(["--db"]).arg(&db).arg("cache").arg("dir").output().unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an absent store still reports its directory; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        dir.path().display().to_string(),
+        "the directory alone is reported: {stdout}"
+    );
+}
+
+// _(Index store size report: size of a recognized store)_ — `cache size --json` over a store the
+// system recognizes as its own reports the store's own byte count under the recognized state, and
+// exits with the success code.
+#[test]
+fn cache_size_reports_the_byte_count_of_a_recognized_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    write_c10r_store(&db, silent_cartographer::graph::schema::SCHEMA_VERSION);
+    let expected_bytes = std::fs::metadata(&db).unwrap().len();
+
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("size")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(report["state"], "recognized", "a c10r store is recognized: {report}");
+    assert_eq!(
+        report["bytes"].as_u64(),
+        Some(expected_bytes),
+        "the byte count matches the store file's own length: {report}"
+    );
+}
+
+// _(Index store size report: auxiliary files count toward the total)_ — `cache size --json` over a
+// recognized store accompanied by its `-wal` and `-shm` sidecar files reports a total covering the
+// store and both sidecars together, not the store file alone.
+#[test]
+fn cache_size_sums_the_store_and_its_wal_shm_sidecars() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    write_c10r_store(&db, silent_cartographer::graph::schema::SCHEMA_VERSION);
+    let wal = dir.path().join("index.db-wal");
+    let shm = dir.path().join("index.db-shm");
+    std::fs::write(&wal, b"wal sidecar contents").unwrap();
+    std::fs::write(&shm, b"shm").unwrap();
+    let db_only_bytes = std::fs::metadata(&db).unwrap().len();
+
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("size")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(report["state"], "recognized", "a c10r store is recognized: {report}");
+    // Opening the store to classify it touches the sidecars, so their post-run sizes rather than the
+    // bytes this test wrote are the ones the total must match; the point under test is that they are
+    // summed in at all, evidenced by the total exceeding the store file alone.
+    let expected_bytes = std::fs::metadata(&db).unwrap().len()
+        + std::fs::metadata(&wal).unwrap().len()
+        + std::fs::metadata(&shm).unwrap().len();
+    assert_eq!(
+        report["bytes"].as_u64(),
+        Some(expected_bytes),
+        "the total covers the store and both sidecars together: {report}"
+    );
+    assert!(
+        report["bytes"].as_u64().unwrap() > db_only_bytes,
+        "the sidecars contribute to the total, beyond the store file alone: {report}"
+    );
+}
+
+// _(Index store size report: an incompatible store reports a size)_ — `cache size --json` over a
+// store carrying an older schema version reports its byte count, names the incompatible state, and
+// exits with the success code.
+#[test]
+fn cache_size_reports_bytes_and_incompatible_state_for_an_older_schema_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    write_c10r_store(&db, 11);
+    let expected_bytes = std::fs::metadata(&db).unwrap().len();
+
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("size")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an incompatible store is still a success; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(
+        report["state"], "incompatible",
+        "the older version is incompatible: {report}"
+    );
+    assert_eq!(
+        report["bytes"].as_u64(),
+        Some(expected_bytes),
+        "an incompatible store still reports its byte count: {report}"
+    );
+}
+
+// _(Index store size report: a recognized store that cannot be measured reports no size)_ — a
+// sidecar that exists but cannot be examined leaves part of the total unknown. The answer keeps the
+// state the classification reached and omits the figure, because a total missing one file understates
+// what is at the path. A symlink loop is the fixture: it is a file that is present and unstattable,
+// which an absent sidecar (the resting state, worth zero) is not.
+#[cfg(unix)]
+#[test]
+fn cache_size_reports_no_bytes_when_a_sidecar_cannot_be_examined() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    write_c10r_store(&db, silent_cartographer::graph::schema::SCHEMA_VERSION);
+    std::os::unix::fs::symlink(dir.path().join("index.db-shm"), dir.path().join("index.db-wal")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("index.db-wal"), dir.path().join("index.db-shm")).unwrap();
+
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("size")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unmeasurable store is still a success; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(
+        report["state"], "recognized",
+        "the classification still stands; only the measurement failed: {report}"
+    );
+    assert!(
+        report.get("bytes").is_none(),
+        "a total that cannot cover every file is withheld rather than understated: {report}"
+    );
+
+    let human = c10r()
+        .args(["--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("size")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&human.stdout).trim(),
+        format!("cannot measure the store at {}", db.display()),
+        "the human rendering names the path without a figure"
+    );
+}
+
+// _(Index store size report: the human rendering states the size)_ — the default rendering of a
+// recognized store is its byte count against the path, not the JSON answer.
+#[test]
+fn cache_size_human_line_states_the_byte_count_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    write_c10r_store(&db, silent_cartographer::graph::schema::SCHEMA_VERSION);
+    let expected_bytes = std::fs::metadata(&db).unwrap().len();
+
+    let out = c10r()
+        .args(["--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("size")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("{expected_bytes} bytes at {}", db.display()),
+        "the human line carries the count and the path"
+    );
+}
+
+// _(Index store size report: an absent store reports no size)_ — `cache size --json` against a
+// `--db` path where no store exists names the absent state, carries no `bytes` key, and exits with
+// the success code.
+#[test]
+fn cache_size_reports_no_bytes_for_an_absent_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    assert!(!db.exists());
+
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("size")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an absent store is still a success; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(report["state"], "absent", "no store exists at the path: {report}");
+    assert!(
+        report.get("bytes").is_none(),
+        "no byte count for an absent store: {report}"
+    );
+}
+
+// _(Index store size report: an unrecognized file reports no size)_ — `cache size --json` against a
+// file the system does not recognize as its own store names the unrecognized state, carries no
+// `bytes` key, exits with the success code, and leaves the file's original bytes untouched.
+#[test]
+fn cache_size_reports_no_bytes_for_a_foreign_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let original = b"not a real sqlite file, cache size must not remove it".to_vec();
+    std::fs::write(&db, &original).unwrap();
+
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("size")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unrecognized file is still a success; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(
+        report["state"], "unrecognized",
+        "a file with no c10r marker is unrecognized: {report}"
+    );
+    assert!(
+        report.get("bytes").is_none(),
+        "no byte count for an unrecognized file: {report}"
+    );
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        original,
+        "the foreign file's bytes are untouched by a size read"
+    );
+}
+
+// _(Index store size report: an unexaminable path reports no size)_ — `cache size --json` against a
+// directory at the `--db` path names the unreadable state, distinct from absent and unrecognized,
+// carries no `bytes` key, and exits with the success code.
+#[test]
+fn cache_size_reports_no_bytes_for_an_unreadable_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    std::fs::create_dir(&db).unwrap();
+
+    let out = c10r()
+        .args(["--json", "--db"])
+        .arg(&db)
+        .arg("cache")
+        .arg("size")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unreadable path is still a success; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(
+        report["state"], "unreadable",
+        "a directory at the store path is unreadable, not absent or unrecognized: {report}"
+    );
+    assert!(
+        report.get("bytes").is_none(),
+        "no byte count for an unreadable path: {report}"
+    );
 }

@@ -1,6 +1,6 @@
 //! The `c10r` command-line surface: the query commands (`get`, `trace`, `find`), the operational
-//! set (`build`, `status`, `doctor`, `cache`, `hooks`), and the self-describing surface (`manifest`,
-//! `completions`).
+//! set (`build`, `status`, `doctor`, `cache` (`clear`/`dir`/`size`), `hooks`), and the
+//! self-describing surface (`manifest`, `completions`).
 //!
 //! `get` folds definition-lookup and enclosure-by-position onto a detail axis; `trace` folds the
 //! relation taxonomy onto a relation argument. Every answer carries the calibrated output contract
@@ -85,8 +85,8 @@ pub enum Command {
     Status(StatusArgs),
     /// Report whether each required language indexer is present, and its version.
     Doctor,
-    /// Remove the stored index at the discovered `--db` path.
-    Cache,
+    /// The index store: the action decides whether it is removed, located, or measured.
+    Cache(CacheArgs),
     /// Install the repository hooks that keep the index current.
     Hooks(HooksArgs),
     /// Emit the command/flag structure and the current index state as JSON, for machine
@@ -378,6 +378,28 @@ pub enum HookAction {
 pub struct HooksArgs {
     /// The action to perform.
     pub action: HookAction,
+}
+
+/// The action `cache` performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CacheAction {
+    /// Remove the stored index at the discovered `--db` path.
+    Clear,
+    /// Report the directory holding the index store.
+    Dir,
+    /// Report the on-disk size of the index store.
+    Size,
+}
+
+/// Arguments for `cache`.
+#[derive(Debug, Args)]
+pub struct CacheArgs {
+    /// The action to perform.
+    ///
+    /// The value name spells the accepted set, so the rejection a caller gets for omitting the
+    /// action names the alternatives without a second invocation to discover them.
+    #[arg(value_name = "clear|dir|size")]
+    pub action: CacheAction,
 }
 
 /// Arguments for `status`.
