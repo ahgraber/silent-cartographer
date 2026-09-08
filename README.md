@@ -39,16 +39,22 @@ cargo build --release          # built at target/release/c10r
 cargo install --path . --locked # or install it onto your PATH
 ```
 
-Both source routes need:
-
-- the Rust toolchain pinned by `rust-toolchain.toml` (rustup installs it automatically);
-- `rust-analyzer` on `PATH`, to index Rust workspaces;
-- `scip-python` (`npm install -g @sourcegraph/scip-python`), to index Python workspaces.
+Both source routes additionally need the Rust toolchain pinned by `rust-toolchain.toml`, which rustup installs automatically.
 
 The first build downloads the ~33 MB embedding model that `search` and `similar` use, and checks it against `models/potion-code-16M-v2.manifest.json`.
 The model is compiled into the binary, so `c10r` needs no network or configuration at runtime.
 
-`c10r doctor` reports whether the language indexers are installed and responsive.
+### Language indexers
+
+Whichever route you install by, `c10r build` shells out to an indexer for the language it is indexing:
+
+```sh
+rustup component add rust-analyzer        # Rust workspaces
+npm install -g @sourcegraph/scip-python   # Python workspaces
+```
+
+You only need the one for the languages you index.
+`c10r doctor` reports which are present and which are missing.
 
 ## Quick start
 
@@ -56,11 +62,12 @@ The model is compiled into the binary, so `c10r` needs no network or configurati
 
 ```sh
 cd your-project
+# check the language indexers are installed and responsive
+c10r doctor
 # index the workspace into .c10r/index.db
 c10r build
 # rebuild the index after every commit
 c10r hooks install
-
 ```
 
 ### Using `c10r`
@@ -127,6 +134,10 @@ It advertises eight tools, one per command: `get`, `trace`, `find`, `search`, `s
 Each returns that command's structured answer unmodified, so provenance, freshness, typed absence, and heuristic labels arrive intact.
 A command failure arrives as a tool error carrying the exit category and `c10r`'s diagnostic.
 `cache` is deliberately absent: no tool on this surface removes an index store.
+
+`c10r` and `c10r-mcp` are versioned independently, and their version numbers drift apart.
+Matching numbers mean nothing, and a mismatch is not a problem.
+What has to agree is the command-surface version the server was built against, which the server checks at startup and reports as a refusal if it differs — see [startup refusals](#startup-refusals).
 
 ### Install
 

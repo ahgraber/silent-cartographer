@@ -13,6 +13,10 @@ A failed test job leaves the tag with no release; fix the problem and re-run the
 
 The release commit names its paths, so unrelated work in progress elsewhere in the tree neither blocks the release nor rides along in it.
 
+The two version numbers are independent and may drift.
+Compatibility between them is carried by `SURFACE_VERSION`, pinned on both sides in `src/manifest.rs` and `mcp/src/c10r_mcp/surface.py`: when the crate's command surface changes, that constant moves, the package's pin has to follow, and the package needs a release of its own.
+Nothing else about a crate release requires one.
+
 The harness in `evals/` is not released.
 
 ## Prerequisites
