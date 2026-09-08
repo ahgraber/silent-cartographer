@@ -1,0 +1,91 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+# Publishes the `c10r-mcp` Python package for a tag cut locally with `just release mcp`.
+# The tag is the only input: tests run against it, and nothing is published unless
+# they pass. See docs/releasing.md.
+name: "CD (MCP server)"
+
+on: # yamllint disable-line rule:truthy
+  push:
+    tags: ["c10r-mcp-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # The same checks CI runs on pull requests, re-run against the tagged commit.
+  test:
+    name: Test
+    uses: ./.github/workflows/ci-python.yaml
+
+  release:
+    name: Build and release
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload the distributions
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the previous tag in this series has to be reachable
+          persist-credentials: false
+
+      # Caching stays off: a cache a pull request run can write must not reach a
+      # published distribution.
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+
+      - name: Build the sdist and wheel
+        run: uv build --directory mcp
+
+      # The changelog section written for this version is the release body. Falling
+      # back to generated notes keeps a release from being blocked on formatting.
+      - name: Create the release
+        shell: bash
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          TAG: "${{ github.ref_name }}"
+        run: |
+          set -euo pipefail
+          version="${TAG#c10r-mcp-v}"
+          notes="$(mktemp)"
+          if [ -f mcp/CHANGELOG.md ]; then
+              # Match the heading for exactly this version: the version must be bounded
+              # by characters that cannot continue it, so searching 1.2.3 does not match
+              # a 1.2.30 heading. Headings are matched before the section-end rule, so a
+              # second matching heading ends the section rather than restarting it.
+              awk -v version="${version}" '
+                BEGIN { gsub(/\./, "\\.", version); heading = "^## .*[^0-9.]" version "([^0-9.]|$)" }
+                /^## / { if (collecting) exit; collecting = ($0 ~ heading); next }
+                collecting { print }
+              ' mcp/CHANGELOG.md >"${notes}"
+          fi
+
+          # A draft left by an earlier failed run would make `create` fail; a published
+          # release is never touched.
+          if [ "$(gh release view "${TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)" = true ]; then
+              gh release delete "${TAG}" --yes
+          fi
+
+          notes_args=(--notes-file "${notes}")
+          if [ ! -s "${notes}" ]; then
+              echo "no changelog section for ${version}; falling back to generated notes" >&2
+              notes_args=(--generate-notes)
+              # Left to itself, --generate-notes compares against the newest release of
+              # either series, so an interleaved v* release would bound the range. Name
+              # the previous tag of this series instead.
+              previous="$(git describe --tags --abbrev=0 --match 'c10r-mcp-v*' "${TAG}^" 2>/dev/null || true)"
+              if [ -n "${previous}" ]; then
+                  notes_args+=(--notes-start-tag "${previous}")
+              fi
+          fi
+
+          # Drafted first, then published, so a failed upload never leaves a visible
+          # release with missing distributions.
+          gh release create "${TAG}" --repo="${GITHUB_REPOSITORY}" --draft \
+              --title="c10r-mcp ${version}" "${notes_args[@]}" mcp/dist/*
+
+          gh release edit "${TAG}" --repo="${GITHUB_REPOSITORY}" --draft=false

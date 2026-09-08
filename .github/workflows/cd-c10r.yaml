@@ -1,0 +1,138 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+# Publishes the `c10r` binary for a tag cut locally with `just release-c10r`.
+# The tag is the only input: tests run against it, and nothing is published unless
+# they pass. See docs/releasing.md.
+name: "CD (c10r)"
+
+on: # yamllint disable-line rule:truthy
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The same checks CI runs on pull requests, re-run against the tagged commit.
+  test:
+    name: Test
+    uses: ./.github/workflows/ci-rust.yaml
+
+  # Created as a draft, so a failed binary build never leaves a visible release with
+  # missing assets. The publish job below flips it once every archive is attached.
+  release:
+    name: Draft the release
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the previous tag in this series has to be reachable
+          persist-credentials: false
+
+      # The changelog section for this version is the release body. Falling back to
+      # generated notes keeps a release from being blocked on changelog formatting.
+      - name: Draft the release
+        shell: bash
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          TAG: "${{ github.ref_name }}"
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          notes="$(mktemp)"
+          if [ -f CHANGELOG.md ]; then
+              # Match the heading for exactly this version: the version must be bounded
+              # by characters that cannot continue it, so searching 1.2.3 does not match
+              # a 1.2.30 heading. Headings are matched before the section-end rule, so a
+              # second matching heading ends the section rather than restarting it.
+              awk -v version="${version}" '
+                BEGIN { gsub(/\./, "\\.", version); heading = "^## .*[^0-9.]" version "([^0-9.]|$)" }
+                /^## / { if (collecting) exit; collecting = ($0 ~ heading); next }
+                collecting { print }
+              ' CHANGELOG.md >"${notes}"
+          fi
+
+          # A draft left by an earlier failed run would make `create` fail; a published
+          # release is never touched.
+          if [ "$(gh release view "${TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)" = true ]; then
+              gh release delete "${TAG}" --yes
+          fi
+
+          notes_args=(--notes-file "${notes}")
+          if [ ! -s "${notes}" ]; then
+              echo "no changelog section for ${version}; falling back to generated notes" >&2
+              notes_args=(--generate-notes)
+              # Left to itself, --generate-notes compares against the newest release of
+              # either series, so an interleaved c10r-mcp-v* release would bound the
+              # range. Name the previous tag of this series instead.
+              previous="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
+              if [ -n "${previous}" ]; then
+                  notes_args+=(--notes-start-tag "${previous}")
+              fi
+          fi
+
+          gh release create "${TAG}" --repo="${GITHUB_REPOSITORY}" --draft \
+              --title="c10r ${version}" "${notes_args[@]}"
+
+  binaries:
+    name: ${{ matrix.target }}
+    needs: release
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # upload the archives as release assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on native runners rather than cross-compiled: rusqlite (bundled),
+          # sqlite-vec, and the tokenizers `esaxx_fast` feature all compile C.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Caching is off in this job. A cache a pull request run can write must not
+      # reach a published artifact; build.rs re-fetches the model payload and verifies
+      # it against the manifest's checksums on this clean runner instead.
+      - name: Install the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          target: "${{ matrix.target }}"
+          cache: false
+
+      - name: Build and upload
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
+        with:
+          bin: c10r
+          target: "${{ matrix.target }}"
+          archive: $bin-$tag-$target
+          include: LICENSE,README.md
+          checksum: sha256
+          locked: true # build the committed dependency resolution, not a fresh one
+          token: "${{ secrets.GITHUB_TOKEN }}"
+
+  publish:
+    name: Publish the release
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # take the release out of draft
+    steps:
+      - name: Publish
+        shell: bash
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          TAG: "${{ github.ref_name }}"
+        run: gh release edit "${TAG}" --repo="${GITHUB_REPOSITORY}" --draft=false

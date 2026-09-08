@@ -1,0 +1,56 @@
+# git-cliff: builds mcp/CHANGELOG.md for the `c10r-mcp` package from Conventional Commits.
+# Passed explicitly as `--config mcp/.cliff.toml`; see ../docs/releasing.md.
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to `c10r-mcp` are documented here.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+body = """
+{% if version %}
+## [{{ version | trim_start_matches(pat="c10r-mcp-v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}
+## [Unreleased]
+{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+protect_breaking_commits = true
+
+# This package's own tag series. Without it the crate's `v*` tags would bound the
+# commit range and truncate this changelog.
+tag_pattern = "^c10r-mcp-v"
+
+# Only commits that touched the package.
+include_paths = ["mcp/**"]
+
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Changed" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^test", group = "Testing" },
+  { message = "^revert", group = "Removed" },
+  { message = "^chore", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^build", skip = true },
+  { message = "^style", skip = true },
+  { message = "^bump", skip = true },
+  { message = ".*", group = "Other" },
+]
+
+filter_commits = false
+sort_commits = "oldest"
