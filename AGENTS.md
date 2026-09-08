@@ -259,7 +259,11 @@ Cross-cutting rules apply to both; language-specific tooling is grouped under it
 
 - Semantic Versioning is REQUIRED (MAJOR.MINOR.PATCH).
 - Conventional Commits are REQUIRED for commit messages and/or PR titles.
-- Keep a Changelog is REQUIRED; it is managed via `uv-ship` during the release process and follows <https://keepachangelog.com> format.
+- Keep a Changelog is REQUIRED; it follows <https://keepachangelog.com> format.
+  `just changelog <package> <bump>` drafts the next section from the commit history with `git-cliff`, that draft is edited by hand, and `just release <package> <bump>` then commits, tags, and pushes it; GitHub Actions tests the tag and publishes.
+  The `c10r` crate tags `v*`, the `c10r-mcp` package in `mcp/` tags `c10r-mcp-v*`, and each changelog is scoped to its own series.
+  See `docs/releasing.md`.
+- Never cut a release, push a tag, or bump a version without an explicit instruction to release.
 - After the first MINOR release, all changes affecting data/schema/contracts MUST include a migration plan and a deprecation schedule.
 
 ## Testing
