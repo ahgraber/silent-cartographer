@@ -23,8 +23,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Only a pull request is filtered. A push to main, a tag release through
-  # `workflow_call`, and a manual run all test everything.
+  # Filters over the same ranges as ci-rust.yaml; see the note there.
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
@@ -42,18 +41,37 @@ jobs:
         id: filter
         shell: bash
         env:
+          EVENT: "${{ github.event_name }}"
+          REF: "${{ github.ref }}"
           BASE: "${{ github.event.pull_request.base.sha }}"
+          BEFORE: "${{ github.event.before }}"
+          SHA: "${{ github.sha }}"
         run: |
           set -euo pipefail
-          if [ -z "${BASE}" ]; then
+          zero=0000000000000000000000000000000000000000
+
+          range=""
+          if [[ "${REF}" == refs/tags/* ]]; then
+              : # a release tests everything
+          elif [[ "${EVENT}" == pull_request && -n "${BASE}" ]]; then
+              range="${BASE}...HEAD"
+          elif [[ "${EVENT}" == push && -n "${BEFORE}" && "${BEFORE}" != "${zero}" ]] \
+              && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              range="${BEFORE}..${SHA}"
+          fi
+
+          if [[ -z "${range}" ]]; then
+              echo "no diffable range; testing everything" >&2
               echo "mcp=true" >>"${GITHUB_OUTPUT}"
               echo "evals=true" >>"${GITHUB_OUTPUT}"
               exit 0
           fi
-          changed="$(git diff --name-only "${BASE}...HEAD")"
+
+          echo "filtering over ${range}" >&2
+          changed="$(git diff --name-only "${range}")"
 
           # The MCP tests drive the built binary, so a crate change is an MCP change.
-          if grep -qE '^(mcp/|src/|build\.rs|Cargo\.(toml|lock)|rust-toolchain\.toml|models/[^/]*\.manifest\.json|\.github/workflows/ci-python\.yaml)' <<<"${changed}"; then
+          if grep -qE '^(mcp/(src|tests)/|mcp/(pyproject\.toml|uv\.lock)|src/|build\.rs|Cargo\.(toml|lock)|rust-toolchain\.toml|models/[^/]*\.manifest\.json|\.github/workflows/ci-python\.yaml)' <<<"${changed}"; then
               echo "mcp=true" >>"${GITHUB_OUTPUT}"
           else
               echo "mcp=false" >>"${GITHUB_OUTPUT}"
@@ -81,6 +99,20 @@ jobs:
       # and needs the rust-analyzer component that `c10r build` shells out to.
       - name: Install the pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          components: rust-analyzer, rust-src
+
+      # The tests index temporary workspaces outside this repository, where
+      # rust-toolchain.toml does not apply; see the note in ci-rust.yaml.
+      - name: Pin the toolchain for the rustup proxies
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTUP_TOOLCHAIN="$(rustup show active-toolchain | cut -d' ' -f1)"
+          export RUSTUP_TOOLCHAIN
+          echo "RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN}" >>"${GITHUB_ENV}"
+          cd "${RUNNER_TEMP}"
+          rust-analyzer --version
 
       - name: Cache the embedding model payload
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -25,8 +25,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Only a pull request is filtered. A push to main, a tag release through
-  # `workflow_call`, and a manual run all build everything.
+  # Pull requests filter against the merge base, pushes against the commits the push
+  # advanced over. A tag, a manual run, and any push whose prior commit is unavailable
+  # (a new branch, a force-push) build everything, because there is nothing to diff.
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
@@ -43,14 +44,33 @@ jobs:
         id: filter
         shell: bash
         env:
+          EVENT: "${{ github.event_name }}"
+          REF: "${{ github.ref }}"
           BASE: "${{ github.event.pull_request.base.sha }}"
+          BEFORE: "${{ github.event.before }}"
+          SHA: "${{ github.sha }}"
         run: |
           set -euo pipefail
-          if [ -z "${BASE}" ]; then
+          zero=0000000000000000000000000000000000000000
+
+          range=""
+          if [[ "${REF}" == refs/tags/* ]]; then
+              : # a release tests everything
+          elif [[ "${EVENT}" == pull_request && -n "${BASE}" ]]; then
+              range="${BASE}...HEAD"
+          elif [[ "${EVENT}" == push && -n "${BEFORE}" && "${BEFORE}" != "${zero}" ]] \
+              && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              range="${BEFORE}..${SHA}"
+          fi
+
+          if [[ -z "${range}" ]]; then
+              echo "no diffable range; building everything" >&2
               echo "rust=true" >>"${GITHUB_OUTPUT}"
               exit 0
           fi
-          if git diff --name-only "${BASE}...HEAD" | grep -qE \
+
+          echo "filtering over ${range}" >&2
+          if git diff --name-only "${range}" | grep -qE \
               '^(src/|tests/|build\.rs|Cargo\.(toml|lock)|rust-toolchain\.toml|models/[^/]*\.manifest\.json|\.github/workflows/ci-rust\.yaml)'; then
               echo "rust=true" >>"${GITHUB_OUTPUT}"
           else
@@ -68,11 +88,30 @@ jobs:
         with:
           persist-credentials: false
 
-      # Reads rust-toolchain.toml, so the channel and components (rustfmt, clippy,
-      # rust-analyzer) match what everyone develops against. `c10r build` shells out
-      # to `rust-analyzer scip`, so the integration tests need that component present.
+      # Reads rust-toolchain.toml, so the channel matches what everyone develops
+      # against. The components are named again here because the tests depend on
+      # rust-analyzer being present, and a silent omission surfaces only as a
+      # confusing failure deep inside the suite.
       - name: Install the pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          components: rust-analyzer, rust-src
+
+      # `c10r build` shells out to `rust-analyzer`, and the tests run it from temporary
+      # workspaces outside this repository. There, rust-toolchain.toml does not apply and
+      # the rustup proxy resolves the runner's default toolchain, which carries no
+      # rust-analyzer component — so the proxy runs and exits non-zero. Pinning
+      # RUSTUP_TOOLCHAIN makes the proxies resolve this toolchain from any directory.
+      - name: Pin the toolchain for the rustup proxies
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTUP_TOOLCHAIN="$(rustup show active-toolchain | cut -d' ' -f1)"
+          export RUSTUP_TOOLCHAIN
+          echo "RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN}" >>"${GITHUB_ENV}"
+          # Prove it resolves outside the repository, where the tests will run it.
+          cd "${RUNNER_TEMP}"
+          rust-analyzer --version
 
       # build.rs downloads the embedding model from the revision the manifest pins and
       # verifies every file's SHA-256. Caching on the manifest's own hash means a cache
