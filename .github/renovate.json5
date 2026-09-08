@@ -1,0 +1,57 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:best-practices",
+    // Supersedes the `helpers:pinGitHubActionDigests` that best-practices already pulls in,
+    // adding the semver `extractVersion` so pinned digests still show a readable version.
+    "helpers:pinGitHubActionDigestsToSemver",
+    ":automergePr", // ":automergeBranch",
+    ":configMigration",
+    ":dependencyDashboard",
+    ":disableRateLimiting",
+    // The pre-commit manager is one of the few disabled by default.
+    ":enablePreCommit",
+    ":renovatePrefix",
+    ":semanticCommits",
+    ":separateMultipleMajorReleases",
+    ":separateMultipleMinorReleases",
+    ":separatePatchReleases",
+    ":timezone(America/New_York)",
+    // Shared presets; they resolve from that repo's default branch.
+    "github>ninerealmlabs/precommit-template//.github/renovate/autoMerge.json5",
+    "github>ninerealmlabs/precommit-template//.github/renovate/customManagers.json5",
+    "github>ninerealmlabs/precommit-template//.github/renovate/labels.json5",
+    "github>ninerealmlabs/precommit-template//.github/renovate/packageRules.json5",
+    "github>ninerealmlabs/precommit-template//.github/renovate/semanticCommits.json5",
+  ],
+  dependencyDashboardTitle: "Renovate Dashboard 🤖",
+  suppressNotifications: ["prEditedNotification", "prIgnoreNotification"],
+  schedule: ["before 5am"],
+  minimumReleaseAge: "3 days",
+  ignorePaths: [
+    // Conformance fixtures: their manifests are test input, not this project's dependencies.
+    "tests/fixtures/**",
+  ],
+  packageRules: [
+    {
+      description: ["Group the Rust crates into one PR per update type"],
+      matchManagers: ["cargo"],
+      semanticCommitScope: "deps",
+    },
+    {
+      // These crates are pinned to an exact version on purpose (protobuf tracks `scip`;
+      // sqlite-vec's on-disk format is pre-1.0 and warned unstable; the model2vec-rs and
+      // tokenizers pair must compile one tokenizer). A bump is a schema decision.
+      description: ["Never auto-merge the exact-pinned crates"],
+      matchManagers: ["cargo"],
+      matchPackageNames: ["protobuf", "sqlite-vec", "model2vec-rs", "tokenizers"],
+      automerge: false,
+      addLabels: ["review/manual"],
+    },
+    {
+      description: ["Separate the Python subprojects from the Rust crate"],
+      matchManagers: ["pep621"],
+      semanticCommitScope: "python-deps",
+    },
+  ],
+}
