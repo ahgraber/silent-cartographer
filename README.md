@@ -14,12 +14,21 @@ Structure comes from tree-sitter.
 
 Silent Cartographer is available as a command-line interface and/or an MCP server.
 
-`c10r` is not published to crates.io, so `cargo install c10r` and `cargo binstall c10r` do not find it.
-Install it one of the three ways below.
-
 ### A prebuilt binary
 
 Each [release](https://github.com/ahgraber/silent-cartographer/releases) carries an archive per platform — Linux (x86-64) and macOS (Apple Silicon) — named `c10r-<tag>-<target>.tar.gz` for you to download, extract, and place on your `PATH`.
+
+### With `uv`
+
+`uv tool install` builds the binary from GitHub and puts it on your `PATH`:
+
+```sh
+uv tool install git+https://github.com/ahgraber/silent-cartographer@<tag>
+```
+
+`<tag>` pins a released version; a branch name or a commit hash works there too, and omitting `@<tag>` builds the default branch.
+To upgrade, run the command again with the new tag.
+`uv tool uninstall c10r` removes it.
 
 ### From the repository
 
@@ -39,7 +48,7 @@ cargo build --release          # built at target/release/c10r
 cargo install --path . --locked # or install it onto your PATH
 ```
 
-Both source routes additionally need the Rust toolchain pinned by `rust-toolchain.toml`, which rustup installs automatically.
+All three source routes additionally need the Rust toolchain pinned by `rust-toolchain.toml`, which rustup installs automatically.
 
 The first build downloads the ~33 MB embedding model that `search` and `similar` use, and checks it against `models/potion-code-16M-v2.manifest.json`.
 The model is compiled into the binary, so `c10r` needs no network or configuration at runtime.
@@ -49,8 +58,10 @@ The model is compiled into the binary, so `c10r` needs no network or configurati
 Whichever route you install by, `c10r build` shells out to an indexer for the language it is indexing:
 
 ```sh
-rustup component add rust-analyzer        # Rust workspaces
-npm install -g @sourcegraph/scip-python   # Python workspaces
+# Rust workspaces
+rustup component add rust-analyzer
+# Python workspaces
+npm install -g @sourcegraph/scip-python
 ```
 
 You only need the one for the languages you index.

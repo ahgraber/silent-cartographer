@@ -1,0 +1,17 @@
+# Builds the c10r binary into a wheel, so `uv tool install git+<repo>@<tag>` works.
+# The version comes from Cargo.toml, so a release does not edit this file.
+# Setting `project.name` here stops maturin from reading the other metadata out of
+# Cargo.toml, so those fields are repeated below.
+[project]
+name = "c10r"
+dynamic = ["version"]
+description = "A persistent codebase knowledge graph answering precise, type-aware navigation."
+readme = "README.md"
+license = "Apache-2.0"
+
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "bin"

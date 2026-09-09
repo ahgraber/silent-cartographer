@@ -54,11 +54,12 @@ Editing the manifest version by hand between them would desynchronize the two.
 
 ## Settings
 
-| File                                    | Holds                                                                                                |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| [`justfile`](../justfile)               | the release steps themselves, for both artifacts                                                     |
-| [`.cliff.toml`](../.cliff.toml)         | git-cliff for the crate: `v*` tags, excluding commits that touch only `mcp/`, `evals/`, or `.specs/` |
-| [`mcp/.cliff.toml`](../mcp/.cliff.toml) | git-cliff for the package: `c10r-mcp-v*` tags, only commits touching `mcp/`                          |
+| File                                    | Holds                                                                                                         |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| [`justfile`](../justfile)               | the release steps themselves, for both artifacts                                                              |
+| [`.cliff.toml`](../.cliff.toml)         | git-cliff for the crate: `v*` tags, excluding commits that touch only `mcp/`, `evals/`, or `.specs/`          |
+| [`mcp/.cliff.toml`](../mcp/.cliff.toml) | git-cliff for the package: `c10r-mcp-v*` tags, only commits touching `mcp/`                                   |
+| [`pyproject.toml`](../pyproject.toml)   | the wheel `uv tool install` builds; its version comes from `Cargo.toml`, so a release does not edit this file |
 
 Each changelog is scoped to its own tag series and paths.
 Without `tag_pattern`, the other artifact's tags would bound the commit range and truncate the changelog.
@@ -69,10 +70,16 @@ git-cliff is always invoked as `--unreleased --prepend`, which adds only the new
 The version bump goes through whichever tool owns the manifest: the crate's version is edited in place and `cargo metadata` propagates it into `Cargo.lock`, while `uv version` bumps and re-locks the package together.
 Push is the last step, so a failure there leaves a local tag to delete before retrying.
 
-## crates.io
+## Package registries
 
-Publishing is off; nothing in the release path runs `cargo publish`.
-Enabling it needs a crates.io token and a publish step, and an offline path in [`build.rs`](../build.rs), which downloads the embedding model on every build; docs.rs builds without network access.
+Publishing is off.
+Nothing in the release path runs `cargo publish` or uploads a wheel.
+
+crates.io needs a token and a publish step.
+It also needs an offline path in [`build.rs`](../build.rs), because that script downloads the embedding model on every build and docs.rs builds without network access.
+PyPI needs a trusted publisher and one wheel per platform, built in CI; the Linux wheel has to be built inside a manylinux container.
+Both are planned for the same time.
+Until then, users install with `cargo install --git` or `uv tool install git+…`, which build from a tag.
 
 ## Continuous integration
 
