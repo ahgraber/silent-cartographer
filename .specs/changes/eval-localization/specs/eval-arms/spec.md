@@ -38,6 +38,33 @@ Serves: evidence-of-utility, instruction-set
 - **WHEN** a c10r query runs against the task's repository
 - **THEN** c10r returns an answer from the pre-built index without error
 
+### Requirement: Index Build Cost Recording
+
+The build manifest SHALL carry, for each treatment-arm task whose image was built, that task's index build wall-clock time and resulting index size, so the one-time cost of adopting c10r stays measurable outside the paired comparison.
+Merging further build records into a manifest SHALL preserve the entries earlier builds recorded, and SHALL replace an entry only for a task the current records measure again.
+
+The manifest is a captured artifact rather than report content; no requirement obliges the report to render it.
+
+Serves: evidence-of-utility
+
+#### Scenario: Manifest carries each built task's index cost
+
+- **GIVEN** build records from a treatment-arm image build
+- **WHEN** they are merged into the build manifest
+- **THEN** the manifest carries each recorded task's index build wall-clock time and index size
+
+#### Scenario: An interrupted build keeps what it measured
+
+- **GIVEN** a manifest holding entries from an earlier build
+- **WHEN** records from a later build covering only some of those tasks are merged
+- **THEN** the manifest retains the entries the later build did not measure and replaces those it did
+
+#### Scenario: An incomplete record is refused
+
+- **GIVEN** a build record missing the task identity, the wall-clock time, or the index size
+- **WHEN** it is merged
+- **THEN** the merge is refused and the existing manifest is left unchanged
+
 ### Requirement: Baseline Purity
 
 Baseline-arm task environments SHALL NOT contain c10r, and baseline-arm agent context SHALL NOT reference c10r.
@@ -73,6 +100,48 @@ Serves: instruction-set, comparable-telemetry
 - **GIVEN** two treatment runs executed under different instruction-set versions
 - **WHEN** their recorded results are queried
 - **THEN** each trial is attributable to the version it ran under
+
+### Requirement: Recorded Settings Immutability
+
+Rendering a run configuration into a directory that already holds trials SHALL be refused when a previously recorded setting has changed, so that a rerun cannot relabel trials produced under different settings; a refusal SHALL leave every arm's recorded settings unaltered.
+
+Serves: comparable-telemetry, evidence-of-utility
+
+#### Scenario: Changed setting refuses the render
+
+- **GIVEN** a run directory holding trials recorded under a given model and resource caps
+- **WHEN** a configuration with a different model is rendered into it
+- **THEN** the render is refused and names the settings that changed
+
+#### Scenario: Refusal leaves the directory untouched
+
+- **GIVEN** a render that is refused for one arm
+- **WHEN** the run directory is inspected
+- **THEN** no arm's recorded settings have changed
+
+#### Scenario: A setting the record never carried is not a conflict
+
+- **GIVEN** a run directory whose recorded settings predate a newly added setting
+- **WHEN** a configuration carrying that setting is rendered into it
+- **THEN** the render proceeds and records the new setting
+
+### Requirement: Blocked Arm Interleaving
+
+The runner SHALL divide the stable issue order into fixed-size blocks and run both arms within each block, and SHALL reverse which arm leads from one block to the next, so that no arm is confined to one window of the run.
+
+Serves: evidence-of-utility
+
+#### Scenario: Both arms run within each block
+
+- **GIVEN** a paired sweep over a subset spanning several blocks
+- **WHEN** the run plan is inspected
+- **THEN** every block schedules both arms over the same issues
+
+#### Scenario: Leading arm alternates between blocks
+
+- **GIVEN** a run plan spanning at least two blocks
+- **WHEN** the leading arm of consecutive blocks is compared
+- **THEN** the leading arm differs between them
 
 ### Requirement: Dev-Frozen Separation
 

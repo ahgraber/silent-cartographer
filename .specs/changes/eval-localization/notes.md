@@ -46,8 +46,32 @@
   - `[task]` is registry metadata requiring `name` in `org/name` form (we use `<arm>/<instance_id>`); harness fields (instance, arm, dataset revision) live in Pier's free-form `[metadata]` table.
   - The verifier is `tests/test.sh` (discovered by convention, run in the shared agent environment); the reward file must be a flat numeric mapping written to `/logs/verifier/reward.json`; non-numeric grading detail goes to a `grade-details.json` sidecar.
 
+## Split manifest regenerated at the registered frozen size (2026-09-11)
+
+- Command: `uv run c10r-evals generate --revision a637bd46829f3132e12938c8a0ca93173a977b8e --seed 0 --subset dev --out tasks/`.
+
+- Captured output, comparing the manifest against a snapshot of its prior state:
+
+  | Check                               | Result             |
+  | ----------------------------------- | ------------------ |
+  | Dev ids unchanged                   | true (20 distinct) |
+  | Previously drawn frozen ids dropped | 0                  |
+  | Frozen listed / distinct            | 300 / 300          |
+  | Duplicate frozen ids remaining      | none               |
+  | Dev and frozen overlap              | none               |
+
+  The prior manifest held 200 listed / 199 distinct frozen ids, with `conan-io__conan-18153` repeated.
+  That repeat was an artifact of a draw taken before `make_split` deduplicated, and the regenerated draw extends the earlier one rather than redrawing it, which is what InstanceAllocation requires.
+
+- The same run regenerated the 20 dev instances into 40 tasks across 16 distinct repositories, each task carrying the new pre-run characteristics.
+  `source_file_count` ranged from 32 to 1172 with no zeros, and the source-file cue was true for 6 of the 20 dev issues.
+  Both values were identical across each instance's two arms.
+
+- `tasks/` is gitignored, so the manifest is a local artifact regenerated from the recorded seed and dataset revision rather than a committed file.
+
 ## Build environment findings, recorded for reruns
 
+- Generation needs network for the treeless repository clones on first use of each repository; a populated clone cache makes a rerun offline.
 - sqlite-vec 0.1.9's C amalgamation needs `-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t` under musl (BSD type names that glibc leaks transitively but musl headers never provide); wired into the script.
 - Compiling the main crate needs more RAM than podman machines allot by default (rustc SIGKILL = VM OOM); fixed with `podman machine set --memory 8192 --cpus 6`.
 - The nix-packaged podman (5.8.2) ships no Rosetta support (no `--rosetta` flags, no `/mnt/rosetta` mount); x86 containers on this machine run under qemu, which handles light workloads but segfaulted rustc — hence native cross-compilation, never emulated compilation.

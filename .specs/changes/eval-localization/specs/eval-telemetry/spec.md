@@ -4,7 +4,9 @@
 
 ### Requirement: Complete Trial Capture
 
-For every scheduled trial, the experiment store SHALL contain exactly one record carrying the trial's identity (instance, arm, agent, model, and — for treatment trials — instruction-set version), its terminal state, its cost totals, its reward scores, its invocation counts, and its raw trajectory and reward artifacts where they exist.
+For every scheduled trial that recorded an outcome, the experiment store SHALL contain exactly one record carrying the trial's identity (dataset revision, instance, arm, agent, model, attempt, platform, and — for treatment trials — instruction-set version), the pre-run task characteristics recorded with its task, its terminal state, its cost totals, its reward scores, its invocation counts, and its raw trajectory and reward artifacts where they exist.
+
+A trial killed before it recorded an outcome SHALL NOT be imported, because its instance is not recoverable from its outputs; such a trial SHALL be reported as pending so it can be run again.
 
 Serves: comparable-telemetry, evidence-of-utility
 
@@ -12,7 +14,7 @@ Serves: comparable-telemetry, evidence-of-utility
 
 - **GIVEN** a completed treatment trial with a parsed answer
 - **WHEN** import runs over the trial's outputs
-- **THEN** one record exists carrying identity, cost totals, reward scores, uptake, and attached trajectory and reward artifacts
+- **THEN** one record exists carrying identity, the task's pre-run characteristics, cost totals, reward scores, uptake, and attached trajectory and reward artifacts
 
 #### Scenario: Unparsed trial still captured
 
@@ -37,6 +39,12 @@ Serves: comparable-telemetry, evidence-of-utility
 - **GIVEN** a scheduled trial that failed on provisioning before the agent acted
 - **WHEN** import runs
 - **THEN** one record exists carrying the infrastructure-failure terminal state and no reward scores
+
+#### Scenario: Trial killed before recording an outcome reported as pending
+
+- **GIVEN** a scheduled trial whose run was interrupted before it wrote its outcome
+- **WHEN** import runs and the arm's pending instances are listed
+- **THEN** no record exists for that trial and its instance is listed as pending
 
 ### Requirement: Idempotent Import
 
@@ -68,6 +76,24 @@ Serves: comparable-telemetry
 - **WHEN** import runs again over those outputs
 - **THEN** the import reports an explicit error for that trial and the existing record is unchanged
 
+### Requirement: Token Category Capture
+
+For every trial, the experiment store SHALL record each token category the trial's trajectory reports, and SHALL record the model, provider, harness, and caching configuration the trial ran under; a token category the trajectory does not report SHALL be absent from the record rather than recorded as zero.
+
+Serves: comparable-telemetry, evidence-of-utility
+
+#### Scenario: Reported categories recorded
+
+- **GIVEN** a trial whose trajectory reports input, cached-input, output, and reasoning token counts
+- **WHEN** import runs
+- **THEN** the record carries each of those categories alongside the trial's serving configuration
+
+#### Scenario: Unreported category absent
+
+- **GIVEN** a trial whose trajectory reports no cache-write token count
+- **WHEN** import runs
+- **THEN** the record carries no cache-write figure and substitutes no zero
+
 ### Requirement: Invocation Count Fidelity
 
 For every trial, the recorded uptake count SHALL equal the number of c10r invocations observable in that trial's trajectory, and the recorded search count SHALL equal the number of search-tool invocations (grep, glob, and equivalent search commands) observable in the same trajectory.
@@ -94,7 +120,7 @@ Serves: instruction-set, comparable-telemetry, evidence-of-utility
 
 ### Requirement: Cross-Run Comparability
 
-Recorded trials SHALL be selectable by instance, arm, and instruction-set version without reading raw trajectories.
+Recorded trials SHALL be selectable by instance, arm, and instruction-set version, and their pre-run task characteristics SHALL be readable, without reading raw trajectories.
 
 Serves: comparable-telemetry, reusable-runway
 
@@ -103,3 +129,9 @@ Serves: comparable-telemetry, reusable-runway
 - **GIVEN** a store holding trials from two arms and two instruction-set versions
 - **WHEN** trials are selected by one arm and one version
 - **THEN** exactly the matching trials return, and the selection reads no raw trajectory
+
+#### Scenario: Task characteristics read from the store
+
+- **GIVEN** a store holding a paired run's trials
+- **WHEN** the task-level analyses read each trial's pre-run task characteristics
+- **THEN** the values return from the store and no task tree or raw trajectory is read

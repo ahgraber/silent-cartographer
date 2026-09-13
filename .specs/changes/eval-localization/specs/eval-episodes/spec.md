@@ -86,6 +86,44 @@ Serves: evidence-of-utility
 - **WHEN** the task is generated
 - **THEN** no test-only file appears in the gold answer
 
+### Requirement: Pre-Run Task Characteristics
+
+For every instance, task generation SHALL compute the repository's tracked Python source-file count at the instance's base commit and whether the issue text names a source file, and SHALL record both with the task metadata before any trial runs; the recorded values SHALL be identical across the instance's two arms.
+
+An issue names a source file when its text contains an exact tracked Python source path, or a Python source basename that occurs exactly once among the repository's tracked Python source files.
+
+Serves: evidence-of-utility
+
+#### Scenario: Characteristics recorded with every task
+
+- **GIVEN** an instance whose repository holds a known number of tracked Python source files at its base commit
+- **WHEN** task generation runs
+- **THEN** each arm's task records that source-file count and a source-file-cue indicator, and the two arms' recorded values are identical
+
+#### Scenario: Issue naming an exact path
+
+- **GIVEN** an instance whose issue text contains a tracked Python source path
+- **WHEN** task generation runs
+- **THEN** the recorded source-file-cue indicator is true
+
+#### Scenario: Issue naming a unique basename
+
+- **GIVEN** an instance whose issue text contains a Python source basename that occurs in exactly one tracked source file
+- **WHEN** task generation runs
+- **THEN** the recorded source-file-cue indicator is true
+
+#### Scenario: Issue naming an ambiguous basename
+
+- **GIVEN** an instance whose issue text contains a Python source basename that occurs in more than one tracked source file
+- **WHEN** task generation runs
+- **THEN** the recorded source-file-cue indicator is false
+
+#### Scenario: Issue naming no source file
+
+- **GIVEN** an instance whose issue text contains no tracked Python source path or basename
+- **WHEN** task generation runs
+- **THEN** the recorded source-file-cue indicator is false
+
 ### Requirement: Grading Totality
 
 The verifier SHALL record a score for every completed trial; a trial whose answer is missing, malformed, or unparseable SHALL be scored as an empty answer, SHALL be marked as unparsed, and SHALL NOT abort the trial or the run.

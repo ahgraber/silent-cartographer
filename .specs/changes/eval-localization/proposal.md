@@ -4,14 +4,16 @@
 
 The north star defines c10r's single measure of success — an agent trusts c10r enough to stop grepping — but nothing measures it.
 All utility claims (precise navigation at lower token cost than grep) currently rest on dogfood anecdotes.
-This change builds the evaluation foundation and runs its first evaluation: a paired, two-arm localization benchmark on real GitHub issues testing one precise claim — for a predeclared model and task sample, the c10r treatment (the binary plus its instruction prompt) lowers the primary agent cost metric while paired historical-fix file recovery stays within a pre-registered non-inferiority margin of the same agent with its standard search tools alone.
+This change builds the evaluation foundation and runs its first evaluation: a paired, two-arm localization benchmark on real GitHub issues that estimates, for a predeclared model and task sample, how the c10r treatment (the binary plus its instruction prompt) changes agent token use and paired historical-fix file recovery against the same agent with its standard search tools alone.
+The evaluation reports estimates and their uncertainty.
+It registers formal superiority, non-inferiority, equivalence, and harm claims against reference boundaries before the frozen run, but it issues no adoption verdict and combines no two claims into one.
 It also produces two durable assets: a frozen, evidence-tested c10r instruction set, and a run-to-analysis telemetry pipeline that later evaluations reuse unchanged.
 
 ## User Stories
 
 ### Story: evidence-of-utility
 
-As a c10r maintainer, I want paired head-to-head measurements of a coding agent with c10r versus grep-only on real issue-localization work, so that the claim "c10r finds the right code with fewer tokens at equal accuracy" rests on data instead of intuition.
+As a c10r maintainer, I want paired head-to-head measurements of a coding agent with c10r versus the same agent with its standard search tools on real issue-localization work, so that statements about how c10r changes token use and file recovery rest on measured estimates and their uncertainty instead of intuition.
 
 Ladders to: north-star outcomes 1 (precise locate) and 2 (blast radius), and the north-star success measure ("an agent trusts c10r enough to stop grepping").
 
@@ -40,15 +42,15 @@ Ladders to: the north-star success measure — the evidence plan only reaches it
 - `evals/` — a uv-managed Python project in this repo housing the harness (task generation, grading, analysis, telemetry import).
 - Episode dataset: task generation from the SWE-bench-Live Python `verified` split into Harbor-format localization tasks (issue + repo checkout at `base_commit`; no test execution).
 - Localization verifier: grade the agent's structured answer against the gold patch's file set; emit accuracy scores as the task reward.
-- Arm definitions: baseline (grep-only) and treatment (c10r on PATH + versioned instruction prompt), differing only in c10r availability and instructions; c10r built as a static Linux binary and injected into treatment task images.
+- Arm definitions: baseline (standard search tools) and treatment (c10r on PATH + versioned instruction prompt), differing only in c10r availability and instructions; c10r built as a static Linux binary and injected into treatment task images.
 - Pier-driven runs: `claude-code` agent, docker environment, pinned model and caps identical across arms.
 - Telemetry: MLflow import of every scheduled trial with its terminal state (cost, accuracy, uptake, artifacts), idempotent across re-imports.
-- Paired analysis: per-task deltas and arm-level summaries for cost superiority and accuracy non-inferiority.
+- Paired analysis: per-task deltas, arm-level summaries, paired effect estimates with two-sided confidence intervals, the registered formal claims judged against the reference boundaries, the registered plots, and the registered task-level analyses.
 - Instruction-set protocol: iterate on a dev subset, then freeze and version for the reported run.
 
 **Out of scope:**
 
-- The later fix-rate evaluations (full-fix on DeepSWE; SWE-bench-Live full-fix runs at volume and the SWE-bench-Live→Harbor converter) — future changes, sketched in the appendix.
+- The later fix-rate evaluations (full-fix on DeepSWE; SWE-bench-Live full-fix runs at volume and the SWE-bench-Live to Harbor converter).
 - The Codex harness (the DeepSWE full-fix evaluation adds the second harness).
 - The SlopCodeBench claim-3 satellite.
 - MCP integration (CLI-only by decision).
@@ -72,26 +74,12 @@ Mechanism sketch, to be formalized in `design.md`:
 - **Telemetry.**
   Importer walks Pier's `jobs/` tree; one MLflow run per scheduled trial keyed by a stable trial identity (idempotent re-import, terminal state recorded); params carry task, arm, model, prompt version; metrics carry ATIF token/cost totals, reward components, uptake and search counts; trajectory and reward files attach as artifacts.
 - **Analysis.**
-  Paired per-task deltas; Wilcoxon signed-rank on the primary cost metric (total tokens); a one-sided paired-difference confidence interval judged against the non-inferiority margin for accuracy; report renders a summary table.
+  Paired per-task deltas; the paired difference in hit rate and the mean paired log token ratio as the two primary estimates, each with a two-sided confidence interval; the claims registered for each axis evaluated independently against the reference boundaries; the registered plots and task-level analyses; report renders estimates before claims.
   Dev/frozen split of instances chosen up front so prompt iteration never touches the reported subset.
 
-## Open Questions
+## Resolved decisions
 
-- Instance allocation — **resolved (design, 2026-08-15):** 20 dev / 100 frozen, disjoint, seed-recorded; remainder unassigned headroom.
+- Instance allocation — **resolved (design, 2026-08-15; frozen size set 2026-09-11):** 20 dev / 300 frozen, disjoint, seed-recorded; the remaining 180 stay unassigned headroom.
 - Model — **resolved (design, 2026-08-15):** local models via proxy for iteration; model identity is a recorded per-run parameter; the frozen run's model is chosen at freeze time (direction: generic API endpoint with a model manifest, e.g. OpenRouter).
-- MLflow backend — **resolved (design, 2026-08-15):** configurable via the standard tracking URI; local `mlruns/` default for testing, existing tracking server for real runs.
-- Non-inferiority margin for accuracy: margin, interval method, and a power calculation are recorded together before the frozen run starts, sized from dev-run discordance (the earlier 3-point lean is underpowered at 100 pairs — see design PairedStatistics).
-
-## Appendix: future evaluations (out of scope, recorded for continuity)
-
-Full exploration lives in `.specs/eval-benchmark-ideation.md` (benchmark verdicts, Pier source findings, cost model, SlopCodeBench assessment; that document uses "Stage 0/1/2" for what this proposal names descriptively).
-Condensed runway:
-
-| Evaluation                          | Substrate                                                                                                                 | Adds                                                                                                                                  | Gate                                                           |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| Full-fix (DeepSWE)                  | DeepSWE via Pier (Harbor registry `datacurve/deep-swe`, ~34 Py + ~5 Rust tasks)                                           | Full fix attempts on contamination-free tasks; Codex as second harness; Modal as scale-out env                                        | localization run shows cost signal and a working frozen prompt |
-| Full-fix at volume (SWE-bench-Live) | SWE-bench-Live Python `verified` at volume (needs the HF→Harbor converter, ~1 day)                                        | Citable cost-superiority + accuracy non-inferiority numbers at N=200–500; optional old SWE-bench Verified as the memorized-repo probe | DeepSWE full-fix shows signal                                  |
-| Rust localization                   | `abundant/swe-gen-rust` (Harbor-native, 1,000 tasks; ships gold `fix.patch` → Rust variant of the localization benchmark) | Rust sample size without conversion work; sample-and-validate task quality first                                                      | opportunistic                                                  |
-| Claim-3 satellite                   | SlopCodeBench (Harbor-native, 36 problems)                                                                                | Verbosity/duplication under iterative extension — does structural self-awareness reduce slop; write-heavy index-churn stress test     | after prompt freeze                                            |
-
-Carry-overs designed for in this change: Harbor task format, Pier ATIF telemetry, the MLflow importer schema, the arm/instruction-set versioning, and the paired-analysis tooling all apply to every evaluation above.
+- MLflow backend — **resolved (design, 2026-08-15):** configurable via the standard tracking URI; local `sqlite:///mlflow.db` default for testing, existing tracking server for real runs.
+- Reference boundaries — **resolved (design, 2026-09-11):** 2.5 percentage points for accuracy and 10% for token use, recorded with the interval methods and the expected precision before the frozen run starts (see design PairedStatistics).

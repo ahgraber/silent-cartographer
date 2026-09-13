@@ -1,5 +1,9 @@
 # Design: eval-localization
 
+> `evals/docs/experiment-design.md` is the source of truth for the experiment's measures, analyses, reference boundaries, and run size.
+> This file records implementation decisions.
+> On conflict, `evals/docs/experiment-design.md` is correct.
+
 ## Context
 
 - `evals/` is a new uv-managed Python project inside this repo, separate from the Rust workspace.
@@ -40,8 +44,8 @@
 
 ### Decision: EstimandTreatmentBundle
 
-**Chosen:** the measured estimand is the effect of the c10r treatment bundle — the binary plus its instruction prompt — on agent cost and accuracy.
-The benchmark supports "the c10r treatment helps / does not help"; it never attributes an effect to the tool alone.
+**Chosen:** the measured estimand is the effect of the c10r treatment bundle, which includes the binary and its instruction prompt, on agent cost and accuracy.
+The benchmark estimates that bundle's effect and never attributes an effect to the tool alone.
 
 **Rationale:** the arms differ in two coupled elements (tool availability and instructions), and a CLI tool with no instructions has no uptake path — the bundle is the deployable unit.
 Separating the prompt's effect from the tool's would need a third arm this change does not fund.
@@ -52,14 +56,19 @@ Separating the prompt's effect from the tool's would need a third arm this chang
 
 ### Decision: InstanceAllocation
 
-**Chosen:** 20 dev instances (instruction-set iteration) and 100 frozen instances (reported run), disjoint, drawn deterministically from the 500 with a recorded seed; the remaining 380 stay unassigned as headroom. (User decision, 2026-08-15.)
+**Chosen:** 20 dev instances (instruction-set iteration) and 300 frozen instances (reported run), disjoint, drawn deterministically from the 500 with a recorded seed; the remaining 180 stay unassigned as headroom. (User decision, 2026-08-15; frozen size set 2026-09-11.)
 
-**Rationale:** 20 instances give enough variety to iterate the prompt; 100 paired instances keep the frozen run in the ~$20–80 band.
-Whether 100 pairs power the accuracy margin is settled by the freeze-time power calculation (see PairedStatistics); promoting headroom instances is the escape hatch if they do not.
+**Rationale:** 20 instances give enough variety to iterate the prompt.
+The frozen size balances runtime against the precision of the two primary estimates (see PairedStatistics); it is not sized to guarantee any formal claim.
+At 300 issues the run takes about 93 hours under the measured configuration and leaves 180 issues for later work.
+
+The draw is by index from the sorted instance ids, so raising the frozen size extends the frozen set and leaves the dev set and the instances already drawn under a smaller size untouched.
+A frozen size is therefore raised, never redrawn, and trials already recorded keep their subset.
 
 **Alternatives considered:**
 
-- 30/200 or 20/480: more power at 2–5× the cost; headroom instances can be promoted in a later run without redesign.
+- 225 frozen: 450 episodes and about 70 hours; moving from 225 to 300 costs 150 episodes and narrows the expected intervals by about 13%.
+- 480 frozen: 960 episodes and about 149 hours, intervals about 21% narrower than 300, and no headroom left for a second run.
 
 ### Decision: ArmConstructionDatasetSide
 
@@ -75,14 +84,16 @@ Each instance yields one logical episode, materialized as exactly one task per (
 ### Decision: IndexBakedAtBuild
 
 **Chosen:** the treatment image builds the c10r index at image-build time; the agent starts each episode with a warm index.
-Index build cost (wall-clock, index size) is recorded per task and reported separately as a one-time cost.
-The report also derives the amortization break-even: the number of episodes at which the treatment's per-episode saving covers the one-time index cost.
+Index build cost (wall-clock, index size) is recorded per treatment image in the build manifest.
+The manifest is a captured artifact for ad-hoc analysis, not report content: the report answers one question, whether the treatment changes per-episode token use and historical-fix file recovery, and a one-time setup cost does not bear on it. (User decision, 2026-09-13.)
 
 **Rationale:** models the deployed steady state — a persistent index that many queries amortize; charging index construction to every episode would bill the treatment arm for a cost real usage pays once.
+Recording the cost keeps it available to anyone who later asks what adoption costs, without widening the report's question.
 
 **Alternatives considered:**
 
-- Agent indexes at episode start: charges indexing to treatment tokens and wall-clock; rejected for the primary comparison, but the separately-reported one-time cost keeps the trade-off visible.
+- Agent indexes at episode start: charges indexing to treatment tokens and wall-clock; rejected for the primary comparison, and the recorded manifest keeps the trade-off measurable outside it.
+- Rendering index build cost as a report section: makes the trade-off visible to every reader without them seeking it out, at the price of answering a question the report was not scoped to ask.
 
 ### Decision: PromptViaAgentConfig
 
@@ -97,10 +108,10 @@ Instruction sets are versioned files in `evals/` (e.g. `prompts/c10r-first.md`);
 
 ### Decision: EffectiveToolPolicy
 
-**Chosen:** "grep-only" is operationalized as the agent's standard shipped toolset — file reading, glob, grep/search, and shell — with c10r absent everywhere; the treatment arm runs the identical toolset with `c10r *` additionally admitted through `allowed_tools`.
+**Chosen:** the baseline uses the agent's standard shipped toolset, including file reading, glob, grep/search, and shell, with c10r absent everywhere; the treatment arm runs the identical toolset with `c10r *` additionally admitted through `allowed_tools`.
 Each arm's effective allowed and disallowed tool lists are recorded as run parameters, and arm parity is checked against those lists, not only against caps.
 
-**Rationale:** without an exact effective-tool-policy comparison, "grep-only" is unverifiable and parity claims rest on caps alone; the comparison target is the agent as it ships, since that is what a real user would run without c10r.
+**Rationale:** without an exact effective-tool-policy comparison, arm parity would rest on caps alone; the comparison target is the agent as it ships, since that is what a real user would run without c10r.
 
 **Alternatives considered:**
 
@@ -164,7 +175,10 @@ A parent run per (arm × subset × instruction version) sweep groups trials.
 
 **Chosen:** the primary cost metric is total tokens per trial (prompt + completion as counted by the trajectory's totals, including the treatment's appended system prompt).
 Secondary cost metrics: cost in USD, tool-call count, wall-clock, peak context tokens.
-The report presents all of them, but the cost-superiority claim rides on the primary alone.
+The report presents all of them, but the registered token-use claims ride on the primary alone.
+Each token category the model or harness exposes is recorded with the model, provider, harness, and caching configuration.
+If the report derives a financial figure, it records the named price schedule and pricing date.
+If required token categories are missing, it marks the figure unavailable and does not impute them.
 
 **Rationale:** tokens compare across API and local-model runs where dollars do not; the appended prompt is a real recurring cost of the treatment bundle, so it counts against the treatment; declaring one primary metric before the run prevents selecting whichever metric flatters the result.
 
@@ -175,22 +189,79 @@ The report presents all of them, but the cost-superiority claim rides on the pri
 
 ### Decision: PairedStatistics
 
-**Chosen:** the accuracy estimand is the paired difference in any-gold-file hit rate (treatment − baseline) over the frozen subset; the cost estimand is the paired difference in the primary cost metric.
-Cost superiority: Wilcoxon signed-rank on paired primary-cost deltas.
-Accuracy non-inferiority: a one-sided confidence interval for the paired difference in proportions (Tango's score interval); non-inferiority holds if the interval's lower bound stays above −δ.
-The margin δ, the confidence level, and a power calculation fed by dev-run discordance rates MUST be recorded in this file, as an amendment, before the frozen run starts.
-The proposal's 3-point lean is superseded: at 100 pairs and plausible discordance (~15%), a 3-point margin yields under 20% power, so the recorded margin must be sized jointly with N (promoting headroom instances if needed) to reach acceptable power.
-Trials are independent containerized episodes with the model snapshot pinned per run; attempt identity is recorded, and replication (multiple attempts per instance under local models) is the variance lever.
+**Chosen:** the experiment reports two paired effect estimates and evaluates the registered formal claims beside them.
+It issues no adoption verdict and does not combine the accuracy and token-use results into one outcome.
 
-**Rationale:** pairing is the main variance-reduction lever at N=100.
-A two-sided paired test answers "do the arms differ?", which cannot conclude "no worse than baseline by δ" — the non-inferiority question needs an interval judged against the margin.
-Declaring margin, method, and power together before the data exists is what makes "equal accuracy" falsifiable; declaring them earlier than freeze time adds nothing.
+The accuracy estimate is the paired difference in `any_gold_hit` rates, `lambda = p_treatment - p_baseline`.
+The report includes its two-sided 95% Tango score interval and the four paired outcome counts: both hit, treatment only, baseline only, and neither hit.
+
+The primary token-use estimate is the mean paired log total-token ratio, `theta = mean(log(tokens_treatment / tokens_baseline))`.
+The report presents `exp(theta)` with a two-sided 95% percentile-bootstrap interval over instances.
+It also reports the median paired ratio and the ratio of total tokens.
+
+The registered reference boundaries are 2.5 percentage points for accuracy and 10% for token use.
+Applicable comparison plots show the boundaries even when an interval crosses them.
+The experiment fixes the boundaries before the frozen run and does not widen them after it observes the results.
+
+Accuracy registers superiority, non-inferiority, equivalence, harm, and material harm.
+Token use registers superiority, non-inferiority, harm, and material harm.
+Token-use equivalence is not registered because lower token use is beneficial.
+The report evaluates each applicable claim independently under the exact rules in `evals/docs/experiment-design.md`.
+
+Instances are treated as independent, with no adjustment for instances from the same repository. (User decision, 2026-09-09.)
+
+**Registered before the frozen run (2026-09-11):** accuracy boundary `0.025`, token-use boundary `0.10`, one-sided confidence level `0.95`, `K = 1` attempt per instance and arm, `N = 300` frozen pairs, and 600 episodes.
+The run has no early-stopping rule.
+
+The expected two-sided accuracy interval has a half-width of about 4.9 percentage points at `N = 300`.
+The expected two-sided token-ratio interval is about `[0.91, 1.09]` around the estimate.
+The planning estimates use variation from three attempts per arm on each of the 20 dev issues.
+They depend on the model and configuration and do not enter the frozen-run results.
+
+**Rationale:** the estimates and intervals show the magnitude and uncertainty of each effect even when no formal claim is supported.
+The boundaries give readers preregistered reference points while the trajectory-level data let them apply different decision rules.
 
 **Alternatives considered:**
 
-- McNemar's test judged against the margin: tests whether paired proportions differ (marginal homogeneity), not whether treatment is within δ of baseline — the wrong hypothesis for the claim.
+- Both axes as pass/fail non-inferiority tests, with the pair of outcomes as the experiment's verdict: both tests must pass, so the chance of a clear result is the product of the two marginal powers — a few percent at the dev point estimates.
+  An underpowered run would then have been recorded as a negative product decision.
+- A three-zone rule on the estimate (adopt, reject, inconclusive) with pre-registered probability thresholds: names the inconclusive state instead of hiding it inside a failure, but still converts the estimate into a verdict this experiment does not need to issue.
+- Sequential monitoring with futility stopping: caps the cost of an uninformative run, but each interim look needs an error-spending rule to keep the registered claims honest, and the deliverable is the estimate, which only improves with all 300 pairs.
+- Harm detection as the decision rule, with the treatment advancing unless harm is demonstrated: inverts the burden so that a small or noisy run endorses the treatment by default.
+  Harm remains a registered claim; it is not a gate.
 - Unpaired arm means with t-tests: throws away pairing, needs far larger N, and is sensitive to per-instance difficulty spread.
-- Formal arm-order counterbalancing and paired sampling seeds: trials share no state that would give run order a mechanism, and the harness exposes no sampling seeds; pinned snapshots plus recorded attempts cover the real threat (provider drift).
+- Cluster-robust intervals over repository: the frozen set draws its instances from a smaller number of repositories, so shared difficulty is plausible, but the effect cannot be measured from the data at hand and the user chose to assume independence.
+  The resulting intervals are somewhat narrower than the truth.
+
+### Decision: PreRunTaskCharacteristics
+
+**Chosen:** task generation computes two characteristics from the issue text and the repository at the base commit, and records them with the task metadata before either arm runs: the repository's tracked `.py` file count, and whether the issue text names a source file (an exact tracked `.py` path, or a `.py` basename that occurs exactly once among the repository's tracked Python sources).
+The report shows the paired accuracy and token-ratio estimates against each characteristic.
+Source-file count stays continuous and is plotted on a log scale, with no data-derived size threshold.
+These estimates are descriptive; no formal subgroup claim is registered.
+
+**Rationale:** a reader deciding when to make c10r available can only condition on what is knowable before an agent starts.
+Measures produced during a trajectory — baseline step count, token use, search counts — explain a result but cannot select a tool in advance.
+Computing the two characteristics at generation time, before either arm runs, keeps them independent of the outcome; choosing a size threshold after seeing the data would let the split be picked to flatter the result.
+
+**Alternatives considered:**
+
+- Deriving the characteristics at analysis time from the stored tasks: the repository checkout is no longer at hand, so the computation would depend on re-fetching state the run does not pin.
+- A binary large/small repository split: the threshold has no defensible prior value, and any value chosen after the run is a researcher degree of freedom.
+
+### Decision: BlockedArmInterleaving
+
+**Chosen:** the runner divides the stable issue order into blocks of 10 and runs both arms within each block, reversing which arm leads from one block to the next.
+
+**Rationale:** paired episodes then sit close together in time, so a change in endpoint load affects both arms of a pair similarly, and each arm is spread across the whole run rather than concentrated in one window.
+Reversing the lead arm keeps the same instance from running in the same arm-position on consecutive blocks.
+Load can still vary within a block, so elapsed-time and failure differences keep a time-varying component; this is recorded as a limitation rather than claimed away.
+
+**Alternatives considered:**
+
+- Running one arm to completion and then the other (the original plan): rejected at proposal time on the grounds that trials share no state giving run order a mechanism.
+  Two baseline runs under identical settings later differed by 3 instances and by 2 agent failures, which is consistent with endpoint load affecting outcomes, so arm and time are no longer allowed to be confounded.
+- Full randomization of the episode order: breaks the same confound, but gives up the reproducible run order that makes an interrupted sweep resumable.
 
 ### Decision: StaticBinaryTarget
 
@@ -208,7 +279,7 @@ This is a build target addition — build tooling, not a product contract change
 ## Architecture
 
 ```text
-SWE-bench-Live Python verified (HF, pinned revision, seed-recorded 20 dev / 100 frozen split)
+SWE-bench-Live Python verified (HF, pinned revision, seed-recorded 20 dev / 300 frozen split)
         │
         │  evals: task generation
         ▼
@@ -222,20 +293,42 @@ tasks/ (Harbor format)
                                                               │
                                                               │  evals: importer (idempotent, keyed by trial identity)
                                                               ▼
-                                              MLflow (MLFLOW_TRACKING_URI: local mlruns/ or tracking server)
+                                         MLflow (MLFLOW_TRACKING_URI: sqlite:///mlflow.db or tracking server)
                                                               │
                                                               │  evals: paired analysis
                                                               ▼
-                                    report: cost superiority + accuracy non-inferiority + uptake + exclusions
+              report: paired estimates + intervals + plots + registered claims + uptake + exclusions
 ```
 
 ## Risks
 
 - **Uptake failure** — the prompt may not get the agent to reach for c10r at all: dev-subset iteration measures uptake explicitly before anything freezes; intent-to-treat keeps the headline honest either way.
 - **Local-model instruction-following** — weaker models may emit malformed answers or ignore c10r: grading totality turns malformed answers into measured zeros instead of crashes; the answer parser is strict on schema but salvages a JSON block embedded in prose.
-- **Contamination** — memorized repos shrink the measurable edge: accepted; pairing cancels it in deltas; the report carries the caveat and treats observed effects as conservative.
+- **Contamination** — memorized repos can shrink the measurable effect and can interact with the treatment; pairing controls shared issue difficulty but does not cancel memorization; the report carries the caveat and treats observed effects as conservative.
 - **Gold-file noise** — a valid alternative fix may touch non-gold files: accepted and literature-standard, but not guaranteed symmetric — a treatment that surfaces valid alternatives more often is penalized for them, which is why the report claims historical-fix recovery, not localization correctness.
 - **Differential failure rates** — one arm may time out or exhaust budget more often: every scheduled trial records a terminal state and agent failures score as outcomes (FailureStatePolicy), so failures move the estimate instead of vanishing from it.
 - **Substrate drift** — Pier/Harbor/MLflow API changes: versions pinned in `uv.lock` and recorded as run params.
 - **x86 images on Apple Silicon** — emulation is slow: run fleets on a Linux host; the harness itself is architecture-neutral.
 - **Dataset availability** — HF dataset moves or changes: pin the dataset revision; generated task trees are themselves replayable artifacts.
+
+## Verification Waivers
+
+Both entries cover requirements whose contract is about behavior inside a built container.
+The test suite runs without a container runtime, so neither can be demonstrated in-suite; the evidence is a captured manual run instead.
+Both waivers were added on 2026-09-13, during this change's implementation and after a verify run flagged the gap.
+That provenance is recorded here so a later reader does not mistake them for constraints established before the work began.
+
+- **Requirement:** Runner-Compatible Task Format **Reason:** the contract is that the selected runner accepts a generated task without task-specific runner modifications.
+  Demonstrating it requires Pier, a Docker daemon, and an image build.
+  The suite has none of these, and adding them would make every test run depend on a container runtime.
+  **Manual evidence:** `.specs/changes/eval-localization/notes.md`, "Pier end-to-end smoke (2026-08-25)" — command `uv run pier run -p tasks/dev/baseline -i 'jazzband__tablib-613' --agent nop --env docker`; result 1 trial, 0 exceptions, 17 s, with Pier building the environment, running the agent, executing `tests/test.sh` as verifier, and parsing the reward.
+  **Recorded:** 2026-09-13
+
+- **Requirement:** Treatment Provisioning **Reason:** the contract is that c10r is executable and answers queries against a pre-built index with no network access.
+  Only a built treatment image can show this.
+  The in-suite test asserts the injected Dockerfile lines, which is a weaker claim than the requirement makes.
+  **Manual evidence:** `.specs/changes/eval-localization/notes.md`, "Treatment provisioning evidence (2026-08-25)" — command `docker run --rm --network none c10r-eval-treatment-jazzband__tablib-613 sh -c 'c10r status && c10r find Dataset'`; `status` reported a fresh index with pinned model identity, and `find Dataset` returned results with a resume cursor.
+  **Scope limit:** the capture covered one image out of 17 built from 20 dev instances, and it predates later c10r changes.
+  It is evidence that provisioning worked at that revision, not that every frozen-run image will.
+  The re-capture at frozen-run provisioning is tracked as an unchecked task in `tasks.md`.
+  **Recorded:** 2026-09-13
