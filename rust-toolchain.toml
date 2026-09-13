@@ -5,7 +5,7 @@
 # 1.88 is the code floor (let-chains, stabilized in Rust 1.88; edition 2024 alone
 # only needs 1.85). Pinned to a recent stable above the floor; raise to the
 # current stable as the project advances.
-channel = "1.95.0"
+channel = "1.96.1"
 # rust-analyzer is a runtime dependency of c10r itself (`c10r build` shells out to
 # `rust-analyzer scip`); pinning it here keeps the analyzer version — which is
 # index provenance — locked to the toolchain, and stops rustup's rust-analyzer
