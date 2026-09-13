@@ -1,0 +1,59 @@
+{
+  "version": "2026-09-11-reference-boundaries",
+  "primary_cost_metric": "total_tokens",
+  "accuracy_reference_boundary": 0.025,
+  "token_use_reference_boundary": 0.1,
+  "confidence_level": 0.95,
+  "attempts_per_cell": 1,
+  "planned_pairs": 300,
+  "registered_claims": {
+    "note": "Each claim is evaluated independently; the accuracy and token-use results are never combined into one verdict.",
+    "accuracy": {
+      "superior": "one-sided 95% score lower bound above 0",
+      "non_inferior": "one-sided 95% score lower bound above -0.025",
+      "equivalent": "two one-sided tests at alpha 0.05, so the two-sided 90% score interval lies inside [-0.025, +0.025]",
+      "harm": "one-sided 95% score upper bound below 0",
+      "material_harm": "one-sided 95% score upper bound below -0.025"
+    },
+    "token_use": {
+      "superior": "upper bootstrap ratio bound below 1.00",
+      "non_inferior": "upper bootstrap ratio bound below 1.10",
+      "equivalent": "not registered; lower token use is a benefit rather than a deviation to bound",
+      "harm": "lower bootstrap ratio bound above 1.00",
+      "material_harm": "lower bootstrap ratio bound above 1.10"
+    }
+  },
+  "expected_precision_at_planned_pairs": {
+    "accuracy_half_width": 0.0485,
+    "token_ratio_interval": [0.914, 1.094],
+    "note": "Two-sided 95% precision scaled from the dev variation to 300 pairs; planning values, not guarantees. The report uses the observed frozen-run uncertainty."
+  },
+  "variance_inputs": {
+    "between_instance": 0.0,
+    "within_cell_baseline": 0.0667,
+    "within_cell_treatment": 0.1167,
+    "sd_paired_log_cost_ratio": 0.794,
+    "source": "K=3 dev replication, 2026-09-10, recomputed 2026-09-11; re-measure per model",
+    "attempt_basis": {
+      "accuracy": "mean per-cell sample variance over the three attempts of each cell",
+      "cost": "spread of single-attempt paired log ratios, pooled over the nine ways of pairing one baseline attempt with one treatment attempt; the frozen run is K=1, so a pair carries single-attempt noise rather than the noise of a three-attempt mean"
+    },
+    "job_runs": {
+      "baseline": [
+        "dev-bounded/2026-09-07__21-30-27",
+        "dev-recover/2026-09-08__13-13-35",
+        "dev-recover/2026-09-09__13-03-05"
+      ],
+      "treatment": [
+        "dev-recover/2026-09-08__21-21-16",
+        "dev-recover/2026-09-09__16-49-16",
+        "dev-recover/2026-09-09__19-57-35"
+      ]
+    }
+  },
+  "failure_policy": {
+    "agent_failure": "scored as an outcome, counted as a miss",
+    "infra_failure": "instance excluded when no usable attempt exists in an arm",
+    "attempt_selection": "latest usable attempt represents the cell"
+  }
+}

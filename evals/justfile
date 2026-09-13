@@ -1,12 +1,11 @@
-# c10r-evals runbook. Every recipe runs from this directory; `just` lists them by group.
-# Configuration comes from the environment (see .env.example); direnv loads .env
-# on cd, and this fallback picks it up in shells where direnv is not active.
+# c10r-evals runbook
 #
-# Shared arguments keep one order wherever they appear: cfg, subset, arch, out.
+# Shared arguments use consistent names: cfg, subset, arch, prompt, and out.
 
+# Load .env when direnv is inactive.
 set dotenv-load := true
 
-instructions := 'c10r-first'
+instructions := 'c10r-dev-refined'
 dev_config := 'dev'
 tracking_uri := env('MLFLOW_TRACKING_URI', 'sqlite:///mlflow.db')
 
@@ -15,8 +14,6 @@ dataset_revision := `python3 -c "import json,pathlib; p=pathlib.Path('tasks/data
 # List the available recipes.
 default:
     @just --list
-
-# --- project -----------------------------------------------------------------
 
 # Install the project environment.
 [group('project')]
@@ -34,7 +31,7 @@ lint:
     uv run ruff check .
     shellcheck scripts/*.sh
 
-# Report which run variables are set, without printing the secret.
+# Check required settings without printing secrets.
 [group('project')]
 env-check:
     #!/usr/bin/env bash
@@ -64,32 +61,41 @@ env-check:
     docker info > /dev/null 2>&1 && echo "docker daemon reachable" || { echo "docker daemon unreachable — start the podman machine"; status=1; }
     exit "${status}"
 
-# --- prepare -----------------------------------------------------------------
-
-# Fetch the dataset at a pinned revision and generate one task tree per arm.
+# Generate per-arm task trees from a pinned dataset revision.
 [group('prepare')]
 generate revision subset='dev':
     uv run c10r-evals generate --revision {{ revision }} --seed 0 --subset {{ subset }} --out tasks/
 
-# Cross-compile the static c10r binary the treatment arm installs.
+# Build the static treatment binary.
 [group('prepare')]
 binary arch='aarch64':
     scripts/build-c10r-musl.sh {{ arch }}
 
-# Copy the binary into every treatment task and append its index build step.
+# Add c10r and its index build step to treatment tasks.
 [group('prepare')]
 inject subset='dev' arch='aarch64':
     uv run python -c "from pathlib import Path; from c10r_evals.armtree import inject_c10r; print(len(inject_c10r(Path('tasks/{{ subset }}/treatment'), Path('vendor/c10r/{{ arch }}/c10r'))), 'tasks injected')"
 
-# Build every treatment image and record its index cost. Rerun after `inject` reports a non-zero count.
+# Build treatment images and preserve partial build records.
 [group('prepare')]
 images subset='dev' arch='aarch64':
     #!/usr/bin/env bash
-    set -euo pipefail
+    set -uo pipefail
     platform=$([ "{{ arch }}" = "aarch64" ] && echo linux/arm64 || echo linux/amd64)
-    scripts/build-treatment-images.sh tasks/{{ subset }}/treatment build-manifest.json "${platform}"
+    records="build-records-{{ subset }}.jsonl"
+    merge() {
+        if [ -s "${records}" ]; then
+            uv run c10r-evals build-manifest build-manifest.json "${records}"
+        fi
+    }
+    # Recover records from an interrupted build.
+    merge || exit 1
+    scripts/build-treatment-images.sh tasks/{{ subset }}/treatment "${records}" "${platform}"
+    build_status=$?
+    merge || exit 1
+    exit "${build_status}"
 
-# Render both arms' Pier job configs for one instruction set.
+# Render Pier configs for both arms.
 [group('prepare')]
 config prompt=instructions out=dev_config subset='dev' arch='aarch64':
     #!/usr/bin/env bash
@@ -101,11 +107,18 @@ config prompt=instructions out=dev_config subset='dev' arch='aarch64':
         --tasks-root tasks/{{ subset }} \
         --platform "${platform}"
 
-# --- run ---------------------------------------------------------------------
+# Show remaining work without running trials.
+[group('run')]
+status cfg=dev_config:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    for which in baseline treatment; do
+        config="configs/{{ cfg }}/${which}.yaml"
+        [ -f "${config}" ] || { echo "${which}: no config"; continue; }
+        uv run c10r-evals pending "${config}" > /dev/null
+    done
 
-# `-i` filters a dataset given by `-p`, so the arm tree is named explicitly; `-o` keeps the
-# throwaway trial out of the sweep directory the importer reads.
-# Run one instance of one arm: the cheap check that auth, routing, and token accounting work.
+# Check one arm without adding the trial to an imported sweep.
 [group('run')]
 smoke instance which='baseline' cfg=dev_config subset='dev':
     uv run pier run -c configs/{{ cfg }}/{{ which }}.yaml \
@@ -113,39 +126,26 @@ smoke instance which='baseline' cfg=dev_config subset='dev':
         -i {{ instance }} \
         -o jobs/smoke
 
-# Run one arm over its whole task tree.
+# Start or resume both arms to the requested scorable-attempt count.
 [group('run')]
-arm which cfg=dev_config:
-    uv run pier run -c configs/{{ cfg }}/{{ which }}.yaml
+run subset='dev' cfg=dev_config attempts='1' *flags:
+    uv run c10r-evals run {{ subset }} --cfg {{ cfg }} --attempts {{ attempts }} {{ flags }}
 
-# Run both arms, baseline first.
-[group('run')]
-sweep cfg=dev_config: (arm 'baseline' cfg) (arm 'treatment' cfg)
-
-# Both arms, then ingest, then the report, then serve it for reading.
-[group('run')]
-experiment criteria cfg=dev_config: (sweep cfg) (ingest cfg) (analyze criteria) mlflow
-
-# --- results -----------------------------------------------------------------
-
-# Load both arms' trials into the experiment store. Re-running skips what is already recorded.
+# Import unrecorded trials from both arms.
 [group('results')]
 ingest cfg=dev_config:
     uv run c10r-evals import configs/{{ cfg }}/baseline configs/{{ cfg }}/treatment
 
-# Run the paired analysis and write the report.
+# Write the paired analysis report.
 [group('results')]
 analyze criteria prompt=instructions out='report.md':
     uv run c10r-evals analyze \
         --criteria {{ criteria }} \
         --split-manifest tasks/split-manifest.json \
         --instruction-version {{ prompt }} \
-        --build-manifest build-manifest.json \
         --out {{ out }}
 
-# Ingest and analysis do not need this — they open a sqlite store directly — it is for reading results.
-# Idempotent: a server already answering on the port is left alone.
-# Serve the experiment store for browsing.
+# Serve the experiment store for browsing; ingest and analysis access it directly.
 [group('results')]
 mlflow port='5000':
     #!/usr/bin/env bash
@@ -172,9 +172,7 @@ mlflow port='5000':
     echo "mlflow did not answer on {{ port }} within 20s; see mlflow-ui.log" >&2
     exit 1
 
-# The health check runs first so this never kills an unrelated process that happens to
-# hold the port — on macOS the AirPlay receiver claims 5000.
-# Stop the server serving the experiment store.
+# Stop the listener only when its MLflow health check responds.
 [group('results')]
 mlflow-stop port='5000':
     #!/usr/bin/env bash

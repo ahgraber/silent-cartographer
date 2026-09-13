@@ -10,38 +10,30 @@ with a differing artifact digest fails loudly and alters nothing.
 import hashlib
 import json
 import logging
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from mlflow.tracking import MlflowClient
 
+from c10r_evals import trial_evidence
+from c10r_evals.armconfig import recorded_setting_keys
 from c10r_evals.runtime import log_fields
 
 logger = logging.getLogger(__name__)
 
 EXPERIMENT_NAME = "c10r-evals"
 
-COMPLETED = "completed"
-AGENT_FAILURE = "agent-failure"
-INFRA_FAILURE = "infra-failure"
-
-# Pier records a failed trial as an exception type, not a status string. The agent's
-# own execution timeout is always the agent's doing.
-AGENT_FAILURE_EXCEPTIONS = {"AgentTimeoutError"}
-
-# A non-zero agent exit covers two different events. The agent CLI exits non-zero both
-# when it exhausts a limit of its own — the turn cap, or the per-response output
-# ceiling a repetition loop reaches — and when the endpoint refuses the request. Only
-# the first is the agent's doing, and the two are told apart by whether the episode
-# consumed anything: an endpoint that refuses produces no tokens, while an agent that
-# talks itself past a ceiling produces many.
-AMBIGUOUS_EXIT_EXCEPTIONS = {"NonZeroAgentExitCodeError"}
-
-_C10R_INVOCATION = re.compile(r"(?:^|[;&|()`]\s*)c10r\b")
-_SEARCH_INVOCATION = re.compile(r"(?:^|[;&|()`]\s*)(?:grep|egrep|fgrep|rg|fd|find)\b")
-_BASH_TOOL_NAMES = {"bash", "shell", "terminal"}
-_SEARCH_TOOL_NAMES = {"grep", "glob"}
+COMPLETED = trial_evidence.COMPLETED
+AGENT_FAILURE = trial_evidence.AGENT_FAILURE
+INFRA_FAILURE = trial_evidence.INFRA_FAILURE
+instance_id_from_result = trial_evidence.instance_id_from_result
+episode_consumed_tokens = trial_evidence.episode_consumed_tokens
+classify_terminal_state = trial_evidence.classify_terminal_state
+count_invocations = trial_evidence.count_invocations
+trajectory_wall_clock = trial_evidence.trajectory_wall_clock
+task_characteristics = trial_evidence.task_characteristics
+_read_trajectory = trial_evidence.read_trajectory
+_read_reward = trial_evidence.read_reward
 
 EMPTY_ANSWER_REWARD = {
     "reward": 0.0,
@@ -51,6 +43,15 @@ EMPTY_ANSWER_REWARD = {
     "any_gold_hit": 0,
     "unparsed": True,
 }
+
+# Categories Pier's FinalMetrics model carries in `extra` rather than as first-class
+# fields: `extra` is reserved for "custom aggregate metrics" precisely because not every
+# harness reports every category (Claude Code, for example, only populates the
+# cache-write count when a step actually wrote to the cache).
+TOKEN_EXTRA_METRIC_KEYS = (
+    "total_reasoning_tokens",
+    "total_cache_creation_input_tokens",
+)
 
 
 class ImportMismatchError(Exception):
@@ -67,14 +68,25 @@ class SweepMeta:
     model: str
     agent: str = "claude-code"
     platform: str = "linux/amd64"
-    # Episode bounds, defaulted so a sweep recorded before they existed still loads.
-    agent_timeout_sec: float | None = None
-    max_output_tokens: int | None = None
+    # Every other recorded key, kept as written. A run setting added to the renderer is
+    # recorded here and logged as a parameter without changing this class. `load` requires
+    # every currently declared setting to be present, so a sweep whose metadata predates
+    # one fails to import rather than silently recording fewer params than another sweep.
+    settings: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, sweep_dir: Path) -> "SweepMeta":
-        raw = json.loads((sweep_dir / "sweep-meta.json").read_text())
-        return cls(**raw)
+        meta_path = sweep_dir / "sweep-meta.json"
+        raw = json.loads(meta_path.read_text())
+        named = {f.name for f in fields(cls)} - {"settings"}
+        settings = {k: v for k, v in raw.items() if k not in named}
+        missing = sorted(recorded_setting_keys() - settings.keys())
+        if missing:
+            raise ValueError(
+                f"{meta_path} is missing declared setting(s): {', '.join(missing)}; "
+                "re-render the sweep configuration before importing"
+            )
+        return cls(**{k: v for k, v in raw.items() if k in named}, settings=settings)
 
 
 def trial_identity(meta: SweepMeta, instance_id: str, attempt: str) -> str:
@@ -86,127 +98,29 @@ def trial_identity(meta: SweepMeta, instance_id: str, attempt: str) -> str:
     return hashlib.sha256(material.encode()).hexdigest()[:24]
 
 
+DIGEST_EXCLUDED_DIRS = ("agent/sessions",)
+
+
 def artifact_digest(trial_dir: Path) -> str:
-    """Content digest over every file in the trial directory, order-independent."""
+    """Content digest over the trial's recorded evidence, order-independent.
+
+    `agent/sessions` is excluded because it is not measurement evidence.
+    """
+
+    def included(path: Path) -> bool:
+        # Test the path before touching the filesystem: an excluded file may be unreadable,
+        # and `is_file()` would raise on it.
+        relative = path.relative_to(trial_dir).as_posix()
+        if any(relative == excluded or relative.startswith(f"{excluded}/") for excluded in DIGEST_EXCLUDED_DIRS):
+            return False
+        return path.is_file()
+
     digest = hashlib.sha256()
-    for file in sorted(p for p in trial_dir.rglob("*") if p.is_file()):
-        digest.update(str(file.relative_to(trial_dir)).encode())
+    for file in sorted(p for p in trial_dir.rglob("*") if included(p)):
+        digest.update(file.relative_to(trial_dir).as_posix().encode())
         digest.update(b"\x00")
         digest.update(hashlib.sha256(file.read_bytes()).digest())
     return digest.hexdigest()[:24]
-
-
-def instance_id_from_result(result: dict, fallback: str) -> str:
-    """Read the instance identifier from a Pier trial result.
-
-    Pier names a trial's task `<arm>/<instance-id>` and records the task path as a
-    structured id, so the instance is the last segment of either.
-    """
-    task_name = result.get("task_name")
-    if isinstance(task_name, str) and task_name:
-        return task_name.rsplit("/", 1)[-1]
-    task_id = result.get("task_id")
-    if isinstance(task_id, dict) and isinstance(task_id.get("path"), str):
-        return task_id["path"].rstrip("/").rsplit("/", 1)[-1]
-    return fallback
-
-
-def episode_consumed_tokens(trial_dir: Path) -> bool:
-    """Whether the agent got far enough to spend anything on the model."""
-    path = trial_dir / "agent" / "trajectory.json"
-    if not path.is_file():
-        return False
-    final = json.loads(path.read_text()).get("final_metrics") or {}
-    return (final.get("total_prompt_tokens", 0) + final.get("total_completion_tokens", 0)) > 0
-
-
-def classify_terminal_state(trial_dir: Path) -> str:
-    """Map a trial's recorded outcome to its terminal state.
-
-    - No exception and a written reward: the episode finished and was graded.
-    - The agent's own execution timeout: the agent caused the failure, so it is an outcome.
-    - A non-zero agent exit that consumed tokens: the agent exhausted a limit of its
-      own, which is also an outcome. The same exit with no tokens spent means nothing
-      ran, so it is an infrastructure failure.
-    - Anything else, including an ungraded trial: infrastructure failure.
-
-    Classifying a limit the agent reached as infrastructure would drop that episode from
-    the analysis instead of scoring it, which favours whichever arm exhausts limits more
-    often. An agent that exhausts its turn or spend cap instead exits zero, arrives here
-    as `completed`, and is graded on whatever answer it left behind.
-    """
-    result_path = trial_dir / "result.json"
-    if not result_path.is_file():
-        return INFRA_FAILURE
-    exception_info = json.loads(result_path.read_text()).get("exception_info")
-    if exception_info:
-        exception_type = exception_info.get("exception_type")
-        if exception_type in AGENT_FAILURE_EXCEPTIONS:
-            return AGENT_FAILURE
-        if exception_type in AMBIGUOUS_EXIT_EXCEPTIONS and episode_consumed_tokens(trial_dir):
-            return AGENT_FAILURE
-        return INFRA_FAILURE
-    if (trial_dir / "verifier" / "reward.json").is_file():
-        return COMPLETED
-    return INFRA_FAILURE
-
-
-def count_invocations(trajectory: dict) -> tuple[int, int]:
-    """Count c10r invocations (uptake) and search-tool invocations from ATIF tool calls.
-
-    A step carries no `tool_calls` key at all when the agent called no tool.
-    """
-    uptake = 0
-    search = 0
-    for step in trajectory.get("steps", []):
-        for call in step.get("tool_calls") or []:
-            name = str(call.get("function_name", "")).lower()
-            if name in _SEARCH_TOOL_NAMES:
-                search += 1
-            elif name in _BASH_TOOL_NAMES:
-                command = str(call.get("arguments", {}).get("command", ""))
-                uptake += len(_C10R_INVOCATION.findall(command))
-                search += len(_SEARCH_INVOCATION.findall(command))
-    return uptake, search
-
-
-def _parse_timestamp(value: object) -> float | None:
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            from datetime import datetime
-
-            return datetime.fromisoformat(value).timestamp()
-        except ValueError:
-            return None
-    return None
-
-
-def trajectory_wall_clock(trajectory: dict) -> float | None:
-    """Elapsed seconds between the first and last step timestamps, when present."""
-    timestamps = [
-        ts
-        for ts in (_parse_timestamp(step.get("timestamp")) for step in trajectory.get("steps", []))
-        if ts is not None
-    ]
-    if len(timestamps) < 2:
-        return None
-    return max(timestamps) - min(timestamps)
-
-
-def _read_trajectory(trial_dir: Path) -> dict | None:
-    path = trial_dir / "agent" / "trajectory.json"
-    if not path.is_file():
-        return None
-    return json.loads(path.read_text())
-
-
-def _read_reward(trial_dir: Path) -> dict | None:
-    path = trial_dir / "verifier" / "reward.json"
-    if not path.is_file():
-        return None
-    return json.loads(path.read_text())
 
 
 def _ensure_experiment(client: MlflowClient) -> str:
@@ -236,8 +150,12 @@ class ImportSummary:
     skipped: int = 0
 
 
-def import_sweep(sweep_dir: Path, tracking_uri: str) -> ImportSummary:
-    """Import every scheduled trial under `sweep_dir/jobs/` — exactly one record each."""
+def import_sweep(sweep_dir: Path, tracking_uri: str, *, project_root: Path | None = None) -> ImportSummary:
+    """Import every scheduled trial under `sweep_dir/jobs/` — exactly one record each.
+
+    `project_root` anchors relative task paths and defaults to the current working directory.
+    """
+    project_root = project_root if project_root is not None else Path.cwd()
     meta = SweepMeta.load(sweep_dir)
     client = MlflowClient(tracking_uri=tracking_uri)
     experiment_id = _ensure_experiment(client)
@@ -246,11 +164,18 @@ def import_sweep(sweep_dir: Path, tracking_uri: str) -> ImportSummary:
 
     summary = ImportSummary()
     jobs_dir = sweep_dir / "jobs"
+    if not jobs_dir.is_dir():
+        # An arm that has not run yet is not an error; the other arm still imports.
+        log_fields(logger, logging.INFO, "sweep_skipped", sweep=str(sweep_dir), reason="no jobs directory")
+        return summary
     trial_dirs = sorted(
         p for job in sorted(jobs_dir.iterdir()) if job.is_dir() for p in sorted(job.iterdir()) if p.is_dir()
     )
+    # A trial directory without result.json never produced a record: the run was cancelled or
+    # killed mid-flight. Importing one would invent an instance id from the directory name.
+    trial_dirs = [p for p in trial_dirs if (p / "result.json").is_file()]
     for trial_dir in trial_dirs:
-        _import_trial(client, experiment_id, parent_run_id, meta, trial_dir, summary)
+        _import_trial(client, experiment_id, parent_run_id, meta, trial_dir, summary, project_root)
     log_fields(
         logger,
         logging.INFO,
@@ -269,13 +194,16 @@ def _import_trial(
     meta: SweepMeta,
     trial_dir: Path,
     summary: ImportSummary,
+    project_root: Path,
 ) -> None:
     result_path = trial_dir / "result.json"
-    instance_id = (
-        instance_id_from_result(json.loads(result_path.read_text()), trial_dir.name)
-        if result_path.is_file()
-        else trial_dir.name
-    )
+    if not result_path.is_file():
+        raise ValueError(
+            f"trial {trial_dir.name} has no result.json, so its instance is unknown; "
+            "import_sweep filters these out before reaching here"
+        )
+    result = json.loads(result_path.read_text())
+    instance_id = instance_id_from_result(result, trial_dir.name)
     attempt = trial_dir.name
     identity = trial_identity(meta, instance_id, attempt)
     digest = artifact_digest(trial_dir)
@@ -289,6 +217,11 @@ def _import_trial(
             )
         summary.skipped += 1
         return
+
+    # Read before anything is written for this trial: a task tree that is missing or
+    # missing characteristics means something upstream is wrong, and that must abort
+    # before a partial record for this trial exists to leave behind.
+    characteristics = task_characteristics(result, project_root)
 
     terminal_state = classify_terminal_state(trial_dir)
     trajectory = _read_trajectory(trial_dir)
@@ -319,8 +252,7 @@ def _import_trial(
         ("platform", meta.platform),
         ("attempt", attempt),
         ("terminal_state", terminal_state),
-        ("agent_timeout_sec", meta.agent_timeout_sec),
-        ("max_output_tokens", meta.max_output_tokens),
+        *sorted(meta.settings.items()),
     ):
         client.log_param(run_id, key, value)
 
@@ -338,6 +270,10 @@ def _import_trial(
         ):
             if key in final:
                 client.log_metric(run_id, key, final[key])
+        extra = final.get("extra") or {}
+        for key in TOKEN_EXTRA_METRIC_KEYS:
+            if key in extra:
+                client.log_metric(run_id, key, extra[key])
         wall_clock = trajectory_wall_clock(trajectory)
         if wall_clock is not None:
             client.log_metric(run_id, "wall_clock_s", wall_clock)
@@ -353,6 +289,8 @@ def _import_trial(
 
     client.log_metric(run_id, "uptake_count", uptake)
     client.log_metric(run_id, "search_count", search)
+    client.log_metric(run_id, "source_file_count", float(characteristics["source_file_count"]))
+    client.log_metric(run_id, "source_file_cue", 1.0 if characteristics["source_file_cue"] else 0.0)
 
     for artifact in (trial_dir / "agent" / "trajectory.json", trial_dir / "verifier" / "reward.json", result_path):
         if artifact.is_file():

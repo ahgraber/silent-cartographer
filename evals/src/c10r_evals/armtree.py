@@ -16,7 +16,11 @@ SCIP_PYTHON_VERSION = "0.6.6"
 
 INJECTION_MARKER = "# --- c10r treatment injection ---"
 
-INJECTION_BLOCK = f"""\
+REPO_ANCHOR = "WORKDIR /repo\n"
+
+# A layer's cache key includes its parent chain, so the toolchain goes above the clone to share
+# one layer across tasks; below it each task stores its own copy.
+TOOLING_BLOCK = f"""\
 {INJECTION_MARKER}
 COPY c10r /usr/local/bin/c10r
 RUN chmod +x /usr/local/bin/c10r \\
@@ -24,6 +28,10 @@ RUN chmod +x /usr/local/bin/c10r \\
     && apt-get install -y --no-install-recommends nodejs npm \\
     && rm -rf /var/lib/apt/lists/* \\
     && npm install -g @sourcegraph/scip-python@{SCIP_PYTHON_VERSION}
+"""
+
+# Indexing reads the checked-out repository, so it stays last.
+INDEX_BLOCK = """\
 RUN c10r build --language python
 """
 
@@ -31,6 +39,14 @@ RUN c10r build --language python
 def _task_arm(task_dir: Path) -> str:
     meta = tomllib.loads((task_dir / "task.toml").read_text())
     return meta["metadata"]["arm"]
+
+
+def injected_dockerfile(content: str) -> str:
+    """Return `content` with the toolchain above the clone and indexing at the end."""
+    if REPO_ANCHOR not in content:
+        raise ValueError(f"generated Dockerfile has no {REPO_ANCHOR.strip()!r} line to inject above")
+    head, anchor, tail = content.partition(REPO_ANCHOR)
+    return head + TOOLING_BLOCK + anchor + tail.rstrip("\n") + "\n" + INDEX_BLOCK
 
 
 def inject_c10r(tree_dir: Path, binary_path: Path) -> list[Path]:
@@ -58,23 +74,55 @@ def inject_c10r(tree_dir: Path, binary_path: Path) -> list[Path]:
                 injected.append(task_dir)
             continue
         shutil.copy2(binary_path, binary_dest)
-        dockerfile.write_text(content.rstrip("\n") + "\n" + INJECTION_BLOCK)
+        dockerfile.write_text(injected_dockerfile(content))
         injected.append(task_dir)
     return injected
+
+
+BUILD_MANIFEST_KEYS = ("instance_id", "wall_clock_s", "index_bytes")
+
+
+def _check_entries(entries: list[dict]) -> None:
+    for entry in entries:
+        for key in BUILD_MANIFEST_KEYS:
+            if key not in entry:
+                raise ValueError(f"build manifest entry missing '{key}': {entry}")
 
 
 def write_build_manifest(path: Path, entries: list[dict]) -> None:
     """Record per-task index build cost: wall-clock seconds and index size in bytes.
 
-    Analysis reads this manifest to derive the index amortization break-even.
+    The treatment image bakes its index at build time, so this cost is a one-time cost of
+    preparing the treatment arm, not part of any episode's measures; the manifest keeps it
+    recorded separately, for reporting on its own.
     """
-    for entry in entries:
-        for key in ("instance_id", "wall_clock_s", "index_bytes"):
-            if key not in entry:
-                raise ValueError(f"build manifest entry missing '{key}': {entry}")
+    _check_entries(entries)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"entries": entries}, indent=2) + "\n")
 
 
 def read_build_manifest(path: Path) -> list[dict]:
     return json.loads(path.read_text())["entries"]
+
+
+def read_build_records(path: Path) -> list[dict]:
+    """Read newline-delimited build records, the form `build-treatment-images.sh` appends."""
+    records = []
+    for line in path.read_text().splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return records
+
+
+def merge_build_manifest(path: Path, entries: list[dict]) -> list[dict]:
+    """Merge records by instance ID, replacing matches and preserving unmatched existing entries."""
+    _check_entries(entries)
+    existing: list[dict] = []
+    if path.is_file() and path.read_text().strip():
+        existing = read_build_manifest(path)
+    by_id = {entry["instance_id"]: entry for entry in existing}
+    for entry in entries:
+        by_id[entry["instance_id"]] = entry
+    merged = [by_id[instance_id] for instance_id in sorted(by_id)]
+    write_build_manifest(path, merged)
+    return merged

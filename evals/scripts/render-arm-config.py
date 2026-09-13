@@ -15,19 +15,29 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from c10r_evals.armconfig import base_from_env, render_arm_configs
+from c10r_evals.dataset import TreeRevisionMismatch, read_tree_revision
 from c10r_evals.runtime import log_fields, setup_process
 
 logger = logging.getLogger(__name__)
 
 
 def read_revision(manifest_path: Path) -> str:
-    """Read the pinned dataset revision recorded when the tasks were generated."""
+    """Read the revision shared by the generated dataset and split manifests.
+
+    Raises `SystemExit` when the generated manifests disagree.
+    """
     if not manifest_path.is_file():
         raise SystemExit(f"{manifest_path} not found — generate the tasks first (`just generate`)")
     revision = json.loads(manifest_path.read_text()).get("revision")
     if not revision:
         raise SystemExit(f"{manifest_path} records no 'revision'")
-    return str(revision)
+    try:
+        return read_tree_revision(manifest_path)
+    except TreeRevisionMismatch as mismatch:
+        raise SystemExit(
+            f"{manifest_path.parent} is half-written — {mismatch}. A generate run stopped between "
+            "the two writes. Re-run `just generate <revision> <subset>` to rewrite both."
+        ) from mismatch
 
 
 def main(argv: Sequence[str] | None = None) -> int:

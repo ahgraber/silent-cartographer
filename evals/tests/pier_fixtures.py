@@ -10,6 +10,8 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from c10r_evals.armconfig import ArmConfigBase
+
 DEFAULT_FINAL_METRICS = {
     "total_prompt_tokens": 30_000,
     "total_completion_tokens": 2_000,
@@ -40,6 +42,16 @@ UNPARSED_REWARD = {
 }
 
 START_TS = datetime(2026, 9, 3, 13, 38, 0, tzinfo=UTC)
+
+# Matches what a real render's `ArmConfigBase.recorded_settings()` writes, so a plain
+# `write_sweep_meta(sweep)` call produces metadata the importer's declared-key check
+# (see `armconfig.recorded_setting_keys`) accepts.
+DEFAULT_SETTINGS = ArmConfigBase(
+    model_name="proxy/some-local-model",
+    max_turns=40,
+    max_budget_usd=2.0,
+    env={"ANTHROPIC_BASE_URL": "https://proxy.example/v1"},
+).recorded_settings()
 
 
 def tool_call(function_name: str, **arguments: object) -> dict:
@@ -95,7 +107,11 @@ def write_sweep_meta(
     instruction_set_version: str = "v1",
     dataset_revision: str = "rev-abc",
     model: str = "proxy/some-local-model",
+    **extra: object,
 ) -> None:
+    """Write `sweep-meta.json`. Extra keyword arguments override `DEFAULT_SETTINGS`, the
+    same way a render-time setting (e.g. `endpoint`) reaches `SweepMeta.settings`.
+    """
     sweep_dir.mkdir(parents=True, exist_ok=True)
     (sweep_dir / "sweep-meta.json").write_text(
         json.dumps(
@@ -104,9 +120,40 @@ def write_sweep_meta(
                 "instruction_set_version": instruction_set_version,
                 "dataset_revision": dataset_revision,
                 "model": model,
+                **DEFAULT_SETTINGS,
+                **extra,
             }
         )
     )
+
+
+DEFAULT_SOURCE_FILE_COUNT = 42
+DEFAULT_SOURCE_FILE_CUE = False
+
+
+def task_toml_path(sweep_dir: Path, arm: str, instance_id: str) -> Path:
+    """Where `make_trial` writes the task tree its trial's `task_id.path` points at."""
+    return sweep_dir.parent / "tasks" / "dev" / arm / instance_id / "task.toml"
+
+
+def write_task_toml(
+    sweep_dir: Path,
+    arm: str,
+    instance_id: str,
+    source_file_count: int = DEFAULT_SOURCE_FILE_COUNT,
+    source_file_cue: bool = DEFAULT_SOURCE_FILE_CUE,
+) -> Path:
+    """Write the `[metadata]` fields the importer reads (see `taskgen.py`'s `task.toml`)."""
+    path = task_toml_path(sweep_dir, arm, instance_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[metadata]\n"
+        f'instance_id = "{instance_id}"\n'
+        f'arm = "{arm}"\n'
+        f"source_file_count = {source_file_count}\n"
+        f"source_file_cue = {str(source_file_cue).lower()}\n"
+    )
+    return path
 
 
 def make_trial(
@@ -118,17 +165,33 @@ def make_trial(
     job: str = "job-1",
     attempt_suffix: str = "1",
     arm: str = "treatment",
+    source_file_count: int = DEFAULT_SOURCE_FILE_COUNT,
+    source_file_cue: bool = DEFAULT_SOURCE_FILE_CUE,
+    write_task: bool = True,
 ) -> Path:
-    """Write one trial directory in Pier's output shape and return its path."""
+    """Write one trial directory in Pier's output shape and return its path.
+
+    Also writes the task tree the trial's `task_id.path` points at (real Pier tasks
+    always exist before any trial runs against them), so the importer's read of the
+    task's pre-run characteristics succeeds without every caller wiring one up by hand.
+    Pass `write_task=False` to simulate a task tree the importer cannot find.
+    """
     trial_name = f"{instance_id}__{attempt_suffix}"
     trial_dir = sweep_dir / "jobs" / job / trial_name
     (trial_dir / "agent").mkdir(parents=True, exist_ok=True)
     (trial_dir / "verifier").mkdir(parents=True, exist_ok=True)
 
+    if write_task:
+        write_task_toml(sweep_dir, arm, instance_id, source_file_count, source_file_cue)
+    task_dir = task_toml_path(sweep_dir, arm, instance_id).parent
+
     result = {
         "task_name": f"{arm}/{instance_id}",
         "trial_name": trial_name,
-        "task_id": {"path": f"tasks/dev/{arm}/{instance_id}"},
+        # An absolute path here, unlike real Pier's usual relative one (see
+        # `telemetry._resolve_task_dir`), so fixtures stay hermetic under `tmp_path`
+        # without every test wiring up a `project_root` to match.
+        "task_id": {"path": str(task_dir)},
         "source": arm,
         "exception_info": (
             {"exception_type": exception_type, "exception_message": f"{exception_type} raised"}

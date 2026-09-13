@@ -12,6 +12,7 @@ mlflow.db
 mlruns/
 report.md
 build-manifest.json
+build-records-*.jsonl
 
 # MLflow UI started by `just mlflow`
 mlflow-ui.log

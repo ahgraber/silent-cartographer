@@ -49,6 +49,28 @@ def test_capture_completed(tmp_path, tracking_uri):
     assert record["metrics"]["reward"] == pytest.approx(0.8)
     assert record["metrics"]["any_gold_hit"] == 1
     assert record["metrics"]["uptake_count"] == 1
+    assert record["params"]["attempt"] == "inst-graded__1"
+    assert record["metrics"]["total_cost_usd"] == pytest.approx(0.12)
+    assert record["metrics"]["total_steps"] == 14
+    assert record["metrics"]["precision"] == pytest.approx(1.0)
+    assert record["metrics"]["recall"] == pytest.approx(0.6666)
+    assert record["metrics"]["f1"] == pytest.approx(0.8)
+
+
+def test_raw_artifacts_are_attached_to_the_record(tmp_path, tracking_uri):
+    from mlflow.tracking import MlflowClient
+
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    fx.make_trial(sweep, "inst-graded", trajectory=fx.make_trajectory([fx.bash_call("c10r get handler")]))
+
+    import_sweep(sweep, tracking_uri)
+
+    client = MlflowClient(tracking_uri=tracking_uri)
+    experiment = client.get_experiment_by_name("c10r-evals")
+    run = client.search_runs([experiment.experiment_id], filter_string="tags.instance_id = 'inst-graded'")[0]
+    attached = {a.path for a in client.list_artifacts(run.info.run_id)}
+    assert attached == {"trajectory.json", "reward.json", "result.json"}
 
 
 def test_capture_unparsed(tmp_path, tracking_uri):
@@ -61,6 +83,56 @@ def test_capture_unparsed(tmp_path, tracking_uri):
     assert record["terminal_state"] == COMPLETED
     assert record["metrics"]["unparsed"] == 1.0
     assert record["metrics"]["reward"] == 0.0
+
+
+def test_token_categories_recorded(tmp_path, tracking_uri):
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep, endpoint="https://proxy.example/v1")
+    final_metrics = {
+        "total_prompt_tokens": 10_000,
+        "total_completion_tokens": 2_000,
+        "total_cached_tokens": 6_000,
+        "total_steps": 5,
+        "extra": {"total_reasoning_tokens": 800, "total_cache_creation_input_tokens": 300},
+    }
+    trajectory = fx.make_trajectory([fx.bash_call("ls")], final_metrics)
+    fx.make_trial(sweep, "inst-1", trajectory=trajectory)
+
+    import_sweep(sweep, tracking_uri)
+    record = _single(query_trials(tracking_uri), "inst-1")
+    assert record["metrics"]["total_prompt_tokens"] == 10_000
+    assert record["metrics"]["total_completion_tokens"] == 2_000
+    assert record["metrics"]["total_cached_tokens"] == 6_000
+    assert record["metrics"]["total_reasoning_tokens"] == 800
+    assert record["metrics"]["total_cache_creation_input_tokens"] == 300
+    # The proxy endpoint identifies the provider.
+    assert record["params"]["model"] == "proxy/some-local-model"
+    assert record["params"]["agent"] == "claude-code"
+    assert record["params"]["endpoint"] == "https://proxy.example/v1"
+    assert record["params"]["prompt_caching"] == "True"
+
+
+def test_unreported_category_absent(tmp_path, tracking_uri):
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    fx.make_trial(sweep, "inst-1", trajectory=fx.make_trajectory([fx.bash_call("ls")]))
+
+    import_sweep(sweep, tracking_uri)
+    record = _single(query_trials(tracking_uri), "inst-1")
+    assert "total_reasoning_tokens" not in record["metrics"]
+    assert "total_cache_creation_input_tokens" not in record["metrics"]
+
+
+def test_reported_zero_token_category_recorded_as_zero(tmp_path, tracking_uri):
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    final_metrics = {**fx.DEFAULT_FINAL_METRICS, "extra": {"total_reasoning_tokens": 0}}
+    fx.make_trial(sweep, "inst-1", trajectory=fx.make_trajectory([fx.bash_call("ls")], final_metrics))
+
+    import_sweep(sweep, tracking_uri)
+    record = _single(query_trials(tracking_uri), "inst-1")
+    assert record["metrics"]["total_reasoning_tokens"] == 0.0
+    assert "total_cache_creation_input_tokens" not in record["metrics"]
 
 
 def test_capture_baseline_zero_uptake(tmp_path, tracking_uri):
@@ -245,6 +317,23 @@ def test_uptake_zero(tmp_path, tracking_uri):
     assert record["metrics"]["uptake_count"] == 0
 
 
+def test_invocations_are_counted_at_command_boundaries(tmp_path, tracking_uri):
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    calls = [
+        fx.bash_call("c10r get handler\nc10r get parser\nc10r get router"),
+        fx.bash_call("c10r find Dataset | head -5"),
+        fx.bash_call("grep -rn term /repo --exclude-dir=.c10r\ngrep -rn other /repo"),
+        fx.bash_call("./c10r-wrapper.sh && git log --all --grep=fix"),
+    ]
+    fx.make_trial(sweep, "inst-1", trajectory=fx.make_trajectory(calls))
+
+    import_sweep(sweep, tracking_uri)
+    record = _single(query_trials(tracking_uri), "inst-1")
+    assert record["metrics"]["uptake_count"] == 4
+    assert record["metrics"]["search_count"] == 2
+
+
 def test_mixed_counts(tmp_path, tracking_uri):
     sweep = tmp_path / "sweep"
     fx.write_sweep_meta(sweep)
@@ -332,3 +421,119 @@ def test_query_by_arm_and_version(tmp_path, tracking_uri):
     assert selected[0]["instruction_set_version"] == "v2"
     assert len(query_trials(tracking_uri, arm="treatment")) == 2
     assert len(query_trials(tracking_uri)) == 3
+
+
+def test_task_characteristics_recorded(tmp_path, tracking_uri):
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    fx.make_trial(sweep, "inst-1", source_file_count=87, source_file_cue=True)
+
+    import_sweep(sweep, tracking_uri)
+    record = _single(query_trials(tracking_uri), "inst-1")
+    assert record["metrics"]["source_file_count"] == 87
+    assert record["metrics"]["source_file_cue"] == 1.0
+
+
+def test_task_characteristics_relative_task_id_resolved_against_project_root(tmp_path, tracking_uri):
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    trial = fx.make_trial(sweep, "inst-1", source_file_count=13, source_file_cue=False)
+    result_path = trial / "result.json"
+    result = json.loads(result_path.read_text())
+    result["task_id"] = {"path": "tasks/dev/treatment/inst-1"}
+    result_path.write_text(json.dumps(result))
+
+    import_sweep(sweep, tracking_uri, project_root=tmp_path)
+    record = _single(query_trials(tracking_uri), "inst-1")
+    assert record["metrics"]["source_file_count"] == 13
+
+
+def test_task_characteristics_read_without_trajectory(tmp_path, tracking_uri):
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    fx.make_trial(sweep, "inst-1", source_file_count=201, source_file_cue=True)
+
+    import_sweep(sweep, tracking_uri)
+    task_dir = fx.task_toml_path(sweep, "treatment", "inst-1").parent
+    # Remove the task tree and sweep artifacts.
+    shutil.rmtree(task_dir.parent.parent.parent)
+    shutil.rmtree(sweep)
+
+    record = _single(query_trials(tracking_uri), "inst-1")
+    assert record["metrics"]["source_file_count"] == 201
+    assert record["metrics"]["source_file_cue"] == 1.0
+
+
+def test_task_characteristics_missing_from_task_toml_raises(tmp_path, tracking_uri):
+    """Reject stale or damaged task metadata instead of inventing defaults."""
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    fx.make_trial(sweep, "inst-1")
+    fx.task_toml_path(sweep, "treatment", "inst-1").write_text("[metadata]\n")
+
+    with pytest.raises(ValueError, match="source_file_count"):
+        import_sweep(sweep, tracking_uri)
+    assert query_trials(tracking_uri) == []
+
+
+def test_task_characteristics_missing_task_tree_raises(tmp_path, tracking_uri):
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    fx.make_trial(sweep, "inst-1", write_task=False)
+
+    with pytest.raises(ValueError, match="task tree not found"):
+        import_sweep(sweep, tracking_uri)
+    assert query_trials(tracking_uri) == []
+
+
+def test_import_refuses_sweep_missing_a_declared_setting(tmp_path, tracking_uri):
+    """Require every sweep to record the same setting keys."""
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    fx.make_trial(sweep, "inst-1")
+
+    meta_path = sweep / "sweep-meta.json"
+    trimmed = json.loads(meta_path.read_text())
+    del trimmed["endpoint"]
+    meta_path.write_text(json.dumps(trimmed))
+
+    with pytest.raises(ValueError, match="endpoint"):
+        import_sweep(sweep, tracking_uri)
+    assert query_trials(tracking_uri) == []
+
+
+def test_trial_without_result_json_is_skipped(tmp_path, tracking_uri):
+    """Skip trials with no `result.json` and therefore no instance ID."""
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    fx.make_trial(sweep, "inst-finished")
+    partial = fx.make_trial(sweep, "inst-cancelled")
+    (partial / "result.json").unlink()
+
+    summary = import_sweep(sweep, tracking_uri)
+    assert summary.imported == 1
+    assert [t["instance_id"] for t in query_trials(tracking_uri)] == ["inst-finished"]
+
+
+def test_import_tolerates_an_arm_that_has_not_run(tmp_path, tracking_uri):
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+
+    summary = import_sweep(sweep, tracking_uri)
+    assert summary.imported == 0
+    assert query_trials(tracking_uri) == []
+
+
+def test_digest_ignores_agent_session_state(tmp_path, tracking_uri):
+    """Exclude variable, potentially sensitive session state from evidence digests."""
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    trial = fx.make_trial(sweep, "inst-1")
+    import_sweep(sweep, tracking_uri)
+
+    sessions = trial / "agent" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    (sessions / "session-state.json").write_text('{"rotated": "between runs"}')
+
+    summary = import_sweep(sweep, tracking_uri)
+    assert summary.skipped == 1, "a changed session file must not look like changed evidence"

@@ -40,6 +40,36 @@ def load_instances(revision: str, cache_dir: str | None = None) -> list[Instance
     return [Instance.from_row(row) for row in rows]
 
 
+class TreeRevisionMismatch(Exception):
+    """The two generated manifests name different dataset revisions."""
+
+    def __init__(self, dataset_revision: str, split_revision: str) -> None:
+        self.dataset_revision = dataset_revision
+        self.split_revision = split_revision
+        super().__init__(
+            f"dataset-manifest.json names {dataset_revision} and split-manifest.json names {split_revision}"
+        )
+
+
+def read_dataset_revision(path: Path) -> str:
+    """The pinned revision the task trees were generated at."""
+    return json.loads(path.read_text())["revision"]
+
+
+def read_tree_revision(dataset_manifest: Path) -> str:
+    """Return the revision shared by the dataset and split manifests.
+
+    Raises `TreeRevisionMismatch` when the manifests name different revisions.
+    """
+    from c10r_evals.split import read_split_manifest
+
+    dataset_revision = read_dataset_revision(dataset_manifest)
+    _, split_revision = read_split_manifest(dataset_manifest.parent / "split-manifest.json")
+    if dataset_revision != split_revision:
+        raise TreeRevisionMismatch(dataset_revision, split_revision)
+    return dataset_revision
+
+
 def write_dataset_manifest(path: Path, revision: str, instance_count: int) -> None:
     """Record dataset identity, pinned revision, and instance count for replay."""
     manifest = {

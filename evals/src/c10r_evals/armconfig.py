@@ -21,7 +21,7 @@ import json
 import os
 import shlex
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import yaml
@@ -66,6 +66,7 @@ ENV_MAX_BUDGET_USD = "EVAL_MAX_BUDGET_USD"
 ENV_CONCURRENCY = "EVAL_CONCURRENCY"
 ENV_AGENT_TIMEOUT_SEC = "EVAL_AGENT_TIMEOUT_SEC"
 ENV_MAX_OUTPUT_TOKENS = "EVAL_MAX_OUTPUT_TOKENS"
+ENV_PROMPT_CACHING = "EVAL_PROMPT_CACHING"
 
 DEFAULT_MAX_TURNS = 40
 DEFAULT_MAX_BUDGET_USD = 2.0
@@ -83,6 +84,10 @@ DEFAULT_AGENT_TIMEOUT_SEC = 1200.0
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
 
 
+class SweepMetadataConflict(Exception):
+    """A render would relabel trials that already ran under different settings."""
+
+
 @dataclass(frozen=True)
 class ArmConfigBase:
     """Everything both arms share: model, caps, endpoint routing, and the standard tool policy."""
@@ -92,10 +97,39 @@ class ArmConfigBase:
     max_budget_usd: float
     agent_timeout_sec: float = DEFAULT_AGENT_TIMEOUT_SEC
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    # The operator's prompt-caching intent for the run. Recorded per sweep regardless of
+    # whether it changes the rendered environment — see `_job_config` for how (and when)
+    # `DISABLE_PROMPT_CACHING` is actually emitted.
+    prompt_caching: bool = True
     env: dict[str, str] = field(default_factory=dict)
     allowed_tools: list[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_TOOLS))
     disallowed_tools: list[str] = field(default_factory=lambda: list(DEFAULT_DISALLOWED_TOOLS))
     n_concurrent_trials: int = 2
+
+    def recorded_settings(self) -> dict[str, object]:
+        """Return every scalar trial setting for the sweep record.
+
+        `model_name` is emitted as `model`; `env`, `allowed_tools`, and `disallowed_tools`
+        are omitted. Raises `ValueError` when `ANTHROPIC_BASE_URL` is missing.
+        """
+        settings: dict[str, object] = {}
+        for f in fields(self):
+            if f.name in ("env", "allowed_tools", "disallowed_tools", "model_name"):
+                continue
+            value = getattr(self, f.name)
+            if isinstance(value, str | int | float | bool):
+                settings[f.name] = value
+        endpoint = self.env.get("ANTHROPIC_BASE_URL")
+        if not endpoint:
+            raise ValueError("recorded_settings: required setting 'endpoint' (ANTHROPIC_BASE_URL) is missing")
+        settings["endpoint"] = endpoint
+        return settings
+
+
+def recorded_setting_keys() -> frozenset[str]:
+    """Return all keys emitted by `recorded_settings()`."""
+    excluded = {"env", "allowed_tools", "disallowed_tools", "model_name"}
+    return frozenset(f.name for f in fields(ArmConfigBase) if f.name not in excluded) | {"endpoint"}
 
 
 def _number_from_env(source: Mapping[str, str], key: str, default: float, cast: Callable[[str], float]) -> float:
@@ -106,6 +140,17 @@ def _number_from_env(source: Mapping[str, str], key: str, default: float, cast: 
         return cast(raw)
     except ValueError as exc:
         raise ValueError(f"{key}={raw!r} is not a valid {cast.__name__}") from exc
+
+
+def _bool_from_env(source: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = source.get(key, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    raise ValueError(f"{key}={raw!r} is not a valid boolean (use 1/0, true/false, or yes/no)")
 
 
 def base_from_env(source: Mapping[str, str] | None = None) -> ArmConfigBase:
@@ -125,6 +170,7 @@ def base_from_env(source: Mapping[str, str] | None = None) -> ArmConfigBase:
         max_budget_usd=_number_from_env(env, ENV_MAX_BUDGET_USD, DEFAULT_MAX_BUDGET_USD, float),
         agent_timeout_sec=_number_from_env(env, ENV_AGENT_TIMEOUT_SEC, DEFAULT_AGENT_TIMEOUT_SEC, float),
         max_output_tokens=int(_number_from_env(env, ENV_MAX_OUTPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, int)),
+        prompt_caching=_bool_from_env(env, ENV_PROMPT_CACHING, True),
         env={
             "ANTHROPIC_BASE_URL": env[ENV_PROXY_BASE_URL].strip(),
             "ANTHROPIC_AUTH_TOKEN": f"${{{ENV_PROXY_TOKEN}}}",
@@ -149,6 +195,18 @@ def _job_config(base: ArmConfigBase, arm: str, tasks_root: Path, jobs_dir: Path)
     # condition up to how the CLI compares a zero budget.
     if base.max_budget_usd > 0:
         kwargs["max_budget_usd"] = base.max_budget_usd
+    # The ceiling is derived from the field rather than carried only in `env`, so it
+    # cannot disagree with what the sweep metadata records.
+    agent_env = {**base.env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(base.max_output_tokens)}
+    if not base.prompt_caching:
+        # Pier's claude-code agent only checks `DISABLE_PROMPT_CACHING` inside a branch
+        # gated on Bedrock detection, which this proxy-routed setup (`ANTHROPIC_BASE_URL`)
+        # never enters. `agent.env` still reaches the CLI's subprocess environment
+        # unconditionally, through Pier's own env merge, and any non-empty string there
+        # is truthy to whatever downstream code reads it — a literal "0" included. So this
+        # is set only to disable caching; the enabled default omits the key entirely
+        # rather than risk a falsy-looking value being read as true.
+        agent_env["DISABLE_PROMPT_CACHING"] = "1"
     return {
         "jobs_dir": str(jobs_dir),
         "n_concurrent_trials": base.n_concurrent_trials,
@@ -161,14 +219,56 @@ def _job_config(base: ArmConfigBase, arm: str, tasks_root: Path, jobs_dir: Path)
                 # episode has no bound; exceeding it raises AgentTimeoutError, which
                 # the importer records as the agent's own failure.
                 "override_timeout_sec": base.agent_timeout_sec,
-                # The ceiling is derived from the field rather than carried in `env`,
-                # so it cannot disagree with what the sweep metadata records.
-                "env": {**base.env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(base.max_output_tokens)},
+                "env": agent_env,
                 "kwargs": kwargs,
             }
         ],
         "datasets": [{"path": str(tasks_root / arm)}],
     }
+
+
+def _preflight_sweep_metadata(
+    base: ArmConfigBase,
+    arm_configs: tuple[tuple[str, dict, str], ...],
+    out_dir: Path,
+    dataset_revision: str,
+    platform: str,
+) -> dict[str, dict]:
+    # Resolved before anything is written: `recorded_settings()` can refuse (a required
+    # setting such as the endpoint is missing), and the conflict check below can too. Both
+    # must leave the directory exactly as it was — job configs included — rather than
+    # write a config that disagrees with an unwritten (or stale) record.
+    planned = {
+        arm: {
+            "arm": arm,
+            "instruction_set_version": version,
+            "dataset_revision": dataset_revision,
+            "model": config["agents"][0]["model_name"],
+            "agent": "claude-code",
+            "platform": platform,
+            **base.recorded_settings(),
+        }
+        for arm, config, version in arm_configs
+    }
+
+    # The importer reads this file when the trials are loaded, not when they ran, so
+    # rewriting it over a directory that already holds trials relabels them with settings
+    # they did not run under. Only a value that was recorded before and has since changed
+    # is a conflict: a key the record simply did not carry yet is a new setting, not a
+    # different one. Every arm is checked before any is written, so a refusal leaves the
+    # whole render untouched rather than half applied.
+    for arm, meta in planned.items():
+        meta_path = out_dir / arm / "sweep-meta.json"
+        if not (meta_path.is_file() and (out_dir / arm / "jobs").exists()):
+            continue
+        recorded = json.loads(meta_path.read_text())
+        changed = sorted(k for k, v in recorded.items() if k in meta and meta[k] != v)
+        if changed:
+            raise SweepMetadataConflict(
+                f"{out_dir / arm} already holds trials recorded under different settings "
+                f"({', '.join(changed)}); render into a new directory instead of overwriting it"
+            )
+    return planned
 
 
 def render_arm_configs(
@@ -197,6 +297,17 @@ def render_arm_configs(
     treatment_agent["kwargs"]["allowed_tools"] = tool_flag(allowed["treatment"])
     treatment_agent["kwargs"]["append_system_prompt"] = shlex.quote(prompt_text)
 
+    planned = _preflight_sweep_metadata(
+        base,
+        (
+            ("baseline", baseline, "none"),
+            ("treatment", treatment, instruction_set_version),
+        ),
+        out_dir,
+        dataset_revision,
+        platform,
+    )
+
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = {
         "baseline": out_dir / "baseline.yaml",
@@ -207,19 +318,9 @@ def render_arm_configs(
     paths["baseline"].write_text(yaml.safe_dump(baseline, sort_keys=True))
     paths["treatment"].write_text(yaml.safe_dump(treatment, sort_keys=True))
 
-    for arm, config, version in (("baseline", baseline, "none"), ("treatment", treatment, instruction_set_version)):
+    for arm, meta in planned.items():
         sweep_dir = out_dir / arm
         sweep_dir.mkdir(parents=True, exist_ok=True)
-        meta = {
-            "arm": arm,
-            "instruction_set_version": version,
-            "dataset_revision": dataset_revision,
-            "model": config["agents"][0]["model_name"],
-            "agent": "claude-code",
-            "platform": platform,
-            "agent_timeout_sec": base.agent_timeout_sec,
-            "max_output_tokens": base.max_output_tokens,
-        }
         (sweep_dir / "sweep-meta.json").write_text(json.dumps(meta, indent=2) + "\n")
         paths[f"{arm}_sweep"] = sweep_dir
 
