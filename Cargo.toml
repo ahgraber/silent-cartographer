@@ -23,7 +23,7 @@ clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Embedded SQLite-core store; bundled so builds do not depend on a system libsqlite3.
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Semantic index model: the SCIP protobuf schema the Rust backend emits.
 scip = "0.9"
 # Protobuf runtime for (de)serializing the SCIP index; version pinned to match `scip`.
