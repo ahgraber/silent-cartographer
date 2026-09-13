@@ -45,7 +45,7 @@ model2vec-rs = { version = "=0.2.1", default-features = false, features = ["loca
 # Direct access to the same tokenizer implementation for chunk-size accounting: the exact version
 # model2vec-rs pins, with the feature set its `fancy-regex` passthrough enables, so the build
 # compiles one tokenizer and chunk counts measure exactly what the model receives.
-tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy-regex", "progressbar", "esaxx_fast"] }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex", "progressbar", "esaxx_fast"] }
 # Vector KNN inside the SQLite store; the extension's C source is compiled in statically.
 # Pinned exactly: the crate is pre-v1 and its on-disk format is warned unstable.
 sqlite-vec = "=0.1.9"
