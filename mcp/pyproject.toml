@@ -5,7 +5,7 @@ description = "An MCP server exposing the c10r code-graph CLI as tools."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "fastmcp==4.0.0b3",
+  "fastmcp==4.0.3",
   "setproctitle>=1.3",
 ]
 
