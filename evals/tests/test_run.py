@@ -6,7 +6,9 @@ import pier_fixtures as fx
 import pytest
 import yaml
 
+from c10r_evals import run
 from c10r_evals.run import (
+    RunGroup,
     RunRefused,
     arm_config,
     build_pier_argv,
@@ -270,6 +272,69 @@ def test_the_frozen_attempt_bound_does_not_apply_to_dev():
     check_attempts("dev", attempts=3, planned_attempts=1)
     check_attempts("frozen", attempts=1, planned_attempts=1)
     check_attempts("frozen", attempts=3, planned_attempts=None)
+
+
+class _FakeTopLine:
+    """Records what `execute` does to it instead of touching the terminal."""
+
+    def __init__(self, total, description, stream=None):
+        self.total = total
+        self.descriptions = [description]
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def advance(self, n=1, description=None):
+        if description is not None:
+            self.descriptions.append(description)
+
+    def close(self):
+        self.closed = True
+
+
+class _ReachedExecvp(Exception):
+    """Raised by the monkeypatched `os.execvp` to prove it was reached."""
+
+
+def test_execute_closes_the_progress_line_and_prints_before_exec(monkeypatch, capsys):
+    """Nothing runs after `os.execvp`, so the terminal must be restored ahead of it, not after."""
+
+    def fake_execvp(*args):
+        raise _ReachedExecvp
+
+    fake = _FakeTopLine(total=0, description="")
+    monkeypatch.setattr(run, "TopLine", lambda total, description, stream=None: fake)
+    monkeypatch.setattr(run.os, "execvp", fake_execvp)
+    group = RunGroup(arm="baseline", attempts=1, instances=None, argv=("pier", "run"))
+
+    with pytest.raises(_ReachedExecvp):
+        run.execute([group])
+
+    assert fake.closed
+    assert capsys.readouterr().out.strip() == f"{group.describe()} — running under pier"
+
+
+def test_the_final_line_survives_the_exec_when_stdout_is_redirected():
+    """exec replaces the process without flushing, and redirected stdout is block-buffered.
+
+    An in-memory capture cannot show this: the loss happens in the real stdio buffer, so this
+    runs a genuine exec in a child whose stdout is a pipe.
+    """
+    import subprocess
+    import sys
+
+    child = (
+        "from c10r_evals.run import RunGroup, execute\n"
+        "execute([RunGroup(arm='baseline', attempts=1, instances=None, argv=('echo', 'EXEC RAN'))])\n"
+    )
+    result = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, check=True)
+
+    assert "EXEC RAN" in result.stdout
+    assert "running under pier" in result.stdout
 
 
 def test_build_pier_argv_is_the_single_source_of_the_invocation():

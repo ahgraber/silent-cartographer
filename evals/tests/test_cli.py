@@ -24,6 +24,7 @@ from c10r_evals.telemetry import import_sweep
         (["analyze", "--criteria", "criteria.json"], "_cmd_analyze"),
         (["pending", "cfg.yaml"], "_cmd_pending"),
         (["build-manifest", "m.json", "r.jsonl"], "_cmd_build_manifest"),
+        (["build-images", "tree", "--records", "r.jsonl", "--manifest", "m.json"], "_cmd_build_images"),
     ],
 )
 def test_each_subcommand_parses_and_reaches_its_handler(argv, handler):
@@ -108,6 +109,42 @@ def test_build_manifest_merges_records_through_the_cli(tmp_path):
 
     merged = json.loads(manifest.read_text())["entries"]
     assert [e["instance_id"] for e in merged] == ["dev-1", "frozen-1"]
+
+
+def test_build_images_merges_what_it_measured_when_a_measurement_aborts_the_walk(tmp_path, monkeypatch):
+    """The records are worthless until they reach the manifest, so an abort must not skip the merge."""
+    import subprocess
+
+    from c10r_evals import images
+
+    tree = tmp_path / "treatment"
+    for instance in ("inst-a", "inst-b"):
+        (tree / instance).mkdir(parents=True)
+        (tree / instance / "task.toml").write_text("")
+
+    def fake_run(argv, **kwargs):
+        if argv[1] == "run":  # measuring inst-a's baked index
+            raise subprocess.CalledProcessError(125, argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(images.subprocess, "run", fake_run)
+    manifest = tmp_path / "build-manifest.json"
+
+    code = main(["build-images", str(tree), "--records", str(tmp_path / "r.jsonl"), "--manifest", str(manifest)])
+
+    assert code == 125, "docker's status has to survive, not be replaced by the abort's"
+    assert manifest.is_file(), "the manifest must exist even though the walk stopped partway"
+
+
+def test_build_images_refuses_an_empty_tree_without_a_traceback(tmp_path, capsys):
+    """An unprepared tree is a naming mistake, not a build failure, so it exits distinctly from one."""
+    tree = tmp_path / "treatment"
+    tree.mkdir()
+
+    code = main(["build-images", str(tree), "--records", str(tmp_path / "r.jsonl"), "--manifest", str(tmp_path / "m")])
+
+    assert code == 2
+    assert "generate and inject the tasks first" in capsys.readouterr().err
 
 
 def test_generate_accepts_a_split_that_only_grows(tmp_path, offline_generate):

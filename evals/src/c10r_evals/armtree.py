@@ -106,7 +106,7 @@ def read_build_manifest(path: Path) -> list[dict]:
 
 
 def read_build_records(path: Path) -> list[dict]:
-    """Read newline-delimited build records, the form `build-treatment-images.sh` appends."""
+    """Read newline-delimited build records, the form `c10r-evals build-images` appends."""
     records = []
     for line in path.read_text().splitlines():
         if line.strip():

@@ -1,0 +1,15 @@
+# BuildKit daemon config for the builder `just builder` creates.
+#
+# A treatment tree is hundreds of images, and the docker-container driver keeps every
+# intermediate layer in the builder's own cache on top of loading each finished image into the
+# image store. Without a ceiling that cache grows until the machine's disk fills mid-build.
+#
+# The label is what `just builder-check` reads: it appears in `docker buildx inspect` only when
+# buildkitd parsed this file, so a builder created without `--config` fails the check.
+
+[worker.oci]
+gc = true
+gckeepstorage = "60GB"
+
+[worker.oci.labels]
+c10r-cache-cap = "60GB"

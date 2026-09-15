@@ -70,6 +70,7 @@ The same revision produces the same files.
 ## 2. Prepare the treatment arm
 
 ```sh
+just builder
 just binary
 just inject
 just images
@@ -78,16 +79,21 @@ just images
 For the frozen subset, name it on the recipes that take one:
 
 ```sh
-just binary
 just inject frozen
 just images frozen
 ```
+
+`builder` creates the image builder with a capped BuildKit cache and is a once-per-machine step.
+Without the cap, the builder's cache grows across a few hundred image builds until it fills the machine's disk mid-run.
+`images` runs `just builder-check` first and refuses to start when the capped builder is not selected, so a long build cannot begin on an unconfigured one.
 
 `binary` builds the static c10r binary.
 Rebuild it only when c10r itself changes; one binary serves every subset.
 `inject` copies it into each treatment task and adds the c10r install and index-build steps to the Dockerfile.
 It does not change the baseline tasks.
 `images` builds the treatment images and records the index build time and size.
+It skips a task whose `environment/` directory is unchanged since its recorded build and whose image is still present, so an interrupted run resumes rather than repeating hours of work.
+Regenerating, re-injecting, or rebuilding the binary changes that directory, so those tasks build again.
 
 Every recipe that takes an architecture defaults to `aarch64`, so a local Apple Silicon run passes none.
 The binary architecture must match the image platform, and one sweep must use one architecture.

@@ -28,6 +28,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from c10r_evals.progress import TopLine
 from c10r_evals.resume import arm_status, dataset_path
 from c10r_evals.runtime import log_fields
 
@@ -217,20 +218,27 @@ def plan(
 
 def execute(groups: list[RunGroup]) -> int:
     """Run every group, replacing this process with the last one."""
-    for group in groups[:-1]:
-        log_fields(logger, logging.INFO, "pier_group_start", arm=group.arm, attempts=group.attempts)
-        completed = subprocess.run(list(group.argv), check=False)
-        if completed.returncode != 0:
-            log_fields(
-                logger,
-                logging.ERROR,
-                "pier_group_failed",
-                arm=group.arm,
-                exit_code=completed.returncode,
-            )
-            return completed.returncode
     last = groups[-1]
+    with TopLine(total=len(groups), description=groups[0].describe()) as progress:
+        for index, group in enumerate(groups[:-1]):
+            log_fields(logger, logging.INFO, "pier_group_start", arm=group.arm, attempts=group.attempts)
+            completed = subprocess.run(list(group.argv), check=False)
+            if completed.returncode != 0:
+                log_fields(
+                    logger,
+                    logging.ERROR,
+                    "pier_group_failed",
+                    arm=group.arm,
+                    exit_code=completed.returncode,
+                )
+                return completed.returncode
+            progress.advance(1, description=groups[index + 1].describe())
+    # The top line is restored on leaving the block above, so Pier owns the whole terminal for
+    # the last group; nothing of ours runs after the exec to restore it later.
     log_fields(logger, logging.INFO, "pier_group_exec", arm=last.arm, attempts=last.attempts)
+    # exec replaces the process without flushing Python's buffers, and redirected stdout is
+    # block-buffered, so an unflushed line never reaches the file the sweep was logged to.
+    print(f"{last.describe()} — running under pier", flush=True)
     os.execvp(last.argv[0], list(last.argv))
 
 

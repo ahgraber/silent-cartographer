@@ -76,24 +76,43 @@ binary arch='aarch64':
 inject subset='dev' arch='aarch64':
     uv run python -c "from pathlib import Path; from c10r_evals.armtree import inject_c10r; print(len(inject_c10r(Path('tasks/{{ subset }}/treatment'), Path('vendor/c10r/{{ arch }}/c10r'))), 'tasks injected')"
 
-# Build treatment images and preserve partial build records.
+builder_name := 'c10r'
+
+# Create the image builder with a capped BuildKit cache, replacing any earlier one.
 [group('prepare')]
-images subset='dev' arch='aarch64':
+builder:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Removing the builder discards its cache volume;
+    # images already built live in the image store and survive it.
+    docker buildx rm "{{ builder_name }}" 2> /dev/null || true
+    docker buildx create --name "{{ builder_name }}" --driver docker-container --use --config buildkitd.toml
+    just builder-check
+
+# Check the capped builder is selected and its config took effect.
+[group('prepare')]
+builder-check:
     #!/usr/bin/env bash
     set -uo pipefail
-    platform=$([ "{{ arch }}" = "aarch64" ] && echo linux/arm64 || echo linux/amd64)
-    records="build-records-{{ subset }}.jsonl"
-    merge() {
-        if [ -s "${records}" ]; then
-            uv run c10r-evals build-manifest build-manifest.json "${records}"
-        fi
-    }
-    # Recover records from an interrupted build.
-    merge || exit 1
-    scripts/build-treatment-images.sh tasks/{{ subset }}/treatment "${records}" "${platform}"
-    build_status=$?
-    merge || exit 1
-    exit "${build_status}"
+    current=$(docker buildx inspect --bootstrap 2>/dev/null | awk '/^Name:/ { print $2; exit }')
+    if [ "${current}" != "{{ builder_name }}" ]; then
+        echo "builder is '${current:-none}', not '{{ builder_name }}' — run: just builder" >&2
+        exit 1
+    fi
+    if ! docker buildx inspect --bootstrap 2> /dev/null | grep -q 'c10r-cache-cap'; then
+        echo "builder '{{ builder_name }}' has no cache cap; buildkitd.toml was not applied — run: just builder" >&2
+        exit 1
+    fi
+    echo "builder {{ builder_name }} ready, cache capped"
+
+# Build treatment images and preserve partial build records.
+[group('prepare')]
+images subset='dev' arch='aarch64': builder-check
+    uv run c10r-evals build-images tasks/{{ subset }}/treatment \
+        --records build-records-{{ subset }}.jsonl \
+        --manifest build-manifest.json \
+        --builder "{{ builder_name }}" \
+        --platform {{ if arch == "aarch64" { "linux/arm64" } else { "linux/amd64" } }}
 
 # Render Pier configs for both arms.
 [group('prepare')]

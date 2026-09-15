@@ -126,6 +126,32 @@ def build_parser() -> argparse.ArgumentParser:
     build_manifest.add_argument("records", type=Path, help="Newline-delimited build records from an image build.")
     build_manifest.set_defaults(func=_cmd_build_manifest)
 
+    build_images = subparsers.add_parser(
+        "build-images",
+        help="Build every treatment task's image, timing each build and measuring the baked index.",
+    )
+    build_images.add_argument("tree", type=Path, help="Treatment task tree directory.")
+    build_images.add_argument(
+        "--records",
+        type=Path,
+        required=True,
+        help="Newline-delimited build records file; appended to, never truncated.",
+    )
+    build_images.add_argument(
+        "--manifest", type=Path, required=True, help="Index build manifest to merge records into."
+    )
+    build_images.add_argument(
+        "--platform",
+        default="linux/arm64",
+        help="Docker build platform; must match the injected c10r binary's architecture.",
+    )
+    build_images.add_argument(
+        "--builder",
+        default="c10r",
+        help="Buildx builder to build on, the one `just builder` creates with a capped cache.",
+    )
+    build_images.set_defaults(func=_cmd_build_images)
+
     pending = subparsers.add_parser(
         "pending",
         help="List the instances of one arm still owed a scorable attempt, for resuming an interrupted sweep.",
@@ -333,6 +359,57 @@ def _cmd_build_manifest(args: argparse.Namespace) -> int:
         total=len(merged),
     )
     return 0
+
+
+def _cmd_build_images(args: argparse.Namespace) -> int:
+    import subprocess
+
+    from c10r_evals.armtree import merge_build_manifest, read_build_manifest, read_build_records
+    from c10r_evals.images import build_images, task_dirs
+    from c10r_evals.progress import TopLine
+
+    if args.records.is_file() and args.records.stat().st_size > 0:
+        merge_build_manifest(args.manifest, read_build_records(args.records))
+
+    try:
+        dirs = task_dirs(args.tree)
+    except (OSError, ValueError) as exc:
+        print(f"c10r-evals build-images: {exc}", file=sys.stderr)
+        return 2
+
+    built = {}
+    if args.manifest.is_file():
+        built = {e["instance_id"]: e["env_digest"] for e in read_build_manifest(args.manifest) if "env_digest" in e}
+
+    # A failed index measurement stops the walk partway. The records already appended still have
+    # to reach the manifest, and the status reported has to be docker's rather than the abort's.
+    aborted = 0
+    failed: list[str] = []
+    try:
+        with TopLine(total=len(dirs), description="building images") as progress:
+            failed = build_images(
+                args.tree,
+                args.records,
+                args.platform,
+                args.builder,
+                on_built=lambda instance: progress.advance(1, description=instance),
+                built=built,
+            )
+    except subprocess.CalledProcessError as exc:
+        print(f"c10r-evals build-images: measuring the baked index failed: {exc}", file=sys.stderr)
+        aborted = exc.returncode or 1
+
+    merged = merge_build_manifest(args.manifest, read_build_records(args.records))
+    log_fields(
+        logger,
+        logging.INFO,
+        "build_images_complete",
+        built=len(dirs) - len(failed),
+        failed=len(failed),
+        aborted=bool(aborted),
+        manifest_total=len(merged),
+    )
+    return aborted or (1 if failed else 0)
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
