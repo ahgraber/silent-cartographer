@@ -202,6 +202,12 @@ Every assertion added below was confirmed to fail against a deliberately broken 
   Runner-Compatible Task Format: run Pier end to end on one frozen task.
   Treatment Provisioning: run a c10r query with networking disabled inside a frozen treatment image.
   Record both commands and their output in `notes.md` and update the waiver evidence to name the frozen capture.
+- [ ] `sympy__sympy-27395` has no treatment image, so the frozen run covers 299 of the 300 registered pairs.
+  Its index build fails: scip-python dies with a V8 heap exhaustion (`FATAL ERROR: Ineffective mark-compacts near heap limit`), which c10r reports as `semantic analysis failed`.
+  The heap ceiling tracks the VM's memory when unset, at 2.0 GB on an 8 GB machine and 4.1 GB on a 16 GB one, and sympy exceeds both.
+  Setting `NODE_OPTIONS=--max-old-space-size=8192` inline on the build step did not raise it — the process still died at 2.0 GB — so the variable does not reach the indexer, and the ceiling is not simply a number to raise.
+  Accepted for this run rather than chased: the instance records an infrastructure failure, `assemble_pairs` excludes it, and the report enumerates it and states the shortfall against the registered 300.
+  Before the next evaluation reuses this harness, find why the setting does not reach scip-python; a repository large enough to exhaust the default heap is not specific to this dataset.
 - [ ] Execute the frozen paired run (300 issues × 2 arms = 600 episodes) with the frozen prompt and pinned model snapshot, blocked and arm-interleaved, with no early stop; store run configs beside the outputs.
 - [ ] Import all frozen trials; captured output: store record count matches the scheduled trial count.
 - [ ] Run the analysis and produce the report artifact, attaching the criteria file and split manifest.
