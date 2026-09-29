@@ -1,5 +1,6 @@
 """Planning a sweep: deficit grouping, the argv Pier is given, and the guards that refuse a run."""
 
+import subprocess
 from pathlib import Path
 
 import pier_fixtures as fx
@@ -7,6 +8,8 @@ import pytest
 import yaml
 
 from c10r_evals import run
+from c10r_evals.probe import ProbeFailed
+from c10r_evals.resume import arm_status, scored_attempts
 from c10r_evals.run import (
     RunGroup,
     RunRefused,
@@ -17,6 +20,8 @@ from c10r_evals.run import (
     check_subset,
     plan,
     plan_arm,
+    plan_retry,
+    plan_totals,
     render_plan,
 )
 
@@ -47,7 +52,7 @@ def test_a_whole_tree_pass_names_no_instances(tmp_path):
     """Pier runs the config's own dataset; naming every instance would only be noise."""
     config, _ = write_arm(tmp_path, ["inst-a", "inst-b"])
 
-    groups = plan_arm("baseline", config, attempts=1, pier=PIER)
+    groups = plan_arm("baseline", arm_status(config, 1), pier=PIER)
 
     assert len(groups) == 1
     assert groups[0].instances is None
@@ -60,7 +65,7 @@ def test_a_partial_pass_names_the_tree_and_each_instance(tmp_path):
     fx.write_sweep_meta(sweep, arm="baseline")
     attempts_for(sweep, "inst-a", 1)
 
-    groups = plan_arm("baseline", config, attempts=1, pier=PIER)
+    groups = plan_arm("baseline", arm_status(config, 1), pier=PIER)
 
     argv = groups[0].argv
     assert "-p" in argv
@@ -71,7 +76,7 @@ def test_a_partial_pass_names_the_tree_and_each_instance(tmp_path):
 def test_a_target_above_one_passes_the_attempt_count(tmp_path):
     config, _ = write_arm(tmp_path, ["inst-a"])
 
-    argv = plan_arm("baseline", config, attempts=3, pier=PIER)[0].argv
+    argv = plan_arm("baseline", arm_status(config, 3), pier=PIER)[0].argv
 
     assert argv[-2:] == ("-k", "3")
 
@@ -79,7 +84,7 @@ def test_a_target_above_one_passes_the_attempt_count(tmp_path):
 def test_one_attempt_needs_no_attempt_flag(tmp_path):
     config, _ = write_arm(tmp_path, ["inst-a"])
 
-    assert "-k" not in plan_arm("baseline", config, attempts=1, pier=PIER)[0].argv
+    assert "-k" not in plan_arm("baseline", arm_status(config, 1), pier=PIER)[0].argv
 
 
 # --- deficit grouping
@@ -94,7 +99,7 @@ def test_a_ragged_arm_is_grouped_by_how_much_each_instance_lacks(tmp_path):
     attempts_for(sweep, "inst-c", 1)  # lacks 2
     # inst-d lacks 3
 
-    groups = plan_arm("baseline", config, attempts=3, pier=PIER)
+    groups = plan_arm("baseline", arm_status(config, 3), pier=PIER)
 
     assert [(g.attempts, g.instances) for g in groups] == [
         (1, ("inst-b",)),
@@ -109,7 +114,7 @@ def test_an_even_arm_needs_one_invocation(tmp_path):
     attempts_for(sweep, "inst-a", 1)
     attempts_for(sweep, "inst-b", 1)
 
-    groups = plan_arm("baseline", config, attempts=3, pier=PIER)
+    groups = plan_arm("baseline", arm_status(config, 3), pier=PIER)
 
     assert len(groups) == 1
     assert groups[0].attempts == 2
@@ -121,7 +126,7 @@ def test_an_arm_at_the_target_plans_nothing(tmp_path):
     fx.write_sweep_meta(sweep, arm="baseline")
     attempts_for(sweep, "inst-a", 3)
 
-    assert plan_arm("baseline", config, attempts=3, pier=PIER) == []
+    assert plan_arm("baseline", arm_status(config, 3), pier=PIER) == []
 
 
 # --- interleaving the arms
@@ -197,6 +202,111 @@ def test_one_arm_alone_does_not_block(tmp_path):
     assert groups[0].instances is None
 
 
+# --- how much work the plan represents
+
+
+def test_the_totals_count_each_instance_once_per_arm(tmp_path):
+    """Blocking spreads an arm over many invocations; the totals still report each instance once."""
+    instances = [f"inst-{i:02d}" for i in range(5)]
+    write_arm(tmp_path, instances, arm="baseline")
+    write_arm(tmp_path, instances, arm="treatment")
+
+    groups = plan(tmp_path / "configs" / "cfg", ("baseline", "treatment"), attempts=1, pier=PIER, block_size=2)
+
+    totals = plan_totals(groups)
+
+    assert totals.episodes == 10
+    assert totals.instances_by_arm == {"baseline": 5, "treatment": 5}
+
+
+def test_a_whole_tree_pass_counts_the_instances_it_does_not_name(tmp_path):
+    """The invocation names no instances, so its share of the totals comes from the arm's tree."""
+    write_arm(tmp_path, ["inst-a", "inst-b"], arm="baseline")
+
+    groups = plan(tmp_path / "configs" / "cfg", ("baseline",), attempts=3, pier=PIER)
+
+    totals = plan_totals(groups)
+
+    assert groups[0].instances is None
+    assert totals.episodes == 6
+    assert totals.instances_by_arm == {"baseline": 2}
+
+
+def test_the_episode_total_weights_each_group_by_its_own_shortfall(tmp_path):
+    """A ragged arm runs a different number of attempts per group."""
+    config, sweep = write_arm(tmp_path, ["inst-a", "inst-b", "inst-c"])
+    fx.write_sweep_meta(sweep, arm="baseline")
+    attempts_for(sweep, "inst-a", 2)  # lacks 1
+    attempts_for(sweep, "inst-b", 1)  # lacks 2
+    # inst-c lacks 3
+
+    totals = plan_totals(plan_arm("baseline", arm_status(config, 3), pier=PIER))
+
+    assert totals.episodes == 6
+    assert totals.instances_by_arm == {"baseline": 3}
+
+
+# --- retrying cells that never reached a grade
+
+
+def retryable(tmp_path, instances, arm="baseline"):
+    """An arm whose every instance holds one attempt, agent-failure unless named in `instances`."""
+    config, sweep = write_arm(tmp_path, ["inst-a", "inst-b"], arm=arm)
+    fx.write_sweep_meta(sweep, arm=arm)
+    for instance in ("inst-a", "inst-b"):
+        failed = instance in instances
+        fx.make_trial(
+            sweep,
+            instance,
+            arm=arm,
+            exception_type="AgentTimeoutError" if failed else None,
+            reward=None if failed else fx.GRADED_REWARD,
+        )
+    return config, sweep
+
+
+def test_only_cells_without_a_graded_attempt_are_retried(tmp_path):
+    """An agent failure already counts as done, so a graded cell must not be run again."""
+    retryable(tmp_path, ["inst-b"], arm="baseline")
+    retryable(tmp_path, [], arm="treatment")
+
+    groups = plan_retry(tmp_path / "configs" / "cfg", ("baseline", "treatment"), pier=PIER)
+
+    assert [(g.arm, g.instances) for g in groups] == [("baseline", ("inst-b",))]
+
+
+def test_a_retry_adds_one_attempt_and_leaves_the_earlier_one(tmp_path):
+    """A retry that dies on infrastructure must not cost the pair its recorded outcome."""
+    _, sweep = retryable(tmp_path, ["inst-a", "inst-b"], arm="baseline")
+    retryable(tmp_path, [], arm="treatment")
+
+    groups = plan_retry(tmp_path / "configs" / "cfg", ("baseline", "treatment"), pier=PIER)
+
+    assert [g.attempts for g in groups] == [1]
+    assert "-k" not in groups[0].argv  # one attempt needs no attempt flag
+    assert scored_attempts(sweep) == {"inst-a": 1, "inst-b": 1}  # nothing was removed
+
+
+def test_nothing_is_retried_when_every_cell_reached_a_grade(tmp_path):
+    retryable(tmp_path, [], arm="baseline")
+    retryable(tmp_path, [], arm="treatment")
+
+    assert plan_retry(tmp_path / "configs" / "cfg", ("baseline", "treatment"), pier=PIER) == []
+
+
+def test_a_retry_alternates_the_arms(tmp_path):
+    instances = [f"inst-{i:02d}" for i in range(4)]
+    for arm in ("baseline", "treatment"):
+        _, sweep = write_arm(tmp_path, instances, arm=arm)
+        fx.write_sweep_meta(sweep, arm=arm)
+        for instance in instances:
+            fx.make_trial(sweep, instance, arm=arm, exception_type="AgentTimeoutError", reward=None)
+
+    groups = plan_retry(tmp_path / "configs" / "cfg", ("baseline", "treatment"), pier=PIER, block_size=2)
+
+    assert [g.arm for g in groups] == ["baseline", "treatment", "treatment", "baseline"]
+
+
 def test_a_block_size_below_one_is_refused(tmp_path):
     write_arm(tmp_path, ["inst-a"], arm="baseline")
     write_arm(tmp_path, ["inst-a"], arm="treatment")
@@ -226,7 +336,7 @@ def test_the_printed_plan_is_the_argv_that_would_run(tmp_path):
     fx.write_sweep_meta(sweep, arm="baseline")
     attempts_for(sweep, "inst-a", 1)
 
-    groups = plan_arm("baseline", config, attempts=1, pier=PIER)
+    groups = plan_arm("baseline", arm_status(config, 1), pier=PIER)
     rendered = render_plan(groups)
 
     for token in groups[0].argv:
@@ -309,13 +419,35 @@ def test_execute_closes_the_progress_line_and_prints_before_exec(monkeypatch, ca
     fake = _FakeTopLine(total=0, description="")
     monkeypatch.setattr(run, "TopLine", lambda total, description, stream=None: fake)
     monkeypatch.setattr(run.os, "execvp", fake_execvp)
-    group = RunGroup(arm="baseline", attempts=1, instances=None, argv=("pier", "run"))
+    group = RunGroup(arm="baseline", attempts=1, instances=None, instance_count=1, argv=("pier", "run"))
 
     with pytest.raises(_ReachedExecvp):
-        run.execute([group])
+        run.execute([group], probe=lambda group: None)
 
     assert fake.closed
     assert capsys.readouterr().out.strip() == f"{group.describe()} — running under pier"
+
+
+def test_a_failed_probe_stops_the_run_before_its_group_starts(monkeypatch, caplog):
+    """The probe runs before every group, including the last one, which is exec'd into Pier."""
+    ran = []
+
+    def probe(group):
+        if group.arm == "treatment":
+            raise ProbeFailed("no answer within 60 s")
+
+    monkeypatch.setattr(run, "TopLine", lambda total, description, stream=None: _FakeTopLine(total, description))
+    monkeypatch.setattr(
+        run.subprocess, "run", lambda argv, check: ran.append(argv) or subprocess.CompletedProcess(argv, 0)
+    )
+    monkeypatch.setattr(run.os, "execvp", lambda *args: ran.append(args[1]))
+    first = RunGroup(arm="baseline", attempts=1, instances=None, instance_count=1, argv=("pier", "baseline"))
+    last = RunGroup(arm="treatment", attempts=1, instances=None, instance_count=1, argv=("pier", "treatment"))
+
+    assert run.execute([first, last], probe=probe) != 0
+    assert ran == [["pier", "baseline"]]
+    [failure] = [record for record in caplog.records if record.getMessage() == "endpoint_unresponsive"]
+    assert failure.fields["arm"] == "treatment"
 
 
 def test_the_final_line_survives_the_exec_when_stdout_is_redirected():
@@ -329,7 +461,8 @@ def test_the_final_line_survives_the_exec_when_stdout_is_redirected():
 
     child = (
         "from c10r_evals.run import RunGroup, execute\n"
-        "execute([RunGroup(arm='baseline', attempts=1, instances=None, argv=('echo', 'EXEC RAN'))])\n"
+        "execute([RunGroup(arm='baseline', attempts=1, instances=None, instance_count=1, "
+        "argv=('echo', 'EXEC RAN'))], probe=lambda group: None)\n"
     )
     result = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, check=True)
 

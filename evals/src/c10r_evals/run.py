@@ -24,12 +24,13 @@ import os
 import shlex
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from c10r_evals.probe import ProbeFailed
 from c10r_evals.progress import TopLine
-from c10r_evals.resume import arm_status, dataset_path
+from c10r_evals.resume import ArmStatus, arm_status, dataset_path, sweep_dir, ungraded_instances
 from c10r_evals.runtime import log_fields
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class RunGroup:
     arm: str
     attempts: int
     instances: tuple[str, ...] | None  # None selects the arm's whole task tree
+    instance_count: int  # a whole-tree pass names none, so its size cannot come from `instances`
     argv: tuple[str, ...]
     block: int = 0
 
@@ -143,8 +145,7 @@ def check_attempts(subset: str, attempts: int, planned_attempts: int | None) -> 
 
 def plan_arm(
     arm: str,
-    config: Path,
-    attempts: int,
+    status: ArmStatus,
     pier: Path,
     only: Sequence[str] | None = None,
     block: int = 0,
@@ -154,8 +155,7 @@ def plan_arm(
     `only` restricts the plan to one block of instances; the rest of the arm is planned by the
     other calls that cover the remaining blocks.
     """
-    status = arm_status(config, attempts)
-    dataset = dataset_path(config)
+    dataset = dataset_path(status.config)
     wanted = status.deficits if only is None else {i: d for i, d in status.deficits.items() if i in set(only)}
 
     by_deficit: dict[int, list[str]] = {}
@@ -171,7 +171,8 @@ def plan_arm(
                 arm=arm,
                 attempts=deficit,
                 instances=selected,
-                argv=build_pier_argv(pier, config, dataset, selected, deficit),
+                instance_count=len(instances),
+                argv=build_pier_argv(pier, status.config, dataset, selected, deficit),
                 block=block,
             )
         )
@@ -199,11 +200,28 @@ def plan(
     """
     resolved = pier or pier_executable()
     configs = {arm: arm_config(config_dir, arm) for arm in arms}
+    # Measured once per arm: it walks every trial directory the arm wrote, and all blocks share it.
+    status = {arm: arm_status(configs[arm], attempts) for arm in arms}
     if len(arms) == 1:
         arm = arms[0]
-        return plan_arm(arm, configs[arm], attempts, resolved)
+        return plan_arm(arm, status[arm], resolved)
 
-    outstanding = {arm: set(arm_status(configs[arm], attempts).deficits) for arm in arms}
+    outstanding = {arm: set(status[arm].deficits) for arm in arms}
+    return interleave(
+        arms,
+        outstanding,
+        lambda arm, selected, block: plan_arm(arm, status[arm], resolved, only=selected, block=block),
+        block_size,
+    )
+
+
+def interleave(
+    arms: Sequence[str],
+    outstanding: dict[str, set[str]],
+    plan_block: Callable[[str, list[str], int], list[RunGroup]],
+    block_size: int,
+) -> list[RunGroup]:
+    """Alternate the arms over blocks of the instances they still owe."""
     covered = sorted(set().union(*outstanding.values()))
     groups: list[RunGroup] = []
     for index, block in enumerate(blocks_of(covered, block_size)):
@@ -212,15 +230,79 @@ def plan(
         for arm in ordered_arms:
             selected = [i for i in block if i in outstanding[arm]]
             if selected:
-                groups += plan_arm(arm, configs[arm], attempts, resolved, only=selected, block=index)
+                groups += plan_block(arm, selected, index)
     return groups
 
 
-def execute(groups: list[RunGroup]) -> int:
-    """Run every group, replacing this process with the last one."""
+def plan_retry(
+    config_dir: Path,
+    arms: Sequence[str],
+    pier: Path | None = None,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+) -> list[RunGroup]:
+    """One more attempt for every cell whose scorable attempts were all agent failures.
+
+    The earlier attempt is kept, so a failed retry costs nothing and the analysis takes the later
+    attempt only when there is one.
+    """
+    resolved = pier or pier_executable()
+    configs = {arm: arm_config(config_dir, arm) for arm in arms}
+    outstanding = {arm: ungraded_instances(sweep_dir(configs[arm])) for arm in arms}
+
+    def plan_block(arm: str, selected: list[str], block: int) -> list[RunGroup]:
+        return [
+            RunGroup(
+                arm=arm,
+                attempts=1,
+                instances=tuple(selected),
+                instance_count=len(selected),
+                argv=build_pier_argv(resolved, configs[arm], dataset_path(configs[arm]), selected, 1),
+                block=block,
+            )
+        ]
+
+    return interleave(arms, outstanding, plan_block, block_size)
+
+
+@dataclass(frozen=True)
+class PlanTotals:
+    """The episodes a plan runs and the instances each arm covers."""
+
+    episodes: int
+    instances_by_arm: dict[str, int]
+
+
+def plan_totals(groups: Sequence[RunGroup]) -> PlanTotals:
+    """Sum a plan's work; an arm's groups never name the same instance twice, so the counts add up."""
+    instances_by_arm: dict[str, int] = {}
+    for group in groups:
+        instances_by_arm[group.arm] = instances_by_arm.get(group.arm, 0) + group.instance_count
+    return PlanTotals(
+        episodes=sum(group.instance_count * group.attempts for group in groups),
+        instances_by_arm=instances_by_arm,
+    )
+
+
+def execute(groups: list[RunGroup], probe: Callable[[RunGroup], None]) -> int:
+    """Run every group, replacing this process with the last one.
+
+    `probe` runs before each group and raises `ProbeFailed` when the group's endpoint does not
+    answer; the run then stops before that group starts and returns 2.
+    """
     last = groups[-1]
+    # Whether the bar was drawn at all is not visible afterwards: Pier's output has scrolled over
+    # it and the escape sequences never reach a redirected stream.
+    log_fields(
+        logger,
+        logging.INFO,
+        "terminal_state",
+        stdout_isatty=sys.stdout.isatty(),
+        stderr_isatty=sys.stderr.isatty(),
+    )
     with TopLine(total=len(groups), description=groups[0].describe()) as progress:
         for index, group in enumerate(groups[:-1]):
+            if not _probed(probe, group):
+                return 2
             log_fields(logger, logging.INFO, "pier_group_start", arm=group.arm, attempts=group.attempts)
             completed = subprocess.run(list(group.argv), check=False)
             if completed.returncode != 0:
@@ -233,6 +315,8 @@ def execute(groups: list[RunGroup]) -> int:
                 )
                 return completed.returncode
             progress.advance(1, description=groups[index + 1].describe())
+        if not _probed(probe, last):
+            return 2
     # The top line is restored on leaving the block above, so Pier owns the whole terminal for
     # the last group; nothing of ours runs after the exec to restore it later.
     log_fields(logger, logging.INFO, "pier_group_exec", arm=last.arm, attempts=last.attempts)
@@ -240,6 +324,17 @@ def execute(groups: list[RunGroup]) -> int:
     # block-buffered, so an unflushed line never reaches the file the sweep was logged to.
     print(f"{last.describe()} — running under pier", flush=True)
     os.execvp(last.argv[0], list(last.argv))
+
+
+def _probed(probe: Callable[[RunGroup], None], group: RunGroup) -> bool:
+    """Probe the group's endpoint, reporting a failure instead of raising it."""
+    try:
+        probe(group)
+    except ProbeFailed as exc:
+        log_fields(logger, logging.ERROR, "endpoint_unresponsive", arm=group.arm, reason=str(exc))
+        print(f"c10r-evals: stopped before {group.describe()}: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def render_plan(groups: list[RunGroup]) -> str:

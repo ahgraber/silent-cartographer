@@ -25,7 +25,7 @@ from c10r_evals.analysis import (
     trajectory_cost,
     trajectory_level_output,
 )
-from c10r_evals.report import FIGURE_TITLES, render_report
+from c10r_evals.report import FIGURE_TITLES, figure_captions, render_report
 from c10r_evals.split import FROZEN_SIZE
 from c10r_evals.stats import (
     accuracy_claims,
@@ -423,6 +423,25 @@ def test_report_links_every_registered_plot():
     assert set(FIGURE_TITLES) == set(PLOT_FILENAMES)
     for name, title in FIGURE_TITLES.items():
         assert f"![{title}]({PLOT_FILENAMES[name]})" in report
+
+
+def test_every_figure_carries_a_caption():
+    """A reader cannot tell what the point, band, or curves mean from the image alone."""
+    report = render_report(analyze(paired_trials(n=10), CRITERIA))
+
+    for caption in figure_captions(CRITERIA).values():
+        assert caption in report
+    assert set(figure_captions(CRITERIA)) == set(FIGURE_TITLES)
+
+
+def test_a_caption_names_the_boundary_the_figure_draws():
+    """The band is drawn from the criteria, so a hardcoded caption would contradict the image."""
+    criteria = replace(CRITERIA, accuracy_reference_boundary=0.08, token_use_reference_boundary=0.25)
+
+    captions = figure_captions(criteria)
+
+    assert "plus or minus 0.08" in captions["paired-accuracy"]
+    assert "1.25" in captions["token-ratio-distribution"]
 
 
 def test_report_links_plots_written_outside_the_report_directory():

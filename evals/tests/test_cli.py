@@ -20,6 +20,8 @@ from c10r_evals.telemetry import import_sweep
     [
         (["generate", "--revision", "rev"], "_cmd_generate"),
         (["run", "dev", "--cfg", "dev-recover"], "_cmd_run"),
+        (["retry", "dev", "--cfg", "dev-recover"], "_cmd_retry"),
+        (["reconfigure", "configs/dev", "--agent-timeout-sec", "7200"], "_cmd_reconfigure"),
         (["import", "sweep"], "_cmd_import"),
         (["analyze", "--criteria", "criteria.json"], "_cmd_analyze"),
         (["pending", "cfg.yaml"], "_cmd_pending"),
@@ -192,15 +194,102 @@ def test_setup_process_default_title():
     assert setproctitle.getproctitle() == "c10r-evals"
 
 
-def test_json_log_line_carries_fields(capsys):
-    setup_process("generate")
+def test_json_log_lines_go_to_a_file_not_the_terminal(capsys):
+    log_file = setup_process("generate")
     log_fields(logging.getLogger("c10r_evals.test"), logging.INFO, "task_generated", instance="inst-1", arm="baseline")
-    line = capsys.readouterr().err.strip().splitlines()[-1]
-    record = json.loads(line)
+
+    record = json.loads(log_file.read_text().strip().splitlines()[-1])
     assert record["event"] == "task_generated"
     assert record["level"] == "INFO"
     assert record["instance"] == "inst-1"
     assert record["arm"] == "baseline"
+    assert "task_generated" not in capsys.readouterr().err
+
+
+def test_a_warning_still_reaches_the_terminal(capsys):
+    """Nobody watches the file while a sweep runs, so what asks the operator to act stays visible."""
+    log_file = setup_process("run")
+    log_fields(logging.getLogger("c10r_evals.test"), logging.WARNING, "arm_holds_more_attempts_than_requested")
+
+    assert "arm_holds_more_attempts_than_requested" in capsys.readouterr().err
+    assert "arm_holds_more_attempts_than_requested" in log_file.read_text()
+
+
+def test_the_log_file_is_unique_per_process():
+    """Two same-second invocations of one subcommand would otherwise share a file."""
+    import os
+
+    assert str(os.getpid()) in setup_process("run").name
+
+
+def runnable_arm(tmp_path, monkeypatch):
+    """A one-instance baseline arm in `tmp_path`, with `run` reduced to its planning."""
+    import yaml
+
+    from c10r_evals import run as run_module
+
+    tasks = tmp_path / "tasks" / "dev" / "baseline"
+    tasks.mkdir(parents=True)
+    (tasks / "inst-a").mkdir()
+    config = tmp_path / "configs" / "cfg" / "baseline.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(yaml.safe_dump({"datasets": [{"path": str(tasks)}], "jobs_dir": str(config.parent / "jobs")}))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EVAL_PROXY_TOKEN", "t")
+    for leaked in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(leaked, raising=False)
+    monkeypatch.setattr(run_module, "execute", lambda groups, probe: 0)
+
+
+def test_run_writes_the_plan_beside_the_log_instead_of_echoing_it(tmp_path, monkeypatch, capsys):
+    runnable_arm(tmp_path, monkeypatch)
+
+    assert main(["run", "dev", "--cfg", "cfg", "--arm", "baseline"]) == 0
+
+    plan_file = next((tmp_path / "logs").glob("run-*.plan.txt"))
+    assert "pier" in plan_file.read_text()
+    assert "pier" not in capsys.readouterr().out
+
+
+def test_run_prints_the_plan_when_the_file_cannot_be_written(tmp_path, monkeypatch, capsys):
+    """A sweep that can otherwise run is not refused over its plan file."""
+    from pathlib import Path
+
+    runnable_arm(tmp_path, monkeypatch)
+
+    def unwritable(self, *args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(Path, "write_text", unwritable)
+
+    assert main(["run", "dev", "--cfg", "cfg", "--arm", "baseline"]) == 0
+    assert "pier" in capsys.readouterr().out
+
+
+def test_run_probes_each_group_against_its_arm_config_with_the_proxy_token(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from c10r_evals import probe as probe_module
+    from c10r_evals import run as run_module
+
+    runnable_arm(tmp_path, monkeypatch)
+    probed = []
+    monkeypatch.setattr(probe_module, "probe_endpoint", lambda config, token: probed.append((config, token)))
+    monkeypatch.setattr(run_module, "execute", lambda groups, probe: [probe(group) for group in groups] and 0)
+
+    assert main(["run", "dev", "--cfg", "cfg", "--arm", "baseline"]) == 0
+    assert probed == [(Path("configs") / "cfg" / "baseline.yaml", "t")]
+
+
+def test_logging_falls_back_to_the_terminal_when_no_file_can_be_opened(capsys, tmp_path):
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+
+    assert setup_process("run", log_dir=blocked / "logs") is None
+    log_fields(logging.getLogger("c10r_evals.test"), logging.INFO, "tasks_generated")
+
+    assert "tasks_generated" in capsys.readouterr().err
 
 
 def test_json_formatter_is_valid_json_without_fields():

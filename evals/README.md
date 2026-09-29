@@ -19,6 +19,7 @@ Each stage has a `just` recipe, grouped in the CLI output from `just`.
 
 Store local configuration in the gitignored `.env` file beside this README. direnv loads it on `cd`; `just` also loads it when direnv is inactive.
 Run `just config` after changing a value used in the arm configs.
+Changing the model needs a new config directory rather than a re-render; see [Another model](#another-model).
 
 `just env-check` reports the active settings without printing the proxy token.
 It fails when a required value is missing, a host credential can override the proxy, or the container daemon is unavailable.
@@ -84,7 +85,6 @@ just images frozen
 ```
 
 `builder` creates the image builder with a capped BuildKit cache and is a once-per-machine step.
-Without the cap, the builder's cache grows across a few hundred image builds until it fills the machine's disk mid-run.
 `images` runs `just builder-check` first and refuses to start when the capped builder is not selected, so a long build cannot begin on an unconfigured one.
 
 `binary` builds the static c10r binary.
@@ -131,7 +131,19 @@ Completed episodes and agent failures count as scorable; infrastructure failures
 Its arguments are `<subset> <config> <attempts>`, so `just run dev dev 3` requests three scorable attempts per instance.
 `status` reports the remaining work.
 
+`reconfigure` sets the episode bounds — timeout, turn cap, spend cap, output ceiling, and concurrency — across a config directory, its sweep metadata, and every trial recorded under it.
+Name only the bounds to change; concurrency reaches the arm configs alone, because a trial never records a job-level setting.
+Only the arm configs affect a later run, because the bounds are literals there rather than environment references; set the matching `EVAL_*` variables too or the next `just config` renders the old ones back.
+Rewriting the recorded trials loses what those episodes ran under, so the previous values go to the directory's `reconfigure-log.json`.
+
+`retry` runs one more attempt for every cell whose scorable attempts were all agent failures, for use after raising a limit the agent was exhausting.
+An agent failure scores as a miss rather than a gap, so `run` treats those cells as complete and only `retry` reaches them; the earlier attempt is kept, so a failed retry costs nothing.
+Between them the two cover every cell without a grade: `run` takes the ones an infrastructure failure left with no scorable attempt, `retry` the ones holding nothing but agent failures.
+
 Wrap a full sweep in `caffeinate -ims` so the machine stays awake through it.
+
+Every command writes its records to `logs/<subcommand>-<timestamp>.jsonl` and prints the path on startup; only warnings and errors also reach the terminal.
+`run` writes the Pier invocations it planned to a `.plan.txt` file beside that log rather than printing them.
 
 Pier writes a new job directory for each attempt.
 The importer combines those directories, so rerunning after an interruption preserves earlier results.
@@ -158,14 +170,51 @@ Run `just mlflow` to browse it at <http://127.0.0.1:5000>, then run `just mlflow
 just analyze criteria.json
 ```
 
-Its arguments are `<criteria> <prompt> <output>`, as in `just analyze criteria.json c10r-dev-refined frozen-report.md`.
+Its arguments are `<criteria> <prompt> <output-directory>`, as in `just analyze criteria.json c10r-dev-refined docs/reports/frozen`.
+The output directory defaults to `docs/reports/<model>`, so each model's report has its own.
 
 `criteria.json` records the reference boundaries, confidence level, primary token-use metric, and failure policy.
 Write it before the frozen run starts.
 
-Analysis writes `report.md`, `report.trajectories.json`, and the four registered plots.
+Analysis writes `report.md` and `report.trajectories.json` in the output directory, and the four registered plots under its `images/`.
 The trajectory file contains the measures behind each estimate.
 The optional `--price-schedule` argument adds financial cost under a named, dated price table.
+
+One report covers one model.
+The store holds every model that has been ingested, so the recipe passes `EVAL_MODEL_NAME` and the report describes the model the environment currently names.
+
+## Same experiment, different model
+
+Do _not_ run `just generate` again, rewriting the task trees makes every treatment image build again, and possibly invalidates any cross-analysis.
+Skip [Prepare the treatment arm](#2-prepare-the-treatment-arm) as well, unless the subset or the architecture changed.
+
+Set `EVAL_MODEL_NAME`, along with the endpoint and token if they moved, then render a new config directory and run it.
+Angle brackets mark a value to supply, square brackets an argument that has a default:
+
+```sh
+just env-check
+just config <prompt> <config-dir> <subset> [arch]
+just run <subset> <config-dir> [attempts]
+just status <config-dir>
+just ingest <config-dir>
+```
+
+For `nvidia/Qwen3.6-35B-A3B-NVFP4` over the frozen subset:
+
+```sh
+just env-check
+just config c10r-dev-refined frozen-qwen3.6-35B-A3B frozen
+caffeinate -ims just run frozen frozen-qwen3.6-35B-A3B
+just status frozen-qwen3.6-35B-A3B
+just ingest frozen-qwen3.6-35B-A3B
+```
+
+Only the config directory changes (`just config`), so name it after the model.
+A config directory holds the trials of one model.
+Pier writes its job tree under `configs/<directory>/<arm>/jobs`, `run` counts the attempts already recorded there, and the importer reads the model from the directory's sweep metadata at import time rather than from each trial.
+Re-rendering a directory that already holds trials would relabel them, so `just config` refuses and names the settings that changed.
+
+A new model may need a different timeout and concurrency; see [Concurrency and timeout](#concurrency-and-timeout).
 
 ## Instruction sets
 

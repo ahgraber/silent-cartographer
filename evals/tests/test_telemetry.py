@@ -225,6 +225,37 @@ def test_refused_endpoint_stays_infra_failure(tmp_path, tracking_uri):
     assert "reward" not in record["metrics"]
 
 
+@pytest.mark.parametrize(
+    ("error", "text", "expected"),
+    [
+        ("server_error", "Request timed out", INFRA_FAILURE),
+        ("max_output_tokens", "API Error: Claude's response exceeded the 8000 output token maximum.", AGENT_FAILURE),
+    ],
+)
+def test_an_api_error_after_spending_tokens_is_classified_by_its_kind(tmp_path, tracking_uri, error, text, expected):
+    """An endpoint that stops answering mid-episode is not the agent's doing; its own output ceiling is."""
+    sweep = tmp_path / "sweep"
+    fx.write_sweep_meta(sweep)
+    spent = fx.make_trajectory(
+        [fx.bash_call("grep -rn x /repo")],
+        {"total_prompt_tokens": 30_227, "total_completion_tokens": 1_067, "total_steps": 5},
+    )
+    trial = fx.make_trial(sweep, "inst-api", exception_type="NonZeroAgentExitCodeError", reward=None, trajectory=spent)
+    final = {
+        "type": "assistant",
+        "error": error,
+        "is_api_error_message": True,
+        "message": {"content": [{"text": text}]},
+    }
+    result = {"type": "result", "terminal_reason": "api_error", "is_error": True}
+    (trial / "agent" / "claude-code.txt").write_text(f"{json.dumps(final)}\n{json.dumps(result)}\n")
+
+    import_sweep(sweep, tracking_uri)
+    record = _single(query_trials(tracking_uri), "inst-api")
+    assert record["terminal_state"] == expected
+    assert ("reward" in record["metrics"]) == (expected == AGENT_FAILURE)
+
+
 def test_ungraded_trial_is_infra_failure(tmp_path, tracking_uri):
     """No exception but no reward means the verifier never ran: not an answer to score."""
     sweep = tmp_path / "sweep"

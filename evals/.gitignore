@@ -10,9 +10,18 @@ configs/
 jobs/
 mlflow.db
 mlruns/
-report.md
 build-manifest.json
 build-records-*.jsonl
 
 # MLflow UI started by `just mlflow`
 mlflow-ui.log
+
+# Per-invocation JSON log lines and the plan each sweep ran
+logs/
+
+# Analysis output written outside docs/reports/, which is where a kept report goes.
+/report.md
+/*.png
+
+# Replay data for the report; bulk trial records rather than documentation.
+report.trajectories.json

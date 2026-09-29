@@ -15,11 +15,15 @@ AGENT_FAILURE_EXCEPTIONS = {"AgentTimeoutError"}
 
 # A non-zero agent exit covers two different events. The agent CLI exits non-zero both
 # when it exhausts a limit of its own — the turn cap, or the per-response output
-# ceiling a repetition loop reaches — and when the endpoint refuses the request. Only
-# the first is the agent's doing, and the two are told apart by whether the episode
-# consumed anything: an endpoint that refuses produces no tokens, while an agent that
-# talks itself past a ceiling produces many.
+# ceiling a repetition loop reaches — and when the endpoint refuses or stops answering.
+# Only the first is the agent's doing. An endpoint that fails before the first answer
+# leaves the episode with no tokens; one that fails mid-episode leaves tokens behind, and
+# is told apart by the error kind of the agent's last model call.
 AMBIGUOUS_EXIT_EXCEPTIONS = {"NonZeroAgentExitCodeError"}
+
+# Error kinds the agent CLI records when the endpoint, not the agent, ended the call:
+# connection refused and request timed out both arrive as `server_error`.
+ENDPOINT_ERRORS = {"server_error"}
 
 # A command starts at the beginning of the string or after a separator, and a newline is a
 # separator: one Bash tool call routinely carries several commands on their own lines.
@@ -61,6 +65,26 @@ def episode_consumed_tokens(trial_dir: Path) -> bool:
     return (final.get("total_prompt_tokens", 0) + final.get("total_completion_tokens", 0)) > 0
 
 
+def episode_ended_on_endpoint_error(trial_dir: Path) -> bool:
+    """Whether the agent's last model call failed at the endpoint rather than on a limit of its own.
+
+    Only the agent's raw log records the error kind; the trajectory keeps the message text alone.
+    """
+    path = trial_dir / "agent" / "claude-code.txt"
+    if not path.is_file():
+        return False
+    last = None
+    with path.open() as log:
+        for line in log:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "assistant":
+                last = event
+    return bool(last and last.get("is_api_error_message") and last.get("error") in ENDPOINT_ERRORS)
+
+
 def classify_terminal_state(trial_dir: Path) -> str:
     """Map a trial's recorded outcome to its terminal state.
 
@@ -68,12 +92,13 @@ def classify_terminal_state(trial_dir: Path) -> str:
     - The agent's own execution timeout: the agent caused the failure, so it is an outcome.
     - A non-zero agent exit that consumed tokens: the agent exhausted a limit of its
       own, which is also an outcome. The same exit with no tokens spent means nothing
-      ran, so it is an infrastructure failure.
+      ran, and the same exit after an endpoint error means the endpoint ended the
+      episode; both are infrastructure failures.
     - Anything else, including an ungraded trial: infrastructure failure.
 
     Classifying a limit the agent reached as infrastructure would drop that episode from
     the analysis instead of scoring it, which favours whichever arm exhausts limits more
-    often. An agent that exhausts its turn or spend cap instead exits zero, arrives here
+    often. An agent that exhausts its spend cap instead exits zero, arrives here
     as `completed`, and is graded on whatever answer it left behind.
     """
     result_path = trial_dir / "result.json"
@@ -84,7 +109,11 @@ def classify_terminal_state(trial_dir: Path) -> str:
         exception_type = exception_info.get("exception_type")
         if exception_type in AGENT_FAILURE_EXCEPTIONS:
             return AGENT_FAILURE
-        if exception_type in AMBIGUOUS_EXIT_EXCEPTIONS and episode_consumed_tokens(trial_dir):
+        if (
+            exception_type in AMBIGUOUS_EXIT_EXCEPTIONS
+            and episode_consumed_tokens(trial_dir)
+            and not episode_ended_on_endpoint_error(trial_dir)
+        ):
             return AGENT_FAILURE
         return INFRA_FAILURE
     if (trial_dir / "verifier" / "reward.json").is_file():

@@ -76,6 +76,26 @@ def scored_instances(sweep: Path) -> set[str]:
     return set(scored_attempts(sweep))
 
 
+def ungraded_instances(sweep: Path) -> set[str]:
+    """Instances whose every scorable attempt was an agent failure, so none produced a grade.
+
+    An agent failure counts as done, so these never reach `deficits`; they are the cells to retry
+    once the limit the agent exhausted has been raised.
+    """
+    states: dict[str, set[str]] = {}
+    jobs = sweep / "jobs"
+    if not jobs.is_dir():
+        return set()
+    for job in sorted(p for p in jobs.iterdir() if p.is_dir()):
+        for trial in sorted(p for p in job.iterdir() if p.is_dir()):
+            if not (trial / "result.json").is_file():
+                continue
+            state = classify_terminal_state(trial)
+            if state in USABLE_STATES:
+                states.setdefault(_instance_of(trial), set()).add(state)
+    return {instance for instance, seen in states.items() if seen == {AGENT_FAILURE} and instance}
+
+
 def _instance_of(trial_dir: Path) -> str:
     """Identify a trial's instance exactly as the importer does."""
     import json

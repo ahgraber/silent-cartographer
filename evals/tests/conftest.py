@@ -2,6 +2,7 @@
 
 import pytest
 
+from c10r_evals import runtime
 from c10r_evals.dataset import Instance
 
 SINGLE_FILE_PATCH = """\
@@ -51,6 +52,14 @@ def make_instance(instance_id: str = "demo__repo-1", patch: str = SINGLE_FILE_PA
         patch=patch,
         test_patch=TEST_PATCH,
     )
+
+
+@pytest.fixture(autouse=True)
+def log_dir(tmp_path, monkeypatch):
+    """Keep every `setup_process` call out of the directory the suite happens to run from."""
+    directory = tmp_path / "logs"
+    monkeypatch.setattr(runtime, "LOG_DIR", directory)
+    return directory
 
 
 @pytest.fixture

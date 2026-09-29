@@ -150,19 +150,39 @@ smoke instance which='baseline' cfg=dev_config subset='dev':
 run subset='dev' cfg=dev_config attempts='1' *flags:
     uv run c10r-evals run {{ subset }} --cfg {{ cfg }} --attempts {{ attempts }} {{ flags }}
 
+# Set the agent's limits across a config directory and everything already run under it.
+[group('run')]
+reconfigure cfg=dev_config *flags:
+    uv run c10r-evals reconfigure configs/{{ cfg }} {{ flags }}
+
+# Give cells whose attempts all ended in agent failure another attempt.
+[group('run')]
+retry subset='dev' cfg=dev_config *flags:
+    uv run c10r-evals retry {{ subset }} --cfg {{ cfg }} {{ flags }}
+
 # Import unrecorded trials from both arms.
 [group('results')]
 ingest cfg=dev_config:
     uv run c10r-evals import configs/{{ cfg }}/baseline configs/{{ cfg }}/treatment
 
-# Write the paired analysis report.
+model_name := env('EVAL_MODEL_NAME', 'unknown-model')
+
+# Model served by the endpoint, as a single path component.
+model_slug := replace(model_name, '/', '-')
+
+# Write the paired analysis report, one directory per model.
 [group('results')]
-analyze criteria prompt=instructions out='report.md':
+analyze criteria prompt=instructions out=('docs/reports/' + model_slug):
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{ out }}/images"
     uv run c10r-evals analyze \
         --criteria {{ criteria }} \
         --split-manifest tasks/split-manifest.json \
         --instruction-version {{ prompt }} \
-        --out {{ out }}
+        --model "{{ model_name }}" \
+        --out "{{ out }}/report.md" \
+        --plots-dir "{{ out }}/images"
 
 # Serve the experiment store for browsing; ingest and analysis access it directly.
 [group('results')]

@@ -117,6 +117,46 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true", help="Print the Pier invocations without running them.")
     run.set_defaults(func=_cmd_run)
 
+    reconfigure = subparsers.add_parser(
+        "reconfigure",
+        help="Set the agent's limits across a config directory, its sweep metadata, and every trial "
+        "already recorded under it, so one directory reports one set of limits. Only the arm configs "
+        "affect a later run; the previous values are kept in the directory's reconfigure log.",
+    )
+    reconfigure.add_argument("config_dir", type=Path, help="Config directory, e.g. configs/frozen.")
+    reconfigure.add_argument("--agent-timeout-sec", type=float, default=None, help="Wall-clock seconds per episode.")
+    reconfigure.add_argument("--max-turns", type=int, default=None, help="Agent turn cap.")
+    reconfigure.add_argument(
+        "--max-budget-usd", type=float, default=None, help="Spend cap per episode; 0 removes the limit."
+    )
+    reconfigure.add_argument("--max-output-tokens", type=int, default=None, help="Ceiling on one model response.")
+    reconfigure.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="Trials Pier runs at once within an arm. Fewer leaves more of the endpoint's batch "
+        "capacity per request, which is the other lever on episodes that run out of time.",
+    )
+    reconfigure.add_argument("--dry-run", action="store_true", help="Report what would change without writing.")
+    reconfigure.set_defaults(func=_cmd_reconfigure)
+
+    retry = subparsers.add_parser(
+        "retry",
+        help="Run one more attempt for every cell whose scorable attempts were all agent failures. "
+        "For use after raising a limit the agent was exhausting; it takes those cells past the "
+        "pre-registered attempt count, and the earlier attempt is kept.",
+    )
+    retry.add_argument("subset", choices=("dev", "frozen"), help="Which subset the named config must run.")
+    retry.add_argument("--cfg", required=True, help="Config directory under configs/, e.g. frozen.")
+    retry.add_argument(
+        "--block-size",
+        type=int,
+        default=DEFAULT_BLOCK_SIZE,
+        help="Instances per alternating block, as for `run`.",
+    )
+    retry.add_argument("--dry-run", action="store_true", help="Print the Pier invocations without running them.")
+    retry.set_defaults(func=_cmd_retry)
+
     build_manifest = subparsers.add_parser(
         "build-manifest",
         help="Merge per-instance image build records into the index build manifest, which records each "
@@ -308,9 +348,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         check_attempts,
         check_credentials,
         check_subset,
-        execute,
         plan,
-        render_plan,
     )
 
     config_dir = Path("configs") / args.cfg
@@ -339,10 +377,111 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         return 0
 
-    print(render_plan(groups))
-    if args.dry_run:
+    return _dispatch(args, groups)
+
+
+def _cmd_retry(args: argparse.Namespace) -> int:
+    from c10r_evals.resume import ArmConfigError
+    from c10r_evals.run import RunRefused, arm_config, check_credentials, check_subset, plan_retry
+
+    config_dir = Path("configs") / args.cfg
+    try:
+        if not args.dry_run:
+            check_credentials()
+        for arm in ARMS:
+            check_subset(arm_config(config_dir, arm), args.subset)
+        groups = plan_retry(config_dir, ARMS, block_size=args.block_size)
+    except (RunRefused, ArmConfigError) as exc:
+        print(f"c10r-evals retry: {exc}", file=sys.stderr)
+        return 2
+
+    if not groups:
+        print(
+            f"nothing to retry: every cell in {config_dir} that holds a scorable attempt has a "
+            "graded one. Agent failures are only retried where no attempt reached a grade.",
+            file=sys.stderr,
+        )
         return 0
-    return execute(groups)
+    return _dispatch(args, groups)
+
+
+def _cmd_reconfigure(args: argparse.Namespace) -> int:
+    from dataclasses import fields
+
+    from c10r_evals.reconfigure import LOG_NAME, Limits, ReconfigureError, reconfigure
+
+    try:
+        limits = Limits(
+            agent_timeout_sec=args.agent_timeout_sec,
+            max_turns=args.max_turns,
+            max_budget_usd=args.max_budget_usd,
+            max_output_tokens=args.max_output_tokens,
+            concurrency=args.concurrency,
+        )
+        rewrite = reconfigure(args.config_dir, limits, dry_run=args.dry_run)
+    except (ReconfigureError, OSError, ValueError) as exc:
+        print(f"c10r-evals reconfigure: {exc}", file=sys.stderr)
+        return 2
+
+    verb = "would rewrite" if args.dry_run else "rewrote"
+    print(
+        f"{verb} {rewrite.files} file(s): {rewrite.arm_configs} arm config(s), "
+        f"{rewrite.sweep_metas} sweep metadata file(s), {rewrite.trial_configs} recorded trial(s)",
+        file=sys.stderr,
+    )
+    for f in fields(limits):
+        value = getattr(limits, f.name)
+        if value is not None:
+            print(f"  {f.name} {sorted(rewrite.previous[f.name])} -> {value}", file=sys.stderr)
+    if not args.dry_run:
+        print(f"  previous values recorded in {args.config_dir / LOG_NAME}", file=sys.stderr)
+    log_fields(
+        logger,
+        logging.INFO,
+        "reconfigured",
+        config_dir=str(args.config_dir),
+        files=rewrite.files,
+        trial_configs=rewrite.trial_configs,
+        dry_run=args.dry_run,
+        **{f.name: getattr(limits, f.name) for f in fields(limits) if getattr(limits, f.name) is not None},
+    )
+    return 0
+
+
+def _dispatch(args: argparse.Namespace, groups: list) -> int:
+    """Print the plan for a dry run, otherwise persist it and hand the groups to Pier."""
+    from c10r_evals.probe import probe_endpoint
+    from c10r_evals.run import arm_config, execute, plan_totals, render_plan
+
+    rendered = render_plan(groups)
+    if args.dry_run:
+        print(rendered)
+        return 0
+    # Echoing tens of invocations would scroll the progress line away before the first trial runs.
+    written = _write_plan(None if args.log_file is None else args.log_file.with_suffix(".plan.txt"), rendered)
+    if written is None:
+        print(rendered)
+    else:
+        print(f"{len(groups)} pier invocation(s) planned, written to {written}", file=sys.stderr)
+    totals = plan_totals(groups)
+    arms = ", ".join(f"{count} {arm} instance(s)" for arm, count in sorted(totals.instances_by_arm.items()))
+    print(f"{totals.episodes} episode(s) planned over {arms}", file=sys.stderr)
+    config_dir = Path("configs") / args.cfg
+    token = os.environ["EVAL_PROXY_TOKEN"]  # check_credentials has refused a run without it
+    return execute(groups, probe=lambda group: probe_endpoint(arm_config(config_dir, group.arm), token))
+
+
+def _write_plan(plan_file: Path | None, plan: str) -> Path | None:
+    """The file the plan was written to, or None when it has to go to the terminal instead."""
+    if plan_file is None:
+        return None
+    try:
+        plan_file.write_text(plan + "\n")
+    # A sweep that can otherwise run is not refused over its plan file.
+    except OSError as exc:
+        log_fields(logger, logging.WARNING, "plan_file_unwritable", path=str(plan_file), error=str(exc))
+        return None
+    return plan_file
 
 
 def _cmd_build_manifest(args: argparse.Namespace) -> int:
@@ -487,7 +626,9 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    setup_process(args.command)
+    args.log_file = setup_process(args.command)
+    if args.log_file is not None:
+        print(f"logging to {args.log_file}", file=sys.stderr)
     return args.func(args)
 
 

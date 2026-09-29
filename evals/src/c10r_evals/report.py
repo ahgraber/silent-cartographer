@@ -1,6 +1,7 @@
 """Markdown report rendering for a completed paired analysis."""
 
 from c10r_evals.analysis import CACHE_SIGNAL_NEAR_ZERO_SHARE, CACHE_SIGNAL_TURN_THRESHOLD, PairedAnalysis
+from c10r_evals.criteria import Criteria
 from c10r_evals.telemetry import AGENT_FAILURE, COMPLETED, INFRA_FAILURE
 
 FIGURE_TITLES = {
@@ -9,6 +10,41 @@ FIGURE_TITLES = {
     "token-summaries": "Comparative token summaries",
     "turn-size": "Turn count and average turn size",
 }
+
+
+def figure_captions(criteria: Criteria) -> dict[str, str]:
+    """How to read each figure, with the boundaries it draws named from the criteria."""
+    boundary = criteria.accuracy_reference_boundary
+    ratio_boundary = 1.0 + criteria.token_use_reference_boundary
+    return {
+        "paired-accuracy": (
+            f"Left: the paired hit-rate difference lambda, treatment minus baseline, as a point with its "
+            f"two-sided 95% interval. The dashed line is no difference; the shaded band is the reference "
+            f"boundary, plus or minus {boundary}. An interval wider than the band supports no claim in "
+            f"either direction. Right: how many pairs fall in each of the four outcomes. Only the "
+            f"discordant pairs, where one arm hit and the other missed, move lambda; the pairs where both "
+            f"arms agree contribute nothing to it."
+        ),
+        "token-ratio-distribution": (
+            f"One paired ratio per instance, treatment tokens divided by baseline tokens, on a log x axis. "
+            f"The dashed line at 1.00 is equal spend and the dotted line at {ratio_boundary:.2f} is the "
+            f"reference boundary; a point to the right of 1.00 is an instance where treatment spent more. "
+            f"Below the histogram, the box spans the interquartile range with the median in blue, and the "
+            f"red point with its bar is the geometric mean with its 95% bootstrap interval."
+        ),
+        "token-summaries": (
+            "Per-arm spread of total tokens and of average tokens per turn, both on a log y axis. Each faint "
+            "line joins the two arms of one instance, so a line sloping up is an instance where treatment "
+            "spent more. The box spans the interquartile range."
+        ),
+        "turn-size": (
+            "Each point is one trial, placed by how many turns it used and how large its average turn was, "
+            "with colour and shape marking whether it hit a gold file. The dotted curves are constant total "
+            "tokens, so a trial moving along one curve traded turns against turn size at equal spend, and a "
+            "trial on a higher curve spent more."
+        ),
+    }
+
 
 CAVEATS = """\
 - **Historical-fix file recovery, not localization correctness.** Accuracy grades recovery of the
@@ -327,14 +363,17 @@ def _default_plot_links() -> dict[str, str]:
     return dict(PLOT_FILENAMES)
 
 
-def _append_figures(lines: list[str], plot_links: dict[str, str]) -> None:
+def _append_figures(lines: list[str], plot_links: dict[str, str], result: PairedAnalysis) -> None:
     add = lines.append
+    captions = figure_captions(result.criteria)
     add("## Figures")
     add("")
     for name, title in FIGURE_TITLES.items():
         add(f"### {title}")
         add("")
         add(f"![{title}]({plot_links[name]})")
+        add("")
+        add(captions[name])
         add("")
 
 
@@ -377,7 +416,7 @@ def render_report(result: PairedAnalysis, plot_links: dict[str, str] | None = No
     _append_supporting_measures(lines, result)
     _append_task_level_analyses(lines, result)
     _append_financial_cost(lines, result)
-    _append_figures(lines, plot_links or _default_plot_links())
+    _append_figures(lines, plot_links or _default_plot_links(), result)
     _append_registered_claims(lines, result)
     _append_output_notes(lines, result)
     return "\n".join(lines)
