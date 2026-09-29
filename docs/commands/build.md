@@ -48,5 +48,5 @@ Changing either re-derives every vector on the next build.
 
 ## See also
 
-- [`hooks`](hooks.md) — rebuild automatically after every commit
+- [`hooks`](hooks.md) — refresh the index automatically when git changes the checked-out commit
 - [`doctor`](doctor.md) — check that the language indexers are installed before building

@@ -77,7 +77,7 @@ cd your-project
 c10r doctor
 # index the workspace into .c10r/index.db
 c10r build
-# rebuild the index after every commit
+# refresh the index after commits, rebases, checkouts, and merges
 c10r hooks install
 ```
 
@@ -118,7 +118,7 @@ Agents should start with `c10r manifest`, which prints the whole command surface
 | [`status`](docs/commands/status.md)           | What does the index know, and how well did indexing align?                                                      |
 | [`doctor`](docs/commands/doctor.md)           | Are the language indexers installed and responsive?                                                             |
 | [`cache`](docs/commands/cache.md)             | Where is the stored index, how much disk does it use, and remove it.                                            |
-| [`hooks`](docs/commands/hooks.md)             | Install the post-commit hook that rebuilds the index.                                                           |
+| [`hooks`](docs/commands/hooks.md)             | Install the repository hooks that keep the index tracking the checked-out commit.                               |
 | [`manifest`](docs/commands/manifest.md)       | Print the machine-readable command surface and index state.                                                     |
 | [`completions`](docs/commands/completions.md) | Print a shell completion script.                                                                                |
 
@@ -224,7 +224,7 @@ If the client offers no way to ask, the operation is refused and the refusal nam
 
 The MCP tools are blocking and sequential.
 A `build` that finds the index already current returns immediately.
-A `build` that must analyze a large repository can outlast a client's request timeout; run `c10r build` in a shell and install the commit hook so manual rebuilds stay rare.
+A `build` that must analyze a large repository can outlast a client's request timeout; run `c10r build` in a shell and install the refresh hooks so manual rebuilds stay rare.
 
 ## Embedded model credit
 

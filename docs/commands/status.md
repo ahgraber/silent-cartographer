@@ -28,6 +28,28 @@ Join-alignment counts: how much of the syntactic structure was matched to resolv
 
 The chunk parameters the build ran with.
 
+## Output
+
+Without `--json`, `status` prints one labeled line per fact, projected from the same report `--json` emits.
+
+```text
+workspace: my-repo
+analyzer: rust-analyzer 1.85.0
+freshness: stale_content
+refresh: c10r build '/work/my-repo' --db='/work/my-repo/.c10r/index.db' --workspace='my-repo' --language=rust
+aligned: exact=120 total=120
+text_mismatch: 0
+semantic_only: 3
+duplicate_ambiguous: 0
+syntax_only: 1
+duplicated descriptor groups: 0
+semantic index: <model> corpus definition 2 chunk size 512 overlap 64
+```
+
+When the index is stale, `--json` carries the same command in a `refresh` field, and the human output shows it on a `refresh:` line.
+A fresh index has neither.
+Running the command brings the index back to fresh.
+
 ## See also
 
 - [`build`](build.md) — refresh the index these counts describe

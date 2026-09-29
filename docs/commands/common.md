@@ -51,6 +51,41 @@ Its default also differs per command.
 
 Provenance, freshness, typed absence, and heuristic labels work the same way for every command; see [reading an answer](../../README.md#reading-an-answer).
 
+## The `refresh` field
+
+Every stale answer carries a `refresh` field: a runnable command that rebuilds the index the answer came from.
+A fresh answer carries no `refresh` field at all, rather than an empty one.
+
+In the human rendering, the command appears on its own `refresh:` line directly under the header line that marks the answer stale:
+
+```text
+scip-python 0.6.6 · stale (content changed)
+refresh: c10r build '/path/to/project' --db='/path/to/project/.c10r/index.db' --workspace='project' --language=python
+```
+
+Under `--json`, the same text is the `refresh` field:
+
+```json
+{
+  "freshness": "stale_content",
+  "stale": true,
+  "refresh": "c10r build '/path/to/project' --db='/path/to/project/.c10r/index.db' --workspace='project' --language=python"
+}
+```
+
+The command is `c10r build`, given the workspace root, `--db`, `--workspace`, and `--language` recorded for the index.
+`--db` is absolute, so the command runs from any directory.
+`--language` names the recorded backend, so a workspace with both a `Cargo.toml` and a `pyproject.toml` rebuilds the same backend.
+It adds `--environment` when the query resolved one for the interpreter environment in effect, and `--chunk-size`/`--chunk-overlap` when the index was built with values other than the defaults, so a rebuild does not change the semantic-index identity.
+Running it makes the same query answer fresh again, as long as the sources, analyzer, and environment stay as they were when the command was built.
+
+When the index does not record a workspace root, the field cannot name one to build from.
+It is then a shell comment instead of a runnable command, so pasting it into a shell runs nothing:
+
+```text
+# workspace root not recorded; run from the workspace root: c10r build . --db='/path/to/project/.c10r/index.db' --workspace='project' --language=python
+```
+
 ## The index store
 
 Every store is stamped at creation, and every command checks that stamp before touching the file.
