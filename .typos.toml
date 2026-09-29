@@ -9,6 +9,8 @@ extend-exclude = [
   "*.csv",
   "*.git*",
   "*.sops.yaml",
+  # Generated eval reports quote trial identifiers the runner truncates mid-word.
+  "evals/docs/reports/**",
 ]
 ignore-hidden = true   # ignore hidden files/dirs
 ignore-files = true     # respect ignore files
