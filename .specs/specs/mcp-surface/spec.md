@@ -242,15 +242,15 @@ An unacknowledged invocation SHALL leave every store, file, and repository it wo
 
 #### Scenario: An unacknowledged hook installation writes nothing
 
-- **GIVEN** a git worktree with no commit hook at the target path
+- **GIVEN** a git worktree with no refresh hooks installed
 - **WHEN** the hook-installation tool is invoked without its acknowledgment parameter set
 - **THEN** no file is written and the refusal states what the operation would write and how to proceed
 
 #### Scenario: An acknowledged hook installation proceeds
 
-- **GIVEN** a git worktree with no commit hook at the target path
+- **GIVEN** a git worktree with no refresh hooks installed
 - **WHEN** the hook-installation tool is invoked with its acknowledgment parameter set
-- **THEN** the hook is installed and the tool returns the command's answer
+- **THEN** the refresh hooks are installed and the tool returns the command's answer
 
 ### Requirement: A lifecycle operation proceeds only on confirmed consent
 
