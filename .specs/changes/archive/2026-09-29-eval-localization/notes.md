@@ -37,6 +37,12 @@
   No foreign-workspace warning: the index is built and served at `/repo`.
 - Faker built in-container post-memory-fix (the same instance that OOM'd pre-fix).
 
+## Treatment provisioning evidence, frozen run (2026-09-29)
+
+- Offline query check against a frozen-run treatment image: `docker run --rm --network none c10r-eval-treatment-aider-ai__aider-3806 sh -c 'c10r status && c10r find Coder'`.
+- `status` reports `"freshness": "fresh"`, `"stale": false`, provenance `scip-python 0.6.6`, and a semantic index with model identity `minishlab/potion-code-16M-v2@e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b`, served at workspace `repo`.
+- `find Coder` returns 25 of 42 results with a resume cursor, including `aider.coders.base_coder::Coder` at `aider/coders/base_coder.py`.
+
 ## Runner-compatible task format evidence (2026-08-25)
 
 - Command: `uv run pier run -p tasks/dev/baseline -i 'jazzband__tablib-613' --agent nop --env docker`.

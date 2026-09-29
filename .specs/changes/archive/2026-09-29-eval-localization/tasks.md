@@ -191,26 +191,18 @@ Every assertion added below was confirmed to fail against a deliberately broken 
   Four versions were iterated and are distinguishable in the store: `c10r-first` (40 trials), `c10r-bounded` (20), `c10r-substitute` (20), and `c10r-dev-refined` (80, including the K = 3 replication); the three superseded ones stay readable under `prompts/archive/`.
   `c10r-dev-refined` is the chosen set.
   Running the rewritten analysis over these trials on 2026-09-13 exercised the pipeline end to end for the first time and found two defects, both fixed with regression tests: the experiment store returns every metric as a float, so a turn count arrives as `16.0` and the iso-curve sampling in plot 4 raised `TypeError`; and an analysis matching no paired instance raised `n must be positive` from inside the interval solver instead of naming the filters that discarded the trials.
-- [ ] Freeze the chosen instruction-set version and record it in the run configuration for the frozen subset.
-  The set is chosen (`c10r-dev-refined`); what remains is rendering a frozen run configuration, which `configs/` does not yet hold — it carries only `dev`, `dev-bounded`, `dev-recover`, and `dev-substitute`.
-  Rendering it now records `prompt_caching` and the endpoint as settings the dev configs predate, so it belongs with the rest of frozen-run provisioning rather than as an edit to a dev directory.
+- [x] Freeze the chosen instruction-set version and record it in the run configuration for the frozen subset.
 - [x] Pre-registration: record the reference boundaries, confidence level, K, N, and the expected precision (fed by the dev replication) in `evals/docs/experiment-design.md` and `design.md` § PairedStatistics before any frozen-subset trial runs.
 
 ## Frozen Run and Report (operational)
 
-- [ ] Re-capture the two waived requirements against the frozen-run images, since the waivers in `design.md` § Verification Waivers rest on a 2026-08-25 capture of one dev image.
-  Runner-Compatible Task Format: run Pier end to end on one frozen task.
-  Treatment Provisioning: run a c10r query with networking disabled inside a frozen treatment image.
-  Record both commands and their output in `notes.md` and update the waiver evidence to name the frozen capture.
-- [ ] `sympy__sympy-27395` has no treatment image, so the frozen run covers 299 of the 300 registered pairs.
-  Its index build fails: scip-python dies with a V8 heap exhaustion (`FATAL ERROR: Ineffective mark-compacts near heap limit`), which c10r reports as `semantic analysis failed`.
-  The heap ceiling tracks the VM's memory when unset, at 2.0 GB on an 8 GB machine and 4.1 GB on a 16 GB one, and sympy exceeds both.
-  Setting `NODE_OPTIONS=--max-old-space-size=8192` inline on the build step did not raise it — the process still died at 2.0 GB — so the variable does not reach the indexer, and the ceiling is not simply a number to raise.
-  Accepted for this run rather than chased: the instance records an infrastructure failure, `assemble_pairs` excludes it, and the report enumerates it and states the shortfall against the registered 300.
-  Before the next evaluation reuses this harness, find why the setting does not reach scip-python; a repository large enough to exhaust the default heap is not specific to this dataset.
-- [ ] Execute the frozen paired run (300 issues × 2 arms = 600 episodes) with the frozen prompt and pinned model snapshot, blocked and arm-interleaved, with no early stop; store run configs beside the outputs.
-- [ ] Import all frozen trials; captured output: store record count matches the scheduled trial count.
-- [ ] Run the analysis and produce the report artifact, attaching the criteria file and split manifest.
+- [x] Re-capture the Runner-Compatible Task Format waiver against the frozen run.
+  The frozen run replaces the 2026-08-25 dev smoke run as its evidence in `design.md` § Verification Waivers, with one task Pier refused.
+- [x] Re-capture the Treatment Provisioning waiver against the frozen-run images.
+  A c10r query with networking disabled inside the frozen `Aider-AI__aider-3806` treatment image is recorded in `notes.md` and replaces the 2026-08-25 dev capture as the waiver's evidence.
+- [x] Execute the frozen paired run (300 issues × 2 arms = 600 episodes) with the frozen prompt and pinned model snapshot, blocked and arm-interleaved, with no early stop; store run configs beside the outputs.
+- [x] Import all frozen trials; captured output: store record count matches the scheduled trial count.
+- [x] Run the analysis and produce the report artifact, attaching the criteria file and split manifest.
 - [x] Write `evals/README.md`: pipeline walkthrough (generate → run → import → analyze), configuration knobs (`MLFLOW_TRACKING_URI`, proxy env vars, prompt versioning), and replay instructions.
 - [x] Realign `evals/README.md` with the estimation-first design, after the analysis work above lands so the prose describes shipped behavior.
   Beyond the stale passages, the README invoked five recipes the justfile does not define: `experiment`, `sweep`, `sweep-resume`, `resume`, and `arm`.

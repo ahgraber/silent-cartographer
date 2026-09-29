@@ -321,14 +321,37 @@ That provenance is recorded here so a later reader does not mistake them for con
 - **Requirement:** Runner-Compatible Task Format **Reason:** the contract is that the selected runner accepts a generated task without task-specific runner modifications.
   Demonstrating it requires Pier, a Docker daemon, and an image build.
   The suite has none of these, and adding them would make every test run depend on a container runtime.
-  **Manual evidence:** `.specs/changes/eval-localization/notes.md`, "Pier end-to-end smoke (2026-08-25)" — command `uv run pier run -p tasks/dev/baseline -i 'jazzband__tablib-613' --agent nop --env docker`; result 1 trial, 0 exceptions, 17 s, with Pier building the environment, running the agent, executing `tests/test.sh` as verifier, and parsing the reward.
-  **Recorded:** 2026-09-13
+  **Evidence:** the frozen run with `poolside/Laguna-S-2.1-NVFP4`, whose trial records are under `evals/configs/frozen/baseline/jobs/` and `evals/configs/frozen/treatment/jobs/` and whose report is `evals/docs/reports/poolside-Laguna-S-2.1-NVFP4/report.md`.
+  Pier ran 299 of the 300 generated frozen tasks in each arm with no task-specific runner changes.
+  **Exception:** Pier refused `qubvel-org__segmentation_models.pytorch-1108` in both arms before the agent started, with `invalid tag "qubvel-org__segmentation_models-__aucgf5w-main": invalid reference format`.
+  Pier derives the Docker image name from the trial name, and for this instance ID the derived name puts a hyphen next to a double underscore, which Docker's name format forbids.
+  The failure depends only on the instance ID, so it recurs on every run; this change does not fix it.
+  The first evidence for this waiver was a 2026-08-25 smoke run of one dev task, recorded in `notes.md`.
+  **Recorded:** 2026-09-13; evidence replaced with the frozen run on 2026-09-29
 
 - **Requirement:** Treatment Provisioning **Reason:** the contract is that c10r is executable and answers queries against a pre-built index with no network access.
   Only a built treatment image can show this.
   The in-suite test asserts the injected Dockerfile lines, which is a weaker claim than the requirement makes.
-  **Manual evidence:** `.specs/changes/eval-localization/notes.md`, "Treatment provisioning evidence (2026-08-25)" — command `docker run --rm --network none c10r-eval-treatment-jazzband__tablib-613 sh -c 'c10r status && c10r find Dataset'`; `status` reported a fresh index with pinned model identity, and `find Dataset` returned results with a resume cursor.
-  **Scope limit:** the capture covered one image out of 17 built from 20 dev instances, and it predates later c10r changes.
-  It is evidence that provisioning worked at that revision, not that every frozen-run image will.
-  The re-capture at frozen-run provisioning is tracked as an unchecked task in `tasks.md`.
-  **Recorded:** 2026-09-13
+  **Manual evidence:** `.specs/changes/eval-localization/notes.md`, "Treatment provisioning evidence, frozen run (2026-09-29)" — command `docker run --rm --network none c10r-eval-treatment-aider-ai__aider-3806 sh -c 'c10r status && c10r find Coder'`; `status` reported a fresh index with pinned model identity, and `find Coder` returned results with a resume cursor.
+  **Scope limit:** the capture covers one frozen-run treatment image.
+  It is evidence that provisioning worked for the images the frozen run used, not a check of every image.
+  The first capture, of one dev image on 2026-08-25, is also recorded in `notes.md`.
+  **Note:** `sympy__sympy-27395` has no treatment image, so the frozen run covers 299 of the 300 registered pairs.
+  Its index build fails: scip-python dies with a V8 heap exhaustion (`FATAL ERROR: Ineffective mark-compacts near heap limit`), which c10r reports as `semantic analysis failed`.
+  The heap ceiling tracks the VM's memory when unset, at 2.0 GB on an 8 GB machine and 4.1 GB on a 16 GB one, and sympy exceeds both.
+  Setting `NODE_OPTIONS=--max-old-space-size=8192` inline on the build step did not raise it — the process still died at 2.0 GB — so the variable does not reach the indexer, and the ceiling is not simply a number to raise.
+  Accepted for this run rather than chased: the instance records an infrastructure failure, `assemble_pairs` excludes it, and the report enumerates it and states the shortfall against the registered 300.
+  Before the next evaluation reuses this harness, find why the setting does not reach scip-python; a repository large enough to exhaust the default heap is not specific to this dataset.
+  **Recorded:** 2026-09-13; evidence replaced with the frozen-run capture on 2026-09-29
+
+## Verification Overrides
+
+- **Finding:** CRITICAL — the frozen run with `poolside/Laguna-S-2.1-NVFP4` departs from § FailureStatePolicy and the registered one attempt per cell.
+  On 2026-09-19 `reconfigure` raised the agent timeout from 3600 s to 5400 s, the turn cap from 80 to 120, and lowered concurrency from 3 to 2, rewriting the limits in all 600 recorded trial configs; the previous values are in `evals/configs/frozen/reconfigure-log.json`.
+  `retry` then ran a second attempt for 39 baseline and 58 treatment cells whose first attempt was an agent failure, and the analysis scores the latest attempt, so 22 baseline and 33 treatment misses became graded answers.
+  The report states one attempt per cell.
+  Neither `retry` nor `reconfigure` is covered by a requirement or a design decision.
+  **Stage:** verify **Reason:** the user judged the finding not to warrant remediation.
+  **Constraints:** none recorded.
+  **Follow-up task:** none; the user chose not to remediate.
+  **Approved by:** user **Recorded:** 2026-09-29

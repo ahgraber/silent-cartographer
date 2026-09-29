@@ -1,14 +1,17 @@
-# Delta for eval-telemetry
+# Eval Telemetry Specification
 
-## ADDED Requirements
+## Purpose
+
+Defines how trial outputs become records in the experiment store.
+The contract covers one complete record per trial that recorded an outcome, idempotent import, token category capture, invocation counts, and comparability across runs.
+
+## Requirements
 
 ### Requirement: Complete Trial Capture
 
 For every scheduled trial that recorded an outcome, the experiment store SHALL contain exactly one record carrying the trial's identity (dataset revision, instance, arm, agent, model, attempt, platform, and — for treatment trials — instruction-set version), the pre-run task characteristics recorded with its task, its terminal state, its cost totals, its reward scores, its invocation counts, and its raw trajectory and reward artifacts where they exist.
 
 A trial killed before it recorded an outcome SHALL NOT be imported, because its instance is not recoverable from its outputs; such a trial SHALL be reported as pending so it can be run again.
-
-Serves: comparable-telemetry, evidence-of-utility
 
 #### Scenario: Graded treatment trial captured
 
@@ -40,6 +43,18 @@ Serves: comparable-telemetry, evidence-of-utility
 - **WHEN** import runs
 - **THEN** one record exists carrying the infrastructure-failure terminal state and no reward scores
 
+#### Scenario: Endpoint failure during an episode captured as infrastructure failure
+
+- **GIVEN** a scheduled trial that consumed tokens and then ended because the model endpoint refused or stopped answering
+- **WHEN** import runs
+- **THEN** one record exists carrying the infrastructure-failure terminal state and no reward scores
+
+#### Scenario: Output ceiling captured as agent failure
+
+- **GIVEN** a scheduled trial that ended because one agent response exceeded the configured output ceiling
+- **WHEN** import runs
+- **THEN** one record exists carrying the agent-failure terminal state
+
 #### Scenario: Trial killed before recording an outcome reported as pending
 
 - **GIVEN** a scheduled trial whose run was interrupted before it wrote its outcome
@@ -49,8 +64,6 @@ Serves: comparable-telemetry, evidence-of-utility
 ### Requirement: Idempotent Import
 
 Importing a trial that is already recorded SHALL NOT create a second record or alter the existing record's identity; an import interrupted partway and re-run SHALL converge to the same store state as a single complete import; importing outputs whose trial identity matches an existing record but whose artifact content differs SHALL fail with an explicit error and SHALL NOT alter the existing record.
-
-Serves: comparable-telemetry
 
 #### Scenario: Novel trial imported once
 
@@ -80,8 +93,6 @@ Serves: comparable-telemetry
 
 For every trial, the experiment store SHALL record each token category the trial's trajectory reports, and SHALL record the model, provider, harness, and caching configuration the trial ran under; a token category the trajectory does not report SHALL be absent from the record rather than recorded as zero.
 
-Serves: comparable-telemetry, evidence-of-utility
-
 #### Scenario: Reported categories recorded
 
 - **GIVEN** a trial whose trajectory reports input, cached-input, output, and reasoning token counts
@@ -97,8 +108,6 @@ Serves: comparable-telemetry, evidence-of-utility
 ### Requirement: Invocation Count Fidelity
 
 For every trial, the recorded uptake count SHALL equal the number of c10r invocations observable in that trial's trajectory, and the recorded search count SHALL equal the number of search-tool invocations (grep, glob, and equivalent search commands) observable in the same trajectory.
-
-Serves: instruction-set, comparable-telemetry, evidence-of-utility
 
 #### Scenario: Trajectory with invocations
 
@@ -121,8 +130,6 @@ Serves: instruction-set, comparable-telemetry, evidence-of-utility
 ### Requirement: Cross-Run Comparability
 
 Recorded trials SHALL be selectable by instance, arm, and instruction-set version, and their pre-run task characteristics SHALL be readable, without reading raw trajectories.
-
-Serves: comparable-telemetry, reusable-runway
 
 #### Scenario: Selection by arm and version
 
