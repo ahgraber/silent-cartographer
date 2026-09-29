@@ -1,14 +1,20 @@
-//! Operational-command contract tests: `doctor`'s indexer readiness report and `cache clear`'s index
-//! reset.
+//! Operational-command contract tests: `doctor`'s indexer readiness report, `doctor`'s refresh-hook
+//! status report, and `cache clear`'s index reset.
 //!
 //! These drive the built `c10r` binary through `std::process::Command` so the process-level contract
 //! (exit codes, stdout/stderr separation) is observed as a caller would. `doctor` probes tools by
 //! name on `PATH`, so its tests control `PATH` for the spawned process rather than depending on
-//! whichever indexers happen to be installed on the host running the suite.
+//! whichever indexers happen to be installed on the host running the suite. The hook-status tests
+//! isolate the git invocations they use to set up a throwaway repository from the developer's own git
+//! config, the same way `tests/hooks.rs` does; git itself must still be reachable on `PATH` for
+//! `doctor`'s own probing of the repository, so those tests prepend their indexer-stub directory to
+//! the inherited `PATH` rather than replacing it outright.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+use silent_cartographer::hooks::{HookEvent, WorkspaceLine, render};
 
 /// The generous window a hanging probe must complete within: the production 10s deadline plus ample
 /// slack, kept well under a minute so a genuine hang fails loudly rather than stalling the suite.
@@ -60,8 +66,10 @@ fn doctor_reports_present_indexers_with_version_and_exits_success() {
     );
     assert!(out.stderr.is_empty(), "no diagnostic when every indexer is present");
 
-    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
-    let statuses = statuses.as_array().expect("the report is a list of indexer statuses");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let statuses = report["indexers"]
+        .as_array()
+        .expect("the report's indexers field is a list of indexer statuses");
     assert_eq!(statuses.len(), 2, "both required indexers are reported");
     for status in statuses {
         assert_eq!(status["presence"], "present", "reported present: {status}");
@@ -96,8 +104,10 @@ fn doctor_reports_absent_indexers_with_hint_and_exits_setup_failure() {
         "a missing required indexer is the indexer/setup-failure code"
     );
     // The report still lands on standard output even though the process exits with a failure code.
-    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
-    let statuses = statuses.as_array().expect("the report is a list of indexer statuses");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let statuses = report["indexers"]
+        .as_array()
+        .expect("the report's indexers field is a list of indexer statuses");
     assert_eq!(statuses.len(), 2, "both required indexers are reported");
     for status in statuses {
         assert_eq!(status["presence"], "absent", "reported absent: {status}");
@@ -179,8 +189,8 @@ fn doctor_sanitizes_a_hostile_version_string_in_the_human_report_but_not_json() 
         .output()
         .unwrap();
     assert_eq!(json.status.code(), Some(0));
-    let statuses: serde_json::Value = serde_json::from_slice(&json.stdout).expect("the --json report parses");
-    let rust_analyzer = statuses
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).expect("the --json report parses");
+    let rust_analyzer = report["indexers"]
         .as_array()
         .unwrap()
         .iter()
@@ -265,8 +275,8 @@ fn doctor_reports_a_hanging_indexer_unresponsive_within_a_bounded_time() {
         "an unresponsive required indexer is the indexer/setup-failure code; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
-    let rust = statuses
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let rust = report["indexers"]
         .as_array()
         .unwrap()
         .iter()
@@ -330,8 +340,8 @@ fn doctor_reports_a_hanging_scip_python_unresponsive_within_a_bounded_time() {
         "an unresponsive required indexer is the indexer/setup-failure code; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
-    let scip = statuses
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let scip = report["indexers"]
         .as_array()
         .unwrap()
         .iter()
@@ -376,8 +386,8 @@ fn doctor_survives_a_descendant_holding_the_probe_pipe_open() {
         Some(5),
         "an unresponsive indexer is the setup-failure code"
     );
-    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
-    let rust = statuses
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let rust = report["indexers"]
         .as_array()
         .unwrap()
         .iter()
@@ -412,8 +422,8 @@ fn doctor_handles_an_indexer_that_floods_its_version_output() {
         "a flooding-but-exiting indexer is present, not a failure; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
-    let rust = statuses
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let rust = report["indexers"]
         .as_array()
         .unwrap()
         .iter()
@@ -427,6 +437,722 @@ fn doctor_handles_an_indexer_that_floods_its_version_output() {
         rust["version"].as_str().is_some_and(|v| v.contains("9.9.9-stub")),
         "the version line survives the cap: {rust}"
     );
+}
+
+// _(Refresh-hook status report)_ — `doctor` reports each refresh event's hook status for the git
+// worktree it runs in: installed, present with activation unverified, or not installed with a fix,
+// plus whether the present hook files disagree on the installed workspaces. Most of these tests write
+// the hooks directory's fixture files directly (the same way `src/hooks.rs`'s own unit tests do)
+// rather than through `hooks install`, since the states under test — a disagreement, a hook another
+// tool removed, a kept hook a later write has diverged from — are states installation itself refuses
+// to produce or does not otherwise construct in one step.
+
+/// Isolate a spawned `git` invocation from the developer's own config, matching `tests/hooks.rs`.
+fn isolate_git_config(cmd: &mut Command) -> &mut Command {
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+}
+
+/// A throwaway git repository for one hook-status test, with a root commit so `HEAD` always resolves.
+struct HookStatusRepo {
+    dir: tempfile::TempDir,
+}
+
+impl HookStatusRepo {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = HookStatusRepo { dir };
+        repo.git(&["init", "-q"]);
+        repo.git(&[
+            "-c",
+            "user.email=hook-status-test@example.com",
+            "-c",
+            "user.name=Hook Status Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "root",
+        ]);
+        repo
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn git(&self, args: &[&str]) {
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(self.path());
+        isolate_git_config(&mut cmd);
+        let status = cmd.status().expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The hooks directory `doctor` looks at for this repository: the path `git rev-parse --git-path
+    /// hooks` names under the same git config isolation the `c10r` under test runs with, so a host's
+    /// `core.hooksPath` cannot relocate the fixture files.
+    fn hooks_dir(&self) -> PathBuf {
+        let mut cmd = Command::new("git");
+        cmd.args(["rev-parse", "--git-path", "hooks"]).current_dir(self.path());
+        isolate_git_config(&mut cmd);
+        let output = cmd.output().expect("git runs");
+        assert!(output.status.success(), "git rev-parse --git-path hooks failed");
+        let raw = String::from_utf8(output.stdout).unwrap();
+        self.path().canonicalize().unwrap().join(raw.trim())
+    }
+
+    /// A fresh invocation of the built binary in this repository, with `PATH` set so `git` (needed by
+    /// `doctor`'s own hook-status probing) is still found alongside `bin_dir`, which shadows anything
+    /// of the same name already on `PATH` — the indexer stubs the doctor tests above already use.
+    /// Isolated from the developer's own git config, matching the `git` helper above: `doctor` itself
+    /// invokes git to resolve the hooks directory, and a host's own `core.hooksPath` would otherwise
+    /// point it somewhere other than the repository this test set up.
+    fn c10r(&self, bin_dir: &Path) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_c10r"));
+        cmd.current_dir(self.path()).env("PATH", prepend_to_path(bin_dir));
+        isolate_git_config(&mut cmd);
+        cmd
+    }
+}
+
+/// `PATH` with `bin_dir` prepended to the inherited `PATH`.
+fn prepend_to_path(bin_dir: &Path) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::from(bin_dir);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
+/// A `WorkspaceLine` naming `workspace`, rooted at `repo`.
+fn workspace_line(repo: &HookStatusRepo, workspace: &str) -> WorkspaceLine {
+    let root = repo.path().canonicalize().unwrap();
+    let db = root.join(".c10r/index.db");
+    WorkspaceLine {
+        root,
+        db,
+        workspace: workspace.to_string(),
+    }
+}
+
+/// Write a c10r file for every refresh event in `hooks_dir`, all naming `line`, executable exactly as
+/// `hooks install` leaves it — `doctor` now reports a non-executable c10r file as not installed, since
+/// git would not run it either.
+fn write_installed_hooks(hooks_dir: &Path, line: &WorkspaceLine) {
+    std::fs::create_dir_all(hooks_dir).unwrap();
+    for event in HookEvent::ALL {
+        let path = hooks_dir.join(event.as_str());
+        std::fs::write(&path, render(event, std::slice::from_ref(line))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
+/// The captured prek shim fixture for `event`, the same fixtures `src/hooks.rs` recognizes.
+fn prek_fixture(event: HookEvent) -> &'static str {
+    match event {
+        HookEvent::PostCommit => include_str!("fixtures/prek-shims/0.5.3/post-commit"),
+        HookEvent::PostRewrite => include_str!("fixtures/prek-shims/0.5.3/post-rewrite"),
+        HookEvent::PostCheckout => include_str!("fixtures/prek-shims/0.5.3/post-checkout"),
+        HookEvent::PostMerge => include_str!("fixtures/prek-shims/0.5.3/post-merge"),
+    }
+}
+
+/// This event's entry in a `doctor --json` report's `hooks.events` array.
+fn find_event(events: &[serde_json::Value], event: HookEvent) -> &serde_json::Value {
+    events
+        .iter()
+        .find(|e| e["event"] == event.as_str())
+        .unwrap_or_else(|| panic!("{} is reported: {events:?}", event.as_str()))
+}
+
+// _(Installed hooks are reported)_ — a workspace installed for every refresh event is reported
+// installed with that workspace, for every event.
+#[test]
+fn installed_hooks_are_reported() {
+    let repo = HookStatusRepo::new();
+    let line = workspace_line(&repo, "alpha");
+    write_installed_hooks(&repo.hooks_dir(), &line);
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let hooks = &report["hooks"];
+    assert_eq!(
+        hooks["disagreement"], false,
+        "a single workspace never disagrees: {hooks}"
+    );
+    let events = hooks["events"]
+        .as_array()
+        .expect("hook status applies inside a git worktree");
+    assert_eq!(events.len(), 4, "every refresh event is reported: {hooks}");
+    for event in events {
+        assert_eq!(event["state"], "installed", "{event}");
+        assert_eq!(event["workspaces"], serde_json::json!(["alpha"]), "{event}");
+    }
+}
+
+// _(A non-executable hook is not reported installed)_ — git skips a hook file that is not executable,
+// so a c10r file that lost its executable bit must not be reported installed either.
+#[cfg(unix)]
+#[test]
+fn a_non_executable_hook_is_not_reported_installed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = HookStatusRepo::new();
+    let line = workspace_line(&repo, "alpha");
+    let hooks_dir = repo.hooks_dir();
+    write_installed_hooks(&hooks_dir, &line);
+    std::fs::set_permissions(hooks_dir.join("post-merge"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let events = report["hooks"]["events"].as_array().unwrap();
+
+    let post_merge = find_event(events, HookEvent::PostMerge);
+    assert_eq!(post_merge["state"], "not_installed", "{post_merge}");
+    let fix = post_merge["fix"].as_str().expect("a not-installed event carries a fix");
+    assert!(
+        fix.contains(&hooks_dir.join("post-merge").display().to_string()) && fix.contains("make it executable"),
+        "the fix names the file and says to make it executable: {fix}"
+    );
+    for other in [HookEvent::PostCommit, HookEvent::PostRewrite, HookEvent::PostCheckout] {
+        assert_eq!(find_event(events, other)["state"], "installed");
+    }
+}
+
+// _(A missing hook is reported with a fix)_ — the install command `doctor` suggests for an event whose
+// refresh hook is gone restores it, including for a workspace identity that starts with `-`.
+#[cfg(unix)]
+#[test]
+fn the_suggested_install_command_restores_a_missing_hook_for_a_dash_workspace() {
+    let repo = HookStatusRepo::new();
+    let exe_dir = Path::new(env!("CARGO_BIN_EXE_c10r")).parent().unwrap().to_path_buf();
+    let install = repo
+        .c10r(&exe_dir)
+        .args(["hooks", "install", "--workspace=-foo"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install succeeds: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let post_merge = repo.hooks_dir().join("post-merge");
+    std::fs::remove_file(&post_merge).unwrap();
+
+    let out = repo.c10r(&exe_dir).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let events = report["hooks"]["events"].as_array().unwrap();
+    let fix = find_event(events, HookEvent::PostMerge)["fix"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", &fix])
+        .current_dir(repo.path())
+        .env("PATH", prepend_to_path(&exe_dir));
+    isolate_git_config(&mut cmd);
+    let run = cmd.output().unwrap();
+    assert!(
+        run.status.success(),
+        "the suggested command runs: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(post_merge.is_file(), "the missing hook is restored");
+}
+
+// _(A hand-edited hook is reported modified)_ — a command added by hand to an installed c10r file is
+// still run by git, but the file no longer matches what installation would write, so it is reported
+// modified rather than installed, naming the kept hook as where the user's own commands belong.
+#[test]
+fn a_hand_edited_hook_is_reported_modified() {
+    let repo = HookStatusRepo::new();
+    let line = workspace_line(&repo, "alpha");
+    let hooks_dir = repo.hooks_dir();
+    write_installed_hooks(&hooks_dir, &line);
+
+    let path = hooks_dir.join("post-commit");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let edited = text.replacen("exit $status\n", "echo added-by-hand\nexit $status\n", 1);
+    std::fs::write(&path, edited).unwrap();
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let events = report["hooks"]["events"].as_array().unwrap();
+
+    let post_commit = find_event(events, HookEvent::PostCommit);
+    assert_eq!(post_commit["state"], "modified", "{post_commit}");
+    assert_eq!(
+        post_commit["workspaces_named"],
+        serde_json::json!(["alpha"]),
+        "{post_commit}"
+    );
+    assert!(post_commit.get("workspaces").is_none(), "{post_commit}");
+    let note = post_commit["note"].as_str().expect("a modified event carries a note");
+    assert!(
+        note.contains("post-commit.c10r-prior"),
+        "the note names the kept hook: {note}"
+    );
+    for other in [HookEvent::PostRewrite, HookEvent::PostCheckout, HookEvent::PostMerge] {
+        assert_eq!(find_event(events, other)["state"], "installed");
+    }
+}
+
+// _(Hooks under a supported hook manager are reported installed)_ — installing under a recognized
+// prek shim places c10r at the legacy path; `doctor` reports that event installed too, exercising
+// `hooks install` itself rather than a hand-written fixture.
+#[cfg(unix)]
+#[test]
+fn hooks_under_a_supported_hook_manager_are_reported_installed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = HookStatusRepo::new();
+    let hooks_dir = repo.hooks_dir();
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    for event in HookEvent::ALL {
+        let path = hooks_dir.join(event.as_str());
+        std::fs::write(&path, prek_fixture(event)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let install = repo
+        .c10r(bin_dir.path())
+        .args(["hooks", "install", "--workspace", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "hooks install under a recognized shim succeeds: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let events = report["hooks"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 4);
+    for event in events {
+        assert_eq!(
+            event["state"], "installed",
+            "a c10r file placed at the legacy path under a recognized shim is installed: {event}"
+        );
+    }
+}
+
+// _(Hooks under an unrecognized file are reported unverified)_ — a c10r file at the legacy path under
+// a file this build does not recognize as a hook manager is reported present with activation
+// unverified, and its workspaces are not reported as refreshed.
+#[test]
+fn hooks_under_an_unrecognized_file_are_reported_unverified() {
+    let repo = HookStatusRepo::new();
+    let line = workspace_line(&repo, "alpha");
+    let hooks_dir = repo.hooks_dir();
+    write_installed_hooks(&hooks_dir, &line);
+
+    let e_path = hooks_dir.join("post-commit");
+    let legacy_path = hooks_dir.join("post-commit.legacy");
+    std::fs::rename(&e_path, &legacy_path).unwrap();
+    std::fs::write(&e_path, "#!/bin/sh\necho unrelated\n").unwrap();
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let events = report["hooks"]["events"].as_array().unwrap();
+
+    let post_commit = find_event(events, HookEvent::PostCommit);
+    assert_eq!(post_commit["state"], "unverified", "{post_commit}");
+    assert_eq!(
+        post_commit["workspaces_named"],
+        serde_json::json!(["alpha"]),
+        "{post_commit}"
+    );
+    assert!(
+        post_commit.get("workspaces").is_none(),
+        "an unverified hook's workspaces are not reported as refreshed: {post_commit}"
+    );
+    for other in [HookEvent::PostRewrite, HookEvent::PostCheckout, HookEvent::PostMerge] {
+        assert_eq!(find_event(events, other)["state"], "installed");
+    }
+}
+
+// _(A removed hook is reported with its fix)_ — a c10r file another tool removed for one event is
+// reported not installed with the install command as its fix, and hook status leaves the exit code
+// exactly what indexer readiness alone determines.
+#[cfg(unix)]
+#[test]
+fn a_removed_hook_is_reported_with_its_fix() {
+    let repo = HookStatusRepo::new();
+    let line = workspace_line(&repo, "alpha");
+    let hooks_dir = repo.hooks_dir();
+    write_installed_hooks(&hooks_dir, &line);
+    std::fs::remove_file(hooks_dir.join("post-merge")).unwrap();
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    write_stub(bin_dir.path(), "rust-analyzer", "rust-analyzer 1.99.0-stub");
+    write_stub(bin_dir.path(), "scip-python", "0.9.9-stub");
+
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "both indexers present is the success code regardless of hook status: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let events = report["hooks"]["events"].as_array().unwrap();
+
+    let post_merge = find_event(events, HookEvent::PostMerge);
+    assert_eq!(post_merge["state"], "not_installed", "{post_merge}");
+    let fix = post_merge["fix"].as_str().expect("a not-installed event carries a fix");
+    assert!(
+        fix.contains("c10r hooks install"),
+        "the fix is the install command: {fix}"
+    );
+    assert!(
+        fix.contains("alpha"),
+        "the suggested command names the workspace already installed for the other events: {fix}"
+    );
+    for other in [HookEvent::PostCommit, HookEvent::PostRewrite, HookEvent::PostCheckout] {
+        assert_eq!(find_event(events, other)["state"], "installed");
+    }
+}
+
+// _(A remaining kept hook is reported with its path)_ — a hook kept from an earlier install that
+// remains without a refresh hook, and that differs from the file now at the event's path, is reported
+// not installed naming the kept hook's path and the need to remove or rename it.
+#[test]
+fn a_remaining_kept_hook_is_reported_with_its_path() {
+    let repo = HookStatusRepo::new();
+    let hooks_dir = repo.hooks_dir();
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+
+    let prior_path = hooks_dir.join("post-commit.c10r-prior");
+    std::fs::write(&prior_path, "#!/bin/sh\necho original\n").unwrap();
+    std::fs::write(hooks_dir.join("post-commit"), "#!/bin/sh\necho different\n").unwrap();
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let events = report["hooks"]["events"].as_array().unwrap();
+
+    let post_commit = find_event(events, HookEvent::PostCommit);
+    assert_eq!(post_commit["state"], "not_installed", "{post_commit}");
+    let fix = post_commit["fix"]
+        .as_str()
+        .expect("a not-installed event carries a fix");
+    assert!(
+        fix.contains(&prior_path.display().to_string()),
+        "the fix names the remaining kept hook's path: {fix}"
+    );
+    assert!(
+        fix.contains("remove") && fix.contains("rename"),
+        "the fix states the need to remove or rename it: {fix}"
+    );
+}
+
+// _(Disagreeing hooks are reported)_ — refresh events whose c10r files name different workspace sets
+// are each reported with their own file's workspaces, and the report notes the disagreement.
+#[test]
+fn disagreeing_hooks_are_reported() {
+    let repo = HookStatusRepo::new();
+    let hooks_dir = repo.hooks_dir();
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let alpha = workspace_line(&repo, "alpha");
+    let beta = workspace_line(&repo, "beta");
+    let commit_path = hooks_dir.join("post-commit");
+    std::fs::write(
+        &commit_path,
+        render(HookEvent::PostCommit, std::slice::from_ref(&alpha)),
+    )
+    .unwrap();
+    let merge_path = hooks_dir.join("post-merge");
+    std::fs::write(&merge_path, render(HookEvent::PostMerge, std::slice::from_ref(&beta))).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&commit_path, &merge_path] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let hooks = &report["hooks"];
+    assert_eq!(hooks["disagreement"], true, "{hooks}");
+    let events = hooks["events"].as_array().unwrap();
+    assert_eq!(
+        find_event(events, HookEvent::PostCommit)["workspaces"],
+        serde_json::json!(["alpha"])
+    );
+    assert_eq!(
+        find_event(events, HookEvent::PostMerge)["workspaces"],
+        serde_json::json!(["beta"])
+    );
+}
+
+// _(Outside a git worktree)_ — `doctor` run outside a git worktree states that hook status does not
+// apply, and still exits with the code indexer readiness alone determines.
+#[cfg(unix)]
+#[test]
+fn hook_status_outside_a_git_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin_dir = tempfile::tempdir().unwrap();
+    write_stub(bin_dir.path(), "rust-analyzer", "rust-analyzer 1.99.0-stub");
+    write_stub(bin_dir.path(), "scip-python", "0.9.9-stub");
+    let doctor = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_c10r"))
+            .current_dir(dir.path())
+            .env("PATH", prepend_to_path(bin_dir.path()))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let out = doctor(&["--json", "doctor"]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let hooks = &report["hooks"];
+    assert!(
+        hooks["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "hook status names why it does not apply: {hooks}"
+    );
+    assert!(
+        hooks["events"].is_null(),
+        "no per-event status outside a git worktree: {hooks}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "both indexers present is the success code regardless of hook status: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let human = doctor(&["doctor"]);
+    let stdout = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        stdout.lines().any(|l| l.starts_with("hooks: not applicable (")),
+        "the human report states hook status does not apply: {stdout}"
+    );
+}
+
+/// `doctor`'s human (non-`--json`) output lines for `repo`.
+fn doctor_human_lines(repo: &HookStatusRepo, bin_dir: &Path) -> Vec<String> {
+    let out = repo.c10r(bin_dir).arg("doctor").output().unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The human report line for `event`, which starts with the event's name after two spaces.
+fn human_event_line(lines: &[String], event: HookEvent) -> &str {
+    let prefix = format!("  {}  ", event.as_str());
+    lines
+        .iter()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("{} has a line: {lines:?}", event.as_str()))
+}
+
+// _(Installed hooks are reported, A hand-edited hook is reported modified, Hooks under an unrecognized
+// file are reported unverified, A removed hook is reported with its fix)_ — the human `hooks:` section
+// gives each event one line whose wording depends on its state.
+#[test]
+fn the_human_report_states_each_hook_state() {
+    let repo = HookStatusRepo::new();
+    let line = workspace_line(&repo, "alpha");
+    let hooks_dir = repo.hooks_dir();
+    write_installed_hooks(&hooks_dir, &line);
+
+    let rewrite_path = hooks_dir.join("post-rewrite");
+    let text = std::fs::read_to_string(&rewrite_path).unwrap();
+    std::fs::write(
+        &rewrite_path,
+        text.replacen("exit $status\n", "echo added-by-hand\nexit $status\n", 1),
+    )
+    .unwrap();
+
+    let checkout_path = hooks_dir.join("post-checkout");
+    std::fs::rename(&checkout_path, hooks_dir.join("post-checkout.legacy")).unwrap();
+    std::fs::write(&checkout_path, "#!/bin/sh\necho unrelated\n").unwrap();
+
+    std::fs::remove_file(hooks_dir.join("post-merge")).unwrap();
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let lines = doctor_human_lines(&repo, bin_dir.path());
+    assert!(lines.iter().any(|l| l == "hooks:"), "the section is headed: {lines:?}");
+
+    let commit = human_event_line(&lines, HookEvent::PostCommit);
+    assert!(commit.contains("installed"), "{commit}");
+    assert!(commit.contains("workspaces: alpha"), "{commit}");
+    assert!(
+        commit.contains(&hooks_dir.join("post-commit").display().to_string()),
+        "{commit}"
+    );
+
+    let rewrite = human_event_line(&lines, HookEvent::PostRewrite);
+    assert!(rewrite.contains("modified"), "{rewrite}");
+    assert!(rewrite.contains("workspaces named: alpha"), "{rewrite}");
+    assert!(
+        rewrite.contains("installation and removal replace this file"),
+        "{rewrite}"
+    );
+    assert!(rewrite.contains("post-rewrite.c10r-prior"), "{rewrite}");
+
+    let checkout = human_event_line(&lines, HookEvent::PostCheckout);
+    assert!(checkout.contains("present, activation unverified"), "{checkout}");
+    assert!(!checkout.contains("workspaces"), "{checkout}");
+
+    let merge = human_event_line(&lines, HookEvent::PostMerge);
+    assert!(merge.contains("not installed"), "{merge}");
+    assert!(merge.contains("fix: cd "), "{merge}");
+    assert!(merge.contains("c10r hooks install"), "{merge}");
+    assert!(
+        !lines.iter().any(|l| l.contains("disagree")),
+        "one workspace set never disagrees: {lines:?}"
+    );
+}
+
+// _(Disagreeing hooks are reported)_ — the human report gives each event its own file's workspaces and
+// adds a line stating that the files disagree.
+#[test]
+fn the_human_report_states_disagreeing_hooks() {
+    let repo = HookStatusRepo::new();
+    let hooks_dir = repo.hooks_dir();
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let alpha = workspace_line(&repo, "alpha");
+    let beta = workspace_line(&repo, "beta");
+    let commit_path = hooks_dir.join("post-commit");
+    std::fs::write(
+        &commit_path,
+        render(HookEvent::PostCommit, std::slice::from_ref(&alpha)),
+    )
+    .unwrap();
+    let merge_path = hooks_dir.join("post-merge");
+    std::fs::write(&merge_path, render(HookEvent::PostMerge, std::slice::from_ref(&beta))).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&commit_path, &merge_path] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let lines = doctor_human_lines(&repo, bin_dir.path());
+    assert!(
+        human_event_line(&lines, HookEvent::PostCommit).contains("workspaces: alpha"),
+        "{lines:?}"
+    );
+    assert!(
+        human_event_line(&lines, HookEvent::PostMerge).contains("workspaces: beta"),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("disagree")),
+        "the report states the files disagree: {lines:?}"
+    );
+}
+
+/// Write the captured prek shim for every event as an executable file in `hooks_dir`, and beside it a
+/// refresh hook for `line` at each event's `.legacy` path, executable exactly as `hooks install`
+/// leaves it.
+#[cfg(unix)]
+fn write_shims_over_legacy_hooks(hooks_dir: &Path, line: &WorkspaceLine) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(hooks_dir).unwrap();
+    for event in HookEvent::ALL {
+        let shim = hooks_dir.join(event.as_str());
+        std::fs::write(&shim, prek_fixture(event)).unwrap();
+        let legacy = hooks_dir.join(format!("{}.legacy", event.as_str()));
+        std::fs::write(&legacy, render(event, std::slice::from_ref(line))).unwrap();
+        for path in [&shim, &legacy] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
+// _(A non-executable hook is not reported installed)_ — under a recognized shim git runs the shim and
+// the shim runs the legacy file, so an event is installed only when both are executable.
+#[cfg(unix)]
+#[test]
+fn a_legacy_hook_is_not_reported_installed_when_the_shim_or_the_hook_is_not_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = HookStatusRepo::new();
+    let line = workspace_line(&repo, "alpha");
+    let hooks_dir = repo.hooks_dir();
+    write_shims_over_legacy_hooks(&hooks_dir, &line);
+    std::fs::set_permissions(hooks_dir.join("post-commit"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(
+        hooks_dir.join("post-rewrite.legacy"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let events = report["hooks"]["events"].as_array().unwrap();
+
+    for event in [HookEvent::PostCommit, HookEvent::PostRewrite] {
+        let status = find_event(events, event);
+        assert_eq!(status["state"], "not_installed", "{status}");
+        assert!(
+            status["fix"].as_str().unwrap().contains("not executable"),
+            "the fix says the file is not executable: {status}"
+        );
+    }
+    for other in [HookEvent::PostCheckout, HookEvent::PostMerge] {
+        assert_eq!(find_event(events, other)["state"], "installed");
+    }
+}
+
+// _(A hand-edited hook is reported modified)_ — a command added by hand to a refresh hook at the legacy
+// path, under an executable recognized shim, is reported modified rather than installed.
+#[cfg(unix)]
+#[test]
+fn a_hand_edited_legacy_hook_is_reported_modified() {
+    let repo = HookStatusRepo::new();
+    let line = workspace_line(&repo, "alpha");
+    let hooks_dir = repo.hooks_dir();
+    write_shims_over_legacy_hooks(&hooks_dir, &line);
+
+    let legacy = hooks_dir.join("post-commit.legacy");
+    let text = std::fs::read_to_string(&legacy).unwrap();
+    std::fs::write(
+        &legacy,
+        text.replacen("exit $status\n", "echo added-by-hand\nexit $status\n", 1),
+    )
+    .unwrap();
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    let out = repo.c10r(bin_dir.path()).args(["--json", "doctor"]).output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let events = report["hooks"]["events"].as_array().unwrap();
+
+    let post_commit = find_event(events, HookEvent::PostCommit);
+    assert_eq!(post_commit["state"], "modified", "{post_commit}");
+    assert_eq!(
+        post_commit["workspaces_named"],
+        serde_json::json!(["alpha"]),
+        "{post_commit}"
+    );
+    assert!(post_commit.get("workspaces").is_none(), "{post_commit}");
+    for other in [HookEvent::PostRewrite, HookEvent::PostCheckout, HookEvent::PostMerge] {
+        assert_eq!(find_event(events, other)["state"], "installed");
+    }
 }
 
 /// Write a database at `path` carrying c10r's ownership marker at the given schema version — a store

@@ -14,7 +14,7 @@ use crate::exit::Failure;
 use crate::git::{GitError, GitRepo, SeedMode};
 use crate::graph::chunk::ChunkParams;
 use crate::graph::join::JoinAccounting;
-use crate::graph::store::{Freshness, GraphStore, StoreOpenError};
+use crate::graph::store::{Freshness, GraphStore, IndexMetadata, StoreOpenError};
 use crate::graph::syntax::Language;
 use crate::graph::{content_hash, ingest};
 use crate::identity::WorkspaceId;
@@ -328,6 +328,62 @@ fn current_state(
         }
     };
     Ok((provenance, hash, None))
+}
+
+/// `db` made absolute against the current process's working directory when given relative — the
+/// directory a query's own `--db` argument resolves against — so a command built from it still runs
+/// after the caller changes directory. An already-absolute `db` is returned unchanged; a `db` kept
+/// relative because the working directory cannot be read is returned as-is rather than failing the
+/// answer it rides on.
+fn absolute_db_path(db: &Path) -> PathBuf {
+    if db.is_absolute() {
+        return db.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(db))
+        .unwrap_or_else(|_| db.to_path_buf())
+}
+
+/// The CLI's `--language` value for `language`, matching [`crate::cli::LanguageArg`]'s value names.
+fn language_flag(language: Language) -> &'static str {
+    match language {
+        Language::Rust => "rust",
+        Language::Python => "python",
+    }
+}
+
+/// The command that refreshes the index a stale answer came from: `c10r build <root> --db=<db>
+/// --workspace=<ws>`, with the recorded root and workspace and the query's `--db` made absolute.
+/// `--language` names the backend the index records, so a workspace with both a `Cargo.toml` and a
+/// `pyproject.toml` — ambiguous to detection — rebuilds without needing the flag typed by hand.
+/// `--environment` names the environment in effect for the query, canonical and absolute, because
+/// freshness compares that exact value. Chunk flags appear only when the recorded values differ from
+/// the defaults, so the rebuild keeps the semantic-index identity. Every value uses the `--flag=value`
+/// form, so a workspace identity that starts with `-` is read as that flag's value.
+///
+/// When no root is recorded, the whole text is a shell comment, so pasting it runs nothing.
+fn refresh_command(meta: &IndexMetadata, db: &Path, environment: Option<&EnvironmentFacts>) -> String {
+    let mut tail = format!(
+        " --db={} --workspace={}",
+        shell_quote(&absolute_db_path(db).display().to_string()),
+        shell_quote(meta.workspace_id.as_str())
+    );
+    if let Ok(language) = crate::graph::backend_language(&meta.provenance.analyzer_name) {
+        tail.push_str(&format!(" --language={}", language_flag(language)));
+    }
+    if let Some(env) = environment {
+        tail.push_str(&format!(" --environment={}", shell_quote(&env.environment_path)));
+    }
+    if meta.chunk_params != ChunkParams::default() {
+        tail.push_str(&format!(
+            " --chunk-size={} --chunk-overlap={}",
+            meta.chunk_params.chunk_size, meta.chunk_params.overlap
+        ));
+    }
+    match meta.workspace_root.as_deref() {
+        Some(root) => format!("c10r build {}{tail}", shell_quote(root)),
+        None => format!("# workspace root not recorded; run from the workspace root: c10r build .{tail}"),
+    }
 }
 
 /// Emit a one-line stderr diagnostic that a bounded tool probe timed out, routed through the same
@@ -764,6 +820,10 @@ pub fn run_status(
         },
     });
 
+    if freshness.is_stale() {
+        report["refresh"] = serde_json::json!(refresh_command(&meta, db, environment.as_ref()));
+    }
+
     // The semantic-index identity in effect at build time, the chunk parameters included, rides
     // status as provenance beside the analyzer's.
     if let Some(identity) = store.semantic_index_identity()? {
@@ -856,8 +916,137 @@ pub fn run_status(
     if json {
         Ok(serde_json::to_string_pretty(&report)?)
     } else {
-        Ok(format!("{report:#}"))
+        Ok(render_status_report(&report))
     }
+}
+
+/// A scalar of the status report as display text: strings sanitized, absence as `unknown`.
+fn status_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => crate::render::sanitize(text),
+        serde_json::Value::Null => "unknown".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `path:start-end` for a status row or exemplar, `path` alone when its coordinates are absent.
+fn status_location(row: &serde_json::Value) -> String {
+    let path = status_text(&row["document_path"]);
+    match (&row["span_start"], &row["span_end"]) {
+        (serde_json::Value::Null, _) | (_, serde_json::Value::Null) => path,
+        (start, end) => format!("{path}:{}-{}", status_text(start), status_text(end)),
+    }
+}
+
+/// The human `status` answer: labeled lines projected from the same report `--json` emits, every
+/// value sanitized before it joins a line.
+fn render_status_report(report: &serde_json::Value) -> String {
+    let mut lines = vec![
+        format!("workspace: {}", status_text(&report["workspace"])),
+        format!(
+            "analyzer: {} {}",
+            status_text(&report["provenance"]["analyzer_name"]),
+            status_text(&report["provenance"]["analyzer_version"])
+        ),
+        format!("freshness: {}", status_text(&report["freshness"])),
+    ];
+    if let Some(refresh) = report.get("refresh") {
+        lines.push(format!("refresh: {}", status_text(refresh)));
+    }
+    if let Some(relation) = report.get("workspace_relation") {
+        let recorded = relation
+            .get("recorded_root")
+            .map(|root| format!(" (recorded root {})", status_text(root)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "workspace relation: {}{recorded}",
+            status_text(&relation["state"])
+        ));
+    }
+
+    let alignment = &report["join_alignment"];
+    let buckets: Vec<String> = alignment["aligned"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(rule, count)| format!("{}={}", crate::render::sanitize(rule), status_text(count)))
+        .collect();
+    lines.push(format!("aligned: {}", buckets.join(" ")));
+    for refusal in ["text_mismatch", "semantic_only", "duplicate_ambiguous", "syntax_only"] {
+        lines.push(format!("{refusal}: {}", status_text(&alignment[refusal])));
+    }
+
+    let duplicated = &report["duplicated_descriptors"];
+    lines.push(format!(
+        "duplicated descriptor groups: {}",
+        status_text(&duplicated["group_count"])
+    ));
+    for group in duplicated["groups"].as_array().into_iter().flatten() {
+        lines.push(format!("  {}", status_text(&group["descriptor_base"])));
+        for definition in group["definitions"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "    {} ({}) {}",
+                status_text(&definition["canonical_id"]),
+                status_text(&definition["display_name"]),
+                status_text(&definition["document_path"])
+            ));
+        }
+    }
+
+    if let Some(index) = report.get("semantic_index") {
+        lines.push(format!(
+            "semantic index: {} corpus definition {} chunk size {} overlap {}",
+            status_text(&index["model_identity"]),
+            status_text(&index["corpus_definition_version"]),
+            status_text(&index["chunk_size"]),
+            status_text(&index["chunk_overlap"])
+        ));
+    }
+
+    if let Some(discrepancies) = report.get("discrepancies") {
+        lines.extend(render_status_discrepancies(discrepancies));
+    }
+    lines.join("\n")
+}
+
+/// The discrepancy section of [`render_status_report`]: the bounded summary's groups, or every row.
+fn render_status_discrepancies(discrepancies: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if discrepancies["listing"] == "all" {
+        let rows = discrepancies["rows"].as_array().map(Vec::as_slice).unwrap_or_default();
+        lines.push(format!("discrepancies (all): {} rows", rows.len()));
+        for row in rows {
+            lines.push(format!(
+                "  {} {} found {} at {}",
+                status_text(&row["outcome"]),
+                status_text(&row["expected_name"]),
+                status_text(&row["found_text"]),
+                status_location(row)
+            ));
+        }
+    } else {
+        lines.push(format!(
+            "discrepancies (summary{}): {} in {} groups",
+            if discrepancies["truncated"] == true {
+                ", truncated"
+            } else {
+                ""
+            },
+            status_text(&discrepancies["total_discrepancies"]),
+            status_text(&discrepancies["total_groups"])
+        ));
+        for group in discrepancies["groups"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  {} {}: {} in {} documents, e.g. {}",
+                status_text(&group["outcome"]),
+                status_text(&group["expected_name"]),
+                status_text(&group["count"]),
+                status_text(&group["document_count"]),
+                status_location(&group["exemplar"])
+            ));
+        }
+    }
+    lines
 }
 
 /// The current index state for `manifest`'s orientation block: whether an index has been built, and
@@ -1023,8 +1212,11 @@ pub fn run_get(
     let store = open_query_store(db)?;
     let index_hash = recorded_index_hash(&store)?;
     let relation = workspace_relation(&store, root)?;
+    let meta = store
+        .read_metadata()?
+        .expect("open_query_store guarantees recorded metadata");
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
-    let engine = QueryEngine::new(&store, provenance, hash, environment);
+    let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
 
     let answer = match &position {
         Some((doc, offset)) => engine.get_by_position(doc, *offset, detail, effective_max_lines, from)?,
@@ -1048,6 +1240,7 @@ pub fn run_get(
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+    let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
     Ok(render(&answer, json, styled))
 }
 
@@ -1111,8 +1304,11 @@ pub fn run_trace(
     let store = open_query_store(db)?;
     let index_hash = recorded_index_hash(&store)?;
     let relation_disclosure = workspace_relation(&store, root)?;
+    let meta = store
+        .read_metadata()?
+        .expect("open_query_store guarantees recorded metadata");
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
-    let engine = QueryEngine::new(&store, provenance, hash, environment);
+    let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let identity = PageIdentity {
         command: "trace",
         reference: reference.to_string(),
@@ -1141,11 +1337,13 @@ pub fn run_trace(
         let answer = apply_dependents_pagination(answer, effective_limit, cursor, &identity)?
             .with_workspace_relation(relation_disclosure)
             .with_ordering(order);
+        let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
         return Ok(render(&answer, json, styled));
     };
     let answer = engine.trace(reference, trace_relation, detail, effective_max_lines)?;
     let answer =
         apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation_disclosure);
+    let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
     Ok(render(&answer, json, styled))
 }
 
@@ -1171,8 +1369,11 @@ pub fn run_find(
     let store = open_query_store(db)?;
     let index_hash = recorded_index_hash(&store)?;
     let relation = workspace_relation(&store, root)?;
+    let meta = store
+        .read_metadata()?
+        .expect("open_query_store guarantees recorded metadata");
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
-    let engine = QueryEngine::new(&store, provenance, hash, environment);
+    let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let answer = engine.find(fragment)?;
     let identity = PageIdentity {
         command: "find",
@@ -1187,6 +1388,7 @@ pub fn run_find(
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+    let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
     Ok(render(&answer, json, styled))
 }
 
@@ -1220,8 +1422,11 @@ pub fn run_search(
     let store = open_query_store(db)?;
     let index_hash = recorded_index_hash(&store)?;
     let relation = workspace_relation(&store, root)?;
+    let meta = store
+        .read_metadata()?
+        .expect("open_query_store guarantees recorded metadata");
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
-    let engine = QueryEngine::new(&store, provenance, hash, environment);
+    let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let answer = engine.search(query, detail, effective_max_lines)?;
     let identity = PageIdentity {
         command: "search",
@@ -1236,6 +1441,7 @@ pub fn run_search(
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+    let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
     Ok(render(&answer, json, styled))
 }
 
@@ -1280,8 +1486,11 @@ pub fn run_similar(
     let store = open_query_store(db)?;
     let index_hash = recorded_index_hash(&store)?;
     let relation = workspace_relation(&store, root)?;
+    let meta = store
+        .read_metadata()?
+        .expect("open_query_store guarantees recorded metadata");
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
-    let engine = QueryEngine::new(&store, provenance, hash, environment);
+    let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let answer = match &position {
         Some((doc, offset)) => engine.similar_by_position(doc, *offset, detail, effective_max_lines)?,
         None => engine.similar(
@@ -1303,6 +1512,7 @@ pub fn run_similar(
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+    let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
     Ok(render(&answer, json, styled))
 }
 
@@ -1487,7 +1697,7 @@ pub fn run_impact(
 
     let workspace_id = resolve_workspace(workspace, root)?;
     let db_display = db.display().to_string();
-    let engine = QueryEngine::new(&store, provenance, hash, environment);
+    let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let request = ImpactRequest {
         mode: &mode,
         paths,
@@ -1541,6 +1751,7 @@ pub fn run_impact(
     let answer = apply_impact_pagination(answer, effective_limit, cursor, &identity)?
         .with_workspace_relation(relation)
         .with_ordering(order);
+    let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
     Ok(render(&answer, json, styled))
 }
 
@@ -1592,12 +1803,124 @@ impl IndexerStatus {
     }
 }
 
+/// One event's refresh-hook status, in `doctor`'s JSON answer. Mirrors [`crate::hooks::HookState`]
+/// with paths and workspace lines projected to strings, the same projection [`HookEventReport`]
+/// applies to a `hooks install`/`hooks uninstall` outcome.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum HookEventStatusReport {
+    /// A c10r refresh hook runs for this event, refreshing `workspaces`, byte-for-byte as `hooks
+    /// install` would write it: the file git runs — following prek's shim, when one is recognized —
+    /// is executable.
+    Installed { path: String, workspaces: Vec<String> },
+    /// The file git runs for this event names `workspaces_named`, but its content differs from what
+    /// `hooks install` would write, most commonly a command added by hand, so they are not reported
+    /// as refreshed. `note` says where that command belongs instead.
+    Modified {
+        path: String,
+        workspaces_named: Vec<String>,
+        note: String,
+    },
+    /// A c10r refresh hook is present, but this build cannot confirm the file at the event's path
+    /// reaches it, so `workspaces_named` are not reported as refreshed.
+    Unverified {
+        path: String,
+        workspaces_named: Vec<String>,
+    },
+    /// No c10r refresh hook runs for this event: none is present, or one is but the file git would
+    /// run for it is not executable.
+    NotInstalled { fix: String },
+}
+
+/// One event's name and refresh-hook status, in `doctor`'s JSON answer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HookStatusEvent {
+    /// The git hook name this status is for (`post-commit`, `post-rewrite`, `post-checkout`,
+    /// `post-merge`).
+    pub event: String,
+    #[serde(flatten)]
+    pub status: HookEventStatusReport,
+}
+
+/// `doctor`'s hooks section: refresh-hook status for the git worktree the invocation directory is in,
+/// or the reason hook status does not apply.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum DoctorHooks {
+    /// The invocation directory is in a git worktree with a resolvable hooks directory.
+    Applicable {
+        /// One entry per [`crate::hooks::HookEvent::ALL`], in that order.
+        events: Vec<HookStatusEvent>,
+        /// Whether the events' present c10r files do not all name the same workspace set.
+        disagreement: bool,
+    },
+    /// Hook status does not apply: the invocation directory is not in a git worktree, or its hooks
+    /// directory could not be resolved.
+    NotApplicable {
+        /// Why hook status does not apply.
+        reason: String,
+    },
+}
+
+/// The readiness report `doctor` prints: each required indexer's presence, and the hooks section.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DoctorReport {
+    pub indexers: Vec<IndexerStatus>,
+    pub hooks: DoctorHooks,
+}
+
+/// Project one event's [`crate::hooks::EventHookStatus`] onto its JSON report entry.
+fn hook_status_event_report(status: crate::hooks::EventHookStatus) -> HookStatusEvent {
+    let event = status.event.as_str().to_string();
+    let report = match status.state {
+        crate::hooks::HookState::Installed { path, workspaces } => HookEventStatusReport::Installed {
+            path: path_string(&path),
+            workspaces,
+        },
+        crate::hooks::HookState::Modified {
+            path,
+            workspaces_named,
+            note,
+        } => HookEventStatusReport::Modified {
+            path: path_string(&path),
+            workspaces_named,
+            note,
+        },
+        crate::hooks::HookState::Unverified { path, workspaces_named } => HookEventStatusReport::Unverified {
+            path: path_string(&path),
+            workspaces_named,
+        },
+        crate::hooks::HookState::NotInstalled { fix } => HookEventStatusReport::NotInstalled { fix },
+    };
+    HookStatusEvent { event, status: report }
+}
+
+/// `doctor`'s hooks section for the invocation directory: hook status when it is inside a git
+/// worktree with a resolvable hooks directory, or the reason it is not otherwise.
+fn doctor_hooks_report() -> DoctorHooks {
+    let repo = match GitRepo::discover(Path::new(".")) {
+        Ok(repo) => repo,
+        Err(e) => return DoctorHooks::NotApplicable { reason: e.to_string() },
+    };
+    let hooks_dir = match repo.hooks_dir() {
+        Ok(dir) => dir,
+        Err(e) => return DoctorHooks::NotApplicable { reason: e.to_string() },
+    };
+    let status = crate::hooks::hook_status(&hooks_dir);
+    DoctorHooks::Applicable {
+        events: status.events.into_iter().map(hook_status_event_report).collect(),
+        disagreement: status.disagreement,
+    }
+}
+
 /// `doctor`: probe each required language indexer for presence and version, by the same default
-/// executable name `build` invokes for it. Both indexers are probed unconditionally — the report
-/// covers what a build could need, not what the current workspace's language happens to be — and a
-/// tool that cannot be run for any reason (missing, unexecutable, or erroring) reports absent with an
-/// install hint rather than propagating a failure.
-pub fn run_doctor() -> Vec<IndexerStatus> {
+/// executable name `build` invokes for it, and report the invocation directory's refresh-hook status.
+/// Both indexers are probed unconditionally — the report covers what a build could need, not what the
+/// current workspace's language happens to be — and a tool that cannot be run for any reason
+/// (missing, unexecutable, or erroring) reports absent with an install hint rather than propagating a
+/// failure. Hook status never changes `doctor`'s exit code, which is decided from indexer readiness
+/// alone.
+pub fn run_doctor() -> DoctorReport {
     let rust_analyzer = match RustAdapter::new("rust-analyzer") {
         Ok(adapter) => present_status(RustAdapter::analyzer_name(), adapter.provenance().analyzer_version),
         Err(SemanticError::Timeout(_)) => unresponsive_status(RustAdapter::analyzer_name()),
@@ -1614,7 +1937,10 @@ pub fn run_doctor() -> Vec<IndexerStatus> {
             "install: npm install -g @sourcegraph/scip-python",
         ),
     };
-    vec![rust_analyzer, scip_python]
+    DoctorReport {
+        indexers: vec![rust_analyzer, scip_python],
+        hooks: doctor_hooks_report(),
+    }
 }
 
 /// A present indexer's status, carrying its discovered version and no hint.
@@ -1653,13 +1979,15 @@ fn unresponsive_status(name: &str) -> IndexerStatus {
 
 /// The fixed-width human rendering of a `doctor` report: one line per indexer, its name and status
 /// word in fixed columns, followed by its version when present, its install hint when absent, or its
-/// investigation hint when unresponsive.
+/// investigation hint when unresponsive; then a `hooks:` section reporting each refresh event's
+/// status, or why hook status does not apply.
 ///
-/// The indexer name and version/hint are sanitized: the version comes from the probed tool's own
-/// `--version` output, which a hostile or misbehaving indexer could use to embed terminal-control
-/// bytes.
-pub fn render_doctor_report(statuses: &[IndexerStatus]) -> String {
-    statuses
+/// Every piece of text drawn from outside the process (an indexer's version/hint, a hook path, an
+/// installed workspace name, a fix, a not-applicable reason) is sanitized, since several of these
+/// ultimately come from repository or filesystem content a caller does not control.
+pub fn render_doctor_report(report: &DoctorReport) -> String {
+    let mut lines: Vec<String> = report
+        .indexers
         .iter()
         .map(|s| {
             let name = crate::render::sanitize(&s.name);
@@ -1671,8 +1999,58 @@ pub fn render_doctor_report(statuses: &[IndexerStatus]) -> String {
             let detail = crate::render::sanitize(detail);
             format!("{name:<15}{status:<13}{detail}")
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    lines.extend(render_doctor_hooks(&report.hooks));
+    lines.join("\n")
+}
+
+/// The `hooks:` section of [`render_doctor_report`]'s human rendering: one line per event, then a
+/// line noting disagreement when the events' present c10r files do not all name the same workspace
+/// set. Outside a git worktree, or when the hooks directory cannot be resolved, a single line states
+/// that hook status does not apply and names why.
+fn render_doctor_hooks(hooks: &DoctorHooks) -> Vec<String> {
+    match hooks {
+        DoctorHooks::NotApplicable { reason } => {
+            vec![format!("hooks: not applicable ({})", crate::render::sanitize(reason))]
+        }
+        DoctorHooks::Applicable { events, disagreement } => {
+            let mut lines = vec!["hooks:".to_string()];
+            lines.extend(events.iter().map(render_doctor_hook_event));
+            if *disagreement {
+                lines.push("  the hook files disagree on the installed workspaces".to_string());
+            }
+            lines
+        }
+    }
+}
+
+/// One event's line in [`render_doctor_hooks`].
+fn render_doctor_hook_event(event: &HookStatusEvent) -> String {
+    let name = crate::render::sanitize(&event.event);
+    match &event.status {
+        HookEventStatusReport::Installed { path, workspaces } => format!(
+            "  {name}  installed  {}  workspaces: {}",
+            crate::render::sanitize(path),
+            crate::render::sanitize(&workspaces.join(", "))
+        ),
+        HookEventStatusReport::Modified {
+            path,
+            workspaces_named,
+            note,
+        } => format!(
+            "  {name}  modified  {}  workspaces named: {}  {}",
+            crate::render::sanitize(path),
+            crate::render::sanitize(&workspaces_named.join(", ")),
+            crate::render::sanitize(note)
+        ),
+        HookEventStatusReport::Unverified { path, .. } => format!(
+            "  {name}  present, activation unverified  {}",
+            crate::render::sanitize(path)
+        ),
+        HookEventStatusReport::NotInstalled { fix } => {
+            format!("  {name}  not installed  fix: {}", crate::render::sanitize(fix))
+        }
+    }
 }
 
 /// The outcome of `cache`: the affected `--db` path and whether an index was actually removed.
@@ -1906,45 +2284,100 @@ pub fn render_cache_size_report(outcome: &CacheSizeOutcome, json: bool) -> Strin
     }
 }
 
-/// The outcome of `hooks install`: the hook path written.
+/// One kept or restored hook's move, from its prior path to its new one.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HookMove {
+    /// The path the hook moved from.
+    pub from: String,
+    /// The path the hook moved to.
+    pub to: String,
+}
+
+/// One refresh event's effect from a `hooks install` or `hooks uninstall` report.
+///
+/// `written` is the path a c10r file was created or rewritten at; `kept` is a hook moved aside to keep
+/// it running (`install` only); `deleted` are paths removed outright; `restored` is a kept hook moved
+/// back into the slot a c10r file vacated (`uninstall` only); `unchanged` are paths left exactly as
+/// found. A field is empty or `None` when this event had no such effect.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HookEventReport {
+    /// The git hook name this event corresponds to (`post-commit`, `post-rewrite`, `post-checkout`,
+    /// `post-merge`).
+    pub event: String,
+    /// The path a c10r file was created or rewritten at.
+    pub written: Option<String>,
+    /// A hook moved aside to keep it running.
+    pub kept: Option<HookMove>,
+    /// Paths removed outright.
+    pub deleted: Vec<String>,
+    /// A kept hook moved back into the slot a c10r file vacated.
+    pub restored: Option<HookMove>,
+    /// Paths left exactly as found.
+    pub unchanged: Vec<String>,
+}
+
+/// The outcome of `hooks install` or `hooks uninstall`: which action ran, and each refresh event's
+/// effect on the hooks directory.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HookOutcome {
-    /// The path the hook was written to.
-    pub path: String,
+    /// `"install"` or `"uninstall"`.
+    pub action: &'static str,
+    /// One entry per [`crate::hooks::HookEvent::ALL`], in that order.
+    pub events: Vec<HookEventReport>,
 }
 
-/// The post-commit hook script for a workspace at `root`, indexed at `db` under `workspace`: a
-/// `#!/bin/sh` script that reruns `c10r build` after every commit, keeping the index at the committed
-/// state the diff-seeded assessment's exact path depends on.
-///
-/// All three are substituted with resolved, absolute, shell-quoted values rather than left to
-/// defaults. Git invokes `post-commit` with the working directory at the worktree's top level, which
-/// is neither the caller's invocation directory nor — for a workspace below the repository root — the
-/// workspace at all, so a bare `c10r build` would index the wrong tree into the wrong store under the
-/// wrong identity. `--workspace` is load-bearing for the same reason it is in the recovery recipe:
-/// `build` derives the identity from the root directory name, so leaving it implicit would namespace
-/// symbols under whatever directory the hook happened to run from.
-fn post_commit_hook_script(root: &Path, db: &Path, workspace: &str) -> String {
-    format!(
-        "#!/bin/sh\nc10r build {} --db {} --workspace {}\n",
-        shell_quote(&root.display().to_string()),
-        shell_quote(&db.display().to_string()),
-        shell_quote(workspace),
-    )
+fn path_string(path: &Path) -> String {
+    path.display().to_string()
 }
 
-/// `hooks install`: write the post-commit hook that refreshes the index after every commit.
-///
-/// Refuses rather than overwrites when anything already exists at the resolved hook path: a commit
-/// hook is the caller's, and silently replacing one is destructive — a query-shaped tool has no
-/// license to perform it. The written file is made executable (`0o755`), since a hook git will not
-/// execute is not installed.
-///
-/// `root` and `db` are made absolute before they are written into the script, because the hook runs
-/// from git's own working directory rather than from the caller's.
-pub fn run_hooks_install(root: &Path, db: &Path, workspace: Option<&str>) -> Result<HookOutcome> {
-    let repo = GitRepo::discover(root).map_err(GitError::into_failure)?;
-    let path = repo.post_commit_hook_path().map_err(GitError::into_failure)?;
+/// Project one event's install plan onto its report entry.
+fn install_event_report(plan: &crate::hooks::EventInstallPlan) -> HookEventReport {
+    HookEventReport {
+        event: plan.event.as_str().to_string(),
+        written: plan.write.as_ref().map(|write| path_string(&write.path)),
+        kept: plan
+            .write
+            .as_ref()
+            .and_then(|write| write.kept.as_ref())
+            .map(|(from, to)| HookMove {
+                from: path_string(from),
+                to: path_string(to),
+            }),
+        deleted: plan.deleted.iter().map(|p| path_string(p)).collect(),
+        restored: None,
+        unchanged: plan.unchanged.iter().map(|p| path_string(p)).collect(),
+    }
+}
+
+/// Project one event's uninstall plan onto its report entry.
+fn uninstall_event_report(plan: &crate::hooks::EventUninstallPlan) -> HookEventReport {
+    let mut report = HookEventReport {
+        event: plan.event.as_str().to_string(),
+        written: None,
+        kept: None,
+        deleted: Vec::new(),
+        restored: None,
+        unchanged: Vec::new(),
+    };
+    match &plan.action {
+        None => {}
+        Some(crate::hooks::UninstallAction::Rewrite { path, .. }) => {
+            report.written = Some(path_string(path));
+        }
+        Some(crate::hooks::UninstallAction::Remove { path, restore }) => {
+            report.deleted.push(path_string(path));
+            report.restored = restore.as_ref().map(|prior| HookMove {
+                from: path_string(prior),
+                to: path_string(path),
+            });
+        }
+    }
+    report
+}
+
+/// The workspace line `install` and `uninstall` both act on: the workspace root and index path made
+/// absolute, because the hook runs from git's own working directory rather than from the caller's.
+fn resolve_workspace_line(root: &Path, db: &Path, workspace: Option<&str>) -> Result<crate::hooks::WorkspaceLine> {
     let workspace_id = resolve_workspace(workspace, root)?;
     let absolute_root = root
         .canonicalize()
@@ -1953,45 +2386,162 @@ pub fn run_hooks_install(root: &Path, db: &Path, workspace: Option<&str>) -> Res
     // every component to. An already-absolute `--db` wins outright, since `join` replaces rather than
     // appends when its argument is absolute.
     let absolute_db = absolute_root.join(db);
-
-    // `symlink_metadata` rather than `exists`, which follows symlinks: a dangling symlink at the hook
-    // path would read as absent and the write below would follow it, landing outside the hooks
-    // directory — the one case where refusing-rather-than-overwriting would do neither.
-    if path.symlink_metadata().is_ok() {
-        return Err(anyhow!(
-            "a hook already exists at {}; refusing to overwrite it — remove it first if you mean to \
-             replace it, or add `c10r build` to it by hand",
-            path.display()
-        ));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let script = post_commit_hook_script(&absolute_root, &absolute_db, workspace_id.as_str());
-    std::fs::write(&path, &script).with_context(|| format!("writing hook at {}", path.display()))?;
-
-    // Git hooks are a POSIX-shell mechanism invoked directly by the OS, so the executable bit is a
-    // Unix-only concept; there is no Windows equivalent to gate here.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("marking hook executable at {}", path.display()))?;
-    }
-
-    Ok(HookOutcome {
-        path: path.display().to_string(),
+    Ok(crate::hooks::WorkspaceLine {
+        root: absolute_root,
+        db: absolute_db,
+        workspace: workspace_id.as_str().to_string(),
     })
 }
 
-/// The rendering of a `hooks install` report: the JSON structured answer under `--json`, or a
-/// one-line human summary naming the path written.
+/// `hooks install`: install the refresh hooks for `workspace` in the git worktree at `root`.
+///
+/// Keeps any existing hook rather than refusing: a hook file already at an event's path or its
+/// `.legacy` path is chained, moved aside to `<event>.c10r-prior`, or (with `overwrite`) deleted, per
+/// [`crate::hooks::install_plan`]. A workspace already installed, and every event whose c10r file
+/// already carries the target workspace set, is left byte-for-byte unchanged.
+pub fn run_hooks_install(root: &Path, db: &Path, workspace: Option<&str>, overwrite: bool) -> Result<HookOutcome> {
+    let repo = GitRepo::discover(root).map_err(GitError::into_failure)?;
+    let hooks_dir = repo.hooks_dir().map_err(GitError::into_failure)?;
+    let line = resolve_workspace_line(root, db, workspace)?;
+
+    let plan = crate::hooks::install_plan(&hooks_dir, &line, overwrite).map_err(|refusal| anyhow!("{refusal}"))?;
+    crate::hooks::apply_plan(&hooks_dir, &plan)
+        .with_context(|| format!("writing hooks at {}", hooks_dir.display()))?;
+
+    Ok(HookOutcome {
+        action: "install",
+        events: plan.events.iter().map(install_event_report).collect(),
+    })
+}
+
+/// `hooks uninstall`: remove `workspace` from the installed refresh hooks in the git worktree at
+/// `root`.
+///
+/// Removes the workspace from every c10r file that names it, even when the hook files disagree with
+/// each other. When an event's c10r file is left with no workspace, that file is deleted and any hook
+/// kept from an earlier install is restored to the slot it occupied. A workspace that is not installed
+/// leaves every hook file unchanged.
+pub fn run_hooks_uninstall(root: &Path, db: &Path, workspace: Option<&str>) -> Result<HookOutcome> {
+    let repo = GitRepo::discover(root).map_err(GitError::into_failure)?;
+    let hooks_dir = repo.hooks_dir().map_err(GitError::into_failure)?;
+    let line = resolve_workspace_line(root, db, workspace)?;
+
+    let plan = crate::hooks::uninstall_plan(&hooks_dir, &line);
+    crate::hooks::apply_uninstall_plan(&hooks_dir, &plan)
+        .with_context(|| format!("removing hooks at {}", hooks_dir.display()))?;
+
+    Ok(HookOutcome {
+        action: "uninstall",
+        events: plan.events.iter().map(uninstall_event_report).collect(),
+    })
+}
+
+/// The language backend recorded by the index at `db`, when one exists, its metadata is readable, and
+/// its recorded analyzer names a recognized backend — `None` otherwise, which leaves `run_build` to
+/// detect the backend from the workspace's manifest, exactly as it does for a first build.
+///
+/// A hook build passes this through rather than leaving it to manifest detection, so a workspace with
+/// both a `Cargo.toml` and a `pyproject.toml` — ambiguous to detection — still refreshes once it has
+/// been built once with an explicit `--language`.
+fn recorded_language(db: &Path) -> Option<Language> {
+    if !db.exists() {
+        return None;
+    }
+    let store = GraphStore::open(db).ok()?;
+    let meta = store.read_metadata().ok().flatten()?;
+    crate::graph::backend_language(&meta.provenance.analyzer_name).ok()
+}
+
+/// `hooks run`: decide whether `event` calls for a refresh of `workspace`'s index in the git worktree
+/// at `root`, given the git arguments the event fired with, and build it when it does.
+///
+/// Called by the hook scripts the installed hooks write, once per installed workspace. Never fails:
+/// discovering the repository, reading its rebase state, and the build itself are each fallible, and
+/// any failure is written to standard error naming the event and the workspace rather than
+/// propagated, so a refresh failure never fails the git operation that triggered it. Returns the
+/// build's one-line report when it built, or `None` when the refresh rules skipped this event.
+pub fn run_hooks_run(
+    event: crate::hooks::HookEvent,
+    root: &Path,
+    db: &Path,
+    workspace: Option<&str>,
+    git_args: &[String],
+) -> Option<String> {
+    let attempt = || -> Result<Option<BuildOutcome>> {
+        let repo = GitRepo::discover(root).map_err(GitError::into_failure)?;
+        let rebase = repo.read_rebase_state().map_err(GitError::into_failure)?;
+        if !crate::hooks::should_refresh(event, git_args, &rebase) {
+            return Ok(None);
+        }
+        run_build(
+            db,
+            workspace,
+            root,
+            "rust-analyzer",
+            "scip-python",
+            None,
+            recorded_language(db),
+            false,
+            &ChunkParams::default(),
+        )
+        .map(Some)
+    };
+
+    match attempt() {
+        Ok(Some(outcome)) => Some(build_outcome_line(&outcome)),
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                crate::render::sanitize(&format!(
+                    "c10r hooks run {}: refreshing workspace {} failed: {error:#}",
+                    event.as_str(),
+                    workspace.unwrap_or("(unspecified)")
+                ))
+            );
+            None
+        }
+    }
+}
+
+/// The rendering of a `hooks install` or `hooks uninstall` report: the JSON structured answer under
+/// `--json`, or one human line per effect (`wrote <path>`, `kept <from> as <to>`, `deleted <path>`,
+/// `restored <from> to <path>`, `unchanged <path>`). An uninstall that changed nothing — the workspace
+/// was not installed — reports that in one line instead of an empty report.
 pub fn render_hook_report(outcome: &HookOutcome, json: bool) -> String {
     if json {
-        serde_json::to_string_pretty(outcome).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        format!("installed hook at {}", crate::render::sanitize(&outcome.path))
+        return serde_json::to_string_pretty(outcome).unwrap_or_else(|_| "{}".to_string());
     }
+    let mut lines = Vec::new();
+    for event in &outcome.events {
+        if let Some(path) = &event.written {
+            lines.push(format!("wrote {}", crate::render::sanitize(path)));
+        }
+        if let Some(mv) = &event.kept {
+            lines.push(format!(
+                "kept {} as {}",
+                crate::render::sanitize(&mv.from),
+                crate::render::sanitize(&mv.to)
+            ));
+        }
+        for path in &event.deleted {
+            lines.push(format!("deleted {}", crate::render::sanitize(path)));
+        }
+        if let Some(mv) = &event.restored {
+            lines.push(format!(
+                "restored {} to {}",
+                crate::render::sanitize(&mv.from),
+                crate::render::sanitize(&mv.to)
+            ));
+        }
+        for path in &event.unchanged {
+            lines.push(format!("unchanged {}", crate::render::sanitize(path)));
+        }
+    }
+    if lines.is_empty() && outcome.action == "uninstall" {
+        return "the workspace is not installed; no hook changed".to_string();
+    }
+    lines.join("\n")
 }
 
 /// A hex SHA-256 digest of `text`, the idiom [`crate::graph::content_hash`] and
@@ -2339,23 +2889,6 @@ mod tests {
             ("src/untouched.rs".to_string(), "unchanged".to_string()),
         ];
         assert_eq!(content_hash(&reverted), content_hash(&expected));
-    }
-
-    // Every value the hook script carries is a path or an identity the caller chose, and any of them
-    // may contain a space — the hook is a shell script, so an unquoted space would split one argument
-    // into two and point `build` at a path that does not exist. Each of the three is single-quoted.
-    #[test]
-    fn post_commit_hook_script_shell_quotes_values_containing_a_space() {
-        let script = post_commit_hook_script(
-            Path::new("/home/dev/my project"),
-            Path::new("/home/dev/my project/.c10r/index.db"),
-            "my project",
-        );
-        assert_eq!(
-            script,
-            "#!/bin/sh\nc10r build '/home/dev/my project' --db '/home/dev/my project/.c10r/index.db' \
-             --workspace 'my project'\n"
-        );
     }
 
     // A store that cannot be measured yields no total, so `cache size` reports no byte count rather

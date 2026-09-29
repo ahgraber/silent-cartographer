@@ -288,6 +288,10 @@ fn site_packages_dir(environment: &Path) -> Result<PathBuf, SemanticError> {
 /// read only at the outer edge, keeping this function pure and testable), then a `.venv/` or `venv/`
 /// directory under the workspace root.
 ///
+/// Returns the canonical absolute path, so the same environment resolves to the same text regardless
+/// of how the workspace root or an explicit path was spelled; a path that cannot be canonicalized is
+/// returned as resolved.
+///
 /// Never falls back to a system interpreter: when none resolves, the typed refusal names all three
 /// mechanisms.
 pub fn resolve_environment(
@@ -299,7 +303,7 @@ pub fn resolve_environment(
     // refusal to surface, never a reason to silently try the next mechanism.
     if let Some(path) = explicit {
         if path.is_dir() {
-            return Ok(path.to_path_buf());
+            return Ok(canonicalize_or(path));
         }
         return Err(SemanticError::Environment(format!(
             "the explicit environment path {} is not a directory",
@@ -308,12 +312,12 @@ pub fn resolve_environment(
     }
     // An activated environment is taken as-is: activation is the user's declaration of intent.
     if let Some(path) = virtual_env {
-        return Ok(path.to_path_buf());
+        return Ok(canonicalize_or(path));
     }
     for candidate in [".venv", "venv"] {
         let dir = workspace_root.join(candidate);
         if dir.is_dir() {
-            return Ok(dir);
+            return Ok(canonicalize_or(&dir));
         }
     }
     Err(SemanticError::Environment(format!(
@@ -321,6 +325,11 @@ pub fn resolve_environment(
          (set $VIRTUAL_ENV), or create a .venv/ (or venv/) directory in the workspace root",
         workspace_root.display()
     )))
+}
+
+/// `path` canonicalized, or `path` itself when canonicalization fails.
+fn canonicalize_or(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The installed-package fingerprint of a site-packages directory: a SHA-256 over the sorted
@@ -411,22 +420,32 @@ mod tests {
         std::fs::create_dir(root.join("venv")).unwrap();
         let (_explicit_guard, explicit) = canonical_tempdir();
         let (_active_guard, active) = canonical_tempdir();
+        // Every input is reached through a symbolic link, so each result is canonical only through
+        // resolution. (`PathBuf` equality ignores `.` components, so a `/./` spelling would not show it.)
+        let (_links_guard, links) = canonical_tempdir();
+        let linked = |path: &Path| {
+            let link = links.join(path.file_name().unwrap());
+            if !link.exists() {
+                std::os::unix::fs::symlink(path, &link).unwrap();
+            }
+            link
+        };
 
         // All three mechanisms available: the explicit path wins.
-        let resolved = resolve_environment(Some(&explicit), Some(&active), &root).unwrap();
+        let resolved = resolve_environment(Some(&linked(&explicit)), Some(&linked(&active)), &linked(&root)).unwrap();
         assert_eq!(resolved, explicit, "explicit path outranks $VIRTUAL_ENV and .venv");
 
         // No explicit path: the activated $VIRTUAL_ENV wins over the workspace's .venv.
-        let resolved = resolve_environment(None, Some(&active), &root).unwrap();
+        let resolved = resolve_environment(None, Some(&linked(&active)), &linked(&root)).unwrap();
         assert_eq!(resolved, active, "$VIRTUAL_ENV outranks .venv");
 
         // Neither: the workspace's .venv is found, preferred over venv.
-        let resolved = resolve_environment(None, None, &root).unwrap();
+        let resolved = resolve_environment(None, None, &linked(&root)).unwrap();
         assert_eq!(resolved, root.join(".venv"), ".venv outranks venv");
 
         // With .venv gone, venv resolves.
         std::fs::remove_dir(root.join(".venv")).unwrap();
-        let resolved = resolve_environment(None, None, &root).unwrap();
+        let resolved = resolve_environment(None, None, &linked(&root)).unwrap();
         assert_eq!(resolved, root.join("venv"), "venv is the final directory candidate");
     }
 

@@ -201,6 +201,12 @@ pub struct Answer<T> {
     pub freshness: FreshnessLabel,
     /// Whether the answer is stale (either reason).
     pub stale: bool,
+    /// The runnable command that refreshes the index this answer came from, present exactly when
+    /// `stale` is true so a fresh answer's shape is unchanged. Names the index's location, workspace
+    /// identity, and workspace root, and running it makes the same query answer fresh again when the
+    /// sources, analyzer, and environment stay as they were when the command was built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<String>,
     /// The heuristic grade the answer's content carries, with the provenance that grade obliges.
     /// Absent for relations derived only from resolved reference evidence, so their shape is
     /// unchanged. Rides independently of provenance and freshness, never replacing either.
@@ -262,6 +268,7 @@ impl<T> Answer<T> {
             provenance,
             freshness: freshness.into(),
             stale: freshness.is_stale(),
+            refresh: None,
             classification: None,
             workspace_relation: None,
             ordering: None,
@@ -299,6 +306,15 @@ impl<T> Answer<T> {
     /// answer carries, whatever its outcome, naming the ordering in effect.
     pub fn with_ordering(mut self, ordering: OrderMode) -> Self {
         self.ordering = Some(ordering);
+        self
+    }
+
+    /// Attach the refresh command to a stale answer. A fresh answer is returned unchanged, without
+    /// calling `refresh`, so its shape carries no refresh command.
+    pub fn with_refresh(mut self, refresh: impl FnOnce() -> String) -> Self {
+        if self.stale {
+            self.refresh = Some(refresh());
+        }
         self
     }
 }

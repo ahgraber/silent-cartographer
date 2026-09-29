@@ -11,9 +11,9 @@ use anyhow::Result;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
 
-use silent_cartographer::cli::{CacheAction, Cli, Command, CompletionsArgs, HookAction};
+use silent_cartographer::cli::{CacheAction, Cli, Command, CompletionsArgs, HookAction, HooksArgs};
 use silent_cartographer::commands;
-use silent_cartographer::exit::{ExitCode, classify};
+use silent_cartographer::exit::{ExitCode, Failure, classify};
 use silent_cartographer::manifest;
 use silent_cartographer::render;
 
@@ -42,6 +42,24 @@ fn main() {
         run_completions(&matches, args);
     }
 
+    // `hooks`' cross-action argument validation happens here, ahead of every side effect: an event,
+    // `--root`, and the trailing git arguments belong only to `run`, and `--overwrite` only to
+    // `install`, whichever action the shared `run` path below would otherwise attempt first.
+    //
+    // `hooks run` is then dispatched ahead of the shared path too, like `doctor` and `completions`:
+    // it must print nothing when the refresh rules skip the event, and must always exit with the
+    // success code, which the shared `Ok`-prints / `Err`-diagnoses pattern below does not express.
+    if let Command::Hooks(args) = &cli.command {
+        if let Err(failure) = validate_hooks_args(args) {
+            let error = anyhow::Error::from(failure);
+            eprintln!("{}", render::sanitize(&format!("{error:#}")));
+            std::process::exit(classify(&error).code());
+        }
+        if args.action == HookAction::Run {
+            run_hooks_run(&cli, args);
+        }
+    }
+
     match run(&cli, &matches) {
         Ok(answer) => {
             println!("{answer}");
@@ -62,15 +80,16 @@ fn main() {
 /// indexer/setup-failure code with a diagnostic on standard error naming what is not ready — a tool
 /// that is absent or present-but-unresponsive.
 fn run_doctor(cli: &Cli) -> ! {
-    let statuses = commands::run_doctor();
-    let report = if cli.json {
-        serde_json::to_string_pretty(&statuses).unwrap_or_else(|_| "[]".to_string())
+    let report = commands::run_doctor();
+    let output = if cli.json {
+        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
     } else {
-        commands::render_doctor_report(&statuses)
+        commands::render_doctor_report(&report)
     };
-    println!("{report}");
+    println!("{output}");
 
-    let not_ready: Vec<&str> = statuses
+    let not_ready: Vec<&str> = report
+        .indexers
         .iter()
         .filter(|s| !s.is_ready())
         .map(|s| s.name.as_str())
@@ -98,6 +117,55 @@ fn run_completions(matches: &ArgMatches, args: &CompletionsArgs) -> ! {
     }
     let mut cmd = Cli::command();
     clap_complete::generate(args.shell, &mut cmd, "c10r", &mut std::io::stdout());
+    std::process::exit(ExitCode::Success.code());
+}
+
+/// Reject a `hooks` argument given to an action it does not belong to, before `hooks` has any side
+/// effect: an event, `--root`, and the trailing git arguments belong only to `run`; `--overwrite`
+/// belongs only to `install`. `run` requires both an event and `--root`.
+fn validate_hooks_args(args: &HooksArgs) -> Result<(), Failure> {
+    match args.action {
+        HookAction::Run => {
+            if args.event.is_none() {
+                return Err(Failure::Usage("`hooks run` requires an event".to_string()));
+            }
+            if args.root.is_none() {
+                return Err(Failure::Usage("`hooks run` requires --root".to_string()));
+            }
+        }
+        HookAction::Install | HookAction::Uninstall => {
+            if args.event.is_some() {
+                return Err(Failure::Usage("an event applies only to `hooks run`".to_string()));
+            }
+            if args.root.is_some() {
+                return Err(Failure::Usage("--root applies only to `hooks run`".to_string()));
+            }
+            if !args.git_args.is_empty() {
+                return Err(Failure::Usage(
+                    "trailing arguments after `--` apply only to `hooks run`".to_string(),
+                ));
+            }
+        }
+    }
+    if args.overwrite && args.action != HookAction::Install {
+        return Err(Failure::Usage(
+            "--overwrite applies only to `hooks install`".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Run `hooks run` and exit: see the dispatch comment in `main` for why this runs ahead of the shared
+/// `run` path. `validate_hooks_args` has already confirmed `args.event` and `args.root` are present.
+fn run_hooks_run(cli: &Cli, args: &HooksArgs) -> ! {
+    let event = args.event.expect("validate_hooks_args confirmed an event is present");
+    let root = args
+        .root
+        .as_deref()
+        .expect("validate_hooks_args confirmed --root is present");
+    if let Some(line) = commands::run_hooks_run(event, root, &cli.db, cli.workspace.as_deref(), &args.git_args) {
+        println!("{line}");
+    }
     std::process::exit(ExitCode::Success.code());
 }
 
@@ -256,7 +324,11 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
         },
         Command::Hooks(args) => {
             let outcome = match args.action {
-                HookAction::Install => commands::run_hooks_install(&root, &cli.db, cli.workspace.as_deref())?,
+                HookAction::Install => {
+                    commands::run_hooks_install(&root, &cli.db, cli.workspace.as_deref(), args.overwrite)?
+                }
+                HookAction::Uninstall => commands::run_hooks_uninstall(&root, &cli.db, cli.workspace.as_deref())?,
+                HookAction::Run => unreachable!("hooks run is dispatched before run() in main"),
             };
             Ok(commands::render_hook_report(&outcome, cli.json))
         }

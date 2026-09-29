@@ -472,6 +472,10 @@ fn clap_tree_matches_the_recorded_flag_vocabulary() {
         "discrepancies",
         "all",
         "duplicates",
+        // `hooks install`'s flag to delete rather than keep an existing hook, and `hooks run`'s
+        // workspace-root argument (the installed hooks pass it explicitly).
+        "overwrite",
+        "root",
     ]
     .iter()
     .map(|s| s.to_string())

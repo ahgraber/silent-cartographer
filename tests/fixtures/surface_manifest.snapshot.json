@@ -1,5 +1,5 @@
 {
-  "surface_version": 10,
+  "surface_version": 11,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -649,17 +649,43 @@
     },
     {
       "name": "hooks",
-      "about": "Install the repository hooks that keep the index current",
+      "about": "Install or remove the repository hooks that keep the index current, or run one refresh event's rules (the installed hooks call this)",
       "args": [
         {
           "name": "action",
           "required": true,
           "values": [
-            "install"
+            "install",
+            "uninstall",
+            "run"
           ]
+        },
+        {
+          "name": "event",
+          "required": false,
+          "values": [
+            "post-commit",
+            "post-rewrite",
+            "post-checkout",
+            "post-merge"
+          ]
+        },
+        {
+          "name": "git_args",
+          "required": false
         }
       ],
       "flags": [
+        {
+          "name": "overwrite",
+          "takes_value": false,
+          "global": false
+        },
+        {
+          "name": "root",
+          "takes_value": true,
+          "global": false
+        },
         {
           "name": "db",
           "takes_value": true,

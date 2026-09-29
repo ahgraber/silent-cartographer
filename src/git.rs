@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::exit::Failure;
+use crate::hooks::RebaseState;
 use crate::semantic::probe::{PROBE_DEADLINE, ProbeCapture, ProbeOutcome, run_bounded, run_bounded_full};
 
 /// Which change seeds an impact assessment.
@@ -384,18 +385,18 @@ impl GitRepo {
             .collect())
     }
 
-    /// The absolute path this worktree resolves `hooks/post-commit` to.
+    /// The absolute path this worktree resolves its hooks directory to.
     ///
     /// Resolved through git rather than assumed to be `.git/hooks`: a linked worktree keeps its hooks
     /// in the repository's common directory, and `core.hooksPath` can relocate them outright, so a
     /// hard-coded path would write somewhere git never reads.
     ///
-    /// `git rev-parse --git-path hooks/post-commit` yields a path relative to the invocation
-    /// directory when the repository is nearby, so the result is resolved against the invocation root
-    /// to make it absolute regardless of that relativity.
-    pub fn post_commit_hook_path(&self) -> Result<PathBuf, GitError> {
-        let label = "rev-parse --git-path hooks/post-commit";
-        let capture = spawn_metadata(&self.root, &["rev-parse", "--git-path", "hooks/post-commit"], label)?;
+    /// `git rev-parse --git-path hooks` yields a path relative to the invocation directory when the
+    /// repository is nearby, so the result is resolved against the invocation root to make it
+    /// absolute regardless of that relativity.
+    pub fn hooks_dir(&self) -> Result<PathBuf, GitError> {
+        let label = "rev-parse --git-path hooks";
+        let capture = spawn_metadata(&self.root, &["rev-parse", "--git-path", "hooks"], label)?;
         if !capture.status.success() {
             return Err(GitError::Failed {
                 invocation: label.to_string(),
@@ -410,6 +411,43 @@ impl GitRepo {
         // appends when its argument is absolute.
         let base = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
         Ok(base.join(raw))
+    }
+
+    /// Whether a rebase is in progress in this worktree, and the size of its to-do list.
+    ///
+    /// Resolved the same way [`GitRepo::hooks_dir`] resolves the hooks directory: `git rev-parse
+    /// --git-path rebase-merge` names the directory git's default backend uses while a rebase is in
+    /// progress, absolutized against the invocation root since the raw path may be relative. That
+    /// directory's absence means no rebase is in progress. A to-do entry is a line of
+    /// `git-rebase-todo` in that directory that is neither blank nor a `#` comment; a missing to-do
+    /// file counts zero entries.
+    pub fn read_rebase_state(&self) -> Result<RebaseState, GitError> {
+        let label = "rev-parse --git-path rebase-merge";
+        let capture = spawn_metadata(&self.root, &["rev-parse", "--git-path", "rebase-merge"], label)?;
+        if !capture.status.success() {
+            return Err(GitError::Failed {
+                invocation: label.to_string(),
+                stderr: String::from_utf8_lossy(&capture.stderr).into_owned(),
+            });
+        }
+        let raw = String::from_utf8_lossy(&capture.stdout).trim().to_string();
+        let base = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        let dir = base.join(raw);
+        if !dir.is_dir() {
+            return Ok(RebaseState::None);
+        }
+        let todo_entries = std::fs::read_to_string(dir.join("git-rebase-todo"))
+            .map(|contents| {
+                contents
+                    .lines()
+                    .filter(|line| {
+                        let trimmed = line.trim();
+                        !trimmed.is_empty() && !trimmed.starts_with('#')
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok(RebaseState::InProgress { todo_entries })
     }
 
     /// The workspace root's path prefix within the repository, exactly as [`GitRepo::discover`]

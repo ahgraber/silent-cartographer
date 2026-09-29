@@ -98,6 +98,12 @@ pub fn should_style(color: ColorArg, json: bool, stdout_is_terminal: bool) -> bo
 pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(header_line(answer, styled));
+    // The refresh command sits directly under the stale marker the header line carries, so a human
+    // consumer cannot miss the fix for what the header just disclosed. Absent on a fresh answer,
+    // exactly as the machine answer's field is.
+    if let Some(refresh) = &answer.refresh {
+        lines.push(format!("refresh: {}", sanitize(refresh)));
+    }
     // The workspace disclosure sits directly under the header, above any result, so a human consumer
     // cannot miss what the structural field tells a machine consumer.
     if let Some(line) = workspace_relation_line(answer) {

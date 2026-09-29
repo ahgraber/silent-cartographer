@@ -37,6 +37,29 @@ pub fn stamp_metadata(store: &GraphStore, workspace: &str, root: &std::path::Pat
         .unwrap();
 }
 
+/// Stamp a directly-built fixture store the same way [`stamp_metadata`] does, except the recorded
+/// content hash is `root`'s real, current Rust-source hash rather than an always-stale placeholder —
+/// so a query against the fixture reads as fresh (no refresh notice) as long as the caller also makes
+/// the analyzer provenance the query sees match [`provenance`].
+pub fn stamp_fresh_metadata(store: &GraphStore, workspace: &str, root: &std::path::Path) {
+    let workspace_root = std::fs::canonicalize(root)
+        .unwrap_or_else(|e| panic!("canonicalizing the fixture workspace root {}: {e}", root.display()));
+    let sources = silent_cartographer::commands::collect_rust_sources(root)
+        .unwrap_or_else(|e| panic!("collecting rust sources under {}: {e}", root.display()));
+    let content_hash = silent_cartographer::graph::content_hash(&sources);
+    store
+        .write_metadata(&IndexMetadata {
+            workspace_id: WorkspaceId::new(workspace),
+            workspace_root: workspace_root.to_str().map(str::to_string),
+            provenance: provenance(),
+            content_hash,
+            accounting: JoinAccounting::default(),
+            environment: None,
+            chunk_params: Default::default(),
+        })
+        .unwrap();
+}
+
 /// The workspace-relative path of the single fixture source file.
 pub const DOC: &str = "src/net.rs";
 
@@ -277,4 +300,42 @@ pub fn python_fixture_sources() -> Vec<(String, String)> {
             (rel.to_string(), text)
         })
         .collect()
+}
+
+/// Write an executable stub tool that answers `--version` with `version`, and — for any other
+/// invocation carrying `--output <path>`, the shape both `rust-analyzer` and `scip-python` are run
+/// with — writes an empty file at `<path>` and exits successfully. An empty SCIP index is a valid one
+/// (zero documents), so this lets a real `c10r build` run to completion without a real analyzer
+/// available in this sandbox.
+pub fn write_indexing_stub(dir: &std::path::Path, name: &str, version: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n  echo \"{version}\"\n  exit 0\nfi\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 if [ \"$1\" = \"--output\" ]; then\n    : > \"$2\"\n    exit 0\n  fi\n\
+             \x20 shift\n\
+             done\n\
+             exit 1\n"
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// `PATH` with `dirs` prepended, in order, ahead of the inherited value, so a stub placed in one of
+/// them is found before any same-named tool already on `PATH`.
+pub fn prepend_path(dirs: &[&std::path::Path]) -> std::ffi::OsString {
+    let mut parts: Vec<std::path::PathBuf> = dirs.iter().map(|d| d.to_path_buf()).collect();
+    if let Some(existing) = std::env::var_os("PATH") {
+        parts.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(parts).unwrap()
 }

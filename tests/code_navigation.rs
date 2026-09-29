@@ -18,7 +18,9 @@ use silent_cartographer::semantic::model::{
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
 };
 
-use crate::support::{id_of_pkg, line_col, one_doc_index, one_occ_symbol, sources, ws};
+use crate::support::{
+    id_of_pkg, line_col, one_doc_index, one_occ_symbol, prepend_path, sources, write_indexing_stub, ws,
+};
 
 /// The canonicalized workspace root a directly-ingested fixture store records. These stores are never
 /// queried against a real filesystem root, so a stable stand-in keeps the recorded identity out of the
@@ -1154,6 +1156,642 @@ fn stale_result_flagged_through_get_and_trace() {
         .trace("net::Client", TraceRelation::Contains, None, None)
         .unwrap();
     assert!(trace_answer.stale, "trace result over changed sources is stale");
+}
+
+/// A fake Python environment under `dir/.venv`: a version-only `bin/python` stub and a site-packages
+/// directory holding one installed distribution — enough for `environment_facts` to resolve an
+/// interpreter version and a package fingerprint, and for `resolve_environment`'s `.venv` fallback to
+/// find it with no `$VIRTUAL_ENV` set.
+fn write_fake_venv(dir: &std::path::Path) -> std::path::PathBuf {
+    let venv = dir.join(".venv");
+    let bin = venv.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_indexing_stub(&bin, "python", "Python 3.12.0");
+    let site = venv.join("lib").join("python3.12").join("site-packages");
+    std::fs::create_dir_all(site.join("foo-1.0.dist-info")).unwrap();
+    venv
+}
+
+// _(Scenario: Stale after changed sources)_ — an index whose recorded sources no longer match what is
+// on disk answers stale, and the refresh command it carries names the index's location, the
+// workspace identity, and the workspace root.
+#[test]
+fn stale_after_changed_sources_names_the_index_location_workspace_and_root() {
+    let dir = tempfile::tempdir().unwrap();
+    // No source file is written under `dir`, so a query's own content hash differs from the one the
+    // fixture index recorded: the answer reads stale from the first query.
+    let db = support::build_fixture_db(dir.path(), "refresh-ws");
+
+    let out = silent_cartographer::commands::run_find(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "connect",
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["freshness"], "stale_content");
+    assert_eq!(value["stale"], true);
+
+    let refresh = value["refresh"]
+        .as_str()
+        .expect("a stale answer carries a refresh command");
+    assert!(
+        refresh.starts_with("c10r build "),
+        "the command names the build subcommand: {refresh}"
+    );
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(
+        refresh.contains(&root.display().to_string()),
+        "the command names the workspace root: {refresh}"
+    );
+    assert!(
+        refresh.contains(&db.display().to_string()),
+        "the command names the index location: {refresh}"
+    );
+    assert!(
+        refresh.contains("refresh-ws"),
+        "the command names the workspace identity: {refresh}"
+    );
+}
+
+// _(Scenario: Stale after a changed analyzer)_ — an index recorded under one analyzer version while a
+// different version is in effect answers stale and carries a refresh command.
+#[test]
+fn stale_after_a_changed_analyzer_carries_a_refresh_command() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+    let db = support::build_fixture_db(dir.path(), "refresh-ws");
+    // The fixture records `rust-analyzer 1.85.0` (`support::provenance`); this stub reports a
+    // different version, so only the analyzer identity drifts.
+    let stub = write_indexing_stub(dir.path(), "rust-analyzer-stub", "9.9.9");
+
+    let out = silent_cartographer::commands::run_find(
+        &db,
+        dir.path(),
+        stub.to_str().unwrap(),
+        "connect",
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["freshness"], "stale_version");
+    assert!(
+        value["refresh"].as_str().unwrap().starts_with("c10r build "),
+        "a version-stale answer still carries a refresh command: {value}"
+    );
+}
+
+// _(Scenario: A fresh answer carries no refresh command)_ — an index whose sources and analyzer are
+// unchanged since indexing answers fresh, and the answer carries no `refresh` field at all.
+#[test]
+fn a_fresh_answer_carries_no_refresh_field() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+    let db = support::build_fixture_db(dir.path(), "refresh-ws");
+
+    let out = silent_cartographer::commands::run_find(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "connect",
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["freshness"], "fresh");
+    assert_eq!(value["stale"], false);
+    assert!(
+        value.get("refresh").is_none(),
+        "a fresh answer carries no refresh field: {value}"
+    );
+}
+
+// _(Scenario: The human rendering names the refresh command)_ — a stale answer's human rendering
+// includes the same refresh command the machine answer carries.
+#[test]
+fn human_rendering_includes_the_refresh_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = support::build_fixture_db(dir.path(), "refresh-ws");
+
+    let out = silent_cartographer::commands::run_find(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "connect",
+        0,
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(
+        out.lines().any(|line| line.starts_with("refresh: c10r build ")),
+        "the human rendering names the refresh command: {out}"
+    );
+}
+
+// _(Scenario: Running the refresh command makes the answer fresh)_ — running the refresh command a
+// stale answer carries, against a stub analyzer reachable through `PATH` and the built `c10r` binary,
+// brings the same query back to fresh.
+#[test]
+fn running_the_refresh_command_after_changed_sources_makes_the_answer_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "# fixture manifest\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+    let db = support::build_fixture_db(dir.path(), "refresh-ws");
+
+    // The source changes on disk after the index was built, so a query over it reads stale.
+    std::fs::write(
+        dir.path().join(support::DOC),
+        format!("{}\n// edited\n", support::SOURCE),
+    )
+    .unwrap();
+
+    let out = silent_cartographer::commands::run_find(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "connect",
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["freshness"], "stale_content");
+    let refresh = value["refresh"].as_str().unwrap().to_string();
+
+    // Run the refresh command for real: the built `c10r` binary and a stub `rust-analyzer` that
+    // succeeds without doing real analysis, both reachable on `PATH`.
+    let bin_dir = tempfile::tempdir().unwrap();
+    write_indexing_stub(bin_dir.path(), "rust-analyzer", "1.85.0");
+    let built_bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_c10r"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = prepend_path(&[&built_bin_dir, bin_dir.path()]);
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&refresh)
+        .env("PATH", &path)
+        .current_dir(std::env::temp_dir())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the refresh command runs to completion: {refresh}");
+
+    let out = silent_cartographer::commands::run_find(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "connect",
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["freshness"], "fresh", "the rebuilt index answers fresh: {value}");
+    assert!(
+        value.get("refresh").is_none(),
+        "a fresh answer carries no refresh field: {value}"
+    );
+}
+
+// _(Scenario: Stale after a changed environment)_ — a recorded interpreter environment drifting (an
+// installed distribution added) while the sources and analyzer stay put answers stale, and running
+// the refresh command it carries — which pins the environment currently in effect, not the one
+// originally recorded — brings the same query back to fresh under that same drifted environment.
+#[test]
+fn stale_after_a_changed_environment_is_fresh_once_the_refresh_command_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("pyproject.toml"), "# fixture manifest\n").unwrap();
+    std::fs::write(dir.path().join("app.py"), "x = 1\n").unwrap();
+    let venv = write_fake_venv(dir.path());
+
+    let collected = silent_cartographer::commands::collect_python_sources(dir.path()).unwrap();
+    let facts = silent_cartographer::semantic::python_adapter::environment_facts(&venv).unwrap();
+    // Recorded at whatever version a real `scip-python` on this machine's `PATH` reports (falling
+    // back to a fixed one when none resolves), so only the environment drifts below — never the
+    // analyzer identity `current_state` would also compare.
+    let analyzer_version = silent_cartographer::semantic::python_adapter::PythonAdapter::discover_version(
+        silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name(),
+    )
+    .unwrap_or_else(|_| "0.6.0".to_string());
+    let index = ExtractedIndex {
+        provenance: AnalyzerProvenance {
+            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_version: analyzer_version.clone(),
+        },
+        documents: vec![SourceDocument {
+            path: "app.py".to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: Some(facts),
+    };
+    let db = dir.path().join("index.db");
+    silent_cartographer::commands::build_from_index(&db, "refresh-ws", dir.path(), &index, &collected).unwrap();
+
+    // Drift the environment: one more installed distribution changes the package fingerprint, with
+    // the environment's own path unchanged.
+    std::fs::create_dir(
+        venv.join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("bar-2.0.dist-info"),
+    )
+    .unwrap();
+
+    // Queried through the built binary, not in-process: `current_state`'s environment resolution
+    // reads the whole test process's `$VIRTUAL_ENV`, which an activated development environment may
+    // set to something else entirely, and a child process is the only place that is safe to control.
+    let query = |db: &std::path::Path, root: &std::path::Path| -> serde_json::Value {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+            .arg("--db")
+            .arg(db)
+            .args(["--json", "find", "x"])
+            .current_dir(root)
+            .env_remove("VIRTUAL_ENV")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the query succeeds: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let value = query(&db, dir.path());
+    assert_eq!(value["freshness"], "stale_environment");
+    let refresh = value["refresh"].as_str().unwrap().to_string();
+    // Named canonically and absolutely, so the command runs from any directory.
+    let named_environment = refresh
+        .split("--environment='")
+        .nth(1)
+        .and_then(|s| s.split('\'').next())
+        .expect("the command names --environment");
+    assert!(
+        std::path::Path::new(named_environment).is_absolute(),
+        "the named environment is absolute: {refresh}"
+    );
+    assert_eq!(
+        std::fs::canonicalize(named_environment).unwrap(),
+        std::fs::canonicalize(&venv).unwrap(),
+        "the refresh command names the environment in effect: {refresh}"
+    );
+
+    // Run the refresh command for real: the built `c10r` binary and a stub `scip-python` that
+    // succeeds without doing real analysis, both reachable on `PATH`.
+    let bin_dir = tempfile::tempdir().unwrap();
+    // Reports the same version already recorded, so the final query below still sees a matching
+    // analyzer identity and the environment is the only thing that was ever compared.
+    write_indexing_stub(bin_dir.path(), "scip-python", &analyzer_version);
+    let built_bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_c10r"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = prepend_path(&[&built_bin_dir, bin_dir.path()]);
+
+    // Run from outside the workspace root: the named environment is absolute, so the command does
+    // not depend on the directory it runs from.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&refresh)
+        .env("PATH", &path)
+        .current_dir(elsewhere.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the refresh command runs to completion: {refresh}");
+
+    // The same query, repeated under the same (still drifted) environment, now answers fresh.
+    let value = query(&db, dir.path());
+    assert_eq!(value["freshness"], "fresh", "the rebuilt index answers fresh: {value}");
+    assert!(
+        value.get("refresh").is_none(),
+        "a fresh answer carries no refresh field: {value}"
+    );
+}
+
+/// `PATH` holding only `bin_dir` plus the system directories a spawned process needs to resolve its
+/// own dynamic loader and shared libraries — no inherited entry survives, so a stub placed in
+/// `bin_dir` is the only tool of its name the child process can find.
+fn hermetic_path(bin_dir: &std::path::Path) -> std::ffi::OsString {
+    std::env::join_paths([bin_dir, std::path::Path::new("/usr/bin"), std::path::Path::new("/bin")]).unwrap()
+}
+
+/// Build the Python workspace at `dir` (a manifest and a fake `.venv`, no activated environment) with
+/// the given root spelling, then query it from the workspace directory, both through the built binary
+/// with a stub `scip-python` — answering the version probe and, for `index`, writing an empty (valid)
+/// SCIP index — the only `scip-python` reachable on `PATH`. Returns the query's freshness answer.
+fn build_and_query_env_spelling(
+    dir: &std::path::Path,
+    db: &std::path::Path,
+    build_root: &std::ffi::OsStr,
+) -> serde_json::Value {
+    std::fs::write(
+        dir.join("pyproject.toml"),
+        "[project]\nname = \"pkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    write_fake_venv(dir);
+    let bin_dir = tempfile::tempdir().unwrap();
+    write_indexing_stub(bin_dir.path(), "scip-python", "0.6.0");
+    let path = hermetic_path(bin_dir.path());
+
+    let build = std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+        .arg("build")
+        .arg(build_root)
+        .arg("--db")
+        .arg(db)
+        .args(["--workspace", "env-spelling-ws"])
+        .current_dir(dir)
+        .env_remove("VIRTUAL_ENV")
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "the build succeeds: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let query = std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+        .arg("--db")
+        .arg(db)
+        .args(["--json", "--workspace", "env-spelling-ws", "find", "hello"])
+        .current_dir(dir)
+        .env_remove("VIRTUAL_ENV")
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        query.status.success(),
+        "the query succeeds: {}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    serde_json::from_slice(&query.stdout).unwrap()
+}
+
+// _(Scenario: An index built by the refresh hooks answers fresh)_ — a Python workspace's environment,
+// found through a `.venv` directory with no activated environment, is recorded canonically at build
+// time, so a build naming the workspace root by an absolute path — the way the refresh hooks build —
+// answers fresh to a query run from the workspace directory.
+#[test]
+fn an_index_built_with_an_absolute_root_answers_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join(".c10r").join("index.db");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let value = build_and_query_env_spelling(dir.path(), &db, root.as_os_str());
+    assert_eq!(value["freshness"], "fresh", "built with an absolute root: {value}");
+}
+
+// _(Scenario: An index built from the workspace directory answers fresh)_ — the same workspace, built
+// with the root given as `.`, also answers fresh: freshness does not depend on how the root was
+// spelled at build time.
+#[test]
+fn an_index_built_from_the_workspace_directory_answers_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join(".c10r").join("index.db");
+    let value = build_and_query_env_spelling(dir.path(), &db, std::ffi::OsStr::new("."));
+    assert_eq!(value["freshness"], "fresh", "built with the root '.': {value}");
+}
+
+// _(Scenario: The index does not record its workspace root)_ — a stale answer over an index whose
+// build root could not be recorded exactly says the root is unknown, as a shell comment that runs
+// nothing rather than a placeholder a shell could misparse (`<`/`>` are redirection operators).
+#[test]
+fn stale_answer_with_no_recorded_root_says_the_root_is_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    // No source file is written under `dir`, so the query reads stale from the first query.
+    let db = support::build_fixture_db(dir.path(), "refresh-ws");
+
+    // `workspace_root` is `None` only when a build root could not be recorded exactly (not valid
+    // UTF-8); the fixture helpers always record a canonicalized root, so it is erased here directly,
+    // reading back the metadata `build_from_index` wrote and rewriting it with the one field cleared.
+    let store = GraphStore::open_or_replace(&db).unwrap();
+    let mut meta = store.read_metadata().unwrap().expect("metadata present");
+    meta.workspace_root = None;
+    store.write_metadata(&meta).unwrap();
+    drop(store);
+
+    let out = silent_cartographer::commands::run_find(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "connect",
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["freshness"], "stale_content");
+    let refresh = value["refresh"]
+        .as_str()
+        .expect("a stale answer carries a refresh command");
+    assert!(
+        refresh.starts_with('#'),
+        "an unknown root is a shell comment that runs nothing: {refresh}"
+    );
+    assert!(refresh.contains("root"), "the text says the root is unknown: {refresh}");
+    // The db/workspace parts still ride along, exactly as the normal command shape carries them.
+    assert!(
+        refresh.contains(&db.display().to_string()),
+        "still names the index location: {refresh}"
+    );
+    assert!(
+        refresh.contains("refresh-ws"),
+        "still names the workspace identity: {refresh}"
+    );
+
+    // A comment line is inert — running it does nothing and exits successfully — rather than a shell
+    // misreading `<`/`>` in a bare placeholder as redirection.
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(refresh)
+        .status()
+        .unwrap();
+    assert!(status.success(), "a comment line runs to a no-op success: {refresh}");
+}
+
+// _(Write-site coverage)_ — every query path that produces an `Answer` attaches a refresh command
+// once its index is stale, not only `find`: `get`, `trace` (the item-relation branch and the
+// `dependents` branch), `search`, `similar`, and `impact` each carry one too.
+#[test]
+fn every_query_path_carries_a_refresh_command_on_a_stale_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    // No source file is written under `dir`, so every query below reads stale from its own content
+    // hash mismatch — the one condition every command's freshness check shares.
+    let db = support::build_fixture_db(dir.path(), "refresh-ws");
+
+    let assert_refreshable = |label: &str, out: String| {
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["stale"], true, "{label} answer is stale: {value}");
+        assert!(
+            value["refresh"].as_str().unwrap_or_default().starts_with("c10r build "),
+            "{label} carries a refresh command: {value}"
+        );
+    };
+
+    let get = silent_cartographer::commands::run_get(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        Some("net::Client::connect"),
+        None,
+        Detail::Location,
+        0,
+        1,
+        false,
+        false,
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_refreshable("get", get);
+
+    let trace = silent_cartographer::commands::run_trace(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "net::Client",
+        Relation::Contains,
+        None,
+        None,
+        10,
+        false,
+        OrderMode::Unranked,
+        false,
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_refreshable("trace (contains)", trace);
+
+    let dependents = silent_cartographer::commands::run_trace(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "net::Client::connect",
+        Relation::Dependents,
+        None,
+        None,
+        10,
+        false,
+        OrderMode::Unranked,
+        false,
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_refreshable("trace (dependents)", dependents);
+
+    let search = silent_cartographer::commands::run_search(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        "connect a client",
+        Detail::Signature,
+        10,
+        false,
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_refreshable("search", search);
+
+    let similar = silent_cartographer::commands::run_similar(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        Some("net::Client::connect"),
+        None,
+        Detail::Signature,
+        10,
+        false,
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_refreshable("similar", similar);
+
+    // `impact` additionally needs a real git worktree; a root commit is enough for `HEAD` to
+    // resolve, and a completely clean working tree yields a typed-empty seed set, which still
+    // carries the same freshness/refresh envelope every other outcome does.
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} succeeds");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=refresh-test@example.com",
+        "-c",
+        "user.name=Refresh Test",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "root",
+    ]);
+    let impact = silent_cartographer::commands::run_impact(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        None,
+        None,
+        false,
+        1,
+        OrderMode::Unranked,
+        &[],
+        0,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+    assert_refreshable("impact", impact);
 }
 
 // _(Calibrated output contract — ambiguous write-site; Symbol retrieval at a chosen detail —
@@ -2938,4 +3576,359 @@ fn trace_tests_signature_detail_projects_without_changing_results() {
         }
         other => panic!("expected a reference, got {other:?}"),
     }
+}
+
+/// Spawn the built `c10r` with `args` from `dir`, with `path` as `PATH` and no inherited
+/// `$VIRTUAL_ENV` unless `virtual_env` names one.
+fn run_c10r(
+    dir: &std::path::Path,
+    path: &std::ffi::OsStr,
+    virtual_env: Option<&std::path::Path>,
+    args: &[&std::ffi::OsStr],
+) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_c10r"));
+    command
+        .args(args)
+        .current_dir(dir)
+        .env("PATH", path)
+        .env_remove("VIRTUAL_ENV");
+    if let Some(env) = virtual_env {
+        command.env("VIRTUAL_ENV", env);
+    }
+    command.output().unwrap()
+}
+
+/// A Rust workspace at `dir` built through the built binary (a stub `rust-analyzer`, extra `build`
+/// arguments `build_args`), then edited so `find` reads stale. Returns the stale answer and the `PATH`
+/// under which both the stub analyzer and `c10r` resolve.
+fn stale_rust_workspace(
+    dir: &std::path::Path,
+    db: &std::path::Path,
+    build_args: &[&str],
+) -> (serde_json::Value, std::ffi::OsString) {
+    std::fs::write(dir.join("Cargo.toml"), "# fixture manifest\n").unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+    let bin_dir = dir.join(".stub-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    write_indexing_stub(&bin_dir, "rust-analyzer", "1.85.0");
+    let built_bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_c10r"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let path = prepend_path(&[&built_bin_dir, &bin_dir]);
+
+    let root = std::fs::canonicalize(dir).unwrap();
+    let mut args: Vec<&std::ffi::OsStr> = vec!["build".as_ref(), root.as_os_str(), "--db".as_ref(), db.as_os_str()];
+    args.extend(build_args.iter().map(std::ffi::OsStr::new));
+    let build = run_c10r(dir, &path, None, &args);
+    assert!(
+        build.status.success(),
+        "the build succeeds: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n// edited\n").unwrap();
+    (find_json(dir, db, &path, build_args), path)
+}
+
+/// `find hello --json` through the built binary, naming the workspace identity `build_args` carries.
+fn find_json(
+    dir: &std::path::Path,
+    db: &std::path::Path,
+    path: &std::ffi::OsStr,
+    build_args: &[&str],
+) -> serde_json::Value {
+    let mut args: Vec<&std::ffi::OsStr> = vec!["--db".as_ref(), db.as_os_str(), "--json".as_ref()];
+    args.extend(
+        build_args
+            .iter()
+            .filter(|a| a.starts_with("--workspace="))
+            .map(std::ffi::OsStr::new),
+    );
+    args.extend([std::ffi::OsStr::new("find"), std::ffi::OsStr::new("hello")]);
+    let out = run_c10r(dir, path, None, &args);
+    assert!(
+        out.status.success(),
+        "the query succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// Run `refresh` through `sh` from an unrelated directory and assert it succeeds.
+fn run_refresh(refresh: &str, path: &std::ffi::OsStr) {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(refresh)
+        .env("PATH", path)
+        .env_remove("VIRTUAL_ENV")
+        .current_dir(elsewhere.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the refresh command runs to completion: {refresh}");
+}
+
+// _(Scenario: The refresh command keeps the recorded chunk parameters)_ — an index built with
+// non-default chunk parameters answers stale with a command that carries them, and running it makes
+// the answer fresh.
+#[test]
+fn the_refresh_command_carries_non_default_chunk_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join(".c10r").join("index.db");
+    let (stale, path) = stale_rust_workspace(
+        dir.path(),
+        &db,
+        &["--workspace=chunky-ws", "--chunk-size=128", "--chunk-overlap=16"],
+    );
+    assert_eq!(stale["freshness"], "stale_content", "{stale}");
+    let refresh = stale["refresh"].as_str().unwrap();
+    assert!(
+        refresh.contains("--chunk-size=128 --chunk-overlap=16"),
+        "the command carries the recorded chunk parameters: {refresh}"
+    );
+
+    run_refresh(refresh, &path);
+    let fresh = find_json(dir.path(), &db, &path, &["--workspace=chunky-ws"]);
+    assert_eq!(fresh["freshness"], "fresh", "{fresh}");
+}
+
+// _(Scenario: The refresh command handles a workspace identity that starts with a dash)_ — the
+// command's workspace argument is not read as a flag, so it runs and the answer becomes fresh.
+#[test]
+fn the_refresh_command_runs_for_a_workspace_identity_starting_with_a_dash() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join(".c10r").join("index.db");
+    let (stale, path) = stale_rust_workspace(dir.path(), &db, &["--workspace=-foo"]);
+    assert_eq!(stale["freshness"], "stale_content", "{stale}");
+    let refresh = stale["refresh"].as_str().unwrap();
+
+    run_refresh(refresh, &path);
+    let fresh = find_json(dir.path(), &db, &path, &["--workspace=-foo"]);
+    assert_eq!(fresh["freshness"], "fresh", "{fresh}");
+}
+
+// _(Scenario: An activated environment answers fresh however its path is spelled)_ — the same
+// environment named through `$VIRTUAL_ENV` by a symlink at build time and through a `/./` spelling at
+// query time is one environment, so the answer is fresh.
+#[test]
+fn a_virtual_env_spelled_differently_at_build_and_query_answers_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("pyproject.toml"),
+        "[project]\nname = \"pkg\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let venv = write_fake_venv(dir.path());
+    let link = dir.path().join("active-env");
+    std::os::unix::fs::symlink(&venv, &link).unwrap();
+    let dotted = dir.path().join(".").join(".venv");
+    let db = dir.path().join(".c10r").join("index.db");
+    let bin_dir = tempfile::tempdir().unwrap();
+    write_indexing_stub(bin_dir.path(), "scip-python", "0.6.0");
+    let path = hermetic_path(bin_dir.path());
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+
+    let build = run_c10r(
+        dir.path(),
+        &path,
+        Some(&link),
+        &[
+            "build".as_ref(),
+            root.as_os_str(),
+            "--db".as_ref(),
+            db.as_os_str(),
+            "--workspace=venv-ws".as_ref(),
+        ],
+    );
+    assert!(
+        build.status.success(),
+        "the build succeeds: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let query = run_c10r(
+        dir.path(),
+        &path,
+        Some(&dotted),
+        &[
+            "--db".as_ref(),
+            db.as_os_str(),
+            "--json".as_ref(),
+            "find".as_ref(),
+            "hello".as_ref(),
+        ],
+    );
+    assert!(
+        query.status.success(),
+        "the query succeeds: {}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+    assert_eq!(value["freshness"], "fresh", "{value}");
+}
+
+/// An index over two documents defining `dupcrate::Widget` (a duplicated-descriptor group) and one
+/// symbol whose range spells other text (a join discrepancy), under the given document names.
+fn status_fixture_index(doc_a: &str, doc_b: &str) -> ExtractedIndex {
+    let definition = |doc: &str, range: SourceRange, name: &str| ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "dupcrate",
+            vec![DescriptorSegment::new(name, SegmentKind::Type)],
+        )),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: doc.to_string(),
+            range,
+            role: OccurrenceRole::Definition,
+        }],
+    };
+    let mut index = one_doc_index(
+        doc_a,
+        vec![
+            definition(doc_a, SourceRange::new(0, 7, 0, 13), "Widget"),
+            definition(doc_b, SourceRange::new(0, 7, 0, 13), "Widget"),
+            definition(doc_a, SourceRange::new(1, 4, 1, 5), "Other"),
+        ],
+    );
+    index.documents.push(SourceDocument {
+        path: doc_b.to_string(),
+        encoding: PositionEncoding::Utf8,
+    });
+    index
+}
+
+fn build_status_fixture(dir: &std::path::Path, workspace: &str, doc_a: &str, doc_b: &str) -> std::path::PathBuf {
+    let db = dir.join("index.db");
+    silent_cartographer::commands::build_from_index(
+        &db,
+        workspace,
+        dir,
+        &status_fixture_index(doc_a, doc_b),
+        &[
+            (doc_a.to_string(), "struct Widget;\nlet x = 1;\n".to_string()),
+            (doc_b.to_string(), "struct Widget;\n".to_string()),
+        ],
+    )
+    .unwrap();
+    db
+}
+
+fn status_output(db: &std::path::Path, dir: &std::path::Path, json: bool) -> String {
+    silent_cartographer::commands::run_status(db, dir, "not-a-real-analyzer", json, true, false, true).unwrap()
+}
+
+// _(Scenario: The status report names the refresh command)_ — a stale index's status carries the same
+// refresh command a query answer does, in the machine report and the human one; running it makes the
+// status fresh, and a fresh status carries no such field.
+#[test]
+fn a_stale_status_names_the_refresh_command_and_running_it_makes_status_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "# fixture manifest\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+    let db = support::build_fixture_db(dir.path(), "refresh-ws");
+    std::fs::write(
+        dir.path().join(support::DOC),
+        format!("{}\n// edited\n", support::SOURCE),
+    )
+    .unwrap();
+
+    let value: serde_json::Value = serde_json::from_str(&status_output(&db, dir.path(), true)).unwrap();
+    assert_eq!(value["freshness"], "stale_content", "{value}");
+    let refresh = value["refresh"]
+        .as_str()
+        .expect("a stale status carries a refresh command")
+        .to_string();
+    assert!(refresh.starts_with("c10r build "), "{refresh}");
+    let human = status_output(&db, dir.path(), false);
+    assert!(
+        human.lines().any(|line| line == format!("refresh: {refresh}")),
+        "the human report names the same command: {human}"
+    );
+
+    let bin_dir = tempfile::tempdir().unwrap();
+    write_indexing_stub(bin_dir.path(), "rust-analyzer", "1.85.0");
+    let built_bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_c10r"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    run_refresh(&refresh, &prepend_path(&[&built_bin_dir, bin_dir.path()]));
+
+    let value: serde_json::Value = serde_json::from_str(&status_output(&db, dir.path(), true)).unwrap();
+    assert_eq!(value["freshness"], "fresh", "{value}");
+    assert!(
+        value.get("refresh").is_none(),
+        "a fresh status carries no refresh field: {value}"
+    );
+    assert!(!status_output(&db, dir.path(), false).contains("refresh:"));
+}
+
+// _(Output discipline)_ — the human status report is a projection of the machine one: every string
+// and number a top-level field carries, with the optional sections requested, appears in it.
+#[test]
+fn the_human_status_report_carries_every_value_of_the_machine_report() {
+    fn leaves(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Number(n) => out.push(n.to_string()),
+            serde_json::Value::Array(items) => items.iter().for_each(|v| leaves(v, out)),
+            serde_json::Value::Object(map) => map.values().for_each(|v| leaves(v, out)),
+            _ => {}
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_status_fixture(dir.path(), "status-ws", "a.rs", "b.rs");
+    let report: serde_json::Value = serde_json::from_str(&status_output(&db, dir.path(), true)).unwrap();
+    let human = status_output(&db, dir.path(), false);
+
+    let fields = report.as_object().unwrap();
+    for expected in [
+        "workspace",
+        "provenance",
+        "freshness",
+        "refresh",
+        "join_alignment",
+        "duplicated_descriptors",
+        "semantic_index",
+        "discrepancies",
+    ] {
+        assert!(
+            fields.contains_key(expected),
+            "the fixture exercises {expected}: {report}"
+        );
+    }
+    for (field, value) in fields {
+        let mut found = Vec::new();
+        leaves(value, &mut found);
+        for leaf in found {
+            assert!(
+                human.contains(&leaf),
+                "{field} value {leaf:?} missing from the human report:\n{human}"
+            );
+        }
+    }
+}
+
+// _(Output discipline)_ — control characters in a workspace identity or a document path never reach
+// the human status report.
+#[test]
+fn the_human_status_report_sanitizes_hostile_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_status_fixture(dir.path(), "evil\u{1b}[31m\nws", "a\u{1b}]0;x\u{7}.rs", "b.rs");
+    let human = status_output(&db, dir.path(), false);
+    assert!(
+        !human.contains('\u{1b}') && !human.contains('\u{7}'),
+        "no escape reaches the report: {human:?}"
+    );
+    assert!(
+        human.lines().any(|line| line.starts_with("workspace: evil")),
+        "{human:?}"
+    );
+    assert!(
+        !human.lines().any(|line| line.starts_with("ws")),
+        "the newline did not split the line: {human:?}"
+    );
 }

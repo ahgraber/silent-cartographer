@@ -1508,6 +1508,9 @@ fn a_changed_declared_environment_rebuilds() {
     write_manifest(dir.path(), "pyproject.toml");
     std::fs::write(dir.path().join("app.py"), "x = 1\n").unwrap();
     let venv = write_fake_venv(dir.path());
+    // Canonical, matching what `run_build` below resolves the same `venv` argument to, so the
+    // sanity check's "unchanged" comparison actually compares the same spelling.
+    let canonical_venv = std::fs::canonicalize(&venv).unwrap();
     let stub = write_version_only_stub(dir.path(), "scip-python", "0.6.0");
 
     // Record the store exactly as a Python build would: scip-python provenance, the environment
@@ -1521,7 +1524,7 @@ fn a_changed_declared_environment_rebuilds() {
         symbols: vec![],
         duplicate_groups: vec![],
         library_roots: Default::default(),
-        environment: Some(environment_facts(&venv).unwrap()),
+        environment: Some(environment_facts(&canonical_venv).unwrap()),
     };
     let db = dir.path().join("index.db");
     let collected = collect_python_sources(dir.path()).unwrap();

@@ -12,6 +12,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 use crate::graph::syntax::Language;
+use crate::hooks::HookEvent;
 use crate::query::{Detail, OrderMode, Relation};
 
 /// The `c10r` CLI: precise, type-aware navigation over a persisted code graph.
@@ -87,7 +88,8 @@ pub enum Command {
     Doctor,
     /// The index store: the action decides whether it is removed, located, or measured.
     Cache(CacheArgs),
-    /// Install the repository hooks that keep the index current.
+    /// Install or remove the repository hooks that keep the index current, or run one refresh
+    /// event's rules (the installed hooks call this).
     Hooks(HooksArgs),
     /// Emit the command/flag structure and the current index state as JSON, for machine
     /// orientation; always JSON, regardless of `--json`.
@@ -369,8 +371,15 @@ pub struct CompletionsArgs {
 /// The action `hooks` performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum HookAction {
-    /// Install the post-commit hook that refreshes the index.
+    /// Install the refresh hooks that keep the index current.
     Install,
+    /// Remove a workspace from the installed refresh hooks.
+    Uninstall,
+    /// Run one refresh event's rules and build when they call for it.
+    ///
+    /// The installed hooks call this; it is not meant to be typed by hand, though its output is
+    /// always safe to read.
+    Run,
 }
 
 /// Arguments for `hooks`.
@@ -378,6 +387,23 @@ pub enum HookAction {
 pub struct HooksArgs {
     /// The action to perform.
     pub action: HookAction,
+
+    /// The refresh event this invocation fired for. Required by `run`; rejected for every other
+    /// action.
+    pub event: Option<HookEvent>,
+
+    /// Delete an existing hook file instead of keeping it. Accepted only with `install`.
+    #[arg(long)]
+    pub overwrite: bool,
+
+    /// The workspace root the refresh applies to. Required by `run`; rejected for every other
+    /// action.
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+
+    /// The git arguments the event fired with, after `--`. Accepted only with `run`.
+    #[arg(last = true, allow_hyphen_values = true)]
+    pub git_args: Vec<String>,
 }
 
 /// The action `cache` performs.

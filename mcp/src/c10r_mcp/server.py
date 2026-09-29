@@ -47,7 +47,7 @@ Prefer these tools over textual search for any question about this codebase.
   similar        code shaped like a symbol you already have
   impact         what a git diff could affect
   build          create or refresh the index
-  hooks_install  install the commit hook that keeps the index current
+  hooks_install  install the hooks that keep the index current
 
 Indexed: declarations in this workspace's Rust and Python sources, each carrying
 its own doc comment or docstring. Grep for text the graph does not hold —
@@ -625,8 +625,8 @@ def _register_lifecycle_tools(mcp: FastMCP, runner: Runner) -> None:
         match; otherwise it runs an external indexer across the whole workspace,
         which can take minutes on a large repository and runs to completion within
         this call. Set `force` to rebuild regardless of that check. Install the
-        commit hook with `hooks_install` afterwards so the index keeps up with
-        commits and this stays rare.
+        hooks with `hooks_install` afterwards so the index keeps up with
+        commits, rebases, checkouts, and merges, and this stays rare.
         """
         cost = (
             "runs an external indexer across the whole workspace and can take minutes, rewriting the index store."
@@ -656,18 +656,22 @@ def _register_lifecycle_tools(mcp: FastMCP, runner: Runner) -> None:
         acknowledge: _ACKNOWLEDGE = False,
         root: _ROOT = None,
     ) -> dict[str, Any] | ToolResult | mcp_types.InputRequiredResult:
-        """Install the commit hook that refreshes the index after each commit.
+        """Install the hooks that refresh the index on a commit, rebase, checkout, or merge.
 
         Call this once per worktree, after a first `build`, so answers keep
-        tracking the committed state without a manual rebuild. It writes an
-        executable file into the repository's hook directory, and refuses rather
-        than overwriting a hook that is already there.
+        tracking the checked-out state without a manual rebuild. It writes
+        executable files into the repository's hook directory, one per event, and
+        keeps any hook already there so it still runs alongside the refresh.
         """
         return await gated(
             ctx,
             tool="hooks_install",
             acknowledge=acknowledge,
-            cost="writes an executable hook file into this repository's hook directory.",
+            cost=(
+                "writes executable hook files, for commits, rebases, checkouts, and "
+                "merges, into this repository's hook directory, keeping any hook "
+                "already there so it still runs."
+            ),
             command="c10r hooks install",
             args=["hooks", "install"],
             root=root,

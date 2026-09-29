@@ -26,6 +26,38 @@ fn c10r(dir: &Path) -> Command {
     cmd
 }
 
+/// Write an executable `rust-analyzer` stub into `dir`, answering `--version` with `version` and
+/// failing any other invocation.
+///
+/// A query resolves `rust-analyzer` from `PATH` with no way to redirect it explicitly, so a test that
+/// needs a fresh answer under a fixed analyzer version puts this stub ahead of the ambient `PATH`
+/// (see [`prepend_to_path`]) rather than depending on whichever `rust-analyzer` — if any — happens to
+/// be installed on the host running the suite.
+#[cfg(unix)]
+fn write_rust_analyzer_stub(dir: &Path, version: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("rust-analyzer");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"{version}\"\n  exit 0\nfi\nexit 1\n"),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
+/// `PATH` with `dir` prepended to the inherited `PATH`, so a stub written into `dir` shadows any
+/// same-named tool already on `PATH`.
+#[cfg(unix)]
+fn prepend_to_path(dir: &Path) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::from(dir);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
 // _(Source-faithful content rendering: body renders as source)_ — a multi-line body is shown as
 // multi-line source text, not an escaped single-line scalar.
 #[test]
@@ -279,19 +311,22 @@ fn build_hostile_db(dir: &Path) -> PathBuf {
             locality: None,
         })
         .unwrap();
-    support::stamp_metadata(&store, "hostile-ws", dir);
+    support::stamp_fresh_metadata(&store, "hostile-ws", dir);
     db
 }
 
 // _(Source-faithful content rendering: `get` structural output)_ — a `get` at `location` detail (header
 // plus identity plus location line — no content) renders no ANSI escape and no forged extra row: the
 // hostile display name's escape and the hostile document path's raw newline are both replaced.
+#[cfg(unix)]
 #[test]
 fn get_sanitizes_hostile_name_and_path_in_structural_output() {
     let dir = tempfile::tempdir().unwrap();
     let db = build_hostile_db(dir.path());
+    write_rust_analyzer_stub(dir.path(), &support::provenance().analyzer_version);
 
     let out = c10r(dir.path())
+        .env("PATH", prepend_to_path(dir.path()))
         .arg("--db")
         .arg(&db)
         .args(["get", HOSTILE_ID, "--detail", "location"])
@@ -316,6 +351,7 @@ fn get_sanitizes_hostile_name_and_path_in_structural_output() {
         !stdout.contains('\u{202e}'),
         "no bidirectional override reaches structural output: {stdout:?}"
     );
+    assert!(!stdout.contains("stale"), "the answer is fresh: {stdout:?}");
     // header line + identity line + location line: the raw newline in the hostile path did not forge
     // a fourth line.
     assert_eq!(
@@ -327,12 +363,15 @@ fn get_sanitizes_hostile_name_and_path_in_structural_output() {
 
 // _(Source-faithful content rendering: `find` and `trace` row output)_ — a row-bearing answer over the
 // hostile symbol renders no ANSI escape and no forged row in either command.
+#[cfg(unix)]
 #[test]
 fn find_and_trace_sanitize_hostile_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = build_hostile_db(dir.path());
+    write_rust_analyzer_stub(dir.path(), &support::provenance().analyzer_version);
 
     let find_out = c10r(dir.path())
+        .env("PATH", prepend_to_path(dir.path()))
         .arg("--db")
         .arg(&db)
         .args(["find", "evil"])
@@ -348,10 +387,12 @@ fn find_and_trace_sanitize_hostile_rows() {
         !find_stdout.contains('\u{9b}') && !find_stdout.contains('\u{202e}'),
         "find carries no C1 CSI and no bidirectional override: {find_stdout:?}"
     );
+    assert!(!find_stdout.contains("stale"), "the answer is fresh: {find_stdout:?}");
     // header line + "N results" line + one row: the embedded newline forges no extra row.
     assert_eq!(find_stdout.lines().count(), 3, "no forged row: {find_stdout:?}");
 
     let trace_out = c10r(dir.path())
+        .env("PATH", prepend_to_path(dir.path()))
         .arg("--db")
         .arg(&db)
         .args(["trace", CONTAINER_ID, "--relation", "contains"])
@@ -372,6 +413,7 @@ fn find_and_trace_sanitize_hostile_rows() {
         !trace_stdout.contains('\u{9b}') && !trace_stdout.contains('\u{202e}'),
         "trace carries no C1 CSI and no bidirectional override: {trace_stdout:?}"
     );
+    assert!(!trace_stdout.contains("stale"), "the answer is fresh: {trace_stdout:?}");
     // header line + "N results" line + one row (with its `at <path:span>` location suffix): the
     // embedded newline in the hostile document path forges no extra row.
     assert_eq!(trace_stdout.lines().count(), 3, "no forged row: {trace_stdout:?}");
@@ -526,12 +568,15 @@ fn crlf_body_renders_without_replacement_characters() {
 // embedded newline; at a content-bearing detail the row's projected content — carrying all three
 // injection classes (ANSI escape, C1 CSI, bidirectional override) — renders neutralized to
 // replacement characters while the machine answer round-trips the same content byte-exactly.
+#[cfg(unix)]
 #[test]
 fn references_rows_sanitize_hostile_fields_in_human_output() {
     let dir = tempfile::tempdir().unwrap();
     let db = build_hostile_db(dir.path());
+    write_rust_analyzer_stub(dir.path(), &support::provenance().analyzer_version);
 
     let out = c10r(dir.path())
+        .env("PATH", prepend_to_path(dir.path()))
         .arg("--db")
         .arg(&db)
         .args(["trace", HOSTILE_ID, "--relation", "references"])
@@ -548,6 +593,7 @@ fn references_rows_sanitize_hostile_fields_in_human_output() {
         !stdout.contains('\u{1b}') && !stdout.contains('\u{9b}') && !stdout.contains('\u{202e}'),
         "no raw terminal control reaches the references row: {stdout:?}"
     );
+    assert!(!stdout.contains("stale"), "the answer is fresh: {stdout:?}");
     // header + "N results" + one row: the hostile document path's embedded newline forges no extra
     // row.
     assert_eq!(stdout.lines().count(), 3, "no forged row: {stdout:?}");
@@ -627,19 +673,22 @@ fn build_ambiguous_hostile_db(dir: &Path) -> PathBuf {
             })
             .unwrap();
     }
-    support::stamp_metadata(&store, "hostile-ws", dir);
+    support::stamp_fresh_metadata(&store, "hostile-ws", dir);
     db
 }
 
 // _(Source-faithful content rendering: ambiguous candidate lines sanitize hostile names)_ — two
 // symbols sharing a hostile shortname resolve ambiguously; the human candidate list carries no raw
 // terminal control and the embedded newline forges no extra candidate row.
+#[cfg(unix)]
 #[test]
 fn ambiguous_candidate_lines_sanitize_hostile_names() {
     let dir = tempfile::tempdir().unwrap();
     let db = build_ambiguous_hostile_db(dir.path());
+    write_rust_analyzer_stub(dir.path(), &support::provenance().analyzer_version);
 
     let out = c10r(dir.path())
+        .env("PATH", prepend_to_path(dir.path()))
         .arg("--db")
         .arg(&db)
         .arg("get")
@@ -657,6 +706,7 @@ fn ambiguous_candidate_lines_sanitize_hostile_names() {
         !stdout.contains('\u{1b}'),
         "no ANSI escape reaches the candidate list: {stdout:?}"
     );
+    assert!(!stdout.contains("stale"), "the answer is fresh: {stdout:?}");
     // header + "ambiguous: 2 candidates" + one line per candidate: the embedded newline in the shared
     // hostile display name forges no extra candidate row.
     assert_eq!(
@@ -813,7 +863,7 @@ fn build_hostile_dependents_db(dir: &Path) -> PathBuf {
             &CanonicalId::from_raw("hostile-ws::subject".to_string()),
         )
         .unwrap();
-    support::stamp_metadata(&store, "hostile-ws", dir);
+    support::stamp_fresh_metadata(&store, "hostile-ws", dir);
     db
 }
 
@@ -821,12 +871,15 @@ fn build_hostile_dependents_db(dir: &Path) -> PathBuf {
 // symbol's hostile display name and document path render sanitized in the human `dependents`
 // rendering: the summary and the detail row carry no raw terminal control, and the hostile path's
 // embedded newline forges no extra row.
+#[cfg(unix)]
 #[test]
 fn dependents_rows_render_sanitized_in_human_output() {
     let dir = tempfile::tempdir().unwrap();
     let db = build_hostile_dependents_db(dir.path());
+    write_rust_analyzer_stub(dir.path(), &support::provenance().analyzer_version);
 
     let out = c10r(dir.path())
+        .env("PATH", prepend_to_path(dir.path()))
         .arg("--db")
         .arg(&db)
         .args(["trace", "hostile-ws::subject", "--relation", "dependents"])
@@ -843,6 +896,7 @@ fn dependents_rows_render_sanitized_in_human_output() {
         !stdout.contains('\u{1b}') && !stdout.contains('\u{9b}') && !stdout.contains('\u{202e}'),
         "no raw terminal control reaches the dependents rendering: {stdout:?}"
     );
+    assert!(!stdout.contains("stale"), "the answer is fresh: {stdout:?}");
     // header + ranked-ordering note + summary line + "1 detailed" + one row: the hostile path's
     // embedded newline forges no extra row.
     assert_eq!(stdout.lines().count(), 5, "no forged row: {stdout:?}");
