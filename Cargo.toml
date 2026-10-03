@@ -3,7 +3,7 @@ name = "silent-cartographer"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
-description = "A persistent codebase knowledge graph answering precise, type-aware navigation for Rust."
+description = "A persistent codebase knowledge graph answering precise, type-aware navigation for Rust and Python."
 license = "Apache-2.0"
 
 [lib]
