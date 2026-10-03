@@ -6138,6 +6138,50 @@ fn ingest_python_fixture() -> GraphStore {
     store
 }
 
+// Python modules are named by their module, not by scip-python's `__init__` terminal segment, and a
+// module-level function is a function while a class member is a method; identity is unchanged.
+#[test]
+fn python_module_and_callable_display_and_kind() {
+    let store = ingest_python_fixture();
+
+    let shapes = store.symbol(&py_shapes_module_id()).unwrap().unwrap();
+    assert_eq!(
+        (shapes.display_name.as_str(), shapes.kind.as_str()),
+        ("shapes", "module")
+    );
+    let package = store
+        .symbol(&py_id(&[("pkg", SegmentKind::Module), ("__init__", SegmentKind::Meta)]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(package.display_name, "pkg");
+    assert!(store.symbols_by_shortname("__init__").unwrap().is_empty());
+    let found: Vec<_> = store
+        .symbols_by_shortname("shapes")
+        .unwrap()
+        .into_iter()
+        .map(|r| r.canonical_id)
+        .collect();
+    assert_eq!(found, vec![py_shapes_module_id()]);
+
+    let build = store
+        .symbol(&py_id(&[
+            ("pkg.consumer", SegmentKind::Module),
+            ("build", SegmentKind::Method),
+        ]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(build.kind, "function");
+    let render = store
+        .symbol(&py_id(&[
+            ("pkg.shapes", SegmentKind::Module),
+            ("Widget", SegmentKind::Type),
+            ("render", SegmentKind::Method),
+        ]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(render.kind, "method");
+}
+
 // _(Scenario: Python name token accepted under the default rule)_ — a Python occurrence whose
 // location spells the symbol's own name aligns under the default rule; a Widget occurrence at any
 // other token (the fixture's `W` alias use) carries the rule that actually accepted it, never a

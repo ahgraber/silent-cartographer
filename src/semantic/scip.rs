@@ -90,11 +90,21 @@ pub(super) fn read_range(range: &[i32]) -> Option<SourceRange> {
 pub(super) const DEFINITION_ROLE_BIT: i32 = 1;
 
 /// Map a symbol kind from the SCIP terminal descriptor suffix.
+///
+/// SCIP gives every callable the method suffix, so a callable is a method only when it hangs off a
+/// type (`Type#m()`, or rust-analyzer's `impl#[Type]m()`); any other parent — a module, or an
+/// enclosing function for a nested one — makes it a function.
 pub(super) fn symbol_kind_from(descriptor: &Descriptor) -> SymbolKind {
     match descriptor.segments.last().map(|s| s.kind) {
         Some(SegmentKind::Module) => SymbolKind::Module,
         Some(SegmentKind::Type) => SymbolKind::Type,
-        Some(SegmentKind::Method) => SymbolKind::Method,
+        Some(SegmentKind::Method) => {
+            let parent = descriptor.segments.iter().rev().nth(1).map(|s| s.kind);
+            match parent {
+                Some(SegmentKind::Type | SegmentKind::TypeParameter) => SymbolKind::Method,
+                _ => SymbolKind::Function,
+            }
+        }
         Some(SegmentKind::Term) => SymbolKind::Constant,
         _ => SymbolKind::Other,
     }
@@ -205,6 +215,29 @@ mod tests {
         let parsed = parse_scip_symbol(sym);
         let descriptor = parsed.descriptor.expect("global symbol has a descriptor");
         assert_eq!(descriptor.terminal_name(), Some("connect"));
+    }
+
+    #[test]
+    fn callable_kind_follows_its_enclosing_segment() {
+        // Free function, inherent method, trait method, trait-impl method (`impl#[Type]`), nested function.
+        for (symbol, expected) in [
+            ("rust-analyzer cargo c 0.1.0 net/open().", SymbolKind::Function),
+            ("rust-analyzer cargo c 0.1.0 net/Client#connect().", SymbolKind::Method),
+            ("rust-analyzer cargo c 0.1.0 net/Conn#close().", SymbolKind::Method),
+            (
+                "rust-analyzer cargo c 0.1.0 net/impl#[`Client`]fmt().",
+                SymbolKind::Method,
+            ),
+            ("scip-python python p 0 `pkg.mod`/build().", SymbolKind::Function),
+            ("scip-python python p 0 `pkg.mod`/Widget#size().", SymbolKind::Method),
+            (
+                "scip-python python p 0 `pkg.mod`/build().inner().",
+                SymbolKind::Function,
+            ),
+        ] {
+            let descriptor = parse_scip_symbol(symbol).descriptor.unwrap();
+            assert_eq!(symbol_kind_from(&descriptor), expected, "{symbol}");
+        }
     }
 
     #[test]

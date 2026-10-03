@@ -20,7 +20,7 @@ use super::range::ByteSpan;
 /// model identity and the chunk parameters. Bumped whenever corpus membership or the render
 /// changes, and any bump ships with a schema-version bump so stores built under the old definition
 /// refuse wholesale.
-pub const CORPUS_DEFINITION_VERSION: u32 = 2;
+pub const CORPUS_DEFINITION_VERSION: u32 = 3;
 
 /// The corpus-relevant view of one persisted in-workspace symbol.
 pub struct CorpusSource<'a> {

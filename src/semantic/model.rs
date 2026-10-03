@@ -130,6 +130,20 @@ impl ExtractedSymbol {
     pub fn terminal_name(&self) -> Option<&str> {
         self.descriptor.as_ref().and_then(|d| d.terminal_name())
     }
+
+    /// The name a human reads for the symbol: the terminal name, except that a Python module
+    /// (scip-python's `__init__` meta terminal after the module's namespace segment) is named by the
+    /// last component of its dotted module name. Identity still projects from the whole descriptor.
+    pub fn display_name(&self) -> Option<&str> {
+        let segments = &self.descriptor.as_ref()?.segments;
+        if let [.., namespace, terminal] = segments.as_slice()
+            && terminal.name == "__init__"
+            && terminal.kind == SegmentKind::Meta
+        {
+            return namespace.name.rsplit('.').next();
+        }
+        self.terminal_name()
+    }
 }
 
 /// The provenance of an index: the analyzer's identity and version.

@@ -316,7 +316,7 @@ pub fn ingest_with_params(
         let Some(Some(id)) = identities.get(idx) else {
             continue;
         };
-        let display_name = sym.terminal_name().unwrap_or_default().to_string();
+        let display_name = sym.display_name().unwrap_or_default().to_string();
         // Exhaustive over `SymbolClass`, so a class the backend model gains later cannot default
         // into `in_workspace` and be persisted as a workspace symbol without anyone noticing.
         let class = match sym.class {

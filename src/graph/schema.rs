@@ -23,7 +23,10 @@
 /// merely missing a count. The keyed `aligned_counts` column spares that change any DDL and any
 /// per-rule read/write edit — it does not spare it the version bump.
 ///
-/// Migration: version 16 replaced the twelve `aligned_*_count` columns with a single keyed
+/// Migration: version 17 stores a callable whose parent is not a type as `function` rather than
+/// `method`, and names a Python module by its module name rather than `__init__` (both stored
+/// columns, and both inputs to the passage render, so the corpus definition version moved with it);
+/// version 16 replaced the twelve `aligned_*_count` columns with a single keyed
 /// `aligned_counts` JSON object, retiring the per-rule column, read, and write edits a new rule
 /// used to require;
 /// version 15 reshaped `semantic_vectors` to one row per chunk (carrying its passage's
@@ -32,7 +35,7 @@
 /// columns on `symbols`, and the semantic-index identity in `index_metadata`. The index is derived,
 /// replayable data, so rebuild is the migration — a build replaces an older store of its own
 /// wholesale and a query refuses it with recovery guidance (the replace-or-refuse contract).
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
