@@ -9,7 +9,7 @@
 
 ## Store schema
 
-- [ ] In [src/graph/schema.rs](../../../src/graph/schema.rs), add the `source_files(document_path, content_hash)` table and the four nullable columns `start_line`, `start_column`, `end_line`, `end_column` to `symbols`, `occurrences`, and `join_discrepancies`; bump `SCHEMA_VERSION` to 17 and add the migration note to its doc comment.
+- [ ] In [src/graph/schema.rs](../../../src/graph/schema.rs), add the `source_files(document_path, content_hash)` table and the four nullable columns `start_line`, `start_column`, `end_line`, `end_column` to `symbols`, `occurrences`, and `join_discrepancies`; keep `SCHEMA_VERSION` at 17, which the Python kind and module display-name fix already set, and extend its migration note (design.md § Versions).
 - [ ] Add the line and column fields to `SymbolRow`, `OccurrenceRow`, and `DiscrepancyRow` in [src/graph/store.rs](../../../src/graph/store.rs), and write and read them in `insert_symbol`, the occurrence insert, the discrepancy insert, and each row mapper.
 - [ ] Add store functions to write the per-file fingerprints in the build's transaction and to read them all.
 - [ ] Update the store tests that stamp or compare `SCHEMA_VERSION` only where they assert the literal version.
@@ -77,6 +77,13 @@
 - [ ] Tests: a list longer than `--limit 2` truncates and discloses, and its cursor returns the next files; after another file's content changes, that cursor is refused.
 - [ ] Tests: `status` names both content and analyzer reasons when both changed, only the environment when only it changed, and none when fresh, in JSON and human output.
 
+## End-of-build check
+
+- [ ] In `run_build` ([src/commands.rs](../../../src/commands.rs)), after the store write, run discovery again with the same language and compare it with the indexed source list through the `status` comparison; carry the result in `BuildOutcome` (design.md § BuildEndRecheck).
+- [ ] Add `changed_during_build` to `build_outcome_json`, always present, and one `<change> during build: path` line per file to `build_outcome_line`, sanitized.
+- [ ] Tests, using a stub analyzer that edits the fixture while it runs: an edited file is named changed and `status` then reports stale content; a created file is named added; a deleted file is named removed; the build exits with success in each case.
+- [ ] Tests: an undisturbed build carries an empty list and prints no file line; an already-current build carries an empty list.
+
 ## Surfaces and versions
 
 - [ ] Bump `SURFACE_VERSION` to 12 in [src/manifest.rs](../../../src/manifest.rs) and confirm the surface index lists `--position` and the new `status` flags with their values and defaults.
@@ -86,6 +93,7 @@
 ## Documentation
 
 - [ ] Update [docs/commands/get.md](../../../docs/commands/get.md) and [docs/commands/similar.md](../../../docs/commands/similar.md) for the `--at` forms; add `--position` to [docs/commands/common.md](../../../docs/commands/common.md) with the line and column definition and the `:<digits>` path caveat.
+- [ ] Update [docs/commands/build.md](../../../docs/commands/build.md) for `changed_during_build` and the human lines.
 - [ ] Update [docs/commands/status.md](../../../docs/commands/status.md) for `stale_reasons`, `changed_files`, `--detail files`, `--limit`, and `--cursor`, with a human output example.
 - [ ] Update location examples in the other command docs and the README from `path:start-end` to `path:line:column`, and document the four JSON fields.
 

@@ -60,3 +60,43 @@ Serves: clickable-locations
 - **GIVEN** a semantic occurrence that the join refuses, at coordinates that cannot normalize to a byte range
 - **WHEN** the index is built
 - **THEN** the persisted discrepancy carries neither byte offsets nor a line and column
+
+### Requirement: A build names sources that changed while it ran
+
+After a build writes the store, the system SHALL discover the workspace's sources again and compare each with the text the build indexed.
+A source discovered again with different text SHALL be named changed, a source discovered only now SHALL be named added, and an indexed source no longer discovered SHALL be named removed.
+The build SHALL succeed whether or not any source is named, and both its human answer and its machine answer SHALL name every such source with its classification.
+When no source is named, the machine answer SHALL carry an empty list.
+A build that analyzes nothing because the stored index is already current SHALL carry an empty list.
+
+Serves: build-names-concurrent-edits
+
+#### Scenario: An edit during the build is named
+
+- **GIVEN** a workspace whose analyzer rewrites one source file while it runs
+- **WHEN** the workspace is built
+- **THEN** the build succeeds, its answer names that file as changed, and `status` then reports the index stale for changed content
+
+#### Scenario: A file created during the build is named
+
+- **GIVEN** a workspace whose analyzer creates a new source file while it runs
+- **WHEN** the workspace is built
+- **THEN** the build succeeds and its answer names that file as added
+
+#### Scenario: A file deleted during the build is named
+
+- **GIVEN** a workspace whose analyzer deletes one indexed source file while it runs
+- **WHEN** the workspace is built
+- **THEN** the build succeeds and its answer names that file as removed
+
+#### Scenario: An undisturbed build names nothing
+
+- **GIVEN** a workspace that no process edits during the build
+- **WHEN** the workspace is built
+- **THEN** the machine answer carries an empty list and the human answer names no file
+
+#### Scenario: An already-current build names nothing
+
+- **GIVEN** a workspace whose index is already current
+- **WHEN** the workspace is built without the explicit rebuild option
+- **THEN** no analysis runs and the machine answer carries an empty list

@@ -182,9 +182,35 @@ A store function returns every applicable reason; the existing single-value func
 **Rationale:** Reusing the freshness vocabulary keeps one term per concept, and keeping `freshness` breaks no consumer.
 Deriving the single value from the list keeps the two from disagreeing.
 
+### Decision: BuildEndRecheck
+
+**Chosen:** After the store write, the build runs discovery again with the language backend it used and compares the result with the source list it indexed.
+The comparison is the function `status` uses against `source_files`, classifying each path as `changed`, `added`, or `removed`.
+The machine answer of `build` carries `changed_during_build: [{document_path, change}]`, sorted by path, always present, and empty when nothing changed or nothing was analyzed.
+The human answer prints one `changed during build: path`, `added during build: path`, or `removed during build: path` line per file, sanitized, after the accounting line.
+The exit status stays success.
+The list is not paged.
+
+**Rationale:** The MCP `build` tool returns only the machine answer, so a notice on standard error would not reach an MCP agent.
+The store the build wrote is complete and its recorded fingerprints describe the text it indexed, so `status` already reports it stale; the build answer only adds the cause.
+Reusing the `status` comparison keeps the two reports from disagreeing about one file.
+A build window is short, so the list is short in normal use.
+
+**Alternatives considered:**
+
+- A notice on standard error, as the workspace handoff uses: no contract change, but invisible to MCP agents.
+- A failing exit status: the store is valid and labeled stale, and a hook or agent that reads a failure would retry or stop for no fault of the build.
+- Rebuild until the sources are stable: costs another full analysis per round, and does not end while an editor keeps writing.
+
+**Limit:** an edit that is reverted before the second discovery pass is not named.
+The index then matches the files on disk again, so nothing is stale.
+
 ### Decision: Versions
 
-**Chosen:** `SCHEMA_VERSION` 16 → 17 for `source_files` and the location columns.
+**Chosen:** `SCHEMA_VERSION` 17 for `source_files` and the location columns.
+Version 17 is shared with the Python kind and module display-name fix, which lands first; this change extends the version 17 migration note instead of bumping again.
+No release may ship between the two, because a store built between them would carry version 17 without `source_files`.
+`changed_during_build` is an added field of the `build` machine answer and rides the same surface bump.
 `SURFACE_VERSION` 11 → 12 for `--position`, `status --detail`, `status --limit`, and `status --cursor`; the MCP pin moves to 12.
 The migration is the existing replace-or-refuse rule: a build replaces a v16 store, and a query refuses it with the rebuild command.
 The changelog records two breaking changes: `--at` reads lines by default, and the human location format is `path:line:column`.
@@ -221,6 +247,9 @@ status ──> discovery now ──> SHA-256 per file ──compare──> sourc
           ├─ changed_files counts (when content differs)
           ├─ --detail files → files[] ──> shared page core (--limit / --cursor)
           └─ stale_reasons[] (all applicable) ; freshness = first
+
+build (after store write) ──> discovery again ──compare──> indexed source list
+          └─ changed_during_build[] ──> JSON and human answer
 ```
 
 ## Risks
@@ -250,6 +279,9 @@ status ──> discovery now ──> SHA-256 per file ──compare──> sourc
   The eval harness runs `c10r` through Bash, so the treatment agent sees the new output, and its token totals change.
   No eval parser reads locations.
   Paired runs under one binary stay comparable; comparing runs across c10r versions needs the binary's image digest in the analysis record, or separate sweeps.
+- **A version 17 store without `source_files`.**
+  A development store built after the kind fix and before this change carries version 17 but no `source_files` table, and its currency check can report it current.
+  Mitigation: rebuild development stores with `--force` after this change lands; no release ships between the two.
 - **Lone-CR files.**
   Reported lines follow the editor, while git's hunk lines and SCIP's lines count LF only.
   Mitigation: a test pins that SCIP normalization and hunk mapping keep their current byte results, and a scenario covers a definition after a lone CR.

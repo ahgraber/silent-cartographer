@@ -12,7 +12,13 @@ A reader cannot tell whether the files they care about changed, so they cannot d
 `status` also reports only the first staleness reason it finds.
 When the content and the analyzer version both changed, it reports only the content change, so a short list of changed files would hide that the whole index is stale.
 
-Both problems need the store to record facts per source file, so both changes share one schema version bump.
+`build` reads the sources once, before analysis.
+When a source changes while the analyzer runs, the build still succeeds, and the index it wrote is already stale.
+The build answer does not say so.
+In a dogfood session on 2026-10-02, another session edited a file during a 71-second build, `status` reported the index stale right after the build succeeded, and the agent could not tell why.
+
+The first two problems need the store to record facts per source file, so they share one schema version bump.
+The `status` file list and the end-of-build check use the same comparison of per-file fingerprints.
 
 ## User Stories
 
@@ -29,6 +35,12 @@ As a developer or agent, I want `status` to name the files that changed since th
 
 > Ladders to north-star outcome 5 (**Calibrated trust**): the staleness label names its cause, so the reader decides how far to lean on the index.
 > Ladders to north-star outcome 4 (**Honest under edit**): a partial account of staleness does not pass for a complete one.
+
+### Story: build-names-concurrent-edits
+
+As a developer or agent, I want `build` to name the source files that changed while it ran, so that I know at once that the new index is already stale and which files made it so.
+
+> Ladders to north-star outcome 4 (**Honest under edit**): a build does not report success as if its index matched the workspace when an edit during the build made it stale.
 
 ## Scope
 
@@ -48,6 +60,8 @@ As a developer or agent, I want `status` to name the files that changed since th
 - `status --detail files` (and a bare `--detail`) names each source file that differs from the indexed content as changed, added, or removed (`code-navigation`).
   The list pages with `--limit` and `--cursor`, as query answers do.
 - `status` reports every staleness reason that applies, not only the first (`code-navigation`).
+- After it writes the store, `build` reads the sources again and names each file that changed, was added, or was removed while it ran, in the human and the machine answer (`code-graph`).
+  The build still succeeds.
 - The surface version bump for the new flags.
 - The MCP server: the matching surface pin, and `at` parameter descriptions that name the line and column form.
 - Command documentation for the location format, `--position`, `--at`, and `status --detail files`.
@@ -89,6 +103,10 @@ Switching to it later costs a schema bump and a rebuild, and no contract change,
 `--at path:line:column` resolves to the innermost symbol that encloses that position, as a byte offset does today.
 `--at path:line` resolves to the innermost symbol that covers any part of that line; when several symbols qualify, the answer is the typed candidate set.
 Both rules use only stored lines and columns.
+
+**End-of-build check.**
+After the store write, the build runs discovery again and compares each file with the text it indexed, using the same changed, added, and removed classification as `status`.
+The machine answer carries the list, because the MCP `build` tool returns only the machine answer, so a notice on standard error would not reach an MCP agent.
 
 **Status reasons.**
 `freshness` keeps its current single value for compatibility.
