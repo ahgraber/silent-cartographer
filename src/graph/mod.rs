@@ -47,16 +47,17 @@ pub enum IngestError {
 /// Compute the content hash over the analyzed sources.
 ///
 /// The hash is order-independent: documents are sorted by path so the same sources always hash the
-/// same regardless of discovery order.
+/// same regardless of discovery order. Each path and text is prefixed with its byte length, so a text
+/// that contains the bytes of a separator cannot make one file set hash like another.
 pub fn content_hash(documents: &[(String, String)]) -> String {
     let mut sorted: Vec<&(String, String)> = documents.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = Sha256::new();
     for (path, text) in sorted {
-        hasher.update(path.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(text.as_bytes());
-        hasher.update([0u8]);
+        for part in [path, text] {
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
     }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
@@ -1125,6 +1126,26 @@ mod tests {
     use super::work_bound_fixture::{fn_symbol, index_over};
     use super::*;
     use crate::semantic::model::{ExtractedOccurrence, SourceRange};
+
+    fn source(path: &str, text: &str) -> (String, String) {
+        (path.to_string(), text.to_string())
+    }
+
+    // A file's text may contain any byte sequence, so a separator inside it must not let one file
+    // set hash like another.
+    #[test]
+    fn content_hash_distinguishes_a_text_that_imitates_the_next_file() {
+        let one_file = [source("a.rs", "// x\0b.rs\0// y")];
+        let two_files = [source("a.rs", "// x"), source("b.rs", "// y")];
+        assert_ne!(content_hash(&one_file), content_hash(&two_files));
+    }
+
+    #[test]
+    fn content_hash_ignores_discovery_order() {
+        let forward = [source("a.rs", "one"), source("b.rs", "two")];
+        let reversed = [source("b.rs", "two"), source("a.rs", "one")];
+        assert_eq!(content_hash(&forward), content_hash(&reversed));
+    }
 
     // Each known analyzer names its own language, and an analyzer no backend claims is refused.
     //

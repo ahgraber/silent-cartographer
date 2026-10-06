@@ -25,7 +25,8 @@
 ///
 /// Migration: version 17 stores a callable whose parent is not a type as `function` rather than
 /// `method`, and names a Python module by its module name rather than `__init__` (both stored
-/// columns, and both inputs to the passage render, so the corpus definition version moved with it);
+/// columns, and both inputs to the passage render, so the corpus definition version moved with it)
+/// and computes the aggregate content hash with each path and text length-prefixed;
 /// version 16 replaced the twelve `aligned_*_count` columns with a single keyed
 /// `aligned_counts` JSON object, retiring the per-rule column, read, and write edits a new rule
 /// used to require;
