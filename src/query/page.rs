@@ -225,28 +225,7 @@ pub fn apply_pagination<T>(
         });
     };
 
-    let total = results.len();
-    let page_count = total.div_ceil(limit).max(1);
-    if page_index >= page_count {
-        return Err(out_of_range(page_count - 1));
-    }
-
-    let start = page_index * limit;
-    let page_results: Vec<T> = results.into_iter().skip(start).take(limit).collect();
-    let returned = page_results.len();
-    let truncated = start + returned < total;
-    let cursor = truncated.then(|| encode_token(&param_hash, page_index + 1));
-
-    // A page block is disclosure of a partial view: it is attached only when the answer is not the
-    // whole set on the first page — i.e. the result set was truncated, or a later page was resumed.
-    // A default-bounded query whose set fits within the limit thus reads like an unbounded one.
-    let page = (truncated || page_index > 0).then_some(PageInfo {
-        truncated,
-        page_index,
-        returned,
-        total,
-        cursor,
-    });
+    let (page_results, page) = slice_page(results, limit, page_index, &param_hash)?;
 
     Ok(Answer {
         provenance,
@@ -321,28 +300,8 @@ pub fn apply_report_pagination<T>(
         .next()
         .expect("a found report-shaped answer carries exactly one report");
     let rows = detail(&mut report);
-    let total = rows.len();
-    let page_count = total.div_ceil(limit).max(1);
-    if page_index >= page_count {
-        return Err(out_of_range(page_count - 1));
-    }
-
-    let start = page_index * limit;
-    let page_rows: Vec<DependentItem> = std::mem::take(rows).into_iter().skip(start).take(limit).collect();
-    let returned = page_rows.len();
-    let truncated = start + returned < total;
-    let cursor = truncated.then(|| encode_token(&param_hash, page_index + 1));
+    let (page_rows, page) = slice_page(std::mem::take(rows), limit, page_index, &param_hash)?;
     *rows = page_rows;
-
-    // A page block is disclosure of a partial view: attached only when the detail rows were truncated
-    // to the limit or a later page was resumed, so a report whose rows fit the limit reads unbounded.
-    let page = (truncated || page_index > 0).then_some(PageInfo {
-        truncated,
-        page_index,
-        returned,
-        total,
-        cursor,
-    });
 
     Ok(Answer {
         provenance,
@@ -355,6 +314,40 @@ pub fn apply_report_pagination<T>(
         outcome: Outcome::Found { results: vec![report] },
         page,
     })
+}
+
+/// Page a bounded row set: the rows of page `page_index` at `limit` rows per page, with the page
+/// block that discloses a partial view and the token that resumes the next page. The one slice-and-
+/// token step the answer paths share.
+///
+/// A page block is attached only when the rows were truncated or a later page was resumed, so a set
+/// that fits the limit reads like an unbounded one. A `page_index` past the last page is a usage
+/// error naming the valid range.
+fn slice_page<T>(
+    rows: Vec<T>,
+    limit: usize,
+    page_index: usize,
+    param_hash: &str,
+) -> anyhow::Result<(Vec<T>, Option<PageInfo>)> {
+    let total = rows.len();
+    let page_count = total.div_ceil(limit).max(1);
+    if page_index >= page_count {
+        return Err(out_of_range(page_count - 1));
+    }
+
+    let start = page_index * limit;
+    let page_rows: Vec<T> = rows.into_iter().skip(start).take(limit).collect();
+    let returned = page_rows.len();
+    let truncated = start + returned < total;
+    let cursor = truncated.then(|| encode_token(param_hash, page_index + 1));
+    let page = (truncated || page_index > 0).then_some(PageInfo {
+        truncated,
+        page_index,
+        returned,
+        total,
+        cursor,
+    });
+    Ok((page_rows, page))
 }
 
 /// Apply the result-set bound to a `dependents` impact answer, paging the report's detailed rows.
