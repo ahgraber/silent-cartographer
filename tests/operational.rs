@@ -783,7 +783,7 @@ fn build_outcome_renders_distinguish_a_skip_from_a_build() {
     let json = silent_cartographer::commands::build_outcome_json(&skip);
     assert_eq!(json["rebuilt"], serde_json::Value::Bool(false), "a skip: {json}");
 
-    let built = silent_cartographer::commands::BuildOutcome::Rebuilt(accounting);
+    let built = silent_cartographer::commands::BuildOutcome::Rebuilt(accounting, Vec::new());
     let line = silent_cartographer::commands::build_outcome_line(&built);
     assert!(
         line.starts_with("built:"),
@@ -2135,10 +2135,27 @@ impl StatusWorkspace {
         std::fs::write(path, self.text(name, marker)).unwrap();
     }
 
+    /// Make the stub analyzer run `script` (a shell script) while it analyzes, in every later build.
+    fn edit_while_building(&self, script: &str) {
+        std::fs::write(self.dir.path().join(".stub-bin/on_analyze"), script).unwrap();
+    }
+
     /// A shell command that writes source file `name` with `marker`.
     fn shell_write(&self, name: &str, marker: &str) -> String {
         let path = self.dir.path().join(self.file(name));
         format!("printf '%s' '{}' > '{}'\n", self.text(name, marker), path.display())
+    }
+
+    /// A shell command that deletes source file `name`.
+    fn shell_remove(&self, name: &str) -> String {
+        format!("rm '{}'\n", self.dir.path().join(self.file(name)).display())
+    }
+
+    /// `--json build --force` against this workspace, parsed.
+    fn rebuild(&self) -> serde_json::Value {
+        let out = self.run(&["--json", "build", "--language", self.language_flag(), "--force"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
     }
 
     fn remove(&self, name: &str) {
@@ -2224,6 +2241,148 @@ fn status_names_a_new_file_as_added() {
 #[test]
 fn status_names_a_deleted_file_as_removed() {
     assert_one_file_named("c", "removed", |w| w.remove("c"));
+}
+
+/// The `(document_path, change)` pairs of a build answer's `changed_during_build`.
+fn changed_during_build(answer: &serde_json::Value) -> Vec<(String, String)> {
+    answer["changed_during_build"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the build answer carries the list: {answer}"))
+        .iter()
+        .map(|f| {
+            (
+                f["document_path"].as_str().unwrap().to_string(),
+                f["change"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A build during which `edit` changes the workspace names exactly `name` as `change`, succeeds, and
+/// leaves `status` reporting stale content, on every language backend.
+fn assert_build_names_concurrent_edit(name: &str, change: &str, edit: impl Fn(&StatusWorkspace) -> String) {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        workspace.edit_while_building(&edit(&workspace));
+        let answer = workspace.rebuild();
+        assert_eq!(
+            changed_during_build(&answer),
+            vec![(workspace.file(name), change.to_string())],
+            "{language:?}: {answer}"
+        );
+        let report = workspace.status(&[]);
+        assert_eq!(report["freshness"], "stale_content", "{language:?}: {report}");
+
+        let workspace = StatusWorkspace::build(language);
+        workspace.edit_while_building(&edit(&workspace));
+        let human = workspace.run(&["build", "--language", workspace.language_flag(), "--force"]);
+        assert!(human.status.success(), "{language:?}: the human build succeeds");
+        let human = String::from_utf8(human.stdout).unwrap();
+        assert!(
+            human.contains(&format!("{change} during build: {}", workspace.file(name))),
+            "{language:?}: {human}"
+        );
+    }
+}
+
+// _(Scenario: A file edited during the build is named)_ — an edit made while the analyzer runs is
+// named as changed.
+#[test]
+fn build_names_a_file_edited_during_the_build_as_changed() {
+    assert_build_names_concurrent_edit("b", "changed", |w| w.shell_write("b", "two"));
+}
+
+// _(Scenario: A file created during the build is named)_ — a file created while the analyzer runs is
+// named as added.
+#[test]
+fn build_names_a_file_created_during_the_build_as_added() {
+    assert_build_names_concurrent_edit("d", "added", |w| w.shell_write("d", "one"));
+}
+
+// _(Scenario: A file deleted during the build is named)_ — a file deleted while the analyzer runs is
+// named as removed.
+#[test]
+fn build_names_a_file_deleted_during_the_build_as_removed() {
+    assert_build_names_concurrent_edit("c", "removed", |w| w.shell_remove("c"));
+}
+
+// _(Scenario: An undisturbed build names no file)_ — a build during which nothing changes carries an
+// empty list and prints no file line, and a build that finds the index already current carries one
+// too.
+#[test]
+fn build_without_concurrent_edits_names_no_file() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        let answer = workspace.rebuild();
+        assert_eq!(answer["rebuilt"], true, "{language:?}: {answer}");
+        assert_eq!(answer["changed_during_build"], serde_json::json!([]), "{language:?}");
+        let out = workspace.run(&["build", "--language", workspace.language_flag(), "--force"]);
+        let human = String::from_utf8(out.stdout).unwrap();
+        assert!(!human.contains("during build"), "{language:?}: {human}");
+
+        let out = workspace.run(&["--json", "build", "--language", workspace.language_flag()]);
+        let current: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(current["rebuilt"], false, "{language:?}: {current}");
+        assert_eq!(current["changed_during_build"], serde_json::json!([]), "{language:?}");
+    }
+}
+
+// A source entry that cannot be read because its target is absent (a dangling symlink) is treated
+// as absent: the build succeeds and names no file, rather than failing.
+#[test]
+fn build_skips_a_dangling_source_symlink() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        let link = workspace.dir.path().join(workspace.file("dangling"));
+        std::os::unix::fs::symlink("missing", &link).unwrap();
+        let answer = workspace.rebuild();
+        assert_eq!(answer["rebuilt"], true, "{language:?}: {answer}");
+        assert_eq!(answer["changed_during_build"], serde_json::json!([]), "{language:?}");
+        let report = workspace.status(&["--detail", "files"]);
+        assert_eq!(report["freshness"], "fresh", "{language:?}: {report}");
+    }
+}
+
+// A source file that becomes unreadable while the build runs fails the build with an error naming the
+// file; the index the build wrote before that check stays in the store.
+#[test]
+fn build_fails_naming_a_source_that_becomes_unreadable_during_the_build() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        let store = || silent_cartographer::graph::store::GraphStore::open(&workspace.dir.path().join("index.db"));
+        let before = store().unwrap().read_metadata().unwrap().unwrap().content_hash;
+        workspace.write("a", "two");
+
+        let unreadable = workspace.dir.path().join(workspace.file("d"));
+        let unreadable_path = unreadable.display();
+        workspace.edit_while_building(&format!(
+            "printf x > '{unreadable_path}'\nchmod 000 '{unreadable_path}'\n"
+        ));
+        let out = workspace.run(&["build", "--language", workspace.language_flag()]);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(!out.status.success(), "{language:?}: the build fails");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&workspace.file("d")),
+            "{language:?}: the error names the file: {stderr}"
+        );
+        let store = store().unwrap();
+        assert_ne!(
+            store.read_metadata().unwrap().unwrap().content_hash,
+            before,
+            "{language:?}: the store holds the new build"
+        );
+        assert!(
+            store.source_files().unwrap().contains(&(
+                workspace.file("a"),
+                silent_cartographer::graph::text_hash(&workspace.text("a", "two"))
+            )),
+            "{language:?}: the stored fingerprints are the new build's"
+        );
+    }
 }
 
 // Every stored value `status` reports comes from the one build it read: a build that commits while

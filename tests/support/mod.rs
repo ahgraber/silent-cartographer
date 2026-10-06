@@ -308,8 +308,9 @@ pub fn python_fixture_sources() -> Vec<(String, String)> {
 /// (zero documents), so this lets a real `c10r build` run to completion without a real analyzer
 /// available in this sandbox.
 ///
-/// A file named `on_version` next to the stub is run as a shell script once, at the next `--version`
-/// probe, then set aside.
+/// A file named `on_analyze` next to the stub is run as a shell script just before the index is
+/// written, so a test can edit the workspace while the analyzer runs. A file named `on_version` is
+/// run once, at the next `--version` probe, then set aside.
 pub fn write_indexing_stub(dir: &std::path::Path, name: &str, version: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -325,7 +326,9 @@ pub fn write_indexing_stub(dir: &std::path::Path, name: &str, version: &str) -> 
              \x20 fi\n\
              \x20 echo \"{version}\"\n  exit 0\nfi\n\
              while [ $# -gt 0 ]; do\n\
-             \x20 if [ \"$1\" = \"--output\" ]; then\n    : > \"$2\"\n    exit 0\n  fi\n\
+             \x20 if [ \"$1\" = \"--output\" ]; then\n\
+             \x20   if [ -f \"$(dirname \"$0\")/on_analyze\" ]; then . \"$(dirname \"$0\")/on_analyze\"; fi\n\
+             \x20   : > \"$2\"\n    exit 0\n  fi\n\
              \x20 shift\n\
              done\n\
              exit 1\n"

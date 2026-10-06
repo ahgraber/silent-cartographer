@@ -18,7 +18,7 @@ use crate::graph::join::JoinAccounting;
 use crate::graph::range::LineColumn;
 use crate::graph::store::{Freshness, GraphStore, IndexMetadata, StoreOpenError, stale_reasons_of};
 use crate::graph::syntax::Language;
-use crate::graph::{SourceChange, compare_source_files, content_hash, ingest, text_hash};
+use crate::graph::{SourceChange, SourceDifference, compare_source_files, content_hash, ingest, text_hash};
 use crate::identity::WorkspaceId;
 use crate::query::diff::{self, FileChange};
 use crate::query::impact::{ImpactRequest, shell_quote};
@@ -83,12 +83,24 @@ fn collect_dir(
     skip_dirs: &[&str],
     out: &mut Vec<(String, String)>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+    // An entry that vanishes mid-walk (deleted after it was listed, or a dangling symlink) is absent,
+    // not a failure; the root must exist, and every other I/O error still fails.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir != root => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if entry.file_type()?.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if file_type.is_dir() {
             if name.starts_with('.') || skip_dirs.contains(&name.as_ref()) {
                 continue;
             }
@@ -121,6 +133,7 @@ fn collect_dir(
                         ))
                     );
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
             }
         }
@@ -538,10 +551,7 @@ pub fn run_build(
         }
     };
 
-    let sources = match language {
-        Language::Rust => collect_rust_sources(root)?,
-        Language::Python => collect_python_sources(root)?,
-    };
+    let sources = collect_language_sources(language, root)?;
 
     // Nothing to do when the store already describes this workspace under this analyzer,
     // environment, and chunk parameters: analyzing would reproduce the rows it already holds.
@@ -576,7 +586,27 @@ pub fn run_build(
         chunk_params,
     )
     .map_err(|e| anyhow!("ingest failed: {e}"))?;
-    Ok(BuildOutcome::Rebuilt(accounting))
+
+    // Analysis can take long enough for the workspace to change under it. The store holds the text
+    // that was indexed, so it is complete and labeled by what it recorded; the files that moved since
+    // are reported so the caller knows why `status` calls it stale.
+    let indexed: Vec<(String, String)> = sources.iter().map(|(p, t)| (p.clone(), text_hash(t))).collect();
+    let rediscovered: Vec<(String, String)> = collect_language_sources(language, root)?
+        .iter()
+        .map(|(p, t)| (p.clone(), text_hash(t)))
+        .collect();
+    Ok(BuildOutcome::Rebuilt(
+        accounting,
+        compare_source_files(&indexed, &rediscovered),
+    ))
+}
+
+/// The `(document_path, text)` sources discovery finds under `root` for `language`.
+fn collect_language_sources(language: Language, root: &Path) -> Result<Vec<(String, String)>> {
+    match language {
+        Language::Rust => collect_rust_sources(root),
+        Language::Python => collect_python_sources(root),
+    }
 }
 
 /// The outcome of a build request: the workspace was analyzed and the store rewritten, or the store
@@ -584,10 +614,11 @@ pub fn run_build(
 ///
 /// Both carry the same accounting — the freshly produced one, or the one the store recorded when it
 /// was built — so a caller renders one answer shape either way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildOutcome {
-    /// The workspace was analyzed and the store rebuilt.
-    Rebuilt(crate::graph::join::JoinAccounting),
+    /// The workspace was analyzed and the store rebuilt, with the source files that differed between
+    /// the list indexed and a second discovery pass after the store write.
+    Rebuilt(crate::graph::join::JoinAccounting, Vec<SourceDifference>),
     /// The stored index already described the workspace's sources, analyzer, and environment.
     AlreadyCurrent(crate::graph::join::JoinAccounting),
 }
@@ -596,13 +627,22 @@ impl BuildOutcome {
     /// The join accounting the build produced, or the one the current store already recorded.
     pub fn accounting(&self) -> crate::graph::join::JoinAccounting {
         match self {
-            BuildOutcome::Rebuilt(accounting) | BuildOutcome::AlreadyCurrent(accounting) => *accounting,
+            BuildOutcome::Rebuilt(accounting, _) | BuildOutcome::AlreadyCurrent(accounting) => *accounting,
+        }
+    }
+
+    /// The source files that changed, appeared, or disappeared while the build ran; empty when
+    /// nothing moved or nothing was analyzed.
+    pub fn changed_during_build(&self) -> &[SourceDifference] {
+        match self {
+            BuildOutcome::Rebuilt(_, changed) => changed,
+            BuildOutcome::AlreadyCurrent(_) => &[],
         }
     }
 
     /// Whether the workspace was analyzed and the store rewritten.
     pub fn rebuilt(&self) -> bool {
-        matches!(self, BuildOutcome::Rebuilt(_))
+        matches!(self, BuildOutcome::Rebuilt(..))
     }
 }
 
@@ -735,11 +775,22 @@ fn aligned_buckets_json(accounting: &JoinAccounting) -> serde_json::Value {
     serde_json::Value::Object(aligned)
 }
 
-/// The human `build` answer: the accounting line for a build that ran, or a statement that the
-/// stored index already described the workspace and nothing was analyzed.
+/// The human `build` answer: the accounting line for a build that ran, followed by one
+/// `<change> during build: path` line per source file that moved while it ran, or a statement that
+/// the stored index already described the workspace and nothing was analyzed.
 pub fn build_outcome_line(outcome: &BuildOutcome) -> String {
     match outcome {
-        BuildOutcome::Rebuilt(accounting) => build_accounting_line(accounting),
+        BuildOutcome::Rebuilt(accounting, changed) => {
+            let mut lines = vec![build_accounting_line(accounting)];
+            lines.extend(changed.iter().map(|difference| {
+                crate::render::sanitize(&format!(
+                    "{} during build: {}",
+                    difference.change.label(),
+                    difference.document_path
+                ))
+            }));
+            lines.join("\n")
+        }
         BuildOutcome::AlreadyCurrent(_) => {
             "already current: sources, analyzer, and environment match the stored index; nothing built \
              (use --force to build anyway)"
@@ -749,11 +800,15 @@ pub fn build_outcome_line(outcome: &BuildOutcome) -> String {
 }
 
 /// The structured `build` answer: the accounting projection, plus whether this invocation rebuilt
-/// the store or found it already current.
+/// the store or found it already current, and the files that moved while it ran.
 pub fn build_outcome_json(outcome: &BuildOutcome) -> serde_json::Value {
     let mut value = build_accounting_json(&outcome.accounting());
     if let Some(object) = value.as_object_mut() {
         object.insert("rebuilt".to_string(), serde_json::Value::Bool(outcome.rebuilt()));
+        object.insert(
+            "changed_during_build".to_string(),
+            serde_json::to_value(outcome.changed_during_build()).unwrap_or_default(),
+        );
     }
     value
 }
@@ -2854,6 +2909,18 @@ mod tests {
     use crate::graph::join::JoinAccounting;
     use crate::graph::store::IndexMetadata;
     use crate::query::diff::ChangeKind;
+
+    #[test]
+    fn a_subdirectory_that_vanished_is_absent_but_a_missing_root_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut out = Vec::new();
+        collect_dir(root, &root.join("gone"), "rs", &[], &mut out).unwrap();
+        assert!(out.is_empty());
+
+        let missing_root = root.join("missing");
+        assert!(collect_dir(&missing_root, &missing_root, "rs", &[], &mut out).is_err());
+    }
 
     /// A store recording `workspace_root` as the workspace it describes.
     fn store_recorded_for(workspace_root: &str) -> GraphStore {
