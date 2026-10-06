@@ -61,11 +61,46 @@ Serves: clickable-locations
 - **WHEN** the index is built
 - **THEN** the persisted discrepancy carries neither byte offsets nor a line and column
 
+### Requirement: Recorded declarations carry their header end
+
+For every symbol the index records with a definition span, the system SHALL record where the symbol's header ends, both as a byte offset and as a line and a column, and both forms SHALL denote the same position in the source text the build indexed.
+A symbol's header SHALL be the part of its definition span that precedes the declaration's body, and SHALL start where the definition span starts.
+A declaration with no body distinct from its form, such as a constant, a field, or a parameter, SHALL have a header equal to its whole definition span.
+A document's own module, whose header does not appear in the source, SHALL have no header end, and neither SHALL a symbol without a definition span.
+Line and column SHALL follow the same numbering as every other recorded location.
+
+Serves: clickable-locations
+
+#### Scenario: A function's header ends before its body
+
+- **GIVEN** a function whose declaration form precedes a body
+- **WHEN** the index is built
+- **THEN** the function's header end is the position where its body begins, not the end of its definition span
+
+#### Scenario: A header spans the lines its declaration form spans
+
+- **GIVEN** a function whose parameter list runs over several lines, or a declaration preceded by decorators that its definition span includes
+- **WHEN** the index is built
+- **THEN** the header covers every line from the start of the definition span through the end of the declaration form
+
+#### Scenario: A declaration without a body
+
+- **GIVEN** a constant, a field, or a parameter that the index records with a definition span
+- **WHEN** the index is built
+- **THEN** its header end equals its definition span's end
+
+#### Scenario: A document's own module has no header end
+
+- **GIVEN** any indexed source file
+- **WHEN** the index is built
+- **THEN** the module the file defines carries no header end, while a module declared inside the file carries one
+
 ### Requirement: A build names sources that changed while it ran
 
 After a build writes the store, the system SHALL discover the workspace's sources again and compare each with the text the build indexed.
 A source discovered again with different text SHALL be named changed, a source discovered only now SHALL be named added, and an indexed source no longer discovered SHALL be named removed.
 The build SHALL succeed whether or not any source is named, and both its human answer and its machine answer SHALL name every such source with its classification.
+When a source cannot be read again for a reason other than no longer existing, the build SHALL fail, although the store is already written.
 When no source is named, the machine answer SHALL carry an empty list.
 A build that analyzes nothing because the stored index is already current SHALL carry an empty list.
 
@@ -88,6 +123,12 @@ Serves: build-names-concurrent-edits
 - **GIVEN** a workspace whose analyzer deletes one indexed source file while it runs
 - **WHEN** the workspace is built
 - **THEN** the build succeeds and its answer names that file as removed
+
+#### Scenario: A source that becomes unreadable fails the build
+
+- **GIVEN** a workspace whose analyzer creates a source file that cannot be read while it runs
+- **WHEN** the workspace is built
+- **THEN** the build fails with an error that names that file, and the store holds the new index
 
 #### Scenario: An undisturbed build names nothing
 

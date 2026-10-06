@@ -93,7 +93,7 @@ Both derive from the same file list and text, so `status` reports stale content 
 
 **Line and column at build time.**
 The build computes each location's start and end line and column while it holds the file text, and stores them beside the byte offsets.
-The store keeps no copy of the source.
+Queries read the stored line and column and never recompute them.
 Lines and columns then describe the indexed text, as the byte offsets do, so a stale answer stays self-consistent and stays labeled stale.
 Computing them at query time from the file on disk was rejected: once a file changes, the line numbers would disagree with the byte offsets and point at the wrong code.
 Storing the full file text was deferred.
@@ -101,7 +101,9 @@ Switching to it later costs a schema bump and a rebuild, and no contract change,
 
 **Position resolution.**
 `--at path:line:column` resolves to the innermost symbol that encloses that position, as a byte offset does today.
-`--at path:line` resolves to the innermost symbol that covers any part of that line; when several symbols qualify, the answer is the typed candidate set.
+`--at path:line` resolves to the declaration whose header is on that line, and otherwise to the innermost symbol that encloses the start of the line; when several declarations qualify, the answer is the typed candidate set.
+A header runs from the start of a declaration to where its body begins, so it covers decorators and every line of a multi-line parameter list.
+The build records where each header ends.
 Both rules use only stored lines and columns.
 
 **End-of-build check.**
@@ -113,12 +115,16 @@ The machine answer carries the list, because the MCP `build` tool returns only t
 A new list carries every reason that applies.
 
 **Surfaces.**
-The continuation token already binds every query parameter, so `--position` joins it automatically.
+The continuation token binds `--position` only for a query that reads an `--at` position, because only there does the unit change the answer.
 The surface version rises for `--position`, `status --detail`, and the `status` paging flags; the MCP pin rises with it.
 
-## Open Questions
+## Resolved Questions
 
-- Whether the human rendering shows only the start (`path:line:column`) or the whole range.
-  The start alone is the form editors open; `design.md` decides.
-- The JSON field names and shape for line and column.
-  `design.md` decides, keeping the existing `span_start` and `span_end` fields.
+- 2026-10-03 End-of-build check: after it writes the store, `build` reads the sources again and names each file that changed, was added, or was removed while it ran, in both answers, and still succeeds.
+  Decided with the user.
+- 2026-10-03 Header end: the store records where each symbol's header ends, as a byte offset and as a line and column.
+  Decided with the user.
+- 2026-10-03 `path:line` resolution: a line resolves to the outermost declarations whose header covers it, and otherwise to the innermost symbol that encloses the start of the line, replacing the innermost-symbol rule.
+  Decided with the user.
+- 2026-10-04 Read errors after the store write: a source that disappears before the second read is named removed, and any other read error fails the build although the store is already written.
+  Decided with the user.

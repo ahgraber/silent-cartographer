@@ -7,7 +7,8 @@ SCIP reports a line and a column in the position encoding each document declares
 The build normalizes SCIP positions to byte offsets so the two sources compare in one exact unit, because a column-unit mismatch would silently bind an occurrence to the wrong node.
 Byte offsets then became the output unit without a recorded decision.
 
-The store holds each symbol's source text and the aggregate content hash of all analyzed files, but no per-file record and no copy of whole files.
+The store holds each symbol's source text and the aggregate content hash of all analyzed files, but no per-file record.
+A file's whole text is stored only as the source text of the module the file defines.
 The build is the only production code that writes the aggregate hash (`src/graph/mod.rs`, the index metadata write).
 `status` is the only reader that needs per-file facts.
 
@@ -43,16 +44,14 @@ The existing `LineIndex` in `src/graph/range.rs` stays unchanged: it counts LF o
 Byte offsets stay the internal unit; only the reported line and column use the editor convention.
 
 **Rationale:** Each line and column comes from the same text as its byte offsets, so the two forms cannot disagree, and a stale answer stays self-consistent.
-The store keeps no copy of the source.
+The conversion reads no stored text at query time.
 Changing `LineIndex` itself would change guarded-join normalization and hunk mapping for files with a lone CR.
 
 **Alternatives considered:**
 
 - Compute at query time from the file on disk: once a file changes, lines disagree with byte offsets and point at the wrong code.
-- Store each file's full text and compute at query time: the store grows by about the source size.
-  Deferred, not rejected.
+- Compute at query time from the file's text stored as its module's source text: no new columns, but every location in an answer costs a scan of its whole file, and positions would depend on module text staying in the store.
   Switching later costs a schema bump and a rebuild and no contract change, because the spec defines positions by the indexed text, not by how the store keeps them.
-  Switching back after features come to depend on stored text would cost those features.
 
 ### Decision: LineAndColumnUnits
 
@@ -71,6 +70,24 @@ An exclusive end matches the half-open byte span.
 - UTF-16 columns (the LSP default): exact for LSP clients, but a column no human counts, and still wrong for editors that count characters.
 - Byte columns: need no text to compute, but land mid-character in an editor on any line with a multi-byte character before the location.
 - LF-only lines, matching git and `LineIndex`: one convention in the code, but a `path:line` copied from an editor names the wrong line in a lone-CR file.
+
+### Decision: HeaderEnd
+
+**Chosen:** The build records each symbol's header end in three nullable columns on `symbols`: `header_end` (a byte offset), `header_end_line`, and `header_end_column`.
+The header starts at the definition span's start, so no header start is stored.
+For a declaration the syntax tree recognizes, the header end is the offset where the signature tier is cut at the body delimiter, or the span's end when the declaration has no distinct body.
+For a symbol stored with its name span as its definition span, the header end is that span's end.
+A document's own module, whose stored span is the whole file, has no header end.
+The line and column come from the same converter as every other location.
+
+**Rationale:** The signature tier already cuts each declaration at its body, so the build knows the header end without a new analysis.
+Storing the end, rather than deriving it from `signature_text` at query time, keeps resolution independent of how each language formats its signature: Rust's signature prepends attributes that lie outside the definition span, so the signature is not always a prefix of the span text.
+Storing both units keeps every recorded location in both forms.
+
+**Alternatives considered:**
+
+- Derive the header end from `signature_text` at query time: no schema change, but correct only while every signature is a prefix of its span text.
+- Store the header end line only: serves the line rule, but it would be the one recorded position without a byte offset.
 
 ### Decision: LocationJsonShape
 
@@ -131,18 +148,28 @@ A zero line or column is a usage error naming the accepted forms.
 ### Decision: PositionResolution
 
 **Chosen:** A `path:line:column` position resolves by comparing `(line, column)` pairs against each symbol's stored start and end pairs, with the same enclosure rule the byte offset uses.
-A `path:line` position selects the symbols in the document whose half-open span intersects `[(line, 1), (line + 1, 1))`, which excludes a span that ends at the line's column 1, then keeps those that contain no other selected symbol; one survivor is the answer, several are the typed candidate set.
-The document's module is the answer when no narrower symbol covers the line; an empty document's zero-width module covers no line, so its answer is typed absence.
+A `path:line` position selects the symbols in the document whose header, the half-open range from the definition span's start to the stored header end, intersects `[(line, 1), (line + 1, 1))`, then keeps those that no other selected symbol contains; one survivor is the answer, several are the typed candidate set.
+When no header intersects the line, the position resolves as `(line, 1)` does under the enclosure rule.
+A document's own module carries no header, so it is the answer only through that fallback; an empty document's zero-width module encloses no position, so its answer is typed absence.
 A column past the end of its line needs no special handling: `(L, oversized)` sorts after every stored position on line `L` and before `(L + 1, 1)`, so it selects the symbol that encloses the end of that line, which is the clamp LSP specifies and `position_to_byte` applies to SCIP positions.
 A line past the end of the file sorts after every stored end, so no symbol encloses it.
 
 **Rationale:** Within one text, `(line, column)` order and byte order agree on every position both can name, so the pair comparison returns the same symbol a byte offset at that position returns.
-Neither rule needs the file text, which keeps the per-file storage decision reversible.
+The index records symbols whose span is only their name: Python parameters and attributes, Rust fields, enum variants, associated types, and macros.
+Such a symbol lies inside the declaration that holds it and often starts on that declaration's header line.
+Taking the outermost header on the line returns the declaration on its header lines, and returns the member on a line that declares only the member.
+A header covers decorators and multi-line parameter lists, because the definition span and the declaration form do.
+Body lines carry no header, and the enclosure of the line's first column returns the innermost declaration around them.
+Neither rule reads the file text.
 
 **Alternatives considered:**
 
-- Resolve `path:line` at the first non-blank character: needs the file text.
-- Resolve `path:line` at column 1: an indented method header resolves to the enclosing type.
+- The innermost symbol whose span intersects the line: a Python method header line returns its `self` parameter, and a one-line Rust struct returns its fields.
+- The outermost symbol whose span starts on the line: a decorated Python method's span starts at the decorator, so its `def` line returns a parameter; a line inside a multi-line parameter list does the same.
+- The outermost symbol whose name is on the line: also fails inside multi-line parameter lists, and a Rust file module's name occurrence covers the whole file.
+- Skip symbols whose span equals their name, then take the innermost: loses Rust associated types, members declared on their own line, and functions a macro generates.
+- Resolve at column 1 only: an indented method header resolves to the enclosing type.
+- Resolve at the first non-blank character: a line inside a multi-line parameter list returns a parameter.
 
 ### Decision: StatusFileList
 
@@ -205,9 +232,13 @@ A build window is short, so the list is short in normal use.
 **Limit:** an edit that is reverted before the second discovery pass is not named.
 The index then matches the files on disk again, so nothing is stale.
 
+**Read errors:** a source that disappears before the second pass reads it is named removed.
+Any other read error in the second pass fails the build, although the store is already written.
+Such an error comes from a file or directory that became unreadable during the build, and every later `status` and query reads the same sources and fails with the same error until it is fixed, so reporting success would only defer it.
+
 ### Decision: Versions
 
-**Chosen:** `SCHEMA_VERSION` 17 for `source_files` and the location columns.
+**Chosen:** `SCHEMA_VERSION` 17 for `source_files`, the location columns, and the header-end columns.
 Version 17 is shared with the Python kind and module display-name fix, which lands first; this change extends the version 17 migration note instead of bumping again.
 No release may ship between the two, because a store built between them would carry version 17 without `source_files`.
 `changed_during_build` is an added field of the `build` machine answer and rides the same surface bump.
@@ -235,11 +266,13 @@ build ──reads──> source text (per file)
   │                         │
   └─ join ──> symbols / occurrences / join_discrepancies
                 (span_start, span_end, start_line, start_column, end_line, end_column)
+                (symbols also: header_end, header_end_line, header_end_column)
 
 query ──> Location {span_*, start_*, end_*} ──> JSON (both units)
                                            └──> human: --position line → path:L:C
                                                        --position byte → path:S-E
---at path:L[:C] ──> (line, column) comparison against stored pairs ──> symbol
+--at path:L:C ──> (line, column) enclosure against stored pairs ──> symbol
+--at path:L   ──> outermost header on line L, else enclosure of (L, 1) ──> symbol
 
 impact unmappable region ──> converter over git's pre-change text ──> both units (null when unreadable)
 
@@ -265,23 +298,40 @@ build (after store write) ──> discovery again ──compare──> indexed s
   Mitigation: the breaking change is in the changelog and the command docs; the MCP `at` descriptions name the new form.
 - **Build cost.**
   One extra pass per file to index line starts, and one SHA-256 per file.
-  Mitigation: the build already reads every file and hashes all of them; the five-repo timing check from earlier changes confirms no material slowdown.
+  Measured on the five dogfood clones (ripgrep, fd, Flask, httpx2, Faker) with `build --force`, the release binary at `HEAD` against the working tree, each run twice with the second timing reported so the analyzer cache is warm for both.
+  Build time changed by +0.5% on ripgrep, +2.4% on fd, +1.8% on httpx2, -3.8% on Flask, and +6.1% on Faker (66.9 s to 70.9 s; the first runs differed by +2.8%).
+  Run-to-run spread on one binary is about 5%, so only Faker's difference might exceed noise, and it is at most a few percent.
 - **Store size.**
-  Four integers per symbol, occurrence, and discrepancy row, plus one row per file.
-  Mitigation: measure on the largest dogfood store and record the growth.
+  Four integers per symbol, occurrence, and discrepancy row, three more per symbol for the header end, and one row per file.
+  Measured on the same five builds, the store grew by 1.1% on Faker (96.8 MB to 97.9 MB, the largest), 1.4% on ripgrep, 1.5% on Flask, 1.5% on httpx2, and 2.1% on fd.
+  Store sizes were identical across repeated builds of one binary except for a 4 KB page on two stores, so no `VACUUM` pass was needed.
 - **Answer size for agents.**
-  Four fields per location add an estimated 20 tokens each, about 500 tokens on a 25-row `trace`.
+  The four location fields add about 110 bytes per location row, which is about 28 tokens at four bytes per token.
+  A 25-row `trace`, `find`, or `search` answer grew by 2.8 KB, from roughly 12 KB to 15 KB, an increase of 22% to 23% for `trace` and `search` and 30% to 31% for `find`, on Rust and Python alike.
+  The token counts used the potion-code tokenizer shipped with c10r, because the `tiktoken` encoding files could not be downloaded in the sandbox; it is a subword tokenizer but not a language-model one.
+  It counted 800 additional tokens per 25 rows, or 32 per row, against the earlier estimate of 20 per row.
+  On ripgrep, `trace --relation references` on `SearcherBuilder` went from 3523 to 4329 tokens, and on Faker the same relation on `BaseProvider` went from 3452 to 4252.
   All four stay: the end line is what an agent needs to read a whole definition by line range, and `get --detail body` does not cover reference, `trace`, `search`, or `impact` rows.
-  Mitigation: measure representative `trace`, `find`, and `search` answers before and after with one tokenizer, and record the increase here.
 - **The unreadable pre-change file region in `impact`.**
   It keeps the placeholder byte span `0-0`, which no text was read to derive, so its line and column are null.
 - **Eval comparisons across versions.**
   The eval harness runs `c10r` through Bash, so the treatment agent sees the new output, and its token totals change.
   No eval parser reads locations.
   Paired runs under one binary stay comparable; comparing runs across c10r versions needs the binary's image digest in the analysis record, or separate sweeps.
-- **A version 17 store without `source_files`.**
-  A development store built after the kind fix and before this change carries version 17 but no `source_files` table, and its currency check can report it current.
-  Mitigation: rebuild development stores with `--force` after this change lands; no release ships between the two.
+- **A version 17 store without this change's tables and columns.**
+  A development store built after the kind fix and before this change carries version 17 but not `source_files`, the location columns, or the header-end columns.
+  Its currency check can report it current, and `build --force` fails on it, because the build replaces a store by its version number and creates tables only when they are absent.
+  Mitigation: delete such development stores and build again; no release ships version 17 before this change.
 - **Lone-CR files.**
   Reported lines follow the editor, while git's hunk lines and SCIP's lines count LF only.
   Mitigation: a test pins that SCIP normalization and hunk mapping keep their current byte results, and a scenario covers a definition after a lone CR.
+
+## Verification Waivers
+
+- **Requirement:** code-graph: A build names sources that changed while it ran (a source no longer discovered is named removed, not a failure).
+  **Reason:** In `collect_dir` (`src/commands.rs`), a directory entry deleted after `read_dir` lists it and before `DirEntry::file_type` reads it is skipped as absent.
+  Only a deletion inside that interval reaches the branch; no file state reproduces it, because a dangling symlink still has a type.
+  Injecting the error would add a test-only parameter to production discovery.
+  **Manual evidence:** The branch skips the entry exactly as the two tested vanished-entry branches do: a file that vanishes before it is read (`tests/operational.rs::build_skips_a_dangling_source_symlink`) and a subdirectory that vanishes before it is listed (`src/commands.rs::tests::a_subdirectory_that_vanished_is_absent_but_a_missing_root_fails`).
+  Every other `file_type` error still fails discovery.
+  **Recorded:** 2026-10-05

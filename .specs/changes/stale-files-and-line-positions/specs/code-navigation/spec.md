@@ -66,7 +66,9 @@ Under the line position unit, which is the default, a source position given to `
 A position SHALL be read against the text the index was built from, as a location in an answer is.
 A `path:line:column` position SHALL resolve to the innermost symbol that encloses it, as a byte offset at the same position does.
 A column past the end of its line SHALL denote the end of that line.
-A `path:line` position SHALL resolve to the innermost symbol whose span covers at least one position of that line, a span covering none of the line — one that ends at the line's first column — excluded; when more than one symbol qualifies and none encloses another, the answer SHALL be the typed candidate set of those symbols.
+A `path:line` position SHALL resolve to the outermost symbols whose header covers at least one position of that line; when no header covers the line, it SHALL resolve to the innermost symbol that encloses the line's first column.
+A header or span that ends at the line's first column covers none of that line.
+When more than one symbol qualifies and none encloses another, the answer SHALL be the typed candidate set of those symbols.
 A line past the end of the indexed file SHALL resolve to no symbol, and the answer SHALL be typed absence.
 A line or column of zero SHALL be refused as a usage error that names the accepted forms.
 
@@ -83,6 +85,30 @@ Serves: clickable-locations
 - **GIVEN** the line on which a method's declaration starts, inside a type
 - **WHEN** `get --at path:line` runs
 - **THEN** the method is returned, not the type that encloses it
+
+#### Scenario: A header line that declares parameters
+
+- **GIVEN** the line on which a method's declaration starts, where that line also declares the method's parameters and the index records the parameters as symbols
+- **WHEN** `get --at path:line` runs
+- **THEN** the method is returned, not a parameter
+
+#### Scenario: Every line of a multi-line header
+
+- **GIVEN** a declaration whose header runs over several lines, through decorators or a parameter list
+- **WHEN** `get --at path:line` names any line of that header
+- **THEN** the declaration is returned
+
+#### Scenario: A one-line declaration with members
+
+- **GIVEN** a line holding a type declaration together with its members
+- **WHEN** `get --at path:line` runs
+- **THEN** the type is returned, not its members
+
+#### Scenario: A line declaring a member
+
+- **GIVEN** a line inside a multi-line type that declares one member of that type
+- **WHEN** `get --at path:line` runs
+- **THEN** the member is returned
 
 #### Scenario: A line inside a body
 
