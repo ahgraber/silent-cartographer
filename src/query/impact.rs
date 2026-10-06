@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::git::SeedMode;
+use crate::graph::range::PositionIndex;
 use crate::graph::store::{DEPENDENTS_HORIZON, SymbolRow};
 use crate::identity::CanonicalId;
 
 use super::diff::{FileChange, LineIndex};
-use super::output::{Answer, Location, SymbolView};
+use super::output::{Answer, LineColumns, Location, SymbolView};
 use super::{DependentsReport, OrderMode, QueryEngine, QueryError};
 
 /// Whether the index the answer was drawn from matches the change's pre-change state, and — when it
@@ -85,6 +86,9 @@ pub struct UnmappableRegion {
     pub span_start: usize,
     /// The region's end byte offset on the pre-change side.
     pub span_end: usize,
+    /// The region as line and column in the pre-change text; absent when that text was unreadable.
+    #[serde(flatten)]
+    pub line_column: LineColumns,
 }
 
 /// The runnable recovery procedure an approximate answer carries: the shell steps that produce an
@@ -263,6 +267,7 @@ impl QueryEngine<'_> {
                     document_path: pre_path.clone(),
                     span_start: 0,
                     span_end: 0,
+                    line_column: LineColumns::default(),
                 });
                 continue;
             };
@@ -270,6 +275,7 @@ impl QueryEngine<'_> {
             let holds = self.store.holds_document(pre_path)?;
             // One `LineIndex` per file, reused across every hunk it carries.
             let line_index = LineIndex::new(pre_text);
+            let positions = PositionIndex::new(pre_text);
 
             for range in &change.pre_ranges {
                 let (start, end) = line_index.byte_range(*range);
@@ -278,6 +284,7 @@ impl QueryEngine<'_> {
                         document_path: pre_path.clone(),
                         span_start: start,
                         span_end: end,
+                        line_column: positions.span(start, end).into(),
                     });
                     continue;
                 }
@@ -1066,6 +1073,8 @@ mod tests {
         assert_eq!(results[0].unmappable[0].document_path, "doc.rs");
         assert_eq!(results[0].unmappable[0].span_start, 0);
         assert_eq!(results[0].unmappable[0].span_end, 0);
+        // Without the pre-change text there is no line or column to report.
+        assert_eq!(results[0].unmappable[0].line_column, LineColumns::default());
         assert_eq!(results[0].seed_outcome, SeedOutcome::NoneResolvable);
     }
 

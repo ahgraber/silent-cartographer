@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 
+use crate::cli::PositionUnit;
 use crate::exit::Failure;
 use crate::git::{GitError, GitRepo, SeedMode};
 use crate::graph::chunk::ChunkParams;
@@ -20,7 +21,7 @@ use crate::graph::{content_hash, ingest};
 use crate::identity::WorkspaceId;
 use crate::query::diff::{self, FileChange};
 use crate::query::impact::{ImpactRequest, shell_quote};
-use crate::query::output::{Answer, WorkspaceRelation};
+use crate::query::output::{Answer, LineColumns, WorkspaceRelation};
 use crate::query::page::{
     OrderingIdentity, PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination,
     precheck_cursor,
@@ -189,16 +190,18 @@ pub fn revert_changes(
 
 /// Render an answer, honoring the `--json` flag: the serialized machine answer under `--json`, or the
 /// human projection of that same value otherwise. `styled` gates structural styling on the human
-/// render and is ignored under `--json` (the machine answer is never styled).
+/// render and is ignored under `--json` (the machine answer is never styled); `position` selects the
+/// unit the human render names locations in and is likewise ignored under `--json`.
 pub fn render<T: serde::Serialize + crate::render::HumanRender>(
     answer: &Answer<T>,
     json: bool,
     styled: bool,
+    position: PositionUnit,
 ) -> String {
     if json {
         answer.to_json()
     } else {
-        crate::render::to_human(answer, styled)
+        crate::render::to_human(answer, styled, position)
     }
 }
 
@@ -774,6 +777,7 @@ pub fn build_from_index(
 /// `status`: report provenance, freshness, and the join-alignment counts. With `discrepancies`, add
 /// the bounded grouped discrepancy summary; with `all`, add every persisted discrepancy row instead.
 /// With `duplicates`, add the duplicated-descriptor group detail; the group count is always reported.
+#[allow(clippy::too_many_arguments)] // the CLI's flat command surface travels together
 pub fn run_status(
     db: &Path,
     root: &Path,
@@ -782,6 +786,7 @@ pub fn run_status(
     discrepancies: bool,
     all: bool,
     duplicates: bool,
+    position: PositionUnit,
 ) -> Result<String> {
     let store = open_query_store(db)?;
     let Some(meta) = store.read_metadata()? else {
@@ -873,11 +878,16 @@ pub fn run_status(
             "rows": rows
                 .iter()
                 .map(|r| {
+                    let position = LineColumns::from(r.line_column);
                     serde_json::json!({
                         "document_path": r.document_path,
                         // Typed absence: null when the occurrence's coordinates could not normalize.
                         "span_start": r.span.map(|s| s.0),
                         "span_end": r.span.map(|s| s.1),
+                        "start_line": position.start_line,
+                        "start_column": position.start_column,
+                        "end_line": position.end_line,
+                        "end_column": position.end_column,
                         "outcome": r.outcome,
                         "expected_name": r.expected_name,
                         "found_text": r.found_text,
@@ -896,6 +906,7 @@ pub fn run_status(
                 .groups
                 .iter()
                 .map(|g| {
+                    let position = LineColumns::from(g.exemplar.line_column);
                     serde_json::json!({
                         "outcome": g.outcome,
                         "expected_name": g.expected_name,
@@ -906,6 +917,10 @@ pub fn run_status(
                             // Typed absence: null when the exemplar's coordinates could not normalize.
                             "span_start": g.exemplar.span.map(|s| s.0),
                             "span_end": g.exemplar.span.map(|s| s.1),
+                            "start_line": position.start_line,
+                            "start_column": position.start_column,
+                            "end_line": position.end_line,
+                            "end_column": position.end_column,
                         },
                     })
                 })
@@ -916,7 +931,7 @@ pub fn run_status(
     if json {
         Ok(serde_json::to_string_pretty(&report)?)
     } else {
-        Ok(render_status_report(&report))
+        Ok(render_status_report(&report, position))
     }
 }
 
@@ -929,9 +944,17 @@ fn status_text(value: &serde_json::Value) -> String {
     }
 }
 
-/// `path:start-end` for a status row or exemplar, `path` alone when its coordinates are absent.
-fn status_location(row: &serde_json::Value) -> String {
+/// `path:line:column` of the start for a status row or exemplar under the line unit, `path:start-end`
+/// under the byte unit — and under the line unit when the row has no line and column — and `path`
+/// alone when its coordinates are absent.
+fn status_location(row: &serde_json::Value, position: PositionUnit) -> String {
     let path = status_text(&row["document_path"]);
+    if position == PositionUnit::Line
+        && let (line @ serde_json::Value::Number(_), column @ serde_json::Value::Number(_)) =
+            (&row["start_line"], &row["start_column"])
+    {
+        return format!("{path}:{}:{}", status_text(line), status_text(column));
+    }
     match (&row["span_start"], &row["span_end"]) {
         (serde_json::Value::Null, _) | (_, serde_json::Value::Null) => path,
         (start, end) => format!("{path}:{}-{}", status_text(start), status_text(end)),
@@ -940,7 +963,7 @@ fn status_location(row: &serde_json::Value) -> String {
 
 /// The human `status` answer: labeled lines projected from the same report `--json` emits, every
 /// value sanitized before it joins a line.
-fn render_status_report(report: &serde_json::Value) -> String {
+fn render_status_report(report: &serde_json::Value, position: PositionUnit) -> String {
     let mut lines = vec![
         format!("workspace: {}", status_text(&report["workspace"])),
         format!(
@@ -1004,13 +1027,13 @@ fn render_status_report(report: &serde_json::Value) -> String {
     }
 
     if let Some(discrepancies) = report.get("discrepancies") {
-        lines.extend(render_status_discrepancies(discrepancies));
+        lines.extend(render_status_discrepancies(discrepancies, position));
     }
     lines.join("\n")
 }
 
 /// The discrepancy section of [`render_status_report`]: the bounded summary's groups, or every row.
-fn render_status_discrepancies(discrepancies: &serde_json::Value) -> Vec<String> {
+fn render_status_discrepancies(discrepancies: &serde_json::Value, position: PositionUnit) -> Vec<String> {
     let mut lines = Vec::new();
     if discrepancies["listing"] == "all" {
         let rows = discrepancies["rows"].as_array().map(Vec::as_slice).unwrap_or_default();
@@ -1021,7 +1044,7 @@ fn render_status_discrepancies(discrepancies: &serde_json::Value) -> Vec<String>
                 status_text(&row["outcome"]),
                 status_text(&row["expected_name"]),
                 status_text(&row["found_text"]),
-                status_location(row)
+                status_location(row, position)
             ));
         }
     } else {
@@ -1042,7 +1065,7 @@ fn render_status_discrepancies(discrepancies: &serde_json::Value) -> Vec<String>
                 status_text(&group["expected_name"]),
                 status_text(&group["count"]),
                 status_text(&group["document_count"]),
-                status_location(&group["exemplar"])
+                status_location(&group["exemplar"], position)
             ));
         }
     }
@@ -1175,11 +1198,12 @@ pub fn run_get(
     cursor: Option<&str>,
     json: bool,
     styled: bool,
+    position: PositionUnit,
 ) -> Result<String> {
     // The invocation's shape is validated before the store is opened, so a malformed `get` is a
     // usage error even against an absent index.
-    let position = at.map(parse_position).transpose()?;
-    let reference = match position {
+    let at_position = at.map(parse_position).transpose()?;
+    let reference = match at_position {
         Some(_) => None,
         None => {
             Some(reference.ok_or_else(|| Failure::Usage("get requires a reference or --at position".to_string()))?)
@@ -1218,7 +1242,7 @@ pub fn run_get(
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
 
-    let answer = match &position {
+    let answer = match &at_position {
         Some((doc, offset)) => engine.get_by_position(doc, *offset, detail, effective_max_lines, from)?,
         None => engine.get(
             reference.expect("required when --at is absent"),
@@ -1241,7 +1265,7 @@ pub fn run_get(
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
     let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
-    Ok(render(&answer, json, styled))
+    Ok(render(&answer, json, styled, position))
 }
 
 /// `trace`: return the symbols in a relation to the subject.
@@ -1267,6 +1291,7 @@ pub fn run_trace(
     cursor: Option<&str>,
     json: bool,
     styled: bool,
+    position: PositionUnit,
 ) -> Result<String> {
     if !matches!(relation, Relation::Dependents) && depth.is_some() {
         return Err(Failure::Usage(format!(
@@ -1338,13 +1363,13 @@ pub fn run_trace(
             .with_workspace_relation(relation_disclosure)
             .with_ordering(order);
         let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
-        return Ok(render(&answer, json, styled));
+        return Ok(render(&answer, json, styled, position));
     };
     let answer = engine.trace(reference, trace_relation, detail, effective_max_lines)?;
     let answer =
         apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation_disclosure);
     let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
-    Ok(render(&answer, json, styled))
+    Ok(render(&answer, json, styled, position))
 }
 
 /// `find`: return every symbol whose name contains `fragment`, matched case-insensitively, as a
@@ -1361,6 +1386,7 @@ pub fn run_find(
     cursor: Option<&str>,
     json: bool,
     styled: bool,
+    position: PositionUnit,
 ) -> Result<String> {
     let effective_limit = (limit != 0).then_some(limit);
     // Store-independent cursor checks run before the store opens, so a malformed cursor or a cursor
@@ -1389,7 +1415,7 @@ pub fn run_find(
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
     let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
-    Ok(render(&answer, json, styled))
+    Ok(render(&answer, json, styled, position))
 }
 
 /// `search`: the corpus symbols nearest a natural-language query by estimated relevance — the
@@ -1407,6 +1433,7 @@ pub fn run_search(
     cursor: Option<&str>,
     json: bool,
     styled: bool,
+    position: PositionUnit,
 ) -> Result<String> {
     // Row content exists only under a content-bearing detail; an explicit `--max-lines` at location
     // detail is a modal usage error, decided before the store opens.
@@ -1442,7 +1469,7 @@ pub fn run_search(
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
     let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
-    Ok(render(&answer, json, styled))
+    Ok(render(&answer, json, styled, position))
 }
 
 /// `similar`: the corpus symbols most similar in content to a subject symbol, the subject named by
@@ -1462,11 +1489,12 @@ pub fn run_similar(
     cursor: Option<&str>,
     json: bool,
     styled: bool,
+    position: PositionUnit,
 ) -> Result<String> {
     // The invocation's shape is validated before the store is opened, so a malformed `similar` is a
     // usage error even against an absent index.
-    let position = at.map(parse_position).transpose()?;
-    let reference = match position {
+    let at_position = at.map(parse_position).transpose()?;
+    let reference = match at_position {
         Some(_) => None,
         None => Some(
             reference.ok_or_else(|| Failure::Usage("similar requires a reference or --at position".to_string()))?,
@@ -1491,7 +1519,7 @@ pub fn run_similar(
         .expect("open_query_store guarantees recorded metadata");
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
-    let answer = match &position {
+    let answer = match &at_position {
         Some((doc, offset)) => engine.similar_by_position(doc, *offset, detail, effective_max_lines)?,
         None => engine.similar(
             reference.expect("required when --at is absent"),
@@ -1513,7 +1541,7 @@ pub fn run_similar(
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
     let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
-    Ok(render(&answer, json, styled))
+    Ok(render(&answer, json, styled, position))
 }
 
 /// `impact`: the reverse-reachability impact of a change, seeded from a git diff rather than from a
@@ -1559,6 +1587,7 @@ pub fn run_impact(
     cursor: Option<&str>,
     json: bool,
     styled: bool,
+    position: PositionUnit,
 ) -> Result<String> {
     let effective_limit = (limit != 0).then_some(limit);
     // Store-independent cursor checks run before the store opens, so a malformed cursor or a cursor
@@ -1752,7 +1781,7 @@ pub fn run_impact(
         .with_workspace_relation(relation)
         .with_ordering(order);
     let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
-    Ok(render(&answer, json, styled))
+    Ok(render(&answer, json, styled, position))
 }
 
 /// The seed mode label used in `impact`'s continuation-token identity: `working_tree`, `staged`, or

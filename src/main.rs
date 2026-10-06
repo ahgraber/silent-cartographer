@@ -204,6 +204,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             args.paging.cursor.as_deref(),
             cli.json,
             styled,
+            cli.position,
         ),
         Command::Trace(args) => commands::run_trace(
             &cli.db,
@@ -221,6 +222,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             args.paging.cursor.as_deref(),
             cli.json,
             styled,
+            cli.position,
         ),
         Command::Find(args) => commands::run_find(
             &cli.db,
@@ -231,6 +233,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             args.paging.cursor.as_deref(),
             cli.json,
             styled,
+            cli.position,
         ),
         Command::Search(args) => commands::run_search(
             &cli.db,
@@ -244,6 +247,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             args.paging.cursor.as_deref(),
             cli.json,
             styled,
+            cli.position,
         ),
         Command::Similar(args) => commands::run_similar(
             &cli.db,
@@ -258,6 +262,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             args.paging.cursor.as_deref(),
             cli.json,
             styled,
+            cli.position,
         ),
         Command::Impact(args) => commands::run_impact(
             &cli.db,
@@ -273,6 +278,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             args.paging.cursor.as_deref(),
             cli.json,
             styled,
+            cli.position,
         ),
         Command::Build(args) => {
             let outcome = commands::run_build(
@@ -305,6 +311,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             args.discrepancies,
             args.all,
             args.duplicates,
+            cli.position,
         ),
         Command::Doctor => unreachable!("doctor is dispatched before run() in main"),
         Command::Completions(_) => unreachable!("completions is dispatched before run() in main"),

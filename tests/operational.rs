@@ -82,6 +82,7 @@ fn status_reports_provenance_freshness_and_alignment() {
         false,
         false,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
 
@@ -183,7 +184,22 @@ fn supplied_workspace_overrides_the_default() {
 /// `x` on line 0 — so each is a text-mismatch with a distinct expected name, i.e. `n` distinct
 /// discrepancy groups. Persist it and return the database path (kept alive by the returned tempdir).
 fn build_n_discrepancy_groups(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
-    let source = "let x = 1;\n";
+    build_n_discrepancy_groups_in(Language::Rust, n)
+}
+
+/// The document, its text, and the 0-based range of the token `x` that the discrepancy fixture for
+/// `language` points every symbol at.
+fn discrepancy_token(language: Language) -> (&'static str, &'static str, SourceRange) {
+    match language {
+        Language::Rust => ("m.rs", "let x = 1;\n", SourceRange::new(0, 4, 0, 5)),
+        Language::Python => ("m.py", "def f():\n    x = 1\n", SourceRange::new(1, 4, 1, 5)),
+    }
+}
+
+/// [`build_n_discrepancy_groups`] over a document in `language`, indexed under that backend's
+/// provenance.
+fn build_n_discrepancy_groups_in(language: Language, n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (doc, source, token) = discrepancy_token(language);
     let symbols: Vec<ExtractedSymbol> = (0..n)
         .map(|i| ExtractedSymbol {
             descriptor: Some(Descriptor::new(
@@ -192,18 +208,18 @@ fn build_n_discrepancy_groups(n: usize) -> (tempfile::TempDir, std::path::PathBu
             )),
             kind: SymbolKind::Constant,
             class: SymbolClass::InWorkspace,
-            // Points at "x" (line 0, cols 4..5): spells "x", not "name{i}" → text-mismatch.
+            // Points at "x": spells "x", not "name{i}" → text-mismatch.
             occurrences: vec![ExtractedOccurrence {
-                document_path: "m.rs".to_string(),
-                range: SourceRange::new(0, 4, 0, 5),
+                document_path: doc.to_string(),
+                range: token,
                 role: OccurrenceRole::Definition,
             }],
         })
         .collect();
     let index = ExtractedIndex {
-        provenance: support::provenance(),
+        provenance: support::backend_provenance(language),
         documents: vec![SourceDocument {
-            path: "m.rs".to_string(),
+            path: doc.to_string(),
             encoding: PositionEncoding::Utf8,
         }],
         symbols,
@@ -218,7 +234,7 @@ fn build_n_discrepancy_groups(n: usize) -> (tempfile::TempDir, std::path::PathBu
         "op-ws",
         dir.path(),
         &index,
-        &[("m.rs".to_string(), source.to_string())],
+        &[(doc.to_string(), source.to_string())],
     )
     .unwrap();
     (dir, db)
@@ -230,7 +246,17 @@ fn build_n_discrepancy_groups(n: usize) -> (tempfile::TempDir, std::path::PathBu
 fn discrepancy_summary_is_truncated_but_totals_cover_the_full_set() {
     let groups = DISCREPANCY_GROUP_CAP + 5;
     let (_dir, db) = build_n_discrepancy_groups(groups);
-    let report = run_status(&db, Path::new("."), "not-a-real-analyzer", true, true, false, false).unwrap();
+    let report = run_status(
+        &db,
+        Path::new("."),
+        "not-a-real-analyzer",
+        true,
+        true,
+        false,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
 
     let disc = &v["discrepancies"];
@@ -263,7 +289,17 @@ fn discrepancy_summary_is_truncated_but_totals_cover_the_full_set() {
 fn full_listing_returns_every_row() {
     let groups = DISCREPANCY_GROUP_CAP + 5;
     let (_dir, db) = build_n_discrepancy_groups(groups);
-    let report = run_status(&db, Path::new("."), "not-a-real-analyzer", true, false, true, false).unwrap();
+    let report = run_status(
+        &db,
+        Path::new("."),
+        "not-a-real-analyzer",
+        true,
+        false,
+        true,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
 
     let disc = &v["discrepancies"];
@@ -280,7 +316,17 @@ fn full_listing_returns_every_row() {
 #[test]
 fn summary_group_shape_carries_kind_token_count_and_exemplar() {
     let (_dir, db) = build_n_discrepancy_groups(3);
-    let report = run_status(&db, Path::new("."), "not-a-real-analyzer", true, true, false, false).unwrap();
+    let report = run_status(
+        &db,
+        Path::new("."),
+        "not-a-real-analyzer",
+        true,
+        true,
+        false,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
 
     let groups = v["discrepancies"]["groups"].as_array().unwrap();
@@ -297,6 +343,71 @@ fn summary_group_shape_carries_kind_token_count_and_exemplar() {
         assert!(
             ex["span_end"].as_u64().unwrap() >= ex["span_start"].as_u64().unwrap(),
             "exemplar carries a location span: {ex}"
+        );
+    }
+}
+
+// _(Discrepancy locations carry line and column)_ — full-listing rows and summary exemplars carry
+// the line and column of the refused occurrence beside its byte offsets.
+#[test]
+fn discrepancy_rows_and_exemplars_carry_line_and_column() {
+    for language in support::LANGUAGES {
+        let (_dir, db) = build_n_discrepancy_groups_in(language, 1);
+        let all = run_status(
+            &db,
+            Path::new("."),
+            "not-a-real-analyzer",
+            true,
+            false,
+            true,
+            false,
+            silent_cartographer::cli::PositionUnit::Line,
+        )
+        .unwrap();
+        let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+        let summary = run_status(
+            &db,
+            Path::new("."),
+            "not-a-real-analyzer",
+            true,
+            true,
+            false,
+            false,
+            silent_cartographer::cli::PositionUnit::Line,
+        )
+        .unwrap();
+        let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
+
+        // The token `x` sits at columns 5..6 of line 1 in `let x = 1;` and of line 2 in `    x = 1`.
+        let line = match language {
+            Language::Rust => 1,
+            Language::Python => 2,
+        };
+        for location in [
+            &all["discrepancies"]["rows"][0],
+            &summary["discrepancies"]["groups"][0]["exemplar"],
+        ] {
+            assert_eq!(location["start_line"], line, "{language:?}: {location}");
+            assert_eq!(location["start_column"], 5, "{language:?}: {location}");
+            assert_eq!(location["end_line"], line, "{language:?}: {location}");
+            assert_eq!(location["end_column"], 6, "{language:?}: {location}");
+        }
+
+        let human = run_status(
+            &db,
+            Path::new("."),
+            "not-a-real-analyzer",
+            false,
+            false,
+            true,
+            false,
+            silent_cartographer::cli::PositionUnit::Line,
+        )
+        .unwrap();
+        let doc = discrepancy_token(language).0;
+        assert!(
+            human.lines().any(|row| row.ends_with(&format!(" at {doc}:{line}:5"))),
+            "{language:?}: the human row is located by line and column: {human}"
         );
     }
 }
@@ -374,8 +485,17 @@ fn query_refuses_an_incompatible_store_with_guidance() {
     let db = dir.path().join("index.db");
     write_marked_old_store(&db);
 
-    let err = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false)
-        .expect_err("status against an incompatible store must refuse");
+    let err = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        true,
+        false,
+        false,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .expect_err("status against an incompatible store must refuse");
 
     // The refusal is the typed guard error, not a storage-level failure leaking through.
     let chain = format!("{err:#}");
@@ -412,7 +532,17 @@ fn matching_version_store_operates_normally() {
     build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
 
     // Read paths operate normally.
-    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false).unwrap();
+    let report = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        true,
+        false,
+        false,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .unwrap();
     assert!(report.contains("join_alignment"), "status answers normally: {report}");
     let store = GraphStore::open(&db).unwrap();
     let engine = QueryEngine::new(&store, support::provenance(), content_hash(&sources()), None);
@@ -447,7 +577,17 @@ fn status_reports_per_rule_acceptance_buckets() {
     let db = dir.path().join("index.db");
     build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
 
-    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false).unwrap();
+    let report = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        true,
+        false,
+        false,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
     let alignment = &v["join_alignment"];
 
@@ -680,7 +820,17 @@ fn duplicated_groups_are_retrievable_with_descriptor_and_definitions() {
     )
     .unwrap();
 
-    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, true).unwrap();
+    let report = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        true,
+        false,
+        false,
+        true,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
 
     assert_eq!(
@@ -713,7 +863,17 @@ fn no_duplicates_is_a_definite_zero_group_count() {
     let db = dir.path().join("index.db");
     build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
 
-    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, true).unwrap();
+    let report = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        true,
+        false,
+        false,
+        true,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
 
     assert_eq!(
@@ -749,7 +909,17 @@ fn status_json_always_carries_the_duplicated_group_count() {
     .unwrap();
 
     // No --duplicates flag: the count is still present, but not the per-group detail.
-    let report = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false).unwrap();
+    let report = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        true,
+        false,
+        false,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
     assert_eq!(
         v["duplicated_descriptors"]["group_count"].as_u64(),
@@ -987,6 +1157,7 @@ fn get_answer(db: &Path, root: &Path, json: bool) -> String {
         /* cursor */ None,
         json,
         /* styled */ false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .expect("the query answers")
 }
@@ -1014,10 +1185,20 @@ fn a_query_or_status_against_a_missing_store_creates_nothing() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .expect_err("a query against nothing refuses");
-    let status_err = run_status(&db, dir.path(), "not-a-real-analyzer", true, false, false, false)
-        .expect_err("a status request against nothing refuses");
+    let status_err = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        true,
+        false,
+        false,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .expect_err("a status request against nothing refuses");
 
     for (what, err) in [("query", query_err), ("status", status_err)] {
         let message = format!("{err:#}");
@@ -1180,6 +1361,7 @@ fn every_query_family_carries_the_workspace_disclosure() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .expect("trace answers");
     // `dependents` assembles its own answer shape, so it is a separate site the disclosure has to
@@ -1200,12 +1382,32 @@ fn every_query_family_carries_the_workspace_disclosure() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .expect("dependents answers");
-    let find =
-        silent_cartographer::commands::run_find(&db, root, "not-a-real-analyzer", "connect", 25, None, true, false)
-            .expect("find answers");
-    let status = run_status(&db, root, "not-a-real-analyzer", true, false, false, false).expect("status answers");
+    let find = silent_cartographer::commands::run_find(
+        &db,
+        root,
+        "not-a-real-analyzer",
+        "connect",
+        25,
+        None,
+        true,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .expect("find answers");
+    let status = run_status(
+        &db,
+        root,
+        "not-a-real-analyzer",
+        true,
+        false,
+        false,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+    )
+    .expect("status answers");
 
     for (command, answer) in [
         ("trace", trace),

@@ -36,6 +36,11 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "auto", global = true)]
     pub color: ColorArg,
 
+    /// The unit the human rendering names a location in. The machine answer carries both units whichever
+    /// is selected.
+    #[arg(long, value_enum, default_value = "line", global = true)]
+    pub position: PositionUnit,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -49,6 +54,15 @@ pub enum ColorArg {
     Always,
     /// Never apply styling.
     Never,
+}
+
+/// The unit a source position is named in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PositionUnit {
+    /// `path:line:column`, numbered from 1.
+    Line,
+    /// `path:start-end` byte offsets.
+    Byte,
 }
 
 /// The top-level commands.

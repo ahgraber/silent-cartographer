@@ -6,6 +6,7 @@
 
 use serde::Serialize;
 
+use crate::graph::range::LineColumnSpan;
 use crate::graph::store::Freshness;
 use crate::identity::CanonicalId;
 use crate::query::OrderMode;
@@ -121,6 +122,31 @@ pub struct SymbolView {
     pub external: bool,
 }
 
+/// The line and column of a span's start and exclusive end, serialized as four flat fields beside
+/// the span's byte offsets; all `null` where the position is absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct LineColumns {
+    /// The start line, from 1.
+    pub start_line: Option<u32>,
+    /// The start column, from 1, counting Unicode scalar values.
+    pub start_column: Option<u32>,
+    /// The line of the position after the span's last character, from 1.
+    pub end_line: Option<u32>,
+    /// The column of the position after the span's last character, from 1.
+    pub end_column: Option<u32>,
+}
+
+impl From<Option<LineColumnSpan>> for LineColumns {
+    fn from(span: Option<LineColumnSpan>) -> Self {
+        Self {
+            start_line: span.map(|s| s.start.line),
+            start_column: span.map(|s| s.start.column),
+            end_line: span.map(|s| s.end.line),
+            end_column: span.map(|s| s.end.column),
+        }
+    }
+}
+
 /// A source location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Location {
@@ -130,6 +156,9 @@ pub struct Location {
     pub span_start: usize,
     /// The end byte offset.
     pub span_end: usize,
+    /// The same span as line and column.
+    #[serde(flatten)]
+    pub line_column: LineColumns,
 }
 
 /// The 1-based line window a windowed `get` content answer covers, disclosed whenever the returned

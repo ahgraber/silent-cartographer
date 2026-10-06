@@ -697,6 +697,7 @@ impl TraceItem {
                 document_path: occ.document_path,
                 span_start: occ.span.0,
                 span_end: occ.span.1,
+                line_column: occ.line_column.into(),
             },
             enclosing: occ.enclosing_id,
             test_rule,
@@ -798,6 +799,7 @@ fn location_of(row: &SymbolRow) -> Option<Location> {
             document_path: doc.clone(),
             span_start: start,
             span_end: end,
+            line_column: row.line_column.into(),
         }),
         _ => None,
     }

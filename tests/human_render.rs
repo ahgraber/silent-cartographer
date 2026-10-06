@@ -100,6 +100,41 @@ fn multi_line_body_renders_as_multi_line_source() {
     );
 }
 
+// _(Answers report locations as line and column)_ — `get` at location detail names the symbol's
+// start as `path:line:column` by default, and its start and end byte offsets under `--position byte`.
+#[test]
+fn get_renders_line_and_column_by_default_and_byte_offsets_on_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_fixture_db(dir.path());
+    let get = |extra: &[&str]| {
+        let out = c10r(dir.path())
+            .arg("--db")
+            .arg(&db)
+            .args(extra)
+            .args(["get", "net::Client::connect"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // `pub fn connect(&self) {}` is the fourth line of the fixture, indented eight columns.
+    let start = support::SOURCE.find("pub fn connect").unwrap();
+    let end = start + "pub fn connect(&self) {}".len();
+    let by_line = get(&[]);
+    assert!(
+        by_line.lines().any(|l| l.trim() == format!("{}:4:9", support::DOC)),
+        "the default rendering names line and column: {by_line}"
+    );
+    let by_byte = get(&["--position", "byte"]);
+    assert!(
+        by_byte
+            .lines()
+            .any(|l| l.trim() == format!("{}:{start}-{end}", support::DOC)),
+        "the byte unit names the byte span: {by_byte}"
+    );
+}
+
 /// The `canonical_id` of each result in a `--json` answer, in serialized order.
 fn json_result_ids(stdout: &[u8]) -> Vec<String> {
     let answer: serde_json::Value = serde_json::from_slice(stdout).expect("the --json answer parses");

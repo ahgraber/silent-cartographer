@@ -1,5 +1,5 @@
 {
-  "surface_version": 11,
+  "surface_version": 12,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -77,6 +77,16 @@
             "never"
           ],
           "default": "auto",
+          "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
           "global": true
         }
       ]
@@ -174,6 +184,16 @@
           ],
           "default": "auto",
           "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
+          "global": true
         }
       ]
     },
@@ -223,6 +243,16 @@
             "never"
           ],
           "default": "auto",
+          "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
           "global": true
         }
       ]
@@ -291,6 +321,16 @@
             "never"
           ],
           "default": "auto",
+          "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
           "global": true
         }
       ]
@@ -364,6 +404,16 @@
             "never"
           ],
           "default": "auto",
+          "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
           "global": true
         }
       ]
@@ -439,6 +489,16 @@
             "never"
           ],
           "default": "auto",
+          "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
           "global": true
         }
       ]
@@ -517,6 +577,16 @@
           ],
           "default": "auto",
           "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
+          "global": true
         }
       ]
     },
@@ -566,6 +636,16 @@
           ],
           "default": "auto",
           "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
+          "global": true
         }
       ]
     },
@@ -599,6 +679,16 @@
             "never"
           ],
           "default": "auto",
+          "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
           "global": true
         }
       ]
@@ -643,6 +733,16 @@
             "never"
           ],
           "default": "auto",
+          "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
           "global": true
         }
       ]
@@ -712,6 +812,16 @@
           ],
           "default": "auto",
           "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
+          "global": true
         }
       ]
     },
@@ -745,6 +855,16 @@
             "never"
           ],
           "default": "auto",
+          "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
           "global": true
         }
       ]
@@ -791,6 +911,16 @@
             "never"
           ],
           "default": "auto",
+          "global": true
+        },
+        {
+          "name": "position",
+          "takes_value": true,
+          "values": [
+            "line",
+            "byte"
+          ],
+          "default": "line",
           "global": true
         }
       ]

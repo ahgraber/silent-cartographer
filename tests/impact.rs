@@ -26,6 +26,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use silent_cartographer::commands::{build_from_index, collect_rust_sources, resolve_workspace};
+use silent_cartographer::graph::range::PositionIndex;
+use silent_cartographer::graph::syntax::Language;
 use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind};
 use silent_cartographer::semantic::model::{
     ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding, SourceDocument,
@@ -822,6 +824,583 @@ fn unmappable_regions_are_disclosed_on_an_approximate_answer() {
         unmappable.iter().any(|u| u["document_path"] == "src/untouched.rs"),
         "the region in the unindexed tracked file is disclosed: {report}"
     );
+}
+
+// Line and column in answers.
+
+/// Every JSON object under `value` that carries byte offsets, in document order.
+fn byte_locations(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let mut found = Vec::new();
+    let mut pending = vec![value];
+    while let Some(next) = pending.pop() {
+        match next {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("span_start") {
+                    found.push(next);
+                }
+                pending.extend(map.values());
+            }
+            serde_json::Value::Array(items) => pending.extend(items.iter().rev()),
+            _ => {}
+        }
+    }
+    found
+}
+/// Assert that `location`'s line and column fields denote the same positions as its byte offsets in
+/// the text of its document, found in `sources`.
+/// byte offsets.
+fn assert_line_column_matches_bytes(location: &serde_json::Value, sources: &[(String, String)]) {
+    let document = location["document_path"].as_str().expect("document path");
+    let source = &sources
+        .iter()
+        .find(|(path, _)| path == document)
+        .expect("a known document")
+        .1;
+    let start = location["span_start"].as_u64().expect("byte start") as usize;
+    let end = location["span_end"].as_u64().expect("byte end") as usize;
+    let expected = PositionIndex::new(source)
+        .span(start, end)
+        .expect("offsets inside the source");
+    assert_eq!(
+        [
+            location["start_line"].as_u64(),
+            location["start_column"].as_u64(),
+            location["end_line"].as_u64(),
+            location["end_column"].as_u64(),
+        ],
+        [
+            Some(u64::from(expected.start.line)),
+            Some(u64::from(expected.start.column)),
+            Some(u64::from(expected.end.line)),
+            Some(u64::from(expected.end.column)),
+        ],
+        "line and column disagree with bytes {start}..{end}: {location}"
+    );
+}
+
+/// A repository indexed in one language, with what the machine-answer tests need of it.
+struct LocatedRepo {
+    repo: TestRepo,
+    db: PathBuf,
+    /// The indexed sources, `(path, text)`.
+    sources: Vec<(String, String)>,
+    /// The document holding the method and the type.
+    doc: &'static str,
+    /// A reference that resolves to the method, and one to the type that declares it.
+    method: &'static str,
+    class: &'static str,
+    /// The document with the method's declaration line changed.
+    edited_source: String,
+    /// The document text with two comment lines inserted above everything.
+    shifted_source: String,
+    /// The 1-based line of the method's declaration in the indexed text.
+    method_line: u32,
+}
+
+/// The 0-based `SourceRange` of the `nth` occurrence of `needle` in `source`.
+fn range_of(source: &str, needle: &str, nth: usize) -> SourceRange {
+    let (line, col) = support::line_col(source, source.match_indices(needle).nth(nth).unwrap().0);
+    SourceRange::new(line, col, line, col + needle.len() as u32)
+}
+
+const PYTHON_NET_SOURCE: &str = "class Client:\n    def connect(self):\n        return 1\n\n\ndef open_client():\n    c = Client()\n    return c.connect()\n";
+
+/// A Python repository with a class, its method, and a function that uses both.
+fn python_located_repo() -> LocatedRepo {
+    let doc = "src/net.py";
+    let source = PYTHON_NET_SOURCE;
+    let symbol =
+        |segments: &[(&str, SegmentKind)], kind, occurrences: Vec<(SourceRange, OccurrenceRole)>| ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "mycrate",
+                segments.iter().map(|(n, k)| DescriptorSegment::new(*n, *k)).collect(),
+            )),
+            kind,
+            class: SymbolClass::InWorkspace,
+            occurrences: occurrences
+                .into_iter()
+                .map(|(range, role)| ExtractedOccurrence {
+                    document_path: doc.to_string(),
+                    range,
+                    role,
+                })
+                .collect(),
+        };
+    let net = ("net", SegmentKind::Module);
+    let index = ExtractedIndex {
+        provenance: support::backend_provenance(Language::Python),
+        documents: vec![SourceDocument {
+            path: doc.to_string(),
+            encoding: PositionEncoding::Utf8,
+        }],
+        symbols: vec![
+            symbol(
+                &[net, ("Client", SegmentKind::Type)],
+                SymbolKind::Type,
+                vec![
+                    (range_of(source, "Client", 0), OccurrenceRole::Definition),
+                    (range_of(source, "Client", 1), OccurrenceRole::Reference),
+                ],
+            ),
+            symbol(
+                &[net, ("Client", SegmentKind::Type), ("connect", SegmentKind::Method)],
+                SymbolKind::Method,
+                vec![
+                    (range_of(source, "connect", 0), OccurrenceRole::Definition),
+                    (range_of(source, "connect", 1), OccurrenceRole::Reference),
+                ],
+            ),
+            symbol(
+                &[net, ("open_client", SegmentKind::Method)],
+                SymbolKind::Function,
+                vec![(range_of(source, "open_client", 0), OccurrenceRole::Definition)],
+            ),
+        ],
+        duplicate_groups: Vec::new(),
+        library_roots: Default::default(),
+        environment: None,
+    };
+
+    let repo = TestRepo::new();
+    repo.write(doc, source);
+    repo.commit_all("add python fixture source");
+    let db = repo.path().join(".c10r/index.db");
+    let sources = vec![(doc.to_string(), source.to_string())];
+    build_from_index(&db, &workspace_id(&repo), repo.path(), &index, &sources).unwrap();
+    LocatedRepo {
+        repo,
+        db,
+        sources,
+        doc,
+        method: "connect",
+        class: "Client",
+        edited_source: edit_line(source, 2, "    def connect(self, extra):"),
+        shifted_source: format!("# one\n# two\n{source}"),
+        method_line: 2,
+    }
+}
+
+/// The Rust counterpart of [`python_located_repo`], over the shared `net.rs` fixture.
+fn rust_located_repo() -> LocatedRepo {
+    let (repo, db, _ws) = setup_repo_with_index();
+    LocatedRepo {
+        repo,
+        db,
+        sources: base_sources(),
+        doc: support::DOC,
+        method: "net::Client::connect",
+        class: "net::Client",
+        edited_source: edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}"),
+        shifted_source: format!("// one\n// two\n{}", support::SOURCE),
+        method_line: 4,
+    }
+}
+
+/// A [`LocatedRepo`] for each supported language.
+fn located_repos() -> Vec<(Language, LocatedRepo)> {
+    support::LANGUAGES
+        .into_iter()
+        .map(|language| match language {
+            Language::Rust => (language, rust_located_repo()),
+            Language::Python => (language, python_located_repo()),
+        })
+        .collect()
+}
+
+/// Run `c10r --json <args>` against `db` in `repo`, asserting success.
+fn run_json(repo: &TestRepo, db: &Path, args: &[&str]) -> serde_json::Value {
+    let out = repo
+        .c10r()
+        .arg("--db")
+        .arg(db)
+        .arg("--json")
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{args:?} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("the --json answer parses")
+}
+
+// `find` reports a location whose line and column denote the same position as its byte offsets.
+#[test]
+fn find_location_line_and_column_match_its_byte_offsets() {
+    for (language, located) in located_repos() {
+        let answer = run_json(&located.repo, &located.db, &["find", "connect"]);
+        let locations = byte_locations(&answer);
+        assert!(
+            !locations.is_empty(),
+            "{language:?}: find returns a located symbol: {answer}"
+        );
+        for location in locations {
+            assert_line_column_matches_bytes(location, &located.sources);
+        }
+    }
+}
+
+/// A source in `language` with a type, a member of it, a supertype it declares, and a module-scope
+/// reference to the supertype, as an index with the occurrences that give each `trace` relation a row:
+/// `(source, index)` over the document `doc`.
+fn relation_fixture(language: Language, doc: &str) -> (&'static str, ExtractedIndex) {
+    use silent_cartographer::semantic::model::ExtractedOccurrence as Occ;
+    use support::Decl;
+    // The references to add: the declaration's position in `decls`, the name, and which occurrence
+    // of the name in the source.
+    type Reference = (usize, &'static str, usize);
+    let (source, decls, references): (&'static str, Vec<Decl<'static>>, Vec<Reference>) = match language {
+        Language::Rust => (
+            "use crate::Shape;\npub trait Shape {}\npub struct Square;\nimpl Shape for Square {}\nimpl Square {\n    pub fn area(&self) {}\n}\n",
+            vec![
+                Decl {
+                    segments: &[("Shape", SegmentKind::Type)],
+                    kind: SymbolKind::Type,
+                    within: "trait Shape",
+                },
+                Decl {
+                    segments: &[("Square", SegmentKind::Type)],
+                    kind: SymbolKind::Type,
+                    within: "struct Square",
+                },
+                Decl {
+                    segments: &[("Square", SegmentKind::Type), ("area", SegmentKind::Method)],
+                    kind: SymbolKind::Method,
+                    within: "area(",
+                },
+            ],
+            // The `use` line, the supertype in the impl header, the type in both impl headers.
+            vec![(0, "Shape", 0), (0, "Shape", 2), (1, "Square", 1), (1, "Square", 2)],
+        ),
+        Language::Python => (
+            "from . import Shape\n\n\nclass Shape:\n    pass\n\n\nclass Square(Shape):\n    def area(self):\n        return 1\n",
+            vec![
+                Decl {
+                    segments: &[("Shape", SegmentKind::Type)],
+                    kind: SymbolKind::Type,
+                    within: "class Shape",
+                },
+                Decl {
+                    segments: &[("Square", SegmentKind::Type)],
+                    kind: SymbolKind::Type,
+                    within: "class Square",
+                },
+                Decl {
+                    segments: &[("Square", SegmentKind::Type), ("area", SegmentKind::Method)],
+                    kind: SymbolKind::Method,
+                    within: "area(",
+                },
+            ],
+            // The import line and the base class in the class header.
+            vec![(0, "Shape", 0), (0, "Shape", 2)],
+        ),
+    };
+    let mut index = support::declared_index(language, doc, source, &decls);
+    // `declared_index` lists the symbols in declaration order.
+    for (declaration, name, nth) in references {
+        index.symbols[declaration].occurrences.push(Occ {
+            document_path: doc.to_string(),
+            range: range_of(source, name, nth),
+            role: OccurrenceRole::Reference,
+        });
+    }
+    (source, index)
+}
+
+// The rows of the `contains`, `containers`, `importers`, and `implementers` relations carry line and
+// column that denote the same positions as their byte offsets.
+#[test]
+fn relation_rows_carry_line_and_column_matching_their_byte_offsets() {
+    for language in support::LANGUAGES {
+        let doc = match language {
+            Language::Rust => "src/shapes.rs",
+            Language::Python => "shapes.py",
+        };
+        let (source, index) = relation_fixture(language, doc);
+        let repo = TestRepo::new();
+        repo.write(doc, source);
+        repo.commit_all("add relation fixture source");
+        let db = repo.path().join(".c10r/index.db");
+        let sources = vec![(doc.to_string(), source.to_string())];
+        build_from_index(&db, &workspace_id(&repo), repo.path(), &index, &sources).unwrap();
+
+        for (relation, subject) in [
+            ("contains", "Square"),
+            ("containers", "area"),
+            ("importers", "Shape"),
+            ("implementers", "Shape"),
+        ] {
+            let answer = run_json(&repo, &db, &["trace", subject, "--relation", relation]);
+            let rows = answer["outcome"]["results"].as_array().unwrap_or_else(|| {
+                panic!("{language:?}: {relation} yields rows: {answer}");
+            });
+            assert!(!rows.is_empty(), "{language:?}: {relation} yields rows: {answer}");
+            for row in rows {
+                assert_line_column_matches_bytes(&row["location"], &sources);
+            }
+        }
+    }
+}
+
+// Every answer that reports a location carries the four line and column fields.
+#[test]
+fn get_trace_search_similar_and_impact_carry_line_and_column() {
+    for (language, located) in located_repos() {
+        let LocatedRepo {
+            repo,
+            db,
+            sources,
+            doc,
+            method,
+            class,
+            edited_source,
+            ..
+        } = located;
+        let get = run_json(&repo, &db, &["get", method, "--detail", "location"]);
+        let trace = run_json(&repo, &db, &["trace", class, "--relation", "references"]);
+        let search = run_json(&repo, &db, &["search", "connect a client"]);
+        let similar = run_json(&repo, &db, &["similar", method]);
+        repo.write(doc, &edited_source);
+        let impact = run_json(&repo, &db, &["impact"]);
+        assert_every_impact_location_is_complete(&impact["outcome"]["results"][0], &sources);
+
+        for (command, answer) in [
+            ("get", get),
+            ("trace", trace),
+            ("search", search),
+            ("similar", similar),
+            ("impact", impact),
+        ] {
+            let locations = byte_locations(&answer);
+            assert!(
+                !locations.is_empty(),
+                "{language:?}: {command} reports a location: {answer}"
+            );
+            for location in locations {
+                assert_line_column_matches_bytes(location, &sources);
+            }
+        }
+    }
+}
+
+/// Assert that every seed, every detailed dependent, and every unmappable region of an `impact`
+/// report carries a location whose line and column match its byte offsets, and that the report has
+/// at least one dependent.
+fn assert_every_impact_location_is_complete(report: &serde_json::Value, sources: &[(String, String)]) {
+    let seeds = report["seeds"].as_array().expect("a seeds array");
+    let dependents = report["dependents"]["detail"]
+        .as_array()
+        .expect("a dependents detail array");
+    assert!(
+        !seeds.is_empty() && !dependents.is_empty(),
+        "seeds and dependents present: {report}"
+    );
+    for row in seeds.iter().chain(dependents) {
+        let location = &row["location"];
+        assert!(location.is_object(), "every row carries a location: {row}");
+        assert_line_column_matches_bytes(location, sources);
+    }
+    for region in report["unmappable"].as_array().into_iter().flatten() {
+        assert_line_column_matches_bytes(region, sources);
+    }
+}
+
+/// Run `c10r --color never <args>` against `db` in `repo`, asserting success, and return the human
+/// text.
+fn run_human(repo: &TestRepo, db: &Path, args: &[&str]) -> String {
+    let out = repo
+        .c10r()
+        .arg("--db")
+        .arg(db)
+        .args(["--color", "never"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{args:?} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("the human render is UTF-8")
+}
+
+/// The `path:line:column` and `path:start-end` renderings of every location in a machine answer.
+fn location_renderings(answer: &serde_json::Value) -> Vec<(String, String)> {
+    byte_locations(answer)
+        .into_iter()
+        .map(|l| {
+            let path = l["document_path"].as_str().unwrap();
+            (
+                format!("{path}:{}:{}", l["start_line"], l["start_column"]),
+                format!("{path}:{}-{}", l["span_start"], l["span_end"]),
+            )
+        })
+        .collect()
+}
+
+// A location renders as `path:line:column` by default in every command that reports one, and
+// `--position byte` renders the byte span instead.
+#[test]
+fn locations_render_as_line_and_column_by_default_and_as_bytes_on_request() {
+    for (language, located) in located_repos() {
+        let LocatedRepo {
+            repo,
+            db,
+            doc,
+            method,
+            class,
+            edited_source,
+            ..
+        } = located;
+        let queries: [(&str, Vec<&str>); 4] = [
+            ("find", vec!["find", "connect"]),
+            ("trace", vec!["trace", class, "--relation", "references"]),
+            ("search", vec!["search", "connect a client"]),
+            ("similar", vec!["similar", method]),
+        ];
+        let check_both_units = |command: &str, args: &[&str]| {
+            let renderings = location_renderings(&run_json(&repo, &db, args));
+            let human = run_human(&repo, &db, args);
+            assert!(
+                renderings.iter().any(|(by_line, _)| human.contains(by_line)),
+                "{language:?}: {command} renders a line and column: {renderings:?} in {human}"
+            );
+            assert!(
+                renderings.iter().all(|(_, by_byte)| !human.contains(by_byte)),
+                "{language:?}: {command} renders no byte span by default: {human}"
+            );
+            let byte_args: Vec<&str> = ["--position", "byte"].into_iter().chain(args.iter().copied()).collect();
+            let by_byte = run_human(&repo, &db, &byte_args);
+            assert!(
+                renderings
+                    .iter()
+                    .any(|(_, by_byte_form)| by_byte.contains(by_byte_form)),
+                "{language:?}: {command} renders a byte span on request: {renderings:?} in {by_byte}"
+            );
+        };
+        for (command, args) in &queries {
+            check_both_units(command, args);
+        }
+
+        repo.write(doc, &edited_source);
+        check_both_units("impact", &["impact"]);
+    }
+}
+
+// The position unit shapes only the human render: the machine answer of every location-reporting
+// command is the same under both units.
+#[test]
+fn the_machine_answer_is_the_same_under_both_position_units() {
+    for (language, located) in located_repos() {
+        let LocatedRepo {
+            repo,
+            db,
+            doc,
+            method,
+            class,
+            edited_source,
+            ..
+        } = located;
+        let queries: [(&str, Vec<&str>); 6] = [
+            ("get", vec!["get", method, "--detail", "location"]),
+            ("trace", vec!["trace", class, "--relation", "references"]),
+            ("find", vec!["find", "connect"]),
+            ("search", vec!["search", "connect a client"]),
+            ("similar", vec!["similar", method]),
+            ("impact", vec!["impact"]),
+        ];
+        repo.write(doc, &edited_source);
+        for (command, args) in &queries {
+            let by_line = run_json(&repo, &db, &[&["--position", "line"], args.as_slice()].concat());
+            let by_byte = run_json(&repo, &db, &[&["--position", "byte"], args.as_slice()].concat());
+            assert!(
+                !byte_locations(&by_line).is_empty(),
+                "{language:?}: {command} reports a location: {by_line}"
+            );
+            assert_eq!(by_line, by_byte, "{language:?}: {command}");
+        }
+    }
+}
+
+// After lines are inserted above an indexed definition, the answer is stale and reports the line
+// the definition had when it was indexed.
+#[test]
+fn a_stale_answer_reports_the_indexed_line() {
+    for (language, located) in located_repos() {
+        located.repo.write(located.doc, &located.shifted_source);
+
+        let answer = run_json(
+            &located.repo,
+            &located.db,
+            &["get", located.method, "--detail", "location"],
+        );
+        assert_eq!(answer["stale"], true, "{language:?}: {answer}");
+        let locations = byte_locations(&answer);
+        assert_eq!(locations.len(), 1, "{language:?}: {answer}");
+        // The method's line in the indexed text, two lines above where it now sits in the file.
+        assert_eq!(
+            locations[0]["start_line"], located.method_line,
+            "{language:?}: {answer}"
+        );
+    }
+}
+
+// A changed region in a file the index does not hold reports its line and column in the pre-change
+// text.
+#[test]
+fn an_unmappable_region_reports_its_line_and_column_in_the_pre_change_text() {
+    let repo = TestRepo::new();
+    repo.write(support::DOC, support::SOURCE);
+    repo.write("other/extra.rs", extra_source());
+    let unindexed = "pub fn first() {}\npub fn second() {}\n";
+    repo.write("src/unindexed.rs", unindexed);
+    repo.commit_all("add fixture plus an unindexed tracked file");
+
+    let db = repo.path().join(".c10r/index.db");
+    let ws = workspace_id(&repo);
+    let mut sources = base_sources();
+    sources.push(("src/unindexed.rs".to_string(), unindexed.to_string()));
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &sources).unwrap();
+    repo.write("src/unindexed.rs", "pub fn first() {}\npub fn second_edited() {}\n");
+
+    let answer = run_impact_json(&repo, &db, &[]);
+    let region = report(&answer)["unmappable"]
+        .as_array()
+        .expect("unmappable regions disclosed")
+        .iter()
+        .find(|u| u["document_path"] == "src/unindexed.rs")
+        .expect("the unindexed file's region is disclosed");
+    assert_line_column_matches_bytes(region, &sources);
+    assert_eq!(region["start_line"], 2, "{region}");
+    assert_eq!(region["start_column"], 1, "{region}");
+}
+
+// The same scenario over a Python repository.
+#[test]
+fn a_python_unmappable_region_reports_its_line_and_column_in_the_pre_change_text() {
+    let located = python_located_repo();
+    let unindexed = "def first():\n    pass\n\n\ndef second():\n    pass\n";
+    located.repo.write("src/unindexed.py", unindexed);
+    located.repo.commit_all("add an unindexed tracked python file");
+    let mut sources = located.sources.clone();
+    sources.push(("src/unindexed.py".to_string(), unindexed.to_string()));
+    located
+        .repo
+        .write("src/unindexed.py", &unindexed.replace("second", "second_edited"));
+
+    let answer = run_impact_json(&located.repo, &located.db, &[]);
+    let region = report(&answer)["unmappable"]
+        .as_array()
+        .expect("unmappable regions disclosed")
+        .iter()
+        .find(|u| u["document_path"] == "src/unindexed.py")
+        .expect("the unindexed file's region is disclosed");
+    assert_line_column_matches_bytes(region, &sources);
+    assert_eq!(region["start_line"], 5, "{region}");
+    assert_eq!(region["start_column"], 1, "{region}");
 }
 
 // _(JSON/human parity)_ — `--json` and the human render present the same seeds and the same

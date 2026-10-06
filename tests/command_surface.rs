@@ -445,6 +445,7 @@ fn clap_tree_matches_the_recorded_flag_vocabulary() {
         "workspace",
         "json",
         "color",
+        "position",
         // Query commands. `--limit`/`--max-lines`/`--from`/`--cursor` are per-command bounds on the
         // query commands, not globals, so a command they are meaningless for rejects them as unknown.
         "limit",

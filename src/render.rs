@@ -10,7 +10,7 @@
 //! structure (header lines, a stale marker) and only when the caller passes `styled = true`; source
 //! text is always plain.
 
-use crate::cli::ColorArg;
+use crate::cli::{ColorArg, PositionUnit};
 use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
 use crate::query::output::{
     Answer, Classification, ContentLines, Location, Outcome, PageInfo, SymbolView, WorkspaceRelation,
@@ -95,7 +95,7 @@ pub fn should_style(color: ColorArg, json: bool, stdout_is_terminal: bool) -> bo
 /// Project an answer to human-readable text: a header line describing provenance and freshness, then
 /// the outcome — found results (rendered per result type), a candidate list on ambiguity, or a
 /// one-line sentence for a typed absence or empty relation.
-pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
+pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool, unit: PositionUnit) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(header_line(answer, styled));
     // The refresh command sits directly under the stale marker the header line carries, so a human
@@ -143,7 +143,7 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool) -> String {
                     "note: rows within a distance layer are ordered by a structural importance heuristic".to_string(),
                 );
             }
-            T::render_found(results, &mut lines, styled)
+            T::render_found(results, &mut lines, styled, unit)
         }
         Outcome::Ambiguous {
             candidates,
@@ -206,18 +206,18 @@ fn push_page(lines: &mut Vec<String>, page: &PageInfo, styled: bool) {
 pub trait HumanRender {
     /// Append the human rendering of a found result set to `lines`. `styled` gates structural styling
     /// only; any source text is appended verbatim.
-    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool)
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit)
     where
         Self: Sized;
 }
 
 impl HumanRender for SymbolDetail {
-    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
         use crate::query::DetailPayload;
         for detail in results {
             lines.push(symbol_identity_line(&detail.symbol, styled));
             match &detail.payload {
-                DetailPayload::Location { location } => lines.push(location_line(location.as_ref())),
+                DetailPayload::Location { location } => lines.push(location_line(location.as_ref(), unit)),
                 DetailPayload::Signature { signature } => push_content(lines, signature.as_deref()),
                 DetailPayload::Interface { interface } => push_content(lines, interface.as_deref()),
                 DetailPayload::Body { body } => push_content(lines, body.as_deref()),
@@ -228,7 +228,7 @@ impl HumanRender for SymbolDetail {
 }
 
 impl HumanRender for TraceItem {
-    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
         lines.push(results_header(results.len(), styled));
         for item in results {
             match item {
@@ -246,7 +246,7 @@ impl HumanRender for TraceItem {
                         external_tag(symbol.external)
                     );
                     if let Some(loc) = location {
-                        line.push_str(&format!(" at {}", span_of(loc)));
+                        line.push_str(&format!(" at {}", location_text(loc, unit)));
                     }
                     lines.push(line);
                     if let Some(text) = content {
@@ -270,7 +270,7 @@ impl HumanRender for TraceItem {
                         "  {}  {}  at {}{}",
                         sanitize(subject.canonical_id.as_str()),
                         sanitize(&subject.name),
-                        span_of(location),
+                        location_text(location, unit),
                         attributed
                     ));
                     if let Some(text) = content {
@@ -284,21 +284,21 @@ impl HumanRender for TraceItem {
 }
 
 impl HumanRender for FindItem {
-    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
         lines.push(results_header(results.len(), styled));
         for item in results {
             lines.push(format!(
                 "  {}  {}  at {}",
                 sanitize(item.symbol.canonical_id.as_str()),
                 sanitize(&item.symbol.name),
-                location_at(item.location.as_ref())
+                location_at(item.location.as_ref(), unit)
             ));
         }
     }
 }
 
 impl HumanRender for SearchItem {
-    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
         lines.push(results_header(results.len(), styled));
         for item in results {
             lines.push(format!(
@@ -307,7 +307,7 @@ impl HumanRender for SearchItem {
                 sanitize(&item.symbol.name),
                 sanitize(&item.symbol.kind),
                 external_tag(item.symbol.external),
-                location_at(item.location.as_ref())
+                location_at(item.location.as_ref(), unit)
             ));
             if let Some(text) = &item.content {
                 push_content(lines, Some(text));
@@ -318,7 +318,7 @@ impl HumanRender for SearchItem {
 }
 
 impl HumanRender for SimilarItem {
-    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
         lines.push(results_header(results.len(), styled));
         for item in results {
             // The clone marker renders on the row as deterministic fact — the certainty class above
@@ -337,7 +337,7 @@ impl HumanRender for SimilarItem {
                 sanitize(&item.symbol.name),
                 sanitize(&item.symbol.kind),
                 external_tag(item.symbol.external),
-                location_at(item.location.as_ref()),
+                location_at(item.location.as_ref(), unit),
                 certainty
             ));
             if let Some(text) = &item.content {
@@ -349,7 +349,7 @@ impl HumanRender for SimilarItem {
 }
 
 impl HumanRender for DependentsReport {
-    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
         for report in results {
             lines.push(bold(
                 &format!(
@@ -366,7 +366,7 @@ impl HumanRender for DependentsReport {
                     "  {}  {}  {} at distance {} via {}",
                     sanitize(item.symbol.canonical_id.as_str()),
                     sanitize(&item.symbol.name),
-                    location_at(item.location.as_ref()),
+                    location_at(item.location.as_ref(), unit),
                     item.distance,
                     item.kind.tag()
                 ));
@@ -391,7 +391,7 @@ impl HumanRender for DependentsReport {
 }
 
 impl HumanRender for ImpactReport {
-    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool) {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
         for report in results {
             lines.push(bold(
                 &format!(
@@ -431,7 +431,7 @@ impl HumanRender for ImpactReport {
                             sanitize(&seed.symbol.name),
                             sanitize(&seed.symbol.kind),
                             external_tag(seed.symbol.external),
-                            location_at(seed.location.as_ref())
+                            location_at(seed.location.as_ref(), unit)
                         ));
                     }
                 }
@@ -439,19 +439,20 @@ impl HumanRender for ImpactReport {
             if !report.unmappable.is_empty() {
                 lines.push(bold("regions this index cannot resolve", styled));
                 for region in &report.unmappable {
-                    lines.push(format!(
-                        "  {}:{}-{}",
-                        sanitize(&region.document_path),
-                        region.span_start,
-                        region.span_end
-                    ));
+                    let path = sanitize(&region.document_path);
+                    lines.push(
+                        match (unit, region.line_column.start_line, region.line_column.start_column) {
+                            (PositionUnit::Line, Some(line), Some(column)) => format!("  {path}:{line}:{column}"),
+                            _ => format!("  {path}:{}-{}", region.span_start, region.span_end),
+                        },
+                    );
                 }
             }
             // A definite none carries no seed/dependent blocks: a dependents union over an empty
             // seed set is trivially empty and would only echo the "none" line above as a redundant
             // header.
             if report.seed_outcome != SeedOutcome::NoIndexedSymbolTouched {
-                DependentsReport::render_found(std::slice::from_ref(&report.dependents), lines, styled);
+                DependentsReport::render_found(std::slice::from_ref(&report.dependents), lines, styled, unit);
             }
             if let Exactness::Approximate { recovery } = &report.exactness {
                 lines.push(bold("approximate: run these steps to produce an exact answer", styled));
@@ -521,7 +522,7 @@ mod workspace_disclosure_tests {
     // it as nothing at all — the same three-way shape the machine answer carries.
     #[test]
     fn each_workspace_state_renders_as_its_own_line() {
-        let matched = to_human(&answer(None), false);
+        let matched = to_human(&answer(None), false, PositionUnit::Line);
         assert!(
             !matched.contains("workspace"),
             "a match renders no workspace line: {matched}"
@@ -532,13 +533,14 @@ mod workspace_disclosure_tests {
                 recorded_root: "/projects/other".to_string(),
             })),
             false,
+            PositionUnit::Line,
         );
         assert!(
             mismatched.contains("different workspace") && mismatched.contains("/projects/other"),
             "a mismatch names the workspace the store describes: {mismatched}"
         );
 
-        let unknown = to_human(&answer(Some(WorkspaceRelation::Unknown)), false);
+        let unknown = to_human(&answer(Some(WorkspaceRelation::Unknown)), false, PositionUnit::Line);
         assert!(
             unknown.contains("could not be determined"),
             "an unevaluable comparison reads as undetermined, not as a match: {unknown}"
@@ -558,6 +560,7 @@ mod workspace_disclosure_tests {
                 recorded_root: "/projects/\u{1b}[31mred".to_string(),
             })),
             false,
+            PositionUnit::Line,
         );
         assert!(
             !hostile.contains('\u{1b}'),
@@ -598,9 +601,9 @@ fn candidate_line(view: &SymbolView) -> String {
 }
 
 /// A `location` detail line, or an honest "no location" line for an external symbol.
-fn location_line(location: Option<&Location>) -> String {
+fn location_line(location: Option<&Location>, unit: PositionUnit) -> String {
     match location {
-        Some(l) => format!("  {}", span_of(l)),
+        Some(l) => format!("  {}", location_text(l, unit)),
         None => "  (no location — external symbol)".to_string(),
     }
 }
@@ -631,13 +634,13 @@ fn push_content_window(lines: &mut Vec<String>, content_lines: Option<&ContentLi
     if cl.start > cl.total {
         // Requested past the end: the content is empty; name the total and the full-text recovery.
         lines.push(format!(
-            "  (no lines: --from {} is past the end — content has {} lines; full text: --max-lines 0 --from 1)",
+            "  (no lines: --from {} is past the end — the symbol's text has {} lines; full text: --max-lines 0 --from 1)",
             cl.start, cl.total
         ));
     } else if cl.end < cl.total {
         // More lines remain below the window: name the next window to fetch them.
         lines.push(format!(
-            "  lines {}-{} of {} — next: --from {}",
+            "  lines {}-{} of {} in this symbol — next: --from {}",
             cl.start,
             cl.end,
             cl.total,
@@ -646,26 +649,27 @@ fn push_content_window(lines: &mut Vec<String>, content_lines: Option<&ContentLi
     } else {
         // The window reaches the end but omits the head: name the full-text recovery, not a next page.
         lines.push(format!(
-            "  lines {}-{} of {} — full text: --max-lines 0 --from 1",
+            "  lines {}-{} of {} in this symbol — full text: --max-lines 0 --from 1",
             cl.start, cl.end, cl.total
         ));
     }
 }
 
-/// A location rendered as `path:start-end`.
-fn span_of(location: &Location) -> String {
-    format!(
-        "{}:{}-{}",
-        sanitize(&location.document_path),
-        location.span_start,
-        location.span_end
-    )
+/// A location rendered as `path:line:column` of its start under the line unit, or as
+/// `path:start-end` in byte offsets under the byte unit — and under the line unit too when the
+/// location carries no line and column.
+fn location_text(location: &Location, unit: PositionUnit) -> String {
+    let path = sanitize(&location.document_path);
+    match (unit, location.line_column.start_line, location.line_column.start_column) {
+        (PositionUnit::Line, Some(line), Some(column)) => format!("{path}:{line}:{column}"),
+        _ => format!("{path}:{}-{}", location.span_start, location.span_end),
+    }
 }
 
-/// A dependent's location as `path:start-end`, or `<external>` when it has no source here.
-fn location_at(location: Option<&Location>) -> String {
+/// A dependent's location in the selected unit, or `<external>` when it has no source here.
+fn location_at(location: Option<&Location>, unit: PositionUnit) -> String {
     match location {
-        Some(l) => span_of(l),
+        Some(l) => location_text(l, unit),
         None => "<external>".to_string(),
     }
 }
@@ -765,7 +769,7 @@ mod tests {
             },
         };
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false);
+        ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false, PositionUnit::Line);
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("the change touches nothing the graph tracks"),
@@ -816,7 +820,12 @@ mod tests {
     fn range_mode_discloses_the_dependents_snapshot_and_other_modes_do_not() {
         let range_report = impact_report_fixture("range", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&range_report), &mut lines, false);
+        ImpactReport::render_found(
+            std::slice::from_ref(&range_report),
+            &mut lines,
+            false,
+            PositionUnit::Line,
+        );
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("current index"),
@@ -825,7 +834,12 @@ mod tests {
 
         let working_tree_report = impact_report_fixture("working_tree", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&working_tree_report), &mut lines, false);
+        ImpactReport::render_found(
+            std::slice::from_ref(&working_tree_report),
+            &mut lines,
+            false,
+            PositionUnit::Line,
+        );
         let rendered = lines.join("\n");
         assert!(
             !rendered.contains("current index"),
@@ -846,7 +860,12 @@ mod tests {
         let approximate_report =
             impact_report_fixture("working_tree", Exactness::Approximate { recovery }, Vec::new());
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&approximate_report), &mut lines, false);
+        ImpactReport::render_found(
+            std::slice::from_ref(&approximate_report),
+            &mut lines,
+            false,
+            PositionUnit::Line,
+        );
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("may be missing declarations"),
@@ -855,7 +874,12 @@ mod tests {
 
         let exact_report = impact_report_fixture("working_tree", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&exact_report), &mut lines, false);
+        ImpactReport::render_found(
+            std::slice::from_ref(&exact_report),
+            &mut lines,
+            false,
+            PositionUnit::Line,
+        );
         let rendered = lines.join("\n");
         assert!(
             !rendered.contains("may be missing declarations"),
@@ -869,7 +893,12 @@ mod tests {
     fn exactness_label_reflects_exact_or_approximate() {
         let exact_report = impact_report_fixture("working_tree", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&exact_report), &mut lines, false);
+        ImpactReport::render_found(
+            std::slice::from_ref(&exact_report),
+            &mut lines,
+            false,
+            PositionUnit::Line,
+        );
         let rendered = lines.join("\n");
         assert!(rendered.contains("exactness=exact"), "{rendered}");
         assert!(!rendered.contains("exactness=approximate"), "{rendered}");
@@ -883,7 +912,12 @@ mod tests {
         let approximate_report =
             impact_report_fixture("working_tree", Exactness::Approximate { recovery }, Vec::new());
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&approximate_report), &mut lines, false);
+        ImpactReport::render_found(
+            std::slice::from_ref(&approximate_report),
+            &mut lines,
+            false,
+            PositionUnit::Line,
+        );
         let rendered = lines.join("\n");
         assert!(rendered.contains("exactness=approximate"), "{rendered}");
         assert!(!rendered.contains("exactness=exact"), "{rendered}");
@@ -905,7 +939,7 @@ mod tests {
         };
         let report = impact_report_fixture("working_tree", Exactness::Approximate { recovery }, Vec::new());
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false);
+        ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false, PositionUnit::Line);
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("git worktree add /tmp/c10r-wt deadbeef1234"),
@@ -937,10 +971,11 @@ mod tests {
             document_path: "src/unreachable.rs".to_string(),
             span_start: 10,
             span_end: 20,
+            line_column: Default::default(),
         }];
         let report = impact_report_fixture("working_tree", Exactness::Exact, unmappable);
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false);
+        ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false, PositionUnit::Line);
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("regions this index cannot resolve"),
@@ -953,11 +988,47 @@ mod tests {
 
         let report_without = impact_report_fixture("working_tree", Exactness::Exact, Vec::new());
         let mut lines = Vec::new();
-        ImpactReport::render_found(std::slice::from_ref(&report_without), &mut lines, false);
+        ImpactReport::render_found(
+            std::slice::from_ref(&report_without),
+            &mut lines,
+            false,
+            PositionUnit::Line,
+        );
         let rendered = lines.join("\n");
         assert!(
             !rendered.contains("regions this index cannot resolve"),
             "no unmappable regions means no unresolvable-regions block: {rendered}"
+        );
+    }
+
+    // An unmappable region that carries a line and column renders them under the line unit and its
+    // byte offsets under the byte unit.
+    #[test]
+    fn an_unmappable_region_renders_its_line_and_column_or_its_byte_offsets_by_unit() {
+        let unmappable = vec![UnmappableRegion {
+            document_path: "src/unreachable.rs".to_string(),
+            span_start: 10,
+            span_end: 20,
+            line_column: crate::query::output::LineColumns {
+                start_line: Some(3),
+                start_column: Some(7),
+                end_line: Some(3),
+                end_column: Some(17),
+            },
+        }];
+        let report = impact_report_fixture("working_tree", Exactness::Exact, unmappable);
+        let render = |unit| {
+            let mut lines = Vec::new();
+            ImpactReport::render_found(std::slice::from_ref(&report), &mut lines, false, unit);
+            lines
+        };
+        assert!(
+            render(PositionUnit::Line).contains(&"  src/unreachable.rs:3:7".to_string()),
+            "the line unit names the region's line and column"
+        );
+        assert!(
+            render(PositionUnit::Byte).contains(&"  src/unreachable.rs:10-20".to_string()),
+            "the byte unit names the region's byte offsets"
         );
     }
 

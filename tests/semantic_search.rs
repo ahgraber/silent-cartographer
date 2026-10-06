@@ -544,6 +544,7 @@ fn an_unresolved_position_subject_is_absent_with_no_marker() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     let answer: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -682,6 +683,7 @@ fn run_search_json(db: &Path, root: &Path, query: &str, limit: usize, cursor: Op
         cursor,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     serde_json::from_str(&out).unwrap()
@@ -723,6 +725,7 @@ fn the_human_render_frames_results_as_candidates() {
         None,
         false,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert!(
@@ -762,6 +765,7 @@ fn an_empty_answer_keeps_the_marker_and_scoped_absence() {
         None,
         false,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert!(
@@ -793,6 +797,7 @@ fn clone_markers_render_as_fact_distinct_from_the_estimate() {
         None,
         false,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert!(out.contains("[exact clone"), "the exact clone is stated as fact: {out}");
@@ -866,6 +871,7 @@ fn a_mismatched_token_is_refused_on_similar() {
             cursor,
             true,
             false,
+            silent_cartographer::cli::PositionUnit::Line,
         )
     };
     let first: serde_json::Value = serde_json::from_str(&run("connect", None).unwrap()).unwrap();

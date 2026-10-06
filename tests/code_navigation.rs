@@ -639,7 +639,7 @@ fn trace_contains_symbol_rows_carry_definition_location() {
 
     // And on the human render: the in-workspace member's row names its location; the external
     // member's row carries no `at <path:span>` suffix.
-    let human = silent_cartographer::render::to_human(&answer, false);
+    let human = silent_cartographer::render::to_human(&answer, false, silent_cartographer::cli::PositionUnit::Byte);
     let member_line = human
         .lines()
         .find(|l| l.contains("member") && !l.contains("ext_member"));
@@ -1201,6 +1201,7 @@ fn stale_after_changed_sources_names_the_index_location_workspace_and_root() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1250,6 +1251,7 @@ fn stale_after_a_changed_analyzer_carries_a_refresh_command() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1278,6 +1280,7 @@ fn a_fresh_answer_carries_no_refresh_field() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1305,6 +1308,7 @@ fn human_rendering_includes_the_refresh_command() {
         None,
         false,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert!(
@@ -1340,6 +1344,7 @@ fn running_the_refresh_command_after_changed_sources_makes_the_answer_fresh() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1374,6 +1379,7 @@ fn running_the_refresh_command_after_changed_sources_makes_the_answer_fresh() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1614,6 +1620,7 @@ fn stale_answer_with_no_recorded_root_says_the_root_is_unknown() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1680,6 +1687,7 @@ fn every_query_path_carries_a_refresh_command_on_a_stale_answer() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert_refreshable("get", get);
@@ -1700,6 +1708,7 @@ fn every_query_path_carries_a_refresh_command_on_a_stale_answer() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert_refreshable("trace (contains)", trace);
@@ -1720,6 +1729,7 @@ fn every_query_path_carries_a_refresh_command_on_a_stale_answer() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert_refreshable("trace (dependents)", dependents);
@@ -1736,6 +1746,7 @@ fn every_query_path_carries_a_refresh_command_on_a_stale_answer() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert_refreshable("search", search);
@@ -1753,6 +1764,7 @@ fn every_query_path_carries_a_refresh_command_on_a_stale_answer() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert_refreshable("similar", similar);
@@ -1799,6 +1811,7 @@ fn every_query_path_carries_a_refresh_command_on_a_stale_answer() {
         None,
         true,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .unwrap();
     assert_refreshable("impact", impact);
@@ -2548,6 +2561,7 @@ fn depth_with_non_dependents_relation_is_a_teaching_error() {
         /* cursor */ None,
         false,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .expect_err("--depth with contains must fail");
     let msg = format!("{err:#}");
@@ -2721,6 +2735,7 @@ fn order_with_non_dependents_relation_is_a_teaching_error() {
         /* cursor */ None,
         false,
         false,
+        silent_cartographer::cli::PositionUnit::Line,
     )
     .expect_err("--order with references must fail");
     let msg = format!("{err:#}");
@@ -3833,7 +3848,17 @@ fn build_status_fixture(dir: &std::path::Path, workspace: &str, doc_a: &str, doc
 }
 
 fn status_output(db: &std::path::Path, dir: &std::path::Path, json: bool) -> String {
-    silent_cartographer::commands::run_status(db, dir, "not-a-real-analyzer", json, true, false, true).unwrap()
+    status_output_in(db, dir, json, silent_cartographer::cli::PositionUnit::Line)
+}
+
+fn status_output_in(
+    db: &std::path::Path,
+    dir: &std::path::Path,
+    json: bool,
+    position: silent_cartographer::cli::PositionUnit,
+) -> String {
+    silent_cartographer::commands::run_status(db, dir, "not-a-real-analyzer", json, true, false, true, position)
+        .unwrap()
 }
 
 // _(Scenario: The status report names the refresh command)_ — a stale index's status carries the same
@@ -3898,7 +3923,8 @@ fn the_human_status_report_carries_every_value_of_the_machine_report() {
     let dir = tempfile::tempdir().unwrap();
     let db = build_status_fixture(dir.path(), "status-ws", "a.rs", "b.rs");
     let report: serde_json::Value = serde_json::from_str(&status_output(&db, dir.path(), true)).unwrap();
-    let human = status_output(&db, dir.path(), false);
+    // The byte unit names both ends of a span, as the machine report does.
+    let human = status_output_in(&db, dir.path(), false, silent_cartographer::cli::PositionUnit::Byte);
 
     let fields = report.as_object().unwrap();
     for expected in [
@@ -3946,5 +3972,39 @@ fn the_human_status_report_sanitizes_hostile_values() {
     assert!(
         !human.lines().any(|line| line.starts_with("ws")),
         "the newline did not split the line: {human:?}"
+    );
+}
+
+// _(Output discipline)_ — under the default line unit, a listed discrepancy row names its location as
+// `path:line:column`, the position its machine row reports.
+#[test]
+fn the_human_status_discrepancy_listing_names_each_row_by_line_and_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_status_fixture(dir.path(), "status-lines-ws", "a.rs", "b.rs");
+    let run = |json| {
+        silent_cartographer::commands::run_status(
+            &db,
+            dir.path(),
+            "not-a-real-analyzer",
+            json,
+            true,
+            true,
+            false,
+            silent_cartographer::cli::PositionUnit::Line,
+        )
+        .unwrap()
+    };
+    let machine: serde_json::Value = serde_json::from_str(&run(true)).unwrap();
+    let row = &machine["discrepancies"]["rows"][0];
+    assert_eq!(
+        (&row["start_line"], &row["start_column"]),
+        (&2.into(), &5.into()),
+        "{row}"
+    );
+
+    let human = run(false);
+    assert!(
+        human.lines().any(|line| line.ends_with(" at a.rs:2:5")),
+        "the discrepancy row is located by line and column: {human}"
     );
 }

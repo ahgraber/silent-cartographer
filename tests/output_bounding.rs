@@ -106,6 +106,36 @@ fn limit_caps_the_result_set_and_discloses_truncation() {
     );
 }
 
+// _(The position unit does not change the machine answer)_ — a truncated `trace --json` answer,
+// cursor included, is byte-identical under the line and byte position units.
+#[test]
+fn a_truncated_trace_answer_is_identical_under_both_position_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_fixture_db(dir.path());
+
+    let run = |unit: &str| {
+        c10r(dir.path())
+            .arg("--db")
+            .arg(&db)
+            .args(["--json", "--position", unit])
+            .args(PAGED_QUERY)
+            .args(["--limit", "1"])
+            .output()
+            .unwrap()
+    };
+    let (by_line, by_byte) = (run("line"), run("byte"));
+    let answer = json_answer(&by_line);
+    assert!(
+        answer["page"]["cursor"].as_str().is_some(),
+        "the answer is truncated and carries a cursor: {answer}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&by_line.stdout),
+        String::from_utf8_lossy(&by_byte.stdout),
+        "the two units produce the same machine answer"
+    );
+}
+
 // _(Continuation resumes deterministically)_ — resuming with the token returns the next page exactly
 // where the prior page ended, with no overlap and no gap, and re-issuing the same page is identical.
 #[test]
