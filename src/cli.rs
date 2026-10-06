@@ -36,8 +36,8 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "auto", global = true)]
     pub color: ColorArg,
 
-    /// The unit the human rendering names a location in. The machine answer carries both units whichever
-    /// is selected.
+    /// The unit of a source position: how the human rendering names a location and how `--at` reads
+    /// one. The machine answer carries both units whichever is selected.
     #[arg(long, value_enum, default_value = "line", global = true)]
     pub position: PositionUnit,
 
@@ -56,13 +56,23 @@ pub enum ColorArg {
     Never,
 }
 
-/// The unit a source position is named in.
+/// The unit a source position is named and read in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PositionUnit {
     /// `path:line:column`, numbered from 1.
     Line,
-    /// `path:start-end` byte offsets.
+    /// `path:start-end` byte offsets in the human rendering; `path:byte_offset` for `--at`.
     Byte,
+}
+
+impl PositionUnit {
+    /// The flag value naming this unit.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Line => "line",
+            Self::Byte => "byte",
+        }
+    }
 }
 
 /// The top-level commands.
@@ -225,8 +235,8 @@ pub struct GetArgs {
     #[arg(long, value_enum, default_value = "location")]
     pub detail: DetailArg,
 
-    /// Retrieve the symbol enclosing a source position, given as `path:byte_offset`. Mutually
-    /// exclusive with a positional reference.
+    /// Retrieve the symbol enclosing a source position, given as `path:line:column` or `path:line`
+    /// (`path:byte_offset` under `--position byte`). Mutually exclusive with a positional reference.
     #[arg(long)]
     pub at: Option<String>,
 
@@ -320,8 +330,9 @@ pub struct SimilarArgs {
     #[arg(conflicts_with = "at")]
     pub reference: Option<String>,
 
-    /// Take the symbol enclosing a source position as the subject, given as `path:byte_offset`.
-    /// Mutually exclusive with a positional reference.
+    /// Take the symbol enclosing a source position as the subject, given as `path:line:column` or
+    /// `path:line` (`path:byte_offset` under `--position byte`). Mutually exclusive with a positional
+    /// reference.
     #[arg(long)]
     pub at: Option<String>,
 

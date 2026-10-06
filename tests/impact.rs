@@ -1325,6 +1325,22 @@ fn the_machine_answer_is_the_same_under_both_position_units() {
     }
 }
 
+// `similar --at path:line`, parsed from the command line, takes the method declared on that line as
+// the subject: the answer is the one `similar` gives for the method by name.
+#[test]
+fn similar_at_a_path_and_line_takes_the_method_on_that_line() {
+    for (language, located) in located_repos() {
+        let at = format!("{}:{}", located.doc, located.method_line);
+        let by_line = run_json(&located.repo, &located.db, &["similar", "--at", &at]);
+        let by_name = run_json(&located.repo, &located.db, &["similar", located.method]);
+        assert!(
+            !byte_locations(&by_name).is_empty(),
+            "{language:?}: the method has neighbors: {by_name}"
+        );
+        assert_eq!(by_line["outcome"], by_name["outcome"], "{language:?}");
+    }
+}
+
 // After lines are inserted above an indexed definition, the answer is stale and reports the line
 // the definition had when it was indexed.
 #[test]

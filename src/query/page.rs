@@ -50,6 +50,10 @@ pub struct PageIdentity {
     /// The `get` content-window start line (1-based); `None` for commands without a window (`trace`,
     /// `find`).
     pub from: Option<usize>,
+    /// The position unit (`line` or `byte`), bound only when the query reads an `--at` position: the
+    /// same `--at` string names a different position under each unit, while every other query's
+    /// answer, token included, is the same under either.
+    pub position_unit: Option<&'static str>,
     /// The recorded index identity the answer was drawn from: the index content-hash composed with
     /// the recorded analyzer provenance (name and version). A same-source rebuild under a different
     /// analyzer version changes this even when the content-hash is unchanged, so a stale token is
@@ -473,6 +477,7 @@ mod tests {
             limit: Some(limit),
             max_lines: None,
             from: None,
+            position_unit: None,
             index_hash: "hash".to_string(),
         }
     }
@@ -576,13 +581,14 @@ mod tests {
             limit: Some(10),
             max_lines: Some(20),
             from: Some(3),
+            position_unit: Some("line"),
             index_hash: "index-hash".to_string(),
         };
 
         /// A named single-field change to a query identity.
         type Variation = (&'static str, fn(&mut PageIdentity));
 
-        let variations: [Variation; 10] = [
+        let variations: [Variation; 11] = [
             ("command", |id| id.command = "find"),
             ("reference", |id| id.reference = "other".to_string()),
             ("relation", |id| id.relation = Some("contains")),
@@ -594,6 +600,7 @@ mod tests {
             ("limit", |id| id.limit = Some(11)),
             ("max_lines", |id| id.max_lines = Some(21)),
             ("from", |id| id.from = Some(4)),
+            ("position_unit", |id| id.position_unit = Some("byte")),
             ("index_hash", |id| id.index_hash = "rebuilt".to_string()),
         ];
 

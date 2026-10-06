@@ -668,8 +668,38 @@ fn get_reference_and_at_together_is_a_usage_error() {
     );
 }
 
-// _(Rejections name valid alternatives: malformed `--at` position)_ — a `--at` value that is not
-// `path:byte_offset` — missing the colon separator, or a non-numeric offset — is a usage error
+// _(A zero line is a usage error)_ — under the default line unit, a line or column of zero is
+// refused with a usage error naming the accepted forms, decided before any index is consulted.
+#[test]
+fn a_zero_line_or_column_is_a_usage_error_naming_the_accepted_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    for command in ["get", "similar"] {
+        for position in ["src/net.rs:0", "src/net.rs:0:5", "src/net.rs:3:0"] {
+            let out = c10r()
+                .current_dir(dir.path())
+                .arg("--db")
+                .arg(&db)
+                .args([command, "--at", position])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{command} {position} is a usage error: {stderr}"
+            );
+            assert!(
+                stderr.contains("path:line:column") && stderr.contains("path:line"),
+                "the diagnostic names the accepted forms for {command} {position}: {stderr}"
+            );
+        }
+    }
+    assert!(!db.exists(), "the rejected invocations created no index");
+}
+
+// _(Rejections name valid alternatives: malformed `--at` position)_ — under `--position byte`, a
+// `--at` value that is not `path:byte_offset` — missing the colon separator, or a non-numeric offset — is a usage error
 // naming the expected form, decided independently of whether an index exists.
 #[test]
 fn malformed_at_position_is_a_usage_error_naming_the_expected_form() {
@@ -680,7 +710,7 @@ fn malformed_at_position_is_a_usage_error_naming_the_expected_form() {
         .current_dir(dir.path())
         .arg("--db")
         .arg(&db)
-        .args(["get", "--at", "no-colon-here"])
+        .args(["--position", "byte", "get", "--at", "no-colon-here"])
         .output()
         .unwrap();
     assert_eq!(
@@ -700,7 +730,7 @@ fn malformed_at_position_is_a_usage_error_naming_the_expected_form() {
         .current_dir(dir.path())
         .arg("--db")
         .arg(&db)
-        .args(["get", "--at", "file.rs:notanumber"])
+        .args(["--position", "byte", "get", "--at", "file.rs:notanumber"])
         .output()
         .unwrap();
     assert_eq!(

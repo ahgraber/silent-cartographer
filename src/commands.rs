@@ -15,6 +15,7 @@ use crate::exit::Failure;
 use crate::git::{GitError, GitRepo, SeedMode};
 use crate::graph::chunk::ChunkParams;
 use crate::graph::join::JoinAccounting;
+use crate::graph::range::LineColumn;
 use crate::graph::store::{Freshness, GraphStore, IndexMetadata, StoreOpenError};
 use crate::graph::syntax::Language;
 use crate::graph::{content_hash, ingest};
@@ -26,6 +27,7 @@ use crate::query::page::{
     OrderingIdentity, PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination,
     precheck_cursor,
 };
+use crate::query::resolve::SourcePosition;
 use crate::query::{Detail, OrderMode, QueryEngine, Relation};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
 use crate::semantic::probe::PROBE_DEADLINE;
@@ -1202,7 +1204,7 @@ pub fn run_get(
 ) -> Result<String> {
     // The invocation's shape is validated before the store is opened, so a malformed `get` is a
     // usage error even against an absent index.
-    let at_position = at.map(parse_position).transpose()?;
+    let at_position = at.map(|arg| parse_position(arg, position)).transpose()?;
     let reference = match at_position {
         Some(_) => None,
         None => {
@@ -1243,7 +1245,7 @@ pub fn run_get(
     let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
 
     let answer = match &at_position {
-        Some((doc, offset)) => engine.get_by_position(doc, *offset, detail, effective_max_lines, from)?,
+        Some((doc, at)) => engine.get_by_position(doc, *at, detail, effective_max_lines, from)?,
         None => engine.get(
             reference.expect("required when --at is absent"),
             detail,
@@ -1261,6 +1263,7 @@ pub fn run_get(
         limit: effective_limit,
         max_lines: effective_max_lines,
         from: Some(from),
+        position_unit: at.map(|_| position.label()),
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1349,6 +1352,7 @@ pub fn run_trace(
         limit: effective_limit,
         max_lines: effective_max_lines,
         from: None,
+        position_unit: None,
         index_hash,
     };
     // The relation decides which engine method answers it. `dependents` is the one whose answer does
@@ -1411,6 +1415,7 @@ pub fn run_find(
         limit: effective_limit,
         max_lines: None,
         from: None,
+        position_unit: None,
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1465,6 +1470,7 @@ pub fn run_search(
         limit: effective_limit,
         max_lines: effective_max_lines,
         from: None,
+        position_unit: None,
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1493,7 +1499,7 @@ pub fn run_similar(
 ) -> Result<String> {
     // The invocation's shape is validated before the store is opened, so a malformed `similar` is a
     // usage error even against an absent index.
-    let at_position = at.map(parse_position).transpose()?;
+    let at_position = at.map(|arg| parse_position(arg, position)).transpose()?;
     let reference = match at_position {
         Some(_) => None,
         None => Some(
@@ -1520,7 +1526,7 @@ pub fn run_similar(
     let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let answer = match &at_position {
-        Some((doc, offset)) => engine.similar_by_position(doc, *offset, detail, effective_max_lines)?,
+        Some((doc, at)) => engine.similar_by_position(doc, *at, detail, effective_max_lines)?,
         None => engine.similar(
             reference.expect("required when --at is absent"),
             detail,
@@ -1537,6 +1543,7 @@ pub fn run_similar(
         limit: effective_limit,
         max_lines: effective_max_lines,
         from: None,
+        position_unit: at.map(|_| position.label()),
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1774,6 +1781,7 @@ pub fn run_impact(
         limit: effective_limit,
         max_lines: None,
         from: None,
+        position_unit: None,
         index_hash: page_index_hash,
     };
     // Every impact answer carries the ordering disclosure, whatever its outcome.
@@ -2636,15 +2644,54 @@ fn relation_label(relation: Relation) -> &'static str {
     }
 }
 
-/// Parse a `path:byte_offset` position argument.
-fn parse_position(arg: &str) -> Result<(String, usize)> {
-    let (path, offset) = arg
-        .rsplit_once(':')
-        .ok_or_else(|| Failure::Usage("position must be `path:byte_offset`".to_string()))?;
-    let offset: usize = offset
-        .parse()
-        .map_err(|_| Failure::Usage(format!("invalid byte offset in {arg}")))?;
-    Ok((path.to_string(), offset))
+/// Parse an `--at` position argument in `unit`: `path:byte_offset` under the byte unit;
+/// `path:line:column` or `path:line` under the line unit.
+///
+/// The line unit splits from the right, so a path containing `:` stays usable: when the last two
+/// `:`-separated components are both integers they are the line and column, otherwise one trailing
+/// integer is the line. A line or column of zero is refused, since both count from 1.
+fn parse_position(arg: &str, unit: PositionUnit) -> Result<(String, SourcePosition)> {
+    let digits = |text: &str| -> Option<u32> {
+        (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
+    };
+    match unit {
+        PositionUnit::Byte => {
+            let (path, offset) = arg
+                .rsplit_once(':')
+                .ok_or_else(|| Failure::Usage("position must be `path:byte_offset`".to_string()))?;
+            let offset: usize = offset
+                .parse()
+                .map_err(|_| Failure::Usage(format!("invalid byte offset in {arg}")))?;
+            Ok((path.to_string(), SourcePosition::Byte(offset)))
+        }
+        PositionUnit::Line => {
+            let forms = || Failure::Usage(format!("position must be `path:line:column` or `path:line`, got {arg}"));
+            let (head, last) = arg.rsplit_once(':').ok_or_else(forms)?;
+            let last = digits(last).ok_or_else(forms)?;
+            let (path, position) = match head
+                .rsplit_once(':')
+                .and_then(|(path, line)| Some((path, digits(line)?)))
+            {
+                Some((path, line)) => (path, (line, Some(last))),
+                None => (head, (last, None)),
+            };
+            let zero = || {
+                Failure::Usage(format!(
+                    "lines and columns start at 1; position must be `path:line:column` or `path:line`, got {arg}"
+                ))
+            };
+            Ok((
+                path.to_string(),
+                match position {
+                    (0, _) | (_, Some(0)) => return Err(zero().into()),
+                    (line, Some(column)) => SourcePosition::LineColumn(LineColumn { line, column }),
+                    (line, None) => SourcePosition::Line(line),
+                },
+            ))
+        }
+    }
 }
 
 fn ensure_parent_dir(db: &Path) -> Result<()> {

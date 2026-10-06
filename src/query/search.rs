@@ -16,7 +16,7 @@ use crate::graph::{corpus, embed};
 use crate::identity::CanonicalId;
 
 use super::output::{Answer, Location, SemanticIndexView, SymbolView};
-use super::resolve::Resolution;
+use super::resolve::{Resolution, SourcePosition, resolve_position};
 use super::{Detail, QueryEngine, QueryError, location_of, projected_content, symbol_view};
 
 /// The RRF constant `k` in `score(d) = Σ 1/(k + rank_d)`: the standard damping that keeps a single
@@ -153,20 +153,24 @@ impl QueryEngine<'_> {
         self.similar_of(&subject, detail, max_lines)
     }
 
-    /// `similar` by source position: the subject is the symbol enclosing `(document, byte_offset)`,
+    /// `similar` by source position: the subject is the symbol `position` resolves to in `document`,
     /// resolved exactly as `get --at` resolves it.
     pub fn similar_by_position(
         &self,
         document: &str,
-        byte_offset: usize,
+        position: SourcePosition,
         detail: Detail,
         max_lines: Option<usize>,
     ) -> Result<Answer<SimilarItem>, QueryError> {
         let (provenance, freshness) = self.provenance_and_freshness()?;
-        match self.store.symbol_enclosing_position(document, byte_offset)? {
-            Some(subject) => self.similar_of(&subject, detail, max_lines),
-            // No enclosing symbol resolves: no ranking was derived, so no marker or provenance.
-            None => Ok(Answer::absent(provenance, freshness)),
+        match resolve_position(self.store, document, position)? {
+            Resolution::Unique(subject) => self.similar_of(&subject, detail, max_lines),
+            Resolution::Ambiguous(rows) => {
+                let views = rows.iter().map(symbol_view).collect();
+                Ok(Answer::ambiguous(views, provenance, freshness))
+            }
+            // No symbol resolves: no ranking was derived, so no marker or provenance.
+            Resolution::None => Ok(Answer::absent(provenance, freshness)),
         }
     }
 

@@ -4,14 +4,16 @@
 mod support;
 
 use silent_cartographer::graph::ingest;
+use silent_cartographer::graph::range::{LineColumn, LineColumnSpan};
 use silent_cartographer::graph::store::{
     DEPENDENTS_HORIZON, DependencyKind, EdgeKind, GraphStore, OccurrenceRow, PersistedClass, SymbolRow,
 };
+use silent_cartographer::graph::syntax::Language;
 use silent_cartographer::identity::{
     CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one,
 };
 use silent_cartographer::query::output::Outcome;
-use silent_cartographer::query::resolve::Resolution;
+use silent_cartographer::query::resolve::{Resolution, SourcePosition};
 use silent_cartographer::query::{Detail, OrderMode, QueryEngine, Relation, TraceRelation};
 use silent_cartographer::semantic::model::{
     AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
@@ -515,7 +517,7 @@ fn get_by_position_returns_enclosing_symbol() {
     let idx = support::SOURCE.find("pub fn connect").unwrap();
     let inside = idx + "pub fn connect(&self) {".len(); // inside the method body span
     let answer = engine
-        .get_by_position(support::DOC, inside, Detail::Location, None, 1)
+        .get_by_position(support::DOC, SourcePosition::Byte(inside), Detail::Location, None, 1)
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -2909,7 +2911,13 @@ fn python_get_by_position_resolves_enclosing_method() {
     let source = py_source("pkg/shapes.py");
     let inside_render = source.find("return \"widget\"").unwrap();
     let answer = engine
-        .get_by_position("pkg/shapes.py", inside_render, Detail::Location, None, 1)
+        .get_by_position(
+            "pkg/shapes.py",
+            SourcePosition::Byte(inside_render),
+            Detail::Location,
+            None,
+            1,
+        )
         .unwrap();
     let Outcome::Found { results } = &answer.outcome else {
         panic!("expected found, got {:?}", answer.outcome);
@@ -4007,4 +4015,656 @@ fn the_human_status_discrepancy_listing_names_each_row_by_line_and_column() {
         human.lines().any(|line| line.ends_with(" at a.rs:2:5")),
         "the discrepancy row is located by line and column: {human}"
     );
+}
+
+// ---- Source positions by line and column ----
+
+/// The identities a position-resolved `get` answer names, whether it resolved to one symbol or to a
+/// candidate set; `None` for typed absence.
+fn position_answer_ids(
+    answer: &silent_cartographer::query::output::Answer<silent_cartographer::query::SymbolDetail>,
+) -> Option<Vec<CanonicalId>> {
+    match &answer.outcome {
+        Outcome::Found { results } => Some(results.iter().map(|r| r.symbol.canonical_id.clone()).collect()),
+        Outcome::Ambiguous { candidates, .. } => Some(candidates.iter().map(|c| c.canonical_id.clone()).collect()),
+        Outcome::Absent => None,
+        other => panic!("expected a symbol, a candidate set, or absence, got {other:?}"),
+    }
+}
+
+/// The line and column (both from 1) of the byte at `offset` in `source`.
+fn line_column_of(source: &str, offset: usize) -> SourcePosition {
+    let (line, column) = line_col(source, offset);
+    SourcePosition::LineColumn(LineColumn {
+        line: line + 1,
+        column: column + 1,
+    })
+}
+
+fn function_id(name: &str) -> CanonicalId {
+    id_of_pkg("poscrate", &[(name, SegmentKind::Method)])
+}
+
+fn get_at(store: &GraphStore, doc: &str, position: SourcePosition) -> Option<Vec<CanonicalId>> {
+    let engine = engine_over(store, support::provenance());
+    position_answer_ids(
+        &engine
+            .get_by_position(doc, position, Detail::Location, None, 1)
+            .unwrap(),
+    )
+}
+
+// _(Scenario: A line and column inside a method body)_ — the position resolves to the method.
+#[test]
+fn a_line_and_column_inside_a_method_body_returns_the_method() {
+    for_each_backend(|language, fixture, store| {
+        let (needle, path) = method_body(language);
+        let inside = fixture.source.find(needle).unwrap() + 1;
+        assert_eq!(
+            get_at(store, fixture.doc, line_column_of(fixture.source, inside)),
+            Some(vec![fixture.id(path)]),
+            "{language:?}"
+        );
+    });
+}
+
+/// A body statement of a method in `language`'s header fixture, and the method's descriptor path.
+fn method_body(language: Language) -> (&'static str, &'static [&'static str]) {
+    match language {
+        Language::Rust => ("a + 1", &["P", "get"]),
+        Language::Python => ("return a", &["Q", "plain"]),
+    }
+}
+
+// _(Scenario: A span ending at the line's first column does not cover it)_ — the declaration that
+// ends at column 1 of line 2 is not selected for line 2; the one starting there is.
+#[test]
+fn a_span_ending_at_the_lines_first_column_is_not_selected() {
+    assert_adjacent_spans_resolve_by_line("adj.rs");
+}
+
+// The same scenario over a Python document. A Python header ends after a colon that closes its line, so
+// the rows are stored directly rather than built from Python source.
+#[test]
+fn a_python_span_ending_at_the_lines_first_column_is_not_selected() {
+    assert_adjacent_spans_resolve_by_line("adj.py");
+}
+
+/// Store two declarations in `doc`, one ending at column 1 of line 2 where the other starts, and
+/// assert that line 2 selects the one starting there and line 1 the one ending there.
+fn assert_adjacent_spans_resolve_by_line(doc: &str) {
+    let store = GraphStore::open_in_memory().unwrap();
+    let row = |name: &str, span: (usize, usize), start: (u32, u32), end: (u32, u32)| SymbolRow {
+        canonical_id: function_id(name),
+        display_name: name.to_string(),
+        kind: "function".to_string(),
+        class: PersistedClass::InWorkspace,
+        document_path: Some(doc.to_string()),
+        span: Some(span),
+        line_column: Some(LineColumnSpan {
+            start: LineColumn {
+                line: start.0,
+                column: start.1,
+            },
+            end: LineColumn {
+                line: end.0,
+                column: end.1,
+            },
+        }),
+        header_end: Some((
+            span.1,
+            LineColumn {
+                line: end.0,
+                column: end.1,
+            },
+        )),
+        span_text: None,
+        signature_text: None,
+        interface_text: None,
+        duplicated: false,
+        test_rule: None,
+    };
+    store.insert_symbol(&row("ended", (0, 10), (1, 1), (2, 1))).unwrap();
+    store.insert_symbol(&row("starts", (10, 20), (2, 1), (3, 5))).unwrap();
+    assert_eq!(
+        get_at(&store, doc, SourcePosition::Line(2)),
+        Some(vec![function_id("starts")])
+    );
+    assert_eq!(
+        get_at(&store, doc, SourcePosition::Line(1)),
+        Some(vec![function_id("ended")])
+    );
+}
+
+// _(Scenario: A column past the end of its line)_ — on a middle line of a multi-line function an
+// oversized column returns the function; in Rust, on a line where one declaration ends and another
+// starts it returns the declaration that encloses the end of the line. A Python declaration always
+// begins on its own line, so no Python line ends one declaration and starts another.
+#[test]
+fn an_oversized_column_denotes_the_end_of_its_line() {
+    for language in support::LANGUAGES {
+        let (source, doc, expected): (&str, &str, &[(u32, &str)]) = match language {
+            Language::Rust => (
+                "pub fn first() {\n    let x = 1;\n}  pub fn second() {\n    let y = 2;\n}\n",
+                "wide.rs",
+                &[(2, "first"), (3, "second")],
+            ),
+            Language::Python => (
+                "def first():\n    x = 1\n    return x\n\n\ndef second():\n    y = 2\n    return y\n",
+                "wide.py",
+                &[(2, "first"), (7, "second")],
+            ),
+        };
+        let (first, second) = match language {
+            Language::Rust => ("fn first", "fn second"),
+            Language::Python => ("def first", "def second"),
+        };
+        let decls = [
+            support::Decl {
+                segments: &[("first", SegmentKind::Method)],
+                kind: SymbolKind::Function,
+                within: first,
+            },
+            support::Decl {
+                segments: &[("second", SegmentKind::Method)],
+                kind: SymbolKind::Function,
+                within: second,
+            },
+        ];
+        let store = support::declared_store(language, doc, source, &decls);
+        for (line, name) in expected {
+            let oversized = SourcePosition::LineColumn(LineColumn {
+                line: *line,
+                column: 9999,
+            });
+            assert_eq!(
+                get_at(&store, doc, oversized),
+                Some(vec![support::decl_id(&[(name, SegmentKind::Method)])]),
+                "{language:?}, line {line}"
+            );
+        }
+    }
+}
+
+// _(Scenario: A line past the end of the file; an empty document)_ — typed absence, including for an
+// empty document whose zero-width module covers no line.
+#[test]
+fn a_line_past_the_end_and_an_empty_document_are_typed_absence() {
+    for_each_backend(|language, fixture, store| {
+        let last = fixture.source.lines().count() as u32;
+        assert!(
+            get_at(store, fixture.doc, SourcePosition::Line(last)).is_some(),
+            "{language:?}: the last line is covered, so absence past it is not vacuous"
+        );
+        for past in [last + 1, 99] {
+            assert_eq!(
+                get_at(store, fixture.doc, SourcePosition::Line(past)),
+                None,
+                "{language:?}, line {past}"
+            );
+        }
+
+        let doc = if language == Language::Rust {
+            "empty.rs"
+        } else {
+            "empty.py"
+        };
+        let empty = support::declared_store(language, doc, "", &[]);
+        assert!(
+            empty.module_of_document(doc).unwrap().is_some(),
+            "{language:?}: the empty document holds its module, so absence is not vacuous"
+        );
+        assert_eq!(get_at(&empty, doc, SourcePosition::Line(1)), None, "{language:?}");
+    });
+}
+
+/// The sorted identities `get --at path:line` resolves `line` of the fixture to.
+fn ids_at_line(fixture: &support::HeaderFixture, store: &GraphStore, line: u32) -> Option<Vec<CanonicalId>> {
+    let mut ids = get_at(store, fixture.doc, SourcePosition::Line(line))?;
+    ids.sort();
+    Some(ids)
+}
+
+/// Assert each line in `lines` of `language`'s fixture resolves to exactly `expected`.
+fn assert_lines_resolve(
+    language: Language,
+    fixture: &support::HeaderFixture,
+    store: &GraphStore,
+    lines: impl IntoIterator<Item = u32>,
+    expected: &[CanonicalId],
+) {
+    let mut expected = expected.to_vec();
+    expected.sort();
+    for line in lines {
+        assert_eq!(
+            ids_at_line(fixture, store, line),
+            Some(expected.clone()),
+            "{language:?}, line {line}"
+        );
+    }
+}
+
+/// Run `check` once for every supported language over that language's header fixture and store.
+fn for_each_backend(check: impl Fn(Language, &support::HeaderFixture, &GraphStore)) {
+    for language in support::LANGUAGES {
+        let fixture = support::header_fixture(language);
+        let store = fixture.store(language);
+        check(language, &fixture, &store);
+    }
+}
+
+// _(Scenario: A header line that declares parameters)_ — Python records the parameters as symbols, and
+// the method is returned, not a parameter; Rust records no parameter symbols, so its case is a method
+// header line that declares parameters.
+#[test]
+fn a_method_header_line_that_declares_parameters_returns_the_method() {
+    for_each_backend(|language, fixture, store| {
+        let (needle, path): (&str, &[&str]) = match language {
+            Language::Rust => ("pub fn get(&self", &["P", "get"]),
+            Language::Python => ("def plain(self", &["Q", "plain"]),
+        };
+        assert_lines_resolve(language, fixture, store, [fixture.line(needle)], &[fixture.id(path)]);
+    });
+}
+
+// _(Scenario: Every line of a multi-line header)_ — a decorated Python header and a multi-line
+// parameter list in either language return the declaration on every header line. Rust has no
+// decorators; its attributes lie outside the definition span (see the attribute test).
+#[test]
+fn every_line_of_a_multi_line_header_returns_the_declaration() {
+    for_each_backend(|language, fixture, store| match language {
+        Language::Rust => {
+            let first = fixture.line("pub fn wide(");
+            assert_lines_resolve(
+                language,
+                fixture,
+                store,
+                first..first + 4,
+                &[fixture.id(&["P", "wide"])],
+            );
+        }
+        Language::Python => {
+            let decorated = fixture.line("@property");
+            assert_lines_resolve(
+                language,
+                fixture,
+                store,
+                decorated..decorated + 3,
+                &[fixture.id(&["Q", "area"])],
+            );
+            let first = fixture.line("async def wide(");
+            assert_lines_resolve(
+                language,
+                fixture,
+                store,
+                first..first + 4,
+                &[fixture.id(&["Q", "wide"])],
+            );
+        }
+    });
+}
+
+// _(Scenario: An attribute outside the declaration)_ — Rust only: an attribute above a type is outside
+// the type's definition span, so its line returns the module. Python decorators lie inside the span.
+#[test]
+fn a_rust_attribute_line_returns_the_enclosing_module() {
+    let language = Language::Rust;
+    let fixture = support::header_fixture(language);
+    let store = fixture.store(language);
+    assert_lines_resolve(
+        language,
+        &fixture,
+        &store,
+        [fixture.line("#[derive(Debug)]")],
+        &[fixture.module_id()],
+    );
+}
+
+// _(Scenario: A one-line declaration with members)_ — the type is returned, not its members.
+#[test]
+fn a_one_line_type_with_members_returns_the_type() {
+    for_each_backend(|language, fixture, store| {
+        let needle = match language {
+            Language::Rust => "pub struct P {",
+            Language::Python => "class P:",
+        };
+        assert_lines_resolve(language, fixture, store, [fixture.line(needle)], &[fixture.id(&["P"])]);
+    });
+}
+
+// _(Scenario: A line declaring a member)_ — the member is returned, not the type around it.
+#[test]
+fn a_line_declaring_one_member_of_a_multi_line_type_returns_the_member() {
+    for_each_backend(|language, fixture, store| {
+        let needle = match language {
+            Language::Rust => "pub size: u32,",
+            Language::Python => "size: int = 0",
+        };
+        assert_lines_resolve(
+            language,
+            fixture,
+            store,
+            [fixture.line(needle)],
+            &[fixture.id(&["Q", "size"])],
+        );
+    });
+}
+
+// _(Scenario: A line inside a body)_ — a body line of a method returns the method.
+#[test]
+fn a_method_body_line_returns_the_method() {
+    for_each_backend(|language, fixture, store| {
+        let (needle, path): (&str, &[&str]) = match language {
+            Language::Rust => ("a + 1", &["P", "get"]),
+            Language::Python => ("return a", &["Q", "plain"]),
+        };
+        assert_lines_resolve(language, fixture, store, [fixture.line(needle)], &[fixture.id(path)]);
+    });
+}
+
+// _(Scenario: A line without a header)_ — a blank line between members of a container returns the
+// innermost symbol that encloses it: the class in Python, the module in Rust (an `impl` block is not
+// a symbol).
+#[test]
+fn a_blank_line_between_members_returns_the_enclosing_container() {
+    for_each_backend(|language, fixture, store| {
+        let (after, container, offset) = match language {
+            Language::Rust => ("a + 1", fixture.module_id(), 2),
+            Language::Python => ("size: int = 0", fixture.id(&["Q"]), 1),
+        };
+        let blank = fixture.line(after) + offset;
+        assert_eq!(fixture.source.lines().nth(blank as usize - 1), Some(""), "{language:?}");
+        assert_lines_resolve(language, fixture, store, [blank], &[container]);
+    });
+}
+
+// _(Scenario: A line holding two sibling declarations)_ — Rust: two functions, and a constant beside a
+// static; Python cannot hold two compound statements on a line, so its siblings are two assignments.
+#[test]
+fn two_sibling_declarations_on_one_line_return_the_candidate_set_in_each_language() {
+    for_each_backend(|language, fixture, store| match language {
+        Language::Rust => {
+            assert_lines_resolve(
+                language,
+                fixture,
+                store,
+                [fixture.line("pub fn alpha")],
+                &[fixture.id(&["alpha"]), fixture.id(&["beta"])],
+            );
+            assert_lines_resolve(
+                language,
+                fixture,
+                store,
+                [fixture.line("pub const K")],
+                &[fixture.id(&["K"]), fixture.id(&["S"])],
+            );
+        }
+        Language::Python => assert_lines_resolve(
+            language,
+            fixture,
+            store,
+            [fixture.line("ALPHA = 1")],
+            &[fixture.id(&["ALPHA"]), fixture.id(&["BETA"])],
+        ),
+    });
+}
+
+// _(Scenario: A header that ends at the line's first column)_ — Rust: a function whose body opens at
+// column 1 of line 2 is not selected for that line, so the declaration starting on it is the answer.
+// A Python header always ends after a colon that closes its line, so it cannot end at a first column;
+// the stored-row test above covers the rule independently of any language.
+#[test]
+fn a_rust_header_ending_at_the_lines_first_column_is_not_selected() {
+    let source = "pub fn outer()\n{ pub fn inner() {} }\n";
+    let nested = [
+        support::Decl {
+            segments: &[("outer", SegmentKind::Method)],
+            kind: SymbolKind::Function,
+            within: "outer()",
+        },
+        support::Decl {
+            segments: &[("inner", SegmentKind::Method)],
+            kind: SymbolKind::Function,
+            within: "inner()",
+        },
+    ];
+    let store = support::declared_store(Language::Rust, "nest.rs", source, &nested);
+    let inner = support::decl_id(&[("inner", SegmentKind::Method)]);
+    let outer = support::decl_id(&[("outer", SegmentKind::Method)]);
+    assert_eq!(get_at(&store, "nest.rs", SourcePosition::Line(2)), Some(vec![inner]));
+    assert_eq!(get_at(&store, "nest.rs", SourcePosition::Line(1)), Some(vec![outer]));
+}
+
+/// `get --at <at>` through the command handler, as a machine answer, under `unit`.
+fn get_at_json(
+    db: &std::path::Path,
+    root: &std::path::Path,
+    at: &str,
+    unit: silent_cartographer::cli::PositionUnit,
+) -> serde_json::Value {
+    let out = silent_cartographer::commands::run_get(
+        db,
+        root,
+        "not-a-real-analyzer",
+        None,
+        Some(at),
+        Detail::Location,
+        0,
+        1,
+        false,
+        false,
+        25,
+        None,
+        true,
+        false,
+        unit,
+    )
+    .unwrap();
+    serde_json::from_str(&out).unwrap()
+}
+
+// _(Scenario: The byte unit reads a byte offset)_ — under `--position byte`, `path:byte_offset` inside
+// a method body returns the method.
+#[test]
+fn the_byte_unit_reads_a_byte_offset() {
+    for language in support::LANGUAGES {
+        let fixture = support::header_fixture(language);
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.build_db(language, dir.path());
+        let (needle, path) = method_body(language);
+        let inside = fixture.source.find(needle).unwrap() + 1;
+        let answer = get_at_json(
+            &db,
+            dir.path(),
+            &format!("{}:{inside}", fixture.doc),
+            silent_cartographer::cli::PositionUnit::Byte,
+        );
+        assert_eq!(
+            answer["outcome"]["results"][0]["symbol"]["name"],
+            *path.last().unwrap(),
+            "{language:?}: {answer}"
+        );
+    }
+}
+
+// _(Scenario: A line and column inside a method body)_ — through the `--at` parser, a non-zero
+// `path:line:column` inside a method body returns the method.
+#[test]
+fn an_at_argument_of_line_and_column_inside_a_method_body_returns_the_method() {
+    for language in support::LANGUAGES {
+        let fixture = support::header_fixture(language);
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.build_db(language, dir.path());
+        let (needle, path) = method_body(language);
+        let start = fixture.source.find(needle).unwrap();
+        let (line, column) = line_col(fixture.source, start + 1);
+        assert!(column > 0, "the position is not on a line's first column");
+        let answer = get_at_json(
+            &db,
+            dir.path(),
+            &format!("{}:{}:{}", fixture.doc, line + 1, column + 1),
+            silent_cartographer::cli::PositionUnit::Line,
+        );
+        assert_eq!(
+            answer["outcome"]["results"][0]["symbol"]["name"],
+            *path.last().unwrap(),
+            "{language:?}: {answer}"
+        );
+    }
+}
+
+// _(Scenario: A cursor is bound to the position unit)_ — a `get --at` answer never spans pages, so no
+// token is issued for it; a token minted over the same query identity under the line unit is accepted
+// under that unit and refused under the byte unit.
+#[test]
+fn a_get_at_cursor_is_refused_under_the_other_position_unit() {
+    use silent_cartographer::cli::PositionUnit;
+    use silent_cartographer::graph::store::Freshness;
+    use silent_cartographer::query::output::{Answer, Provenance};
+    use silent_cartographer::query::page::{PageIdentity, apply_pagination};
+
+    for language in support::LANGUAGES {
+        let fixture = support::header_fixture(language);
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.build_db(language, dir.path());
+        let (needle, _) = method_body(language);
+        let at = format!("{}:{}", fixture.doc, fixture.line(needle));
+
+        let metadata = GraphStore::open(&db).unwrap().read_metadata().unwrap().unwrap();
+        let identity = PageIdentity {
+            command: "get",
+            reference: at.clone(),
+            relation: None,
+            detail: Some("location"),
+            depth: None,
+            ordering: None,
+            limit: Some(1),
+            max_lines: None,
+            from: Some(1),
+            position_unit: Some("line"),
+            index_hash: format!(
+                "{}\u{1f}{}\u{1f}{}",
+                metadata.content_hash, metadata.provenance.analyzer_name, metadata.provenance.analyzer_version
+            ),
+        };
+        let provenance = Provenance {
+            analyzer_name: metadata.provenance.analyzer_name.clone(),
+            analyzer_version: metadata.provenance.analyzer_version.clone(),
+        };
+        let paged = apply_pagination(
+            Answer::found(vec!["a", "b"], provenance, Freshness::Fresh),
+            Some(1),
+            None,
+            &identity,
+        )
+        .unwrap();
+        let cursor = paged.page.and_then(|page| page.cursor).expect("a truncated page");
+
+        let run = |unit| {
+            silent_cartographer::commands::run_get(
+                &db,
+                dir.path(),
+                "not-a-real-analyzer",
+                None,
+                Some(&at),
+                Detail::Location,
+                0,
+                1,
+                false,
+                false,
+                1,
+                Some(&cursor),
+                true,
+                false,
+                unit,
+            )
+            .expect_err("the token resumes no page of a single-result answer")
+            .to_string()
+        };
+        assert!(
+            !run(PositionUnit::Line).contains("different query parameters"),
+            "{language:?}: the token is accepted under the unit it was issued under"
+        );
+        assert!(
+            run(PositionUnit::Byte).contains("different query parameters"),
+            "{language:?}: the token is refused under the other unit"
+        );
+    }
+}
+
+// _(Scenario: A stale position reads the indexed text)_ — after lines are inserted above a method,
+// the line the method had when the index was built still returns it, and the answer is stale.
+#[test]
+fn a_stale_position_reads_the_indexed_text() {
+    for language in support::LANGUAGES {
+        let fixture = support::header_fixture(language);
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.build_db(language, dir.path());
+        let (header, path) = match language {
+            Language::Rust => ("pub fn get", &["P", "get"]),
+            Language::Python => ("def plain", &["Q", "plain"]),
+        };
+        let comment = if language == Language::Rust { "//" } else { "#" };
+        std::fs::write(
+            dir.path().join(fixture.doc),
+            format!("{comment} one\n{comment} two\n{comment} three\n{}", fixture.source),
+        )
+        .unwrap();
+
+        let line = fixture.line(header);
+        let answer = get_at_json(
+            &db,
+            dir.path(),
+            &format!("{}:{line}", fixture.doc),
+            silent_cartographer::cli::PositionUnit::Line,
+        );
+        assert_eq!(answer["freshness"], "stale_content", "{language:?}: {answer}");
+        let result = &answer["outcome"]["results"][0];
+        assert_eq!(
+            result["symbol"]["name"],
+            *path.last().unwrap(),
+            "{language:?}: {answer}"
+        );
+        assert_eq!(
+            result["payload"]["location"]["start_line"], line,
+            "{language:?}: {answer}"
+        );
+    }
+}
+
+// _(Scenario: A line position on a Python method)_ — `similar --at path:line` takes the method as the
+// subject: the answer is the one `similar` gives for the method itself.
+#[test]
+fn similar_at_a_line_inside_a_python_method_takes_the_method() {
+    let store = py_store();
+    let engine = py_engine(&store);
+    let source = py_source("pkg/shapes.py");
+    let (line, _) = line_col(&source, source.find("return \"widget\"").unwrap());
+    let by_line = engine
+        .similar_by_position("pkg/shapes.py", SourcePosition::Line(line + 1), Detail::Location, None)
+        .unwrap();
+    let by_name = engine.similar(py_render_id().as_str(), Detail::Location, None).unwrap();
+    assert!(
+        matches!(by_name.outcome, Outcome::Found { .. }),
+        "the method has neighbors"
+    );
+    assert_eq!(by_line.outcome, by_name.outcome);
+}
+
+// _(Scenario: A line position on a Rust method)_ — the Rust counterpart: `similar --at path:line` on a
+// method's header line takes the method.
+#[test]
+fn similar_at_a_line_on_a_rust_method_header_takes_the_method() {
+    let store = built_store();
+    let engine = engine_over(&store, support::provenance());
+    let (line, _) = line_col(support::SOURCE, support::SOURCE.find("pub fn connect").unwrap());
+    let by_line = engine
+        .similar_by_position(support::DOC, SourcePosition::Line(line + 1), Detail::Location, None)
+        .unwrap();
+    let by_name = engine.similar(connect_id().as_str(), Detail::Location, None).unwrap();
+    assert!(
+        matches!(by_name.outcome, Outcome::Found { .. }),
+        "the method has neighbors"
+    );
+    assert_eq!(by_line.outcome, by_name.outcome);
 }

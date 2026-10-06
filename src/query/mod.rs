@@ -17,7 +17,7 @@ use crate::identity::CanonicalId;
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
 
 use output::{Answer, ContentLines, Location, Provenance, SymbolView};
-use resolve::{Resolution, resolve};
+use resolve::{Resolution, SourcePosition, resolve, resolve_position};
 
 /// The detail level at which `get` retrieves a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,23 +221,28 @@ impl<'a> QueryEngine<'a> {
         }
     }
 
-    /// `get` by source position: retrieve the symbol enclosing `(document, byte_offset)`, returning a
-    /// window of its content as [`QueryEngine::get`] does.
+    /// `get` by source position: retrieve the symbol `position` resolves to in `document`, returning a
+    /// window of its content as [`QueryEngine::get`] does. A position naming several symbols yields
+    /// the typed candidate set.
     pub fn get_by_position(
         &self,
         document: &str,
-        byte_offset: usize,
+        position: SourcePosition,
         detail: Detail,
         max_lines: Option<usize>,
         from: usize,
     ) -> Result<Answer<SymbolDetail>, QueryError> {
         let (provenance, freshness) = self.provenance_and_freshness()?;
-        match self.store.symbol_enclosing_position(document, byte_offset)? {
-            Some(row) => {
+        match resolve_position(self.store, document, position)? {
+            Resolution::Unique(row) => {
                 let payload = self.detail_of(&row, detail, max_lines, from);
                 Ok(Answer::found(vec![payload], provenance, freshness))
             }
-            None => Ok(Answer::absent(provenance, freshness)),
+            Resolution::Ambiguous(rows) => {
+                let views = rows.iter().map(symbol_view).collect();
+                Ok(Answer::ambiguous(views, provenance, freshness))
+            }
+            Resolution::None => Ok(Answer::absent(provenance, freshness)),
         }
     }
 

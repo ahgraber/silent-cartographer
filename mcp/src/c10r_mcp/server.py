@@ -178,7 +178,9 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
             Field(
                 description=(
                     "Retrieve whichever symbol encloses a source position, written "
-                    "`path:byte_offset`. Use instead of `reference`, not alongside it."
+                    "`path:line:column` or `path:line` (1-based). A line resolves to the "
+                    "declaration whose header is on that line, else the innermost enclosing "
+                    "symbol. Use instead of `reference`, not alongside it."
                 )
             ),
         ] = None,
@@ -408,7 +410,9 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
             Field(
                 description=(
                     "Take whichever symbol encloses a source position as the subject, "
-                    "written `path:byte_offset`. Use instead of `reference`."
+                    "written `path:line:column` or `path:line` (1-based). A line resolves to "
+                    "the declaration whose header is on that line, else the innermost "
+                    "enclosing symbol. Use instead of `reference`."
                 )
             ),
         ] = None,

@@ -12,6 +12,7 @@ use silent_cartographer::graph::ingest;
 use silent_cartographer::graph::store::GraphStore;
 use silent_cartographer::identity::{CanonicalId, SegmentKind};
 use silent_cartographer::query::output::{Classification, Outcome};
+use silent_cartographer::query::resolve::SourcePosition;
 use silent_cartographer::query::search::{CloneCertainty, SimilarItem};
 use silent_cartographer::query::{Detail, QueryEngine};
 use silent_cartographer::semantic::model::{OccurrenceRole, SourceRange, SymbolClass, SymbolKind};
@@ -404,7 +405,7 @@ fn a_position_resolves_the_enclosing_symbol_as_subject() {
     let engine = engine_over(&store, &srcs);
     let inside_alpha = CLONES_SOURCE.find("let total = x + y;").unwrap() + 4;
     let answer = engine
-        .similar_by_position(CLONES_DOC, inside_alpha, Detail::Signature, None)
+        .similar_by_position(CLONES_DOC, SourcePosition::Byte(inside_alpha), Detail::Signature, None)
         .unwrap();
     let Outcome::Found { results } = answer.outcome else {
         panic!("a position inside a body resolves a subject");
@@ -880,6 +881,49 @@ fn a_mismatched_token_is_refused_on_similar() {
         .expect("a truncated page carries a cursor");
 
     let err = run("open", Some(cursor)).expect_err("a token from another subject is refused");
+    assert_eq!(classify(&err), ExitCode::Usage);
+    assert!(
+        err.to_string().contains("different query parameters"),
+        "the refusal names the mismatch: {err}"
+    );
+}
+
+// _(A cursor is bound to the position unit)_ — `--at src/net.rs:4` names a line under one unit and a
+// byte offset under the other, so a token issued under the line unit is refused under the byte unit.
+#[test]
+fn a_cursor_from_an_at_query_is_refused_under_the_other_position_unit() {
+    use silent_cartographer::cli::PositionUnit;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_db(dir.path());
+    let at = format!("{}:4", support::DOC);
+    let run = |unit: PositionUnit, cursor: Option<&str>| {
+        silent_cartographer::commands::run_similar(
+            &db,
+            dir.path(),
+            "rust-analyzer",
+            None,
+            Some(&at),
+            Detail::Signature,
+            10,
+            false,
+            1,
+            cursor,
+            true,
+            false,
+            unit,
+        )
+    };
+    let first: serde_json::Value = serde_json::from_str(&run(PositionUnit::Line, None).unwrap()).unwrap();
+    let cursor = first["page"]["cursor"]
+        .as_str()
+        .expect("a truncated page carries a cursor");
+
+    assert!(
+        run(PositionUnit::Line, Some(cursor)).is_ok(),
+        "the token resumes under the unit it was issued under"
+    );
+    let err = run(PositionUnit::Byte, Some(cursor)).expect_err("the token is refused under the other unit");
     assert_eq!(classify(&err), ExitCode::Usage);
     assert!(
         err.to_string().contains("different query parameters"),

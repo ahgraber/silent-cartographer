@@ -1529,6 +1529,77 @@ impl GraphStore {
             .optional()
     }
 
+    /// The symbol whose definition span most tightly encloses the position `at` in `document`, by the
+    /// rule [`GraphStore::symbol_enclosing_position`] applies to a byte offset: `start <= at < end`,
+    /// comparing `(line, column)` pairs. Symbols stored without a line and column are not considered.
+    pub fn symbol_enclosing_line_column(&self, document: &str, at: LineColumn) -> rusqlite::Result<Option<SymbolRow>> {
+        self.conn
+            .query_row(
+                "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                        signature_text, interface_text, duplicated, test_rule,
+                        start_line, start_column, end_line, end_column,
+                        header_end, header_end_line, header_end_column
+                 FROM symbols
+                 WHERE document_path = ?1 AND start_line IS NOT NULL
+                   AND (start_line, start_column) <= (?2, ?3) AND (?2, ?3) < (end_line, end_column)
+                 ORDER BY (span_end - span_start) ASC, canonical_id ASC
+                 LIMIT 1",
+                params![document, at.line, at.column],
+                Self::map_symbol,
+            )
+            .optional()
+    }
+
+    /// The symbols a `path:line` position names in `document`: those whose header, the half-open range
+    /// from the definition span's start to the header end, intersects `[(line, 1), (line + 1, 1))`,
+    /// keeping those that no other such symbol contains. A header ending at the line's first column
+    /// covers none of the line. Ordered by `(start, end, canonical_id)`.
+    ///
+    /// A span identical to another's does not contain it, so symbols sharing one span are all
+    /// returned. When no header intersects the line, the answer is the symbol enclosing the line's
+    /// first column, if any. Symbols stored without a line and column or without a header end are not
+    /// selected by the header.
+    pub fn symbols_for_line(&self, document: &str, line: u32) -> rusqlite::Result<Vec<SymbolRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
+                    signature_text, interface_text, duplicated, test_rule,
+                    start_line, start_column, end_line, end_column,
+                    header_end, header_end_line, header_end_column
+             FROM symbols
+             WHERE document_path = ?1 AND start_line IS NOT NULL AND header_end_line IS NOT NULL
+               AND (start_line, start_column) < (?2 + 1, 1) AND (header_end_line, header_end_column) > (?2, 1)
+             ORDER BY start_line, start_column, end_line, end_column, canonical_id",
+        )?;
+        let selected: Vec<SymbolRow> = stmt
+            .query_map(params![document, line], Self::map_symbol)?
+            .collect::<rusqlite::Result<_>>()?;
+        let pairs = |row: &SymbolRow| {
+            let span = row.line_column.expect("the query selects rows with a line and column");
+            ((span.start.line, span.start.column), (span.end.line, span.end.column))
+        };
+        let contained_by_another = |inner: &SymbolRow| {
+            let (inner_start, inner_end) = pairs(inner);
+            selected.iter().any(|outer| {
+                let (outer_start, outer_end) = pairs(outer);
+                (outer_start, outer_end) != (inner_start, inner_end)
+                    && outer_start <= inner_start
+                    && inner_end <= outer_end
+            })
+        };
+        let outermost: Vec<SymbolRow> = selected
+            .iter()
+            .filter(|row| !contained_by_another(row))
+            .cloned()
+            .collect();
+        if !outermost.is_empty() {
+            return Ok(outermost);
+        }
+        Ok(self
+            .symbol_enclosing_line_column(document, LineColumn { line, column: 1 })?
+            .into_iter()
+            .collect())
+    }
+
     /// The symbols whose definition spans overlap the half-open byte range `[start, end)` in
     /// `document`, ordered by `(span_start, span_end, canonical_id)` so a seed set is reproducible.
     ///

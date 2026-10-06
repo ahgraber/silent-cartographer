@@ -5,6 +5,7 @@
 //! (low uniqueness). Resolution accepts any form and resolves up toward identity; an ambiguous lower
 //! form yields a typed candidate set rather than an arbitrary choice.
 
+use crate::graph::range::LineColumn;
 use crate::graph::store::{GraphStore, SymbolRow};
 
 /// The outcome of resolving a reference.
@@ -59,6 +60,35 @@ pub fn resolve(store: &GraphStore, reference: &str) -> rusqlite::Result<Resoluti
     let mut candidates = store.symbols_by_shortname(reference)?;
     candidates.sort_by(|a, b| a.canonical_id.cmp(&b.canonical_id));
     Ok(classify(candidates))
+}
+
+/// A source position as the caller named it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePosition {
+    /// A byte offset into the indexed text.
+    Byte(usize),
+    /// A line and column of the indexed text.
+    LineColumn(LineColumn),
+    /// A whole line of the indexed text.
+    Line(u32),
+}
+
+/// Resolve `position` in `document` to the innermost symbol covering it.
+///
+/// A byte offset or a line and column resolves to the innermost enclosing symbol, or to none. A
+/// line resolves to the outermost symbols whose header covers any part of it, or, when no header does,
+/// to the innermost symbol enclosing its first column: one is unique, several (none enclosing
+/// another) are ambiguous, none is absent.
+pub fn resolve_position(store: &GraphStore, document: &str, position: SourcePosition) -> rusqlite::Result<Resolution> {
+    Ok(match position {
+        SourcePosition::Byte(offset) => single(store.symbol_enclosing_position(document, offset)?),
+        SourcePosition::LineColumn(at) => single(store.symbol_enclosing_line_column(document, at)?),
+        SourcePosition::Line(line) => classify(store.symbols_for_line(document, line)?),
+    })
+}
+
+fn single(row: Option<SymbolRow>) -> Resolution {
+    row.map_or(Resolution::None, |row| Resolution::Unique(Box::new(row)))
 }
 
 fn classify(candidates: Vec<SymbolRow>) -> Resolution {
