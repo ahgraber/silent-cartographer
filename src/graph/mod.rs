@@ -59,6 +59,73 @@ pub fn content_hash(documents: &[(String, String)]) -> String {
             hasher.update(part.as_bytes());
         }
     }
+    hex_digest(hasher)
+}
+
+/// The SHA-256 of one file's text, as lowercase hex.
+pub fn text_hash(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex_digest(hasher)
+}
+
+/// How a source file differs between an indexed source list and a discovered one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceChange {
+    /// Held by the index and still a source file, with different content.
+    Changed,
+    /// A source file the index does not hold.
+    Added,
+    /// Held by the index and no longer a source file.
+    Removed,
+}
+
+impl SourceChange {
+    /// The lowercase name the machine answer and the human rendering carry.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::Added => "added",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+/// One file that differs between an indexed source list and a discovered one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceDifference {
+    pub document_path: String,
+    pub change: SourceChange,
+}
+
+/// The files that differ between `indexed` and `discovered`, both `(document_path, text_hash)`
+/// pairs, sorted by path: a path in both with different hashes is changed, one only in `discovered`
+/// is added, one only in `indexed` is removed.
+pub fn compare_source_files(indexed: &[(String, String)], discovered: &[(String, String)]) -> Vec<SourceDifference> {
+    let indexed: std::collections::BTreeMap<&str, &str> =
+        indexed.iter().map(|(p, h)| (p.as_str(), h.as_str())).collect();
+    let discovered: std::collections::BTreeMap<&str, &str> =
+        discovered.iter().map(|(p, h)| (p.as_str(), h.as_str())).collect();
+    let paths: std::collections::BTreeSet<&str> = indexed.keys().chain(discovered.keys()).copied().collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let change = match (indexed.get(path), discovered.get(path)) {
+                (Some(then), Some(now)) if then != now => SourceChange::Changed,
+                (None, Some(_)) => SourceChange::Added,
+                (Some(_), None) => SourceChange::Removed,
+                _ => return None,
+            };
+            Some(SourceDifference {
+                document_path: path.to_string(),
+                change,
+            })
+        })
+        .collect()
+}
+
+fn hex_digest(hasher: Sha256) -> String {
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -702,6 +769,11 @@ pub fn ingest_with_params(
         }
     }
 
+    let fingerprints: Vec<(String, String)> = sources
+        .iter()
+        .map(|(path, text)| (path.clone(), text_hash(text)))
+        .collect();
+    store.write_source_files(&fingerprints)?;
     store.write_metadata(&IndexMetadata {
         workspace_id: workspace.clone(),
         workspace_root: workspace_root.map(str::to_string),

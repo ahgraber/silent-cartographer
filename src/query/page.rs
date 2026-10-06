@@ -54,6 +54,9 @@ pub struct PageIdentity {
     /// same `--at` string names a different position under each unit, while every other query's
     /// answer, token included, is the same under either.
     pub position_unit: Option<&'static str>,
+    /// The aggregate hash of the source files on disk, bound only by `status`: a token resumes only
+    /// while the source files are as they were when its page was drawn. `None` for every query.
+    pub source_hash: Option<String>,
     /// The recorded index identity the answer was drawn from: the index content-hash composed with
     /// the recorded analyzer provenance (name and version). A same-source rebuild under a different
     /// analyzer version changes this even when the content-hash is unchanged, so a stale token is
@@ -322,7 +325,7 @@ pub fn apply_report_pagination<T>(
 
 /// Page a bounded row set: the rows of page `page_index` at `limit` rows per page, with the page
 /// block that discloses a partial view and the token that resumes the next page. The one slice-and-
-/// token step the answer paths share.
+/// token step the answer paths and `status` share.
 ///
 /// A page block is attached only when the rows were truncated or a later page was resumed, so a set
 /// that fits the limit reads like an unbounded one. A `page_index` past the last page is a usage
@@ -352,6 +355,23 @@ fn slice_page<T>(
         cursor,
     });
     Ok((page_rows, page))
+}
+
+/// Page `rows` for a command whose answer is not a query [`Answer`]: validate `cursor` against
+/// `identity`, then return the page it names and the page block, or the whole set and no page block
+/// when `limit` is `None`.
+pub fn page_rows<T>(
+    rows: Vec<T>,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    identity: &PageIdentity,
+) -> anyhow::Result<(Vec<T>, Option<PageInfo>)> {
+    let param_hash = identity.hash();
+    let page_index = resolve_page_index(cursor, limit, &param_hash)?;
+    match limit {
+        Some(limit) => slice_page(rows, limit, page_index, &param_hash),
+        None => Ok((rows, None)),
+    }
 }
 
 /// Apply the result-set bound to a `dependents` impact answer, paging the report's detailed rows.
@@ -478,6 +498,7 @@ mod tests {
             max_lines: None,
             from: None,
             position_unit: None,
+            source_hash: None,
             index_hash: "hash".to_string(),
         }
     }
@@ -582,13 +603,14 @@ mod tests {
             max_lines: Some(20),
             from: Some(3),
             position_unit: Some("line"),
+            source_hash: Some("disk-hash".to_string()),
             index_hash: "index-hash".to_string(),
         };
 
         /// A named single-field change to a query identity.
         type Variation = (&'static str, fn(&mut PageIdentity));
 
-        let variations: [Variation; 11] = [
+        let variations: [Variation; 12] = [
             ("command", |id| id.command = "find"),
             ("reference", |id| id.reference = "other".to_string()),
             ("relation", |id| id.relation = Some("contains")),
@@ -601,6 +623,7 @@ mod tests {
             ("max_lines", |id| id.max_lines = Some(21)),
             ("from", |id| id.from = Some(4)),
             ("position_unit", |id| id.position_unit = Some("byte")),
+            ("source_hash", |id| id.source_hash = Some("edited".to_string())),
             ("index_hash", |id| id.index_hash = "rebuilt".to_string()),
         ];
 

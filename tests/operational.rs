@@ -83,6 +83,9 @@ fn status_reports_provenance_freshness_and_alignment() {
         false,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .unwrap();
 
@@ -255,6 +258,9 @@ fn discrepancy_summary_is_truncated_but_totals_cover_the_full_set() {
         false,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -298,6 +304,9 @@ fn full_listing_returns_every_row() {
         true,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -325,6 +334,9 @@ fn summary_group_shape_carries_kind_token_count_and_exemplar() {
         false,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -362,6 +374,9 @@ fn discrepancy_rows_and_exemplars_carry_line_and_column() {
             true,
             false,
             silent_cartographer::cli::PositionUnit::Line,
+            None,
+            25,
+            None,
         )
         .unwrap();
         let all: serde_json::Value = serde_json::from_str(&all).unwrap();
@@ -374,6 +389,9 @@ fn discrepancy_rows_and_exemplars_carry_line_and_column() {
             false,
             false,
             silent_cartographer::cli::PositionUnit::Line,
+            None,
+            25,
+            None,
         )
         .unwrap();
         let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
@@ -402,6 +420,9 @@ fn discrepancy_rows_and_exemplars_carry_line_and_column() {
             true,
             false,
             silent_cartographer::cli::PositionUnit::Line,
+            None,
+            25,
+            None,
         )
         .unwrap();
         let doc = discrepancy_token(language).0;
@@ -494,6 +515,9 @@ fn query_refuses_an_incompatible_store_with_guidance() {
         false,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .expect_err("status against an incompatible store must refuse");
 
@@ -541,6 +565,9 @@ fn matching_version_store_operates_normally() {
         false,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .unwrap();
     assert!(report.contains("join_alignment"), "status answers normally: {report}");
@@ -586,6 +613,9 @@ fn status_reports_per_rule_acceptance_buckets() {
         false,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -829,6 +859,9 @@ fn duplicated_groups_are_retrievable_with_descriptor_and_definitions() {
         false,
         true,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -872,6 +905,9 @@ fn no_duplicates_is_a_definite_zero_group_count() {
         false,
         true,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -918,6 +954,9 @@ fn status_json_always_carries_the_duplicated_group_count() {
         false,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .unwrap();
     let v: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -1197,6 +1236,9 @@ fn a_query_or_status_against_a_missing_store_creates_nothing() {
         false,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .expect_err("a status request against nothing refuses");
 
@@ -1406,6 +1448,9 @@ fn every_query_family_carries_the_workspace_disclosure() {
         false,
         false,
         silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
     )
     .expect("status answers");
 
@@ -2016,4 +2061,419 @@ fn a_store_recorded_at_another_root_builds_discloses_and_re_records() {
         new_root.to_str(),
         "the store records the workspace it now describes"
     );
+}
+
+/// A workspace built through the built `c10r` for one language backend, with stub analyzers pinned
+/// first on `PATH` and no inherited `$VIRTUAL_ENV`, so freshness depends only on what a test edits.
+struct StatusWorkspace {
+    dir: tempfile::TempDir,
+    language: Language,
+    path: std::ffi::OsString,
+}
+
+impl StatusWorkspace {
+    /// Build `language`'s workspace: source files `a`, `b`, `c`, and a README that is not a source file.
+    fn build(language: Language) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join(".stub-bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let (manifest, tool) = match language {
+            Language::Rust => ("Cargo.toml", "rust-analyzer"),
+            Language::Python => ("pyproject.toml", "scip-python"),
+        };
+        std::fs::write(dir.path().join(manifest), "# fixture manifest\n").unwrap();
+        support::write_indexing_stub(&bin_dir, tool, "1.85.0");
+        if language == Language::Python {
+            let venv_bin = dir.path().join(".venv/bin");
+            std::fs::create_dir_all(&venv_bin).unwrap();
+            support::write_indexing_stub(&venv_bin, "python", "Python 3.12.0");
+            std::fs::create_dir_all(dir.path().join(".venv/lib/python3.12/site-packages/foo-1.0.dist-info")).unwrap();
+        }
+        let built_bin_dir = Path::new(env!("CARGO_BIN_EXE_c10r")).parent().unwrap().to_path_buf();
+        let path = support::prepend_path(&[&built_bin_dir, &bin_dir]);
+        let workspace = Self { dir, language, path };
+        for name in ["a", "b", "c"] {
+            workspace.write(name, "one");
+        }
+        std::fs::write(workspace.dir.path().join("README.md"), "# readme\n").unwrap();
+        let build = workspace.run(&["build", "--language", workspace.language_flag()]);
+        assert!(
+            build.status.success(),
+            "the build succeeds: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        workspace
+    }
+
+    fn language_flag(&self) -> &'static str {
+        match self.language {
+            Language::Rust => "rust",
+            Language::Python => "python",
+        }
+    }
+
+    /// The workspace-relative path of source file `name`.
+    fn file(&self, name: &str) -> String {
+        match self.language {
+            Language::Rust => format!("src/{name}.rs"),
+            Language::Python => format!("{name}.py"),
+        }
+    }
+
+    /// The text of source file `name` holding a definition distinguished by `marker`.
+    fn text(&self, name: &str, marker: &str) -> String {
+        match self.language {
+            Language::Rust => format!("pub fn {name}_{marker}() {{}}\n"),
+            Language::Python => format!("def {name}_{marker}():\n    pass\n"),
+        }
+    }
+
+    /// Write source file `name` holding a definition distinguished by `marker`.
+    fn write(&self, name: &str, marker: &str) {
+        let path = self.dir.path().join(self.file(name));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, self.text(name, marker)).unwrap();
+    }
+
+    /// A shell command that writes source file `name` with `marker`.
+    fn shell_write(&self, name: &str, marker: &str) -> String {
+        let path = self.dir.path().join(self.file(name));
+        format!("printf '%s' '{}' > '{}'\n", self.text(name, marker), path.display())
+    }
+
+    fn remove(&self, name: &str) {
+        std::fs::remove_file(self.dir.path().join(self.file(name))).unwrap();
+    }
+
+    /// Run the built `c10r` against this workspace's index with `args`.
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+            .arg("--db")
+            .arg(self.dir.path().join("index.db"))
+            .args(args)
+            .current_dir(self.dir.path())
+            .env("PATH", &self.path)
+            .env_remove("VIRTUAL_ENV")
+            .output()
+            .unwrap()
+    }
+
+    /// `status --json` with `args`, parsed.
+    fn status(&self, args: &[&str]) -> serde_json::Value {
+        let mut full = vec!["--json", "status"];
+        full.extend_from_slice(args);
+        let out = self.run(&full);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// The human `status` text with `args`.
+    fn status_human(&self, args: &[&str]) -> String {
+        let mut full = vec!["status"];
+        full.extend_from_slice(args);
+        let out = self.run(&full);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+}
+
+/// The `(document_path, change)` pairs of a status report's file list.
+fn listed_files(report: &serde_json::Value) -> Vec<(String, String)> {
+    report["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the report carries a file list: {report}"))
+        .iter()
+        .map(|f| {
+            (
+                f["document_path"].as_str().unwrap().to_string(),
+                f["change"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// After `edit` runs, `status --detail files` names exactly `name` as `change` and reports stale
+/// content, on every language backend.
+fn assert_one_file_named(name: &str, change: &str, edit: impl Fn(&StatusWorkspace)) {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        edit(&workspace);
+        let report = workspace.status(&["--detail", "files"]);
+        assert_eq!(
+            listed_files(&report),
+            vec![(workspace.file(name), change.to_string())],
+            "{language:?}: {report}"
+        );
+        assert_eq!(report["freshness"], "stale_content", "{language:?}: {report}");
+    }
+}
+
+// _(Scenario: A changed file is named)_ — an edited source file is named as changed.
+#[test]
+fn status_names_an_edited_file_as_changed() {
+    assert_one_file_named("b", "changed", |w| w.write("b", "two"));
+}
+
+// _(Scenario: An added file is named)_ — a new source file is named as added.
+#[test]
+fn status_names_a_new_file_as_added() {
+    assert_one_file_named("d", "added", |w| w.write("d", "one"));
+}
+
+// _(Scenario: A removed file is named)_ — a deleted source file is named as removed.
+#[test]
+fn status_names_a_deleted_file_as_removed() {
+    assert_one_file_named("c", "removed", |w| w.remove("c"));
+}
+
+// Every stored value `status` reports comes from the one build it read: a build that commits while
+// `status` probes the analyzer (a stub whose version probe adds a file and rebuilds under another
+// workspace identity) changes none of the report's stored values.
+#[test]
+fn status_reports_one_build_when_another_commits_during_the_probe() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        let first = workspace.status(&["--discrepancies", "--all"]);
+        let tool_dir = workspace.dir.path().join(".stub-bin");
+        let rebuild = format!(
+            "{}'{}' --db '{}' build --language {} --force --workspace second >/dev/null 2>&1\n",
+            workspace.shell_write("d", "one"),
+            env!("CARGO_BIN_EXE_c10r"),
+            workspace.dir.path().join("index.db").display(),
+            workspace.language_flag(),
+        );
+        std::fs::write(tool_dir.join("on_version"), rebuild).unwrap();
+        let report = workspace.status(&["--detail", "files", "--discrepancies", "--all"]);
+        assert!(
+            tool_dir.join("on_version.ran").exists(),
+            "{language:?}: the probe ran the rebuild"
+        );
+        let second = workspace.status(&[]);
+        assert_eq!(second["workspace"], "second", "{language:?}: the rebuild committed");
+
+        assert_eq!(report["workspace"], first["workspace"], "{language:?}: {report}");
+        assert_eq!(report["join_alignment"], first["join_alignment"], "{language:?}");
+        assert_eq!(report["discrepancies"], first["discrepancies"], "{language:?}");
+        assert_eq!(report["freshness"], "fresh", "{language:?}: {report}");
+        assert_eq!(report["files"], serde_json::json!([]), "{language:?}: {report}");
+    }
+}
+
+// _(Scenario: Counts appear without the file detail)_ — two edits and one creation are counted and
+// no file is named without `--detail`.
+#[test]
+fn status_counts_differences_without_naming_files() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        workspace.write("a", "two");
+        workspace.write("b", "two");
+        workspace.write("d", "one");
+        let report = workspace.status(&[]);
+        assert_eq!(
+            report["changed_files"],
+            serde_json::json!({ "changed": 2, "added": 1, "removed": 0 }),
+            "{language:?}: {report}"
+        );
+        assert!(
+            report.get("files").is_none(),
+            "{language:?}: no file is named: {report}"
+        );
+    }
+}
+
+// _(Scenario: A bare detail flag names the files)_ — `--detail` alone reports what `--detail files`
+// does.
+#[test]
+fn a_bare_detail_flag_means_the_file_detail() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        workspace.write("a", "two");
+        let bare = workspace.status(&["--detail"]);
+        assert_eq!(bare, workspace.status(&["--detail", "files"]), "{language:?}");
+        assert_eq!(listed_files(&bare).len(), 1, "{language:?}: {bare}");
+    }
+}
+
+// _(Scenario: A fresh index names no file; A fresh index names no reason)_ — an unchanged workspace
+// lists no file, carries no counts, and names no staleness reason in either rendering.
+#[test]
+fn a_fresh_index_names_no_file_and_no_reason() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        let report = workspace.status(&["--detail", "files"]);
+        assert!(listed_files(&report).is_empty(), "{language:?}: {report}");
+        assert!(report.get("changed_files").is_none(), "{language:?}: {report}");
+        assert_eq!(report["freshness"], "fresh", "{language:?}: {report}");
+        assert_eq!(report["stale_reasons"], serde_json::json!([]), "{language:?}: {report}");
+        let human = workspace.status_human(&["--detail", "files"]);
+        assert!(!human.contains("stale reasons"), "{language:?}: {human}");
+    }
+}
+
+// _(Scenario: A file that is not a source file is not named)_ — an edited README is neither named nor
+// a reason to read the index stale.
+#[test]
+fn an_edited_readme_is_not_named_and_the_index_stays_fresh() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        std::fs::write(workspace.dir.path().join("README.md"), "# edited\n").unwrap();
+        let report = workspace.status(&["--detail", "files"]);
+        assert!(listed_files(&report).is_empty(), "{language:?}: {report}");
+        assert_eq!(report["freshness"], "fresh", "{language:?}: {report}");
+    }
+}
+
+// _(Scenario: The human rendering names the files)_ — the human report names an edited file as
+// changed and a deleted one as removed.
+#[test]
+fn the_human_status_report_names_changed_and_removed_files() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        workspace.write("a", "two");
+        workspace.remove("c");
+        let human = workspace.status_human(&["--detail", "files"]);
+        assert!(
+            human.contains(&format!("changed: {}", workspace.file("a"))),
+            "{language:?}: {human}"
+        );
+        assert!(
+            human.contains(&format!("removed: {}", workspace.file("c"))),
+            "{language:?}: {human}"
+        );
+    }
+}
+
+// _(Scenario: Counts appear without the file detail)_ — the human report prints the count line when
+// content differs.
+#[test]
+fn the_human_status_report_prints_the_changed_files_count_line() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        workspace.write("a", "two");
+        workspace.write("d", "one");
+        let human = workspace.status_human(&[]);
+        assert!(
+            human
+                .lines()
+                .any(|l| l == "changed files: 1 changed, 1 added, 0 removed"),
+            "{language:?}: {human}"
+        );
+    }
+}
+
+// _(Scenario: The file list is bounded and resumable; A token is refused after further edits)_ — a
+// list longer than the limit truncates and discloses, its cursor returns the rest, and the cursor is
+// refused once another source file changes.
+#[test]
+fn a_long_file_list_is_paged_and_its_cursor_is_refused_after_further_edits() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        for name in ["a", "b", "c"] {
+            workspace.write(name, "two");
+        }
+        let first = workspace.status(&["--detail", "files", "--limit", "2"]);
+        assert_eq!(listed_files(&first).len(), 2, "{language:?}: {first}");
+        assert_eq!(first["page"]["truncated"], true, "{language:?}: {first}");
+        assert_eq!(first["page"]["total"], 3, "{language:?}: {first}");
+        let cursor = first["page"]["cursor"]
+            .as_str()
+            .expect("a truncated page carries a cursor");
+
+        let second = workspace.status(&["--detail", "files", "--limit", "2", "--cursor", cursor]);
+        assert_eq!(
+            listed_files(&second),
+            vec![(workspace.file("c"), "changed".to_string())],
+            "{language:?}: {second}"
+        );
+        assert_eq!(second["page"]["truncated"], false, "{language:?}: {second}");
+
+        let human = workspace.status_human(&["--detail", "files", "--limit", "2"]);
+        assert!(human.contains("(truncated)"), "{language:?}: {human}");
+        assert!(human.contains("--cursor"), "{language:?}: {human}");
+
+        workspace.write("d", "one");
+        let refused = workspace.run(&[
+            "--json", "status", "--detail", "files", "--limit", "2", "--cursor", cursor,
+        ]);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{language:?}: a stale token is a usage error"
+        );
+    }
+}
+
+// _(Scenario: A token is refused after further edits)_ — editing the content of a file that is
+// already listed adds and removes no file, yet the cursor is still refused.
+#[test]
+fn a_file_list_cursor_is_refused_after_a_content_only_edit() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        for name in ["a", "b", "c"] {
+            workspace.write(name, "two");
+        }
+        let first = workspace.status(&["--detail", "files", "--limit", "2"]);
+        let cursor = first["page"]["cursor"]
+            .as_str()
+            .expect("a truncated page carries a cursor");
+
+        workspace.write("a", "three");
+        let refused = workspace.run(&[
+            "--json", "status", "--detail", "files", "--limit", "2", "--cursor", cursor,
+        ]);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{language:?}: the token is a usage error after a content-only edit"
+        );
+    }
+}
+
+// _(Scenario: Content and analyzer both changed)_ — an edit plus a different analyzer version names
+// both reasons, in JSON and in the human report, and the single freshness value is the first.
+#[test]
+fn status_names_content_and_analyzer_reasons_when_both_changed() {
+    for language in support::LANGUAGES {
+        let workspace = StatusWorkspace::build(language);
+        workspace.write("a", "two");
+        let tool = match language {
+            Language::Rust => "rust-analyzer",
+            Language::Python => "scip-python",
+        };
+        support::write_indexing_stub(&workspace.dir.path().join(".stub-bin"), tool, "9.9.9");
+        let report = workspace.status(&[]);
+        assert_eq!(
+            report["stale_reasons"],
+            serde_json::json!(["stale_content", "stale_version"]),
+            "{language:?}: {report}"
+        );
+        assert_eq!(report["freshness"], "stale_content", "{language:?}: {report}");
+        let human = workspace.status_human(&[]);
+        assert!(
+            human.contains("stale reasons: stale_content, stale_version"),
+            "{language:?}: {human}"
+        );
+    }
+}
+
+// _(Scenario: Only the environment changed)_ — a drifted interpreter environment alone names only the
+// environment reason. The Rust backend declares no environment, so only Python can drift.
+#[test]
+fn status_names_only_the_environment_when_only_it_changed() {
+    let workspace = StatusWorkspace::build(Language::Python);
+    std::fs::create_dir(
+        workspace
+            .dir
+            .path()
+            .join(".venv/lib/python3.12/site-packages/bar-2.0.dist-info"),
+    )
+    .unwrap();
+    let report = workspace.status(&[]);
+    assert_eq!(
+        report["stale_reasons"],
+        serde_json::json!(["stale_environment"]),
+        "{report}"
+    );
+    let human = workspace.status_human(&[]);
+    assert!(human.contains("stale reasons: stale_environment"), "{human}");
 }

@@ -802,6 +802,15 @@ impl GraphStore {
         self.conn.unchecked_transaction()
     }
 
+    /// Begin a read snapshot: every store read made while the returned guard is alive sees one build.
+    ///
+    /// The journal mode is the default rollback journal, so a writer cannot commit while a reader
+    /// holds a snapshot open; a caller reads what it needs and drops the guard before any slow work.
+    /// The guard rolls back on drop, a no-op for reads.
+    pub fn read_snapshot(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.conn.unchecked_transaction()
+    }
+
     /// Delete every derived row — occurrences, edges, discrepancies, then symbols — so the running
     /// build wholly supersedes the prior one.
     ///
@@ -817,6 +826,30 @@ impl GraphStore {
         self.conn.execute("DELETE FROM semantic_corpus", [])?;
         self.conn.execute("DELETE FROM symbols", [])?;
         Ok(())
+    }
+
+    /// Replace the per-file fingerprints with `files`, `(document_path, content_hash)` pairs.
+    ///
+    /// Meant to run inside [`Self::begin_build`]'s transaction beside [`Self::write_metadata`], so
+    /// the fingerprints and the aggregate hash they sum to always describe the same build.
+    pub fn write_source_files(&self, files: &[(String, String)]) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM source_files", [])?;
+        let mut stmt = self
+            .conn
+            .prepare("INSERT INTO source_files (document_path, content_hash) VALUES (?1, ?2)")?;
+        for (document_path, content_hash) in files {
+            stmt.execute(params![document_path, content_hash])?;
+        }
+        Ok(())
+    }
+
+    /// Every recorded `(document_path, content_hash)` pair, ordered by path.
+    pub fn source_files(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT document_path, content_hash FROM source_files ORDER BY document_path")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
     }
 
     /// Replace the index metadata row with the given build's metadata.
@@ -1974,7 +2007,8 @@ impl GraphStore {
 }
 
 /// Evaluate one metadata value's freshness against the sources' current content hash, the analyzer
-/// in effect, and the declared environment in effect.
+/// in effect, and the declared environment in effect: the first of [`stale_reasons_of`], or fresh
+/// when none applies.
 ///
 /// Pure over the metadata it is handed, so a caller that already read the metadata — the build's
 /// currency check — compares every field from that one read rather than racing a second read
@@ -1985,21 +2019,34 @@ pub fn freshness_of(
     current: &AnalyzerProvenance,
     current_environment: Option<&EnvironmentFacts>,
 ) -> Freshness {
-    // Content change takes precedence in reporting; version change flags reindex.
+    stale_reasons_of(meta, current_hash, current, current_environment)
+        .first()
+        .copied()
+        .unwrap_or(Freshness::Fresh)
+}
+
+/// Every reason the index is stale, in the order content, version, environment; empty when fresh.
+pub fn stale_reasons_of(
+    meta: &IndexMetadata,
+    current_hash: &str,
+    current: &AnalyzerProvenance,
+    current_environment: Option<&EnvironmentFacts>,
+) -> Vec<Freshness> {
+    let mut reasons = Vec::new();
     if meta.content_hash != current_hash {
-        return Freshness::StaleContent;
+        reasons.push(Freshness::StaleContent);
     }
     if meta.provenance.analyzer_version != current.analyzer_version
         || meta.provenance.analyzer_name != current.analyzer_name
     {
-        return Freshness::StaleVersion;
+        reasons.push(Freshness::StaleVersion);
     }
     // The whole declared environment must match, absence included: a recorded environment that
     // can no longer be resolved is drift, never reported fresh.
     if meta.environment.as_ref() != current_environment {
-        return Freshness::StaleEnvironment;
+        reasons.push(Freshness::StaleEnvironment);
     }
-    Freshness::Fresh
+    reasons
 }
 
 /// The schema version stamped in a store's `PRAGMA user_version` (0 for an unstamped store).
@@ -2735,6 +2782,65 @@ mod tests {
             accounting: JoinAccounting::default(),
             environment: None,
             chunk_params: ChunkParams::default(),
+        }
+    }
+
+    fn environment_facts(fingerprint: &str) -> EnvironmentFacts {
+        EnvironmentFacts {
+            interpreter_version: "Python 3.12".to_string(),
+            environment_path: "/env".to_string(),
+            package_fingerprint: fingerprint.to_string(),
+        }
+    }
+
+    // Every applicable reason is reported, in the order content, version, environment, and the
+    // single freshness value is always the first of them.
+    #[test]
+    fn stale_reasons_list_every_applicable_reason_and_freshness_is_the_first() {
+        let recorded = IndexMetadata {
+            environment: Some(environment_facts("a")),
+            ..plain_metadata()
+        };
+        let same_provenance = recorded.provenance.clone();
+        let other_provenance = AnalyzerProvenance {
+            analyzer_name: "test".to_string(),
+            analyzer_version: "1".to_string(),
+        };
+        let same_environment = environment_facts("a");
+        let other_environment = environment_facts("b");
+
+        let cases = [
+            (
+                "other",
+                &other_provenance,
+                Some(&same_environment),
+                vec![Freshness::StaleContent, Freshness::StaleVersion],
+            ),
+            (
+                "hash",
+                &same_provenance,
+                Some(&other_environment),
+                vec![Freshness::StaleEnvironment],
+            ),
+            ("hash", &same_provenance, Some(&same_environment), vec![]),
+            (
+                "other",
+                &other_provenance,
+                Some(&other_environment),
+                vec![
+                    Freshness::StaleContent,
+                    Freshness::StaleVersion,
+                    Freshness::StaleEnvironment,
+                ],
+            ),
+        ];
+        for (hash, provenance, environment, expected) in cases {
+            let reasons = stale_reasons_of(&recorded, hash, provenance, environment);
+            assert_eq!(reasons, expected);
+            assert_eq!(
+                freshness_of(&recorded, hash, provenance, environment),
+                expected.first().copied().unwrap_or(Freshness::Fresh)
+            );
         }
     }
 

@@ -211,7 +211,7 @@ impl From<OrderArg> for OrderMode {
 
 /// The result-set paging bounds shared by the query commands (`get`, `trace`, `find`). Defined
 /// per-command rather than globally so clap rejects them on commands they are meaningless for
-/// (`build`, `status`, `doctor`, `cache`, `manifest`) as a usage error before any side effect.
+/// (`build`, `doctor`, `cache`, `manifest`) as a usage error before any side effect.
 #[derive(Debug, Args)]
 pub struct PageArgs {
     /// Cap the number of results a result-bearing answer returns. Defaults to 25; `0` means
@@ -470,6 +470,30 @@ pub struct StatusArgs {
     /// the per-group detail.
     #[arg(long)]
     pub duplicates: bool,
+
+    /// Name each source file that differs from the index. The only value is `files`, which a bare
+    /// `--detail` also means.
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "files")]
+    pub detail: Option<StatusDetail>,
+
+    #[command(flatten)]
+    pub paging: PageArgs,
+}
+
+/// The detail kinds `status --detail` can add.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum StatusDetail {
+    /// Each source file that differs from the index, with how it differs.
+    Files,
+}
+
+impl StatusDetail {
+    /// The value name the file list's continuation token binds.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+        }
+    }
 }
 
 /// The language backend selector for `build`: overrides manifest detection.

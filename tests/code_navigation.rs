@@ -3865,8 +3865,20 @@ fn status_output_in(
     json: bool,
     position: silent_cartographer::cli::PositionUnit,
 ) -> String {
-    silent_cartographer::commands::run_status(db, dir, "not-a-real-analyzer", json, true, false, true, position)
-        .unwrap()
+    silent_cartographer::commands::run_status(
+        db,
+        dir,
+        "not-a-real-analyzer",
+        json,
+        true,
+        false,
+        true,
+        position,
+        None,
+        25,
+        None,
+    )
+    .unwrap()
 }
 
 // _(Scenario: The status report names the refresh command)_ — a stale index's status carries the same
@@ -3999,6 +4011,9 @@ fn the_human_status_discrepancy_listing_names_each_row_by_line_and_column() {
             true,
             false,
             silent_cartographer::cli::PositionUnit::Line,
+            None,
+            25,
+            None,
         )
         .unwrap()
     };
@@ -4542,6 +4557,7 @@ fn a_get_at_cursor_is_refused_under_the_other_position_unit() {
             max_lines: None,
             from: Some(1),
             position_unit: Some("line"),
+            source_hash: None,
             index_hash: format!(
                 "{}\u{1f}{}\u{1f}{}",
                 metadata.content_hash, metadata.provenance.analyzer_name, metadata.provenance.analyzer_version

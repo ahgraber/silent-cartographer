@@ -8322,6 +8322,36 @@ fn a_definition_span_on_line_three_starts_at_column_one_and_ends_after_the_brace
     assert_eq!((span.end.line, span.end.column), (3, 15));
 }
 
+#[test]
+fn source_file_rows_equal_the_analyzed_files_and_sum_to_the_aggregate_hash() {
+    let py_sources = support::python_fixture_sources();
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(
+        &mut store,
+        &py_ws(),
+        Some(WS_ROOT),
+        &support::python_fixture_index(),
+        &py_sources,
+    )
+    .unwrap();
+
+    let mut expected: Vec<(String, String)> = py_sources
+        .iter()
+        .map(|(path, text)| (path.clone(), silent_cartographer::graph::text_hash(text)))
+        .collect();
+    expected.sort();
+    assert_eq!(expected.len(), 3);
+    assert_eq!(
+        silent_cartographer::graph::text_hash("abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(store.source_files().unwrap(), expected);
+    assert_eq!(
+        store.read_metadata().unwrap().unwrap().content_hash,
+        content_hash(&py_sources)
+    );
+}
+
 // _(Recorded declarations carry their header end)_ — the build records where each symbol's header
 // ends, and the byte offset and the line and column denote the same position.
 

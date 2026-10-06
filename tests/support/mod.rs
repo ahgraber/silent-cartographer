@@ -307,6 +307,9 @@ pub fn python_fixture_sources() -> Vec<(String, String)> {
 /// with — writes an empty file at `<path>` and exits successfully. An empty SCIP index is a valid one
 /// (zero documents), so this lets a real `c10r build` run to completion without a real analyzer
 /// available in this sandbox.
+///
+/// A file named `on_version` next to the stub is run as a shell script once, at the next `--version`
+/// probe, then set aside.
 pub fn write_indexing_stub(dir: &std::path::Path, name: &str, version: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -315,7 +318,12 @@ pub fn write_indexing_stub(dir: &std::path::Path, name: &str, version: &str) -> 
         &path,
         format!(
             "#!/bin/sh\n\
-             if [ \"$1\" = \"--version\" ]; then\n  echo \"{version}\"\n  exit 0\nfi\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+             \x20 if [ -f \"$(dirname \"$0\")/on_version\" ]; then\n\
+             \x20   mv \"$(dirname \"$0\")/on_version\" \"$(dirname \"$0\")/on_version.ran\"\n\
+             \x20   . \"$(dirname \"$0\")/on_version.ran\"\n\
+             \x20 fi\n\
+             \x20 echo \"{version}\"\n  exit 0\nfi\n\
              while [ $# -gt 0 ]; do\n\
              \x20 if [ \"$1\" = \"--output\" ]; then\n    : > \"$2\"\n    exit 0\n  fi\n\
              \x20 shift\n\

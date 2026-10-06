@@ -611,6 +611,25 @@
           "global": false
         },
         {
+          "name": "detail",
+          "takes_value": true,
+          "values": [
+            "files"
+          ],
+          "global": false
+        },
+        {
+          "name": "limit",
+          "takes_value": true,
+          "default": "25",
+          "global": false
+        },
+        {
+          "name": "cursor",
+          "takes_value": true,
+          "global": false
+        },
+        {
           "name": "db",
           "takes_value": true,
           "default": ".c10r/index.db",

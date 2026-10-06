@@ -27,8 +27,9 @@
 /// `method`, and names a Python module by its module name rather than `__init__` (both stored
 /// columns, and both inputs to the passage render, so the corpus definition version moved with it)
 /// and records each location's line and column beside its byte offsets (`symbols`, `occurrences`,
-/// `join_discrepancies`) and where each symbol's header ends (`symbols`), and computes the aggregate
-/// content hash with each path and text length-prefixed;
+/// `join_discrepancies`), each analyzed file's content hash (`source_files`), and where each symbol's
+/// header ends (`symbols`), and computes the aggregate content hash with each path and text
+/// length-prefixed;
 /// version 16 replaced the twelve `aligned_*_count` columns with a single keyed
 /// `aligned_counts` JSON object, retiring the per-rule column, read, and write edits a new rule
 /// used to require;
@@ -84,6 +85,13 @@ CREATE TABLE IF NOT EXISTS index_metadata (
     semantic_only_count            INTEGER NOT NULL DEFAULT 0,
     duplicate_ambiguous_count      INTEGER NOT NULL DEFAULT 0,
     syntax_only_count              INTEGER NOT NULL DEFAULT 0
+);
+
+-- One row per analyzed source file: the SHA-256 of the file's text, written in the same transaction
+-- as the index metadata from the same source list the aggregate `content_hash` covers.
+CREATE TABLE IF NOT EXISTS source_files (
+    document_path  TEXT PRIMARY KEY,
+    content_hash   TEXT NOT NULL
 );
 
 -- One row per persisted symbol. `class` is 'in_workspace' or 'external'; externals carry identity

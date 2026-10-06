@@ -10,21 +10,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 
-use crate::cli::PositionUnit;
+use crate::cli::{PositionUnit, StatusDetail};
 use crate::exit::Failure;
 use crate::git::{GitError, GitRepo, SeedMode};
 use crate::graph::chunk::ChunkParams;
 use crate::graph::join::JoinAccounting;
 use crate::graph::range::LineColumn;
-use crate::graph::store::{Freshness, GraphStore, IndexMetadata, StoreOpenError};
+use crate::graph::store::{Freshness, GraphStore, IndexMetadata, StoreOpenError, stale_reasons_of};
 use crate::graph::syntax::Language;
-use crate::graph::{content_hash, ingest};
+use crate::graph::{SourceChange, compare_source_files, content_hash, ingest, text_hash};
 use crate::identity::WorkspaceId;
 use crate::query::diff::{self, FileChange};
 use crate::query::impact::{ImpactRequest, shell_quote};
-use crate::query::output::{Answer, LineColumns, WorkspaceRelation};
+use crate::query::output::{Answer, FreshnessLabel, LineColumns, WorkspaceRelation};
 use crate::query::page::{
-    OrderingIdentity, PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination,
+    OrderingIdentity, PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination, page_rows,
     precheck_cursor,
 };
 use crate::query::resolve::SourcePosition;
@@ -240,22 +240,28 @@ fn open_query_store(db: &Path) -> Result<GraphStore> {
 /// state — one the marker labels and a rebuild clears. A root that cannot be canonicalized leaves the
 /// comparison unevaluable, which is disclosed as unknown rather than passed off as a match.
 fn workspace_relation(store: &GraphStore, root: &Path) -> Result<Option<WorkspaceRelation>> {
+    Ok(relation_to_root(store.read_metadata()?.as_ref(), root))
+}
+
+/// [`workspace_relation`] over metadata already read, so a caller holding one snapshot of the store
+/// compares the root that snapshot recorded.
+fn relation_to_root(recorded: Option<&IndexMetadata>, root: &Path) -> Option<WorkspaceRelation> {
     // Every arm that cannot produce an exact comparison lands on `Unknown`: no recorded build, no
     // recorded root, a root that will not resolve, or either side unrepresentable as text. Only an
     // exact match returns "no marker", so nothing is ever passed off as matched by default.
-    let Some(recorded_root) = store.read_metadata()?.and_then(|meta| meta.workspace_root) else {
-        return Ok(Some(WorkspaceRelation::Unknown));
+    let Some(recorded_root) = recorded.and_then(|meta| meta.workspace_root.clone()) else {
+        return Some(WorkspaceRelation::Unknown);
     };
     let Ok(current) = std::fs::canonicalize(root) else {
-        return Ok(Some(WorkspaceRelation::Unknown));
+        return Some(WorkspaceRelation::Unknown);
     };
     let Some(current) = current.to_str() else {
-        return Ok(Some(WorkspaceRelation::Unknown));
+        return Some(WorkspaceRelation::Unknown);
     };
     if current == recorded_root {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(WorkspaceRelation::Mismatched { recorded_root }))
+    Some(WorkspaceRelation::Mismatched { recorded_root })
 }
 
 /// The provenance, source hash, and declared environment currently in effect for a workspace root,
@@ -267,7 +273,27 @@ fn current_state(
     root: &Path,
     rust_analyzer: &str,
 ) -> Result<(AnalyzerProvenance, String, Option<EnvironmentFacts>)> {
-    let recorded = store.read_metadata()?;
+    let (provenance, hash, environment, _sources) = observe_state(store, root, rust_analyzer)?;
+    Ok((provenance, hash, environment))
+}
+
+/// [`current_state`]'s values plus the `(document_path, text)` sources discovery found.
+type ObservedState = (
+    AnalyzerProvenance,
+    String,
+    Option<EnvironmentFacts>,
+    Vec<(String, String)>,
+);
+
+/// [`current_state`] together with the sources discovery found, so a caller that also needs the files
+/// compares the same observation the hash was computed from.
+fn observe_state(store: &GraphStore, root: &Path, rust_analyzer: &str) -> Result<ObservedState> {
+    observe_state_from(store.read_metadata()?, root, rust_analyzer)
+}
+
+/// [`observe_state`] against metadata already read, so a caller holding one snapshot of the store
+/// observes the workspace against the build that snapshot recorded.
+fn observe_state_from(recorded: Option<IndexMetadata>, root: &Path, rust_analyzer: &str) -> Result<ObservedState> {
     // A recorded analyzer decides the language through the one dispatch, so an unrecognized one is
     // refused here as it is at build time. No recorded index at all is not that case: there is no
     // analyzer to read, and the Rust collection is the default a first build assumes.
@@ -313,7 +339,7 @@ fn current_state(
                     .expect("python identity implies metadata")
             }
         };
-        return Ok((provenance, hash, environment));
+        return Ok((provenance, hash, environment, sources));
     }
 
     let sources = collect_rust_sources(root)?;
@@ -332,7 +358,7 @@ fn current_state(
             })
         }
     };
-    Ok((provenance, hash, None))
+    Ok((provenance, hash, None, sources))
 }
 
 /// `db` made absolute against the current process's working directory when given relative — the
@@ -779,6 +805,11 @@ pub fn build_from_index(
 /// `status`: report provenance, freshness, and the join-alignment counts. With `discrepancies`, add
 /// the bounded grouped discrepancy summary; with `all`, add every persisted discrepancy row instead.
 /// With `duplicates`, add the duplicated-descriptor group detail; the group count is always reported.
+///
+/// Every staleness reason is reported, and while the source content differs from the index the counts
+/// of changed, added, and removed files. With `detail`, the differing files are listed, `limit` per
+/// page (`0` is unbounded) and resumed through `cursor`. One discovery pass of the recorded backend's
+/// sources feeds the freshness, the counts, the list, and the continuation token's identity.
 #[allow(clippy::too_many_arguments)] // the CLI's flat command surface travels together
 pub fn run_status(
     db: &Path,
@@ -789,16 +820,41 @@ pub fn run_status(
     all: bool,
     duplicates: bool,
     position: PositionUnit,
+    detail: Option<StatusDetail>,
+    limit: usize,
+    cursor: Option<&str>,
 ) -> Result<String> {
+    let effective_limit = (limit != 0).then_some(limit);
+    if cursor.is_some() && detail.is_none() {
+        return Err(Failure::Usage(
+            "--cursor resumes the file list; add --detail files, or re-issue without --cursor".to_string(),
+        )
+        .into());
+    }
+    precheck_cursor(cursor, effective_limit)?;
     let store = open_query_store(db)?;
+    // Every stored value the report uses is read here, from one build, before discovery and the
+    // analyzer probe run; a build committing while they run cannot mix its values into the report.
+    let snapshot = store.read_snapshot()?;
     let Some(meta) = store.read_metadata()? else {
         return Err(Failure::NoIndex(format!("no index built at {}; run `c10r build` first", db.display())).into());
     };
-    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
-    let freshness = store
-        .freshness(&hash, &provenance, environment.as_ref())?
-        .expect("metadata present");
+    let recorded_files = store.source_files()?;
     let duplicated_groups = store.duplicated_groups()?;
+    let index_hash = index_hash_of(Some(&meta));
+    let semantic_identity = store.semantic_index_identity()?;
+    let relation = relation_to_root(Some(&meta), root);
+    let discrepancy_rows = if all { Some(store.all_discrepancies()?) } else { None };
+    let discrepancy_summary = if discrepancies && !all {
+        Some(store.discrepancy_summary()?)
+    } else {
+        None
+    };
+    drop(snapshot);
+
+    let (provenance, hash, environment, sources) = observe_state_from(Some(meta.clone()), root, rust_analyzer)?;
+    let reasons = stale_reasons_of(&meta, &hash, &provenance, environment.as_ref());
+    let freshness = reasons.first().copied().unwrap_or(Freshness::Fresh);
 
     let mut report = serde_json::json!({
         "workspace": meta.workspace_id.as_str(),
@@ -812,6 +868,7 @@ pub fn run_status(
             crate::graph::store::Freshness::StaleVersion => "stale_version",
             crate::graph::store::Freshness::StaleEnvironment => "stale_environment",
         },
+        "stale_reasons": reasons.iter().copied().map(FreshnessLabel::from).collect::<Vec<_>>(),
         "stale": freshness.is_stale(),
         "join_alignment": {
             // Per-rule acceptance buckets alongside the refusal counts, from the same walk over the
@@ -831,9 +888,44 @@ pub fn run_status(
         report["refresh"] = serde_json::json!(refresh_command(&meta, db, environment.as_ref()));
     }
 
+    let discovered: Vec<(String, String)> = sources
+        .iter()
+        .map(|(path, text)| (path.clone(), text_hash(text)))
+        .collect();
+    let differences = compare_source_files(&recorded_files, &discovered);
+    if reasons.contains(&Freshness::StaleContent) {
+        let count = |change| differences.iter().filter(|d| d.change == change).count();
+        report["changed_files"] = serde_json::json!({
+            "changed": count(SourceChange::Changed),
+            "added": count(SourceChange::Added),
+            "removed": count(SourceChange::Removed),
+        });
+    }
+    if let Some(detail) = detail {
+        let identity = PageIdentity {
+            command: "status",
+            reference: String::new(),
+            relation: None,
+            detail: Some(detail.label()),
+            depth: None,
+            ordering: None,
+            limit: effective_limit,
+            max_lines: None,
+            from: None,
+            position_unit: None,
+            source_hash: Some(hash),
+            index_hash,
+        };
+        let (files, page) = page_rows(differences, effective_limit, cursor, &identity)?;
+        report["files"] = serde_json::to_value(files)?;
+        if let Some(page) = page {
+            report["page"] = serde_json::to_value(page)?;
+        }
+    }
+
     // The semantic-index identity in effect at build time, the chunk parameters included, rides
     // status as provenance beside the analyzer's.
-    if let Some(identity) = store.semantic_index_identity()? {
+    if let Some(identity) = semantic_identity {
         report["semantic_index"] = serde_json::json!({
             "model_identity": identity.model_identity,
             "corpus_definition_version": identity.corpus_definition_version,
@@ -845,7 +937,7 @@ pub fn run_status(
     // The workspace-relationship disclosure rides beside freshness, exactly as it does on a query
     // answer: absent on a match, present otherwise. `workspace` above is the store's display
     // identity, which is never what the comparison turns on.
-    if let Some(relation) = workspace_relation(&store, root)? {
+    if let Some(relation) = relation {
         report["workspace_relation"] = serde_json::to_value(&relation)?;
     }
 
@@ -873,8 +965,7 @@ pub fn run_status(
         );
     }
 
-    if all {
-        let rows = store.all_discrepancies()?;
+    if let Some(rows) = discrepancy_rows {
         report["discrepancies"] = serde_json::json!({
             "listing": "all",
             "rows": rows
@@ -897,8 +988,7 @@ pub fn run_status(
                 })
                 .collect::<Vec<_>>(),
         });
-    } else if discrepancies {
-        let summary = store.discrepancy_summary()?;
+    } else if let Some(summary) = discrepancy_summary {
         report["discrepancies"] = serde_json::json!({
             "listing": "summary",
             "truncated": summary.truncated(),
@@ -975,9 +1065,19 @@ fn render_status_report(report: &serde_json::Value, position: PositionUnit) -> S
         ),
         format!("freshness: {}", status_text(&report["freshness"])),
     ];
+    let reasons: Vec<String> = report["stale_reasons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(status_text)
+        .collect();
+    if !reasons.is_empty() {
+        lines.push(format!("stale reasons: {}", reasons.join(", ")));
+    }
     if let Some(refresh) = report.get("refresh") {
         lines.push(format!("refresh: {}", status_text(refresh)));
     }
+    lines.extend(render_status_files(report));
     if let Some(relation) = report.get("workspace_relation") {
         let recorded = relation
             .get("recorded_root")
@@ -1032,6 +1132,40 @@ fn render_status_report(report: &serde_json::Value, position: PositionUnit) -> S
         lines.extend(render_status_discrepancies(discrepancies, position));
     }
     lines.join("\n")
+}
+
+/// The changed-file section of [`render_status_report`]: the counts, then one `change: path` line per
+/// listed file with the page disclosure and the cursor that resumes the next page.
+fn render_status_files(report: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(counts) = report.get("changed_files") {
+        lines.push(format!(
+            "changed files: {} changed, {} added, {} removed",
+            status_text(&counts["changed"]),
+            status_text(&counts["added"]),
+            status_text(&counts["removed"])
+        ));
+    }
+    for file in report["files"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "{}: {}",
+            status_text(&file["change"]),
+            status_text(&file["document_path"])
+        ));
+    }
+    if let Some(page) = report.get("page") {
+        lines.push(format!(
+            "page {}: {} of {} files{}",
+            status_text(&page["page_index"]),
+            status_text(&page["returned"]),
+            status_text(&page["total"]),
+            if page["truncated"] == true { " (truncated)" } else { "" }
+        ));
+        if let Some(cursor) = page.get("cursor") {
+            lines.push(format!("  resume with --cursor {}", status_text(cursor)));
+        }
+    }
+    lines
 }
 
 /// The discrepancy section of [`render_status_report`]: the bounded summary's groups, or every row.
@@ -1264,6 +1398,7 @@ pub fn run_get(
         max_lines: effective_max_lines,
         from: Some(from),
         position_unit: at.map(|_| position.label()),
+        source_hash: None,
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1353,6 +1488,7 @@ pub fn run_trace(
         max_lines: effective_max_lines,
         from: None,
         position_unit: None,
+        source_hash: None,
         index_hash,
     };
     // The relation decides which engine method answers it. `dependents` is the one whose answer does
@@ -1416,6 +1552,7 @@ pub fn run_find(
         max_lines: None,
         from: None,
         position_unit: None,
+        source_hash: None,
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1471,6 +1608,7 @@ pub fn run_search(
         max_lines: effective_max_lines,
         from: None,
         position_unit: None,
+        source_hash: None,
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1544,6 +1682,7 @@ pub fn run_similar(
         max_lines: effective_max_lines,
         from: None,
         position_unit: at.map(|_| position.label()),
+        source_hash: None,
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1782,6 +1921,7 @@ pub fn run_impact(
         max_lines: None,
         from: None,
         position_unit: None,
+        source_hash: None,
         index_hash: page_index_hash,
     };
     // Every impact answer carries the ordering disclosure, whatever its outcome.
@@ -2601,15 +2741,19 @@ fn hex_sha256(text: &str) -> String {
 /// sources — invalidates in-flight cursors. Absent metadata yields an empty identity — the query
 /// still runs, and a token cannot outlive a since-built index it was never paired with.
 fn recorded_index_hash(store: &GraphStore) -> Result<String> {
-    Ok(store
-        .read_metadata()?
+    Ok(index_hash_of(store.read_metadata()?.as_ref()))
+}
+
+/// [`recorded_index_hash`] over metadata already read.
+fn index_hash_of(metadata: Option<&IndexMetadata>) -> String {
+    metadata
         .map(|m| {
             format!(
                 "{}\u{1f}{}\u{1f}{}",
                 m.content_hash, m.provenance.analyzer_name, m.provenance.analyzer_version
             )
         })
-        .unwrap_or_default())
+        .unwrap_or_default()
 }
 
 /// The modal teaching error for a content bound (`--max-lines`/`--from`) supplied when no
