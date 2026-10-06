@@ -24,7 +24,7 @@ use crate::semantic::rust_adapter::RustAdapter;
 
 use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join, module_by_document};
 use prepared::PreparedCorpus;
-use range::ByteSpan;
+use range::{ByteSpan, LineColumnSpan, PositionIndex};
 use store::{
     DiscrepancyRow, EdgeKind, Freshness, GraphStore, IndexMetadata, OccurrenceRow, PersistedClass, SymbolRow,
 };
@@ -190,6 +190,16 @@ pub fn ingest_with_params(
 
     let content = content_hash(sources);
 
+    // Line and column come from the same text that produced each byte span, so the two forms of a
+    // location always denote the same position.
+    let position_indexes: HashMap<&str, PositionIndex<'_>> = sources
+        .iter()
+        .map(|(path, text)| (path.as_str(), PositionIndex::new(text)))
+        .collect();
+    let line_column = |document: &str, start: usize, end: usize| -> Option<LineColumnSpan> {
+        position_indexes.get(document)?.span(start, end)
+    };
+
     // Map each in-workspace symbol's aligned definition to its name-span, so enclosure and
     // attribution can name enclosing declarations by identity.
     let mut def_name_span: HashMap<CanonicalId, (String, ByteSpan)> = HashMap::new();
@@ -352,6 +362,17 @@ pub fn ingest_with_params(
                 .as_ref()
                 .is_some_and(|d| definition_count_by_descriptor.get(d).copied().unwrap_or(0) > 1);
         let content = definition_content(sym, id, &def_name_span, &prepared);
+        let symbol_line_column = match (&content.document_path, content.span) {
+            (Some(document), Some((start, end))) => line_column(document, start, end),
+            _ => None,
+        };
+        let symbol_header_end = match (&content.document_path, content.header_end) {
+            (Some(document), Some(offset)) => position_indexes
+                .get(document.as_str())
+                .and_then(|index| index.position(offset))
+                .map(|at| (offset, at)),
+            _ => None,
+        };
         symbol_rows.push(SymbolRow {
             canonical_id: id.clone(),
             display_name,
@@ -359,6 +380,8 @@ pub fn ingest_with_params(
             class,
             document_path: content.document_path,
             span: content.span,
+            line_column: symbol_line_column,
+            header_end: symbol_header_end,
             span_text: content.span_text,
             signature_text: content.signature_text,
             interface_text: content.interface_text,
@@ -412,6 +435,7 @@ pub fn ingest_with_params(
             symbol_id: aligned.symbol.clone(),
             document_path: aligned.document_path.clone(),
             span: (aligned.name_span.start, aligned.name_span.end),
+            line_column: line_column(&aligned.document_path, aligned.name_span.start, aligned.name_span.end),
             role: role.to_string(),
             rule: aligned.rule.tag().to_string(),
             enclosing_id,
@@ -540,6 +564,7 @@ pub fn ingest_with_params(
         .map(|occ| DiscrepancyRow {
             document_path: occ.document_path.clone(),
             span: occ.span.map(|s| (s.start, s.end)),
+            line_column: occ.span.and_then(|s| line_column(&occ.document_path, s.start, s.end)),
             outcome: occ.outcome.tag().to_string(),
             expected_name: occ.expected_name.clone(),
             found_text: occ.found_text.clone(),
@@ -710,12 +735,13 @@ pub fn join_guarded(
     ingest(store, workspace, workspace_root, index, sources)
 }
 
-/// The definition content persisted for a symbol: its document, byte span, and the body/signature/
-/// interface tier text. All fields default to `None` (no document, no persisted content).
+/// The definition content persisted for a symbol: its document, byte span, the byte offset where its
+/// header ends (none for a document's own module), and the body/signature/interface tier text. All fields default to `None` (no document, no persisted content).
 #[derive(Default)]
 struct DefinitionContent {
     document_path: Option<String>,
     span: Option<(usize, usize)>,
+    header_end: Option<usize>,
     span_text: Option<String>,
     signature_text: Option<String>,
     interface_text: Option<String>,
@@ -736,6 +762,9 @@ struct DefinitionContent {
 /// alike — the honest, total degradation for a shape the declaration walk did not recognize. An
 /// external symbol, or an in-workspace symbol whose document carries no source, persists no
 /// content.
+///
+/// The header end is the signature tier's cut at the body delimiter for a recognized declaration,
+/// and the span's end for a symbol stored with its name span.
 fn definition_content(
     sym: &ExtractedSymbol,
     id: &CanonicalId,
@@ -762,6 +791,7 @@ fn definition_content(
         return DefinitionContent {
             document_path: Some(doc.clone()),
             span: Some((decl.full_span.start, decl.full_span.end)),
+            header_end: Some(tiers.header_end),
             span_text: text,
             signature_text: Some(tiers.signature),
             interface_text: Some(tiers.interface),
@@ -777,6 +807,7 @@ fn definition_content(
         return DefinitionContent {
             document_path: Some(doc.clone()),
             span: Some((0, source.len())),
+            header_end: None,
             span_text: Some(source.to_string()),
             signature_text: Some(qualified.to_string()),
             interface_text: Some(interface),
@@ -787,6 +818,7 @@ fn definition_content(
     DefinitionContent {
         document_path: Some(doc.clone()),
         span: Some((name_span.start, name_span.end)),
+        header_end: Some(name_span.end),
         span_text: text.clone(),
         signature_text: text.clone(),
         interface_text: text,

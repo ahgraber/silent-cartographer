@@ -725,6 +725,8 @@ fn put_symbol(store: &GraphStore, name: &str) {
             class: PersistedClass::InWorkspace,
             document_path: None,
             span: None,
+            line_column: None,
+            header_end: None,
             span_text: None,
             signature_text: None,
             interface_text: None,
@@ -1307,6 +1309,8 @@ fn tier_content_round_trips_and_nulls_read_back_as_absent() {
             class: PersistedClass::InWorkspace,
             document_path: Some("m.rs".to_string()),
             span: Some((0, 10)),
+            line_column: None,
+            header_end: None,
             span_text: Some("fn with_tiers() {}".to_string()),
             signature_text: Some("fn with_tiers()".to_string()),
             interface_text: Some("/// docs\nfn with_tiers()".to_string()),
@@ -1323,6 +1327,8 @@ fn tier_content_round_trips_and_nulls_read_back_as_absent() {
             class: PersistedClass::InWorkspace,
             document_path: Some("m.rs".to_string()),
             span: Some((20, 30)),
+            line_column: None,
+            header_end: None,
             span_text: Some("fn without_tiers() {}".to_string()),
             signature_text: None,
             interface_text: None,
@@ -1354,6 +1360,8 @@ fn test_rule_round_trips_and_null_reads_back_as_non_test() {
             class: PersistedClass::InWorkspace,
             document_path: Some("m.rs".to_string()),
             span: Some((0, 10)),
+            line_column: None,
+            header_end: None,
             span_text: None,
             signature_text: None,
             interface_text: None,
@@ -1370,6 +1378,8 @@ fn test_rule_round_trips_and_null_reads_back_as_non_test() {
             class: PersistedClass::InWorkspace,
             document_path: Some("m.rs".to_string()),
             span: Some((20, 30)),
+            line_column: None,
+            header_end: None,
             span_text: None,
             signature_text: None,
             interface_text: None,
@@ -7951,4 +7961,593 @@ fn classification_does_not_alter_attribution_or_edges() {
         Some("test_attribute")
     );
     assert_eq!(rule_of(&plain_store, "c", &[("caller", SegmentKind::Method)]), None);
+}
+
+// _(Recorded locations carry line and column)_ — the build records each location's line and column
+// beside its byte offsets, and both forms denote the same positions.
+
+/// The byte offset of 1-based `(line, column)` in `text`, counting lines and columns the way an
+/// editor does: lines end at LF, CRLF, or a lone CR, and a column is one Unicode character. An
+/// independent oracle for the converter the build uses.
+fn byte_at(text: &str, line: i64, column: i64) -> usize {
+    let bytes = text.as_bytes();
+    let (mut l, mut c) = (1, 1);
+    for (offset, ch) in text.char_indices() {
+        if (l, c) == (line, column) {
+            return offset;
+        }
+        match ch {
+            '\r' if bytes.get(offset + 1) == Some(&b'\n') => c += 1,
+            '\r' | '\n' => (l, c) = (l + 1, 1),
+            _ => c += 1,
+        }
+    }
+    assert_eq!((l, c), (line, column), "position {line}:{column} is not in the text");
+    text.len()
+}
+
+/// `(document_path, span, line_column)` for every row of `table`, read from the store file.
+type StoredLocation = (String, Option<(i64, i64)>, Option<[i64; 4]>);
+
+fn stored_locations(db: &std::path::Path, table: &str) -> Vec<StoredLocation> {
+    let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT document_path, span_start, span_end, start_line, start_column, end_line, end_column
+             FROM {table}"
+        ))
+        .unwrap();
+    stmt.query_map([], |r| {
+        let span = match (r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
+        };
+        let line_column = match (
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+        ) {
+            (Some(a), Some(b), Some(c), Some(d)) => Some([a, b, c, d]),
+            _ => None,
+        };
+        Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), span, line_column))
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// Assert every stored location's line and column denote its byte offsets in `sources`, and that
+/// a location without byte offsets has no line and column. Returns how many locations carried both.
+fn assert_locations_agree(rows: &[StoredLocation], sources: &[(String, String)]) -> usize {
+    let mut located = 0;
+    for (document, span, line_column) in rows {
+        match (span, line_column) {
+            (Some((start, end)), Some([sl, sc, el, ec])) => {
+                let text = &sources
+                    .iter()
+                    .find(|(p, _)| p == document)
+                    .expect("document in sources")
+                    .1;
+                assert_eq!(byte_at(text, *sl, *sc) as i64, *start, "start of {document}");
+                assert_eq!(byte_at(text, *el, *ec) as i64, *end, "end of {document}");
+                located += 1;
+            }
+            (None, None) => {}
+            other => panic!("byte offsets and line/column disagree on presence in {document}: {other:?}"),
+        }
+    }
+    located
+}
+
+fn ingest_into_file(
+    dir: &std::path::Path,
+    workspace: &WorkspaceId,
+    index: &ExtractedIndex,
+    src: &[(String, String)],
+) -> (std::path::PathBuf, GraphStore) {
+    let db = dir.join("index.db");
+    let mut store = GraphStore::open_or_replace(&db).unwrap();
+    ingest(&mut store, workspace, Some(WS_ROOT), index, src).unwrap();
+    (db, store)
+}
+
+#[test]
+fn stored_symbol_locations_denote_their_byte_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rust_db, _rust) = ingest_into_file(dir.path(), &ws(), &support::fixture_index(), &sources());
+    let rows = stored_locations(&rust_db, "symbols");
+    assert!(
+        assert_locations_agree(&rows, &sources()) > 0,
+        "the Rust fixture stores definitions"
+    );
+
+    let py_dir = tempfile::tempdir().unwrap();
+    let py_sources = support::python_fixture_sources();
+    let (py_db, _py) = ingest_into_file(py_dir.path(), &py_ws(), &support::python_fixture_index(), &py_sources);
+    let rows = stored_locations(&py_db, "symbols");
+    assert!(
+        assert_locations_agree(&rows, &py_sources) > 0,
+        "the Python fixture stores definitions"
+    );
+    assert!(
+        rows.iter().any(|(_, span, _)| span.is_none()),
+        "the Python fixture holds a symbol with no span, whose line and column stay absent"
+    );
+}
+
+#[test]
+fn stored_occurrence_columns_count_characters() {
+    for language in support::LANGUAGES {
+        // Both references follow a multi-byte character on their line; the start column counts it once.
+        let (doc, source, reference_column) = match language {
+            silent_cartographer::graph::syntax::Language::Rust => (
+                "m.rs",
+                "fn target() {}\nfn a() { let _s = \"\u{e9}\"; target(); }\nfn b() { let _s = \"\u{1F600}\"; target(); }\n",
+                24,
+            ),
+            silent_cartographer::graph::syntax::Language::Python => (
+                "m.py",
+                "def target(): pass\ndef a(): s = \"\u{e9}\"; target()\ndef b(): s = \"\u{1F600}\"; target()\n",
+                19,
+            ),
+        };
+        let at = |needle: &str, skip: usize| {
+            let start = source.match_indices(needle).nth(skip).unwrap().0;
+            let (line, col) = line_col(source, start);
+            SourceRange::new(line, col, line, col + needle.len() as u32)
+        };
+        let target = |range: SourceRange, role: OccurrenceRole| ExtractedOccurrence {
+            document_path: doc.to_string(),
+            range,
+            role,
+        };
+        let mut symbol = one_occ_symbol(
+            "c",
+            &[("target", SegmentKind::Method)],
+            SymbolKind::Function,
+            SymbolClass::InWorkspace,
+            doc,
+            at("target", 0),
+            OccurrenceRole::Definition,
+        );
+        symbol
+            .occurrences
+            .push(target(at("target", 1), OccurrenceRole::Reference));
+        symbol
+            .occurrences
+            .push(target(at("target", 2), OccurrenceRole::Reference));
+        let src = vec![(doc.to_string(), source.to_string())];
+        let mut index = one_doc_index(doc, vec![symbol]);
+        index.provenance = support::backend_provenance(language);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store) = ingest_into_file(dir.path(), &ws(), &index, &src);
+
+        let rows = stored_locations(&db, "occurrences");
+        assert_eq!(assert_locations_agree(&rows, &src), 3, "{language:?}");
+        let id = id_of_pkg("c", &[("target", SegmentKind::Method)]);
+        let columns: Vec<(i64, i64)> = rows
+            .iter()
+            .filter_map(|(_, _, lc)| lc.map(|[line, column, ..]| (line, column)))
+            .collect();
+        assert_eq!(store.occurrences_of(&id).unwrap().len(), 3, "{language:?}");
+        assert!(
+            columns.contains(&(2, reference_column)),
+            "{language:?}, after \u{e9}: {columns:?}"
+        );
+        assert!(
+            columns.contains(&(3, reference_column)),
+            "{language:?}, after the emoji: {columns:?}"
+        );
+    }
+}
+
+#[test]
+fn discrepancy_line_and_column_follow_the_byte_span() {
+    for language in support::LANGUAGES {
+        let (doc, source, beta, expected) = match language {
+            silent_cartographer::graph::syntax::Language::Rust => (
+                "m.rs",
+                "let alpha = 1;\nlet beta = 2;\n",
+                SourceRange::new(1, 4, 1, 8),
+                (2, 5, 2, 9),
+            ),
+            silent_cartographer::graph::syntax::Language::Python => (
+                "m.py",
+                "alpha = 1\nbeta = 2\n",
+                SourceRange::new(1, 0, 1, 4),
+                (2, 1, 2, 5),
+            ),
+        };
+        let src = vec![(doc.to_string(), source.to_string())];
+        let symbol = |name: &str, range: SourceRange| {
+            one_occ_symbol(
+                "c",
+                &[(name, SegmentKind::Term)],
+                SymbolKind::Constant,
+                SymbolClass::InWorkspace,
+                doc,
+                range,
+                OccurrenceRole::Definition,
+            )
+        };
+        let mut index = one_doc_index(
+            doc,
+            vec![
+                // Points at `beta`, which does not spell `alpha`: refused with a normalizable span.
+                symbol("alpha", beta),
+                // Points far past the end of the text: refused with no span.
+                symbol("ghost", SourceRange::new(50, 0, 50, 5)),
+            ],
+        );
+        index.provenance = support::backend_provenance(language);
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store) = ingest_into_file(dir.path(), &ws(), &index, &src);
+
+        let rows = stored_locations(&db, "join_discrepancies");
+        assert_eq!(rows.len(), 2, "{language:?}");
+        assert_eq!(assert_locations_agree(&rows, &src), 1, "{language:?}");
+        let located = store
+            .all_discrepancies()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.span.is_some())
+            .unwrap();
+        let line_column = located.line_column.expect("a normalizable span stores line and column");
+        assert_eq!(
+            (
+                line_column.start.line,
+                line_column.start.column,
+                line_column.end.line,
+                line_column.end.column
+            ),
+            expected,
+            "{language:?}"
+        );
+    }
+}
+
+#[test]
+fn each_line_ending_style_records_a_definition_on_line_five() {
+    let src: Vec<(String, String)> = [("lf.rs", "\n"), ("crlf.rs", "\r\n"), ("cr.rs", "\r")]
+        .into_iter()
+        .map(|(path, ending)| {
+            (
+                path.to_string(),
+                format!("const A: u8 = 1;{ending}const B: u8 = 2;{ending}const C: u8 = 3;{ending}const D: u8 = 4;{ending}fn target() {{}}{ending}"),
+            )
+        })
+        .collect();
+    // SCIP counts lines by LF alone: a lone-CR file is one line, so its definition sits at
+    // character 3 + the bytes before line five.
+    let symbols = src
+        .iter()
+        .map(|(path, text)| {
+            let start = text.find("target").unwrap();
+            let range = if path == "cr.rs" {
+                SourceRange::new(0, start as u32, 0, start as u32 + 6)
+            } else {
+                let (line, col) = line_col(text, start);
+                SourceRange::new(line, col, line, col + 6)
+            };
+            one_occ_symbol(
+                path.trim_end_matches(".rs"),
+                &[("target", SegmentKind::Method)],
+                SymbolKind::Function,
+                SymbolClass::InWorkspace,
+                path,
+                range,
+                OccurrenceRole::Definition,
+            )
+        })
+        .collect();
+    let mut index = one_doc_index("lf.rs", symbols);
+    index.documents = src
+        .iter()
+        .map(|(path, _)| SourceDocument {
+            path: path.clone(),
+            encoding: PositionEncoding::Utf8,
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _store) = ingest_into_file(dir.path(), &ws(), &index, &src);
+
+    let rows = stored_locations(&db, "symbols");
+    assert_eq!(assert_locations_agree(&rows, &src), 3);
+    for (document, _, line_column) in &rows {
+        let [start_line, start_column, end_line, _] = line_column.expect("every definition is located");
+        assert_eq!((start_line, start_column, end_line), (5, 1, 5), "{document}");
+    }
+}
+
+#[test]
+fn a_span_ending_between_cr_and_lf_is_recorded_at_the_cr() {
+    let source = "fn target() {}\r\nfn other() {}\r\n";
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    // The range runs past the end of line 0; SCIP normalization clamps it to the LF-only line end,
+    // which is between the CR and the LF.
+    let index = one_doc_index(
+        "m.rs",
+        vec![one_occ_symbol(
+            "c",
+            &[("target", SegmentKind::Method)],
+            SymbolKind::Function,
+            SymbolClass::InWorkspace,
+            "m.rs",
+            SourceRange::new(0, 3, 0, 99),
+            OccurrenceRole::Definition,
+        )],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (_db, store) = ingest_into_file(dir.path(), &ws(), &index, &src);
+
+    let row = store
+        .all_discrepancies()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the span is refused");
+    assert_eq!(row.span, Some((3, 15)), "the span ends between the CR and the LF");
+    let line_column = row.line_column.unwrap();
+    assert_eq!((line_column.end.line, line_column.end.column), (1, 15));
+}
+
+#[test]
+fn a_definition_span_on_line_three_starts_at_column_one_and_ends_after_the_brace() {
+    let source = "// a\n// b\nfn target() {}\n";
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let index = one_doc_index(
+        "m.rs",
+        vec![one_occ_symbol(
+            "c",
+            &[("target", SegmentKind::Method)],
+            SymbolKind::Function,
+            SymbolClass::InWorkspace,
+            "m.rs",
+            SourceRange::new(2, 3, 2, 9),
+            OccurrenceRole::Definition,
+        )],
+    );
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
+
+    let row = store
+        .symbol(&id_of_pkg("c", &[("target", SegmentKind::Method)]))
+        .unwrap()
+        .unwrap();
+    let span = row.line_column.expect("the definition is located");
+    assert_eq!((span.start.line, span.start.column), (3, 1));
+    assert_eq!((span.end.line, span.end.column), (3, 15));
+}
+
+// _(Recorded declarations carry their header end)_ — the build records where each symbol's header
+// ends, and the byte offset and the line and column denote the same position.
+
+use silent_cartographer::graph::syntax::Language;
+
+/// The stored row for the fixture declaration whose descriptor names are `path`.
+fn header_row(fixture: &support::HeaderFixture, store: &GraphStore, path: &[&str]) -> SymbolRow {
+    store
+        .symbol(&fixture.id(path))
+        .unwrap()
+        .unwrap_or_else(|| panic!("{path:?} is stored"))
+}
+
+/// The stored header end of `row`: its byte offset and its 1-based line and column.
+fn header_end_of(row: &SymbolRow) -> (usize, u32, u32) {
+    let (offset, at) = row.header_end.expect("the symbol has a header end");
+    (offset, at.line, at.column)
+}
+
+/// Run `check` once for every supported language over that language's header fixture and store.
+fn for_each_backend(check: impl Fn(Language, &support::HeaderFixture, &GraphStore)) {
+    for language in support::LANGUAGES {
+        let fixture = support::header_fixture(language);
+        let store = fixture.store(language);
+        check(language, &fixture, &store);
+    }
+}
+
+#[test]
+fn a_functions_header_ends_where_its_body_begins() {
+    for_each_backend(|language, fixture, store| {
+        let (path, header_text): (&[&str], &str) = match language {
+            Language::Rust => (&["P", "get"], "pub fn get(&self, a: u32) -> u32 "),
+            Language::Python => (&["Q", "plain"], "def plain(self, a, b=1):"),
+        };
+        let row = header_row(fixture, store, path);
+        let expected = fixture.source.find(header_text).unwrap() + header_text.len();
+        let (offset, _, _) = header_end_of(&row);
+        assert_eq!(offset, expected, "{language:?}");
+        assert!(
+            offset < row.span.unwrap().1,
+            "{language:?}: the header ends before the span does"
+        );
+    });
+}
+
+#[test]
+fn a_type_declaration_header_ends_at_its_body_delimiter() {
+    for_each_backend(|language, fixture, store| {
+        // (declaration, the header text up to the delimiter that opens the body)
+        let cases: Vec<(&[&str], &str)> = match language {
+            Language::Rust => vec![(&["P"], "pub struct P "), (&["Q"], "pub struct Q ")],
+            Language::Python => vec![(&["P"], "class P:"), (&["Q"], "class Q:")],
+        };
+        for (path, header_text) in cases {
+            let row = header_row(fixture, store, path);
+            let start = fixture.source.find(header_text).unwrap();
+            assert_eq!(
+                header_end_of(&row),
+                (
+                    start + header_text.len(),
+                    fixture.line(header_text),
+                    header_text.chars().count() as u32 + 1
+                ),
+                "{language:?} {path:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_header_covers_every_line_of_its_declaration_form() {
+    for_each_backend(|language, fixture, store| {
+        // (declaration, first line of its form, last line of its form)
+        let cases: Vec<(&[&str], u32, u32)> = match language {
+            Language::Rust => vec![(
+                &["P", "wide"],
+                fixture.line("pub fn wide("),
+                fixture.line("    ) -> u32 {"),
+            )],
+            Language::Python => vec![
+                (&["Q", "area"], fixture.line("@property"), fixture.line("def area")),
+                (
+                    &["Q", "wide"],
+                    fixture.line("async def wide("),
+                    fixture.line(") -> None:"),
+                ),
+            ],
+        };
+        for (path, first, last) in cases {
+            let row = header_row(fixture, store, path);
+            let span = row.line_column.unwrap();
+            let (_, end_line, _) = header_end_of(&row);
+            assert_eq!(
+                span.start.line, first,
+                "{language:?} {path:?}: the header starts at the span"
+            );
+            assert_eq!(
+                end_line, last,
+                "{language:?} {path:?}: the header reaches the end of the form"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_declaration_without_a_body_has_a_header_end_equal_to_its_span_end() {
+    for_each_backend(|language, fixture, store| {
+        let paths: Vec<&[&str]> = match language {
+            Language::Rust => vec![&["K"], &["P", "x"]],
+            Language::Python => vec![&["LIMIT"], &["Q", "size"], &["Q", "plain", "a"]],
+        };
+        for path in paths {
+            let row = header_row(fixture, store, path);
+            let span = row.line_column.unwrap();
+            assert_eq!(
+                header_end_of(&row),
+                (row.span.unwrap().1, span.end.line, span.end.column),
+                "{language:?} {path:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_documents_own_module_has_no_header_end_and_an_inline_module_has_one() {
+    for_each_backend(|language, fixture, store| {
+        let module = store.symbol(&fixture.module_id()).unwrap().unwrap();
+        assert!(module.span.is_some(), "{language:?}: the module is stored with a span");
+        assert_eq!(module.header_end, None, "{language:?}");
+        match language {
+            Language::Rust => {
+                let inline = header_row(fixture, store, &["md"]);
+                let open = fixture.source.find("pub mod md ").unwrap() + "pub mod md ".len();
+                assert_eq!(header_end_of(&inline).0, open);
+            }
+            // Python has no module declared inside a file.
+            Language::Python => {}
+        }
+    });
+}
+
+#[test]
+fn a_symbol_without_a_definition_span_has_no_header_end() {
+    for language in support::LANGUAGES {
+        let fixture = support::header_fixture(language);
+        let needle = match language {
+            Language::Rust => "alpha",
+            Language::Python => "ALPHA",
+        };
+        let mut index = support::declared_index(language, fixture.doc, fixture.source, &fixture.decls);
+        index.symbols.push(one_occ_symbol(
+            "thirdparty",
+            &[("external", SegmentKind::Method)],
+            SymbolKind::Function,
+            SymbolClass::External,
+            fixture.doc,
+            range_of(fixture.source, needle),
+            OccurrenceRole::Reference,
+        ));
+        let mut store = GraphStore::open_in_memory().unwrap();
+        let sources = vec![(fixture.doc.to_string(), fixture.source.to_string())];
+        ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+
+        let external = store
+            .symbol(&id_of_pkg("thirdparty", &[("external", SegmentKind::Method)]))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{language:?}: the external symbol is stored"));
+        assert_eq!(external.span, None, "{language:?}");
+        assert_eq!(external.header_end, None, "{language:?}");
+    }
+}
+
+/// The 0-based range of the first occurrence of `needle` in `source`.
+fn range_of(source: &str, needle: &str) -> SourceRange {
+    let (line, col) = line_col(source, source.find(needle).unwrap());
+    SourceRange::new(line, col, line, col + needle.len() as u32)
+}
+
+#[test]
+fn every_stored_header_end_denotes_its_byte_offset() {
+    type Case = (String, GraphStore, Vec<(String, String)>);
+    let mut cases: Vec<Case> = Vec::new();
+    for language in support::LANGUAGES {
+        let fixture = support::header_fixture(language);
+        let sources = vec![(fixture.doc.to_string(), fixture.source.to_string())];
+        cases.push((format!("{language:?} header fixture"), fixture.store(language), sources));
+    }
+    let mut rust = GraphStore::open_in_memory().unwrap();
+    ingest(&mut rust, &ws(), Some(WS_ROOT), &support::fixture_index(), &sources()).unwrap();
+    cases.push(("Rust exemplar".to_string(), rust, sources()));
+    let mut python = GraphStore::open_in_memory().unwrap();
+    let py_sources = support::python_fixture_sources();
+    ingest(
+        &mut python,
+        &py_ws(),
+        Some(WS_ROOT),
+        &support::python_fixture_index(),
+        &py_sources,
+    )
+    .unwrap();
+    cases.push(("Python conformance fixture".to_string(), python, py_sources));
+
+    for (name, store, sources) in cases {
+        let mut checked = 0;
+        for id in store.rank_projection().unwrap().nodes {
+            let row = store.symbol(&id).unwrap().unwrap();
+            let (Some((start, end)), Some((offset, at))) = (row.span, row.header_end) else {
+                continue;
+            };
+            let text = &sources
+                .iter()
+                .find(|(path, _)| Some(path) == row.document_path.as_ref())
+                .expect("document in sources")
+                .1;
+            assert_eq!(
+                byte_at(text, at.line.into(), at.column.into()),
+                offset,
+                "{name}: {id:?}"
+            );
+            assert!(
+                (start..=end).contains(&offset),
+                "{name}: {id:?} header end lies within its span"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "{name}: no header end was checked");
+    }
 }

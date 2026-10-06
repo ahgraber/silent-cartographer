@@ -77,6 +77,9 @@ pub struct DeclarationTiers {
     /// The signature together with the declaration's own documentation, in source order. Equal to
     /// the signature when the declaration carries no documentation of its own.
     pub interface: String,
+    /// The byte offset where the declaration form ends: the body delimiter, or the end of the
+    /// declaration's span when it has no distinct body. Lies within the declaration's span.
+    pub header_end: usize,
 }
 
 /// The class of one spelled token: what a clone-equivalence normalization may substitute.
@@ -887,6 +890,7 @@ impl SyntaxTree {
             return DeclarationTiers {
                 interface: signature.clone(),
                 signature,
+                header_end: decl.full_span.end,
             };
         };
         match self.language {
@@ -1012,7 +1016,11 @@ impl SyntaxTree {
                 .unwrap_or_else(|| signature.clone()),
             None => signature.clone(),
         };
-        DeclarationTiers { signature, interface }
+        DeclarationTiers {
+            signature,
+            interface,
+            header_end: signature_end.min(decl.full_span.end),
+        }
     }
 
     /// Python tier extraction for a located declaration node.
@@ -1046,7 +1054,11 @@ impl SyntaxTree {
                 .unwrap_or_else(|| signature.clone()),
             None => signature.clone(),
         };
-        DeclarationTiers { signature, interface }
+        DeclarationTiers {
+            signature,
+            interface,
+            header_end: signature_end.min(decl.full_span.end),
+        }
     }
 
     /// Rust document-level documentation: the leading inner-doc-comment run (`//!`, `/*! */`) at the
@@ -2130,6 +2142,7 @@ TOP_LEVEL = 1
         let tiers = tree.declaration_tiers(&fabricated);
         assert_eq!(tiers.signature, src);
         assert_eq!(tiers.interface, tiers.signature);
+        assert_eq!(tiers.header_end, fabricated.full_span.end);
 
         // Spans reaching past the end of the source degrade the same way, without panicking.
         let out_of_bounds = SyntaxDeclaration {

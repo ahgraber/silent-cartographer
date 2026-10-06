@@ -635,6 +635,20 @@ rename to new_name.rs
         assert_eq!(index.line_start(3), "one\r\ntwo\r\n".len());
     }
 
+    // Hunk lines map to byte offsets by LF alone, so a lone CR is not a line break and a CRLF line
+    // keeps its CR.
+    #[test]
+    fn byte_range_splits_lines_at_lf_only_for_lone_cr_and_crlf_text() {
+        let lone_cr = "a\rb\nc\n";
+        let index = LineIndex::new(lone_cr);
+        assert_eq!(index.byte_range(LineRange { start: 1, count: 1 }), (0, 4));
+        assert_eq!(index.byte_range(LineRange { start: 2, count: 1 }), (4, 6));
+
+        let crlf = "one\r\ntwo\r\nthree";
+        let index = LineIndex::new(crlf);
+        assert_eq!(index.byte_range(LineRange { start: 2, count: 1 }), (5, 10));
+    }
+
     // `byte_range` covers exactly the removed text for a multi-line removal, widens an insertion point
     // to one byte at the anchor line, and stays in bounds for a line past the end of the document.
     #[test]

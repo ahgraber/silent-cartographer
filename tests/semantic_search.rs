@@ -632,6 +632,8 @@ fn a_corpus_larger_than_the_knn_cap_still_answers() {
                 class: PersistedClass::InWorkspace,
                 document_path: Some("many.rs".to_string()),
                 span: Some((0, 1)),
+                line_column: None,
+                header_end: None,
                 span_text: Some("fn f() {}".to_string()),
                 signature_text: Some("fn f()".to_string()),
                 interface_text: Some("fn f()".to_string()),

@@ -11,7 +11,7 @@ use crate::graph::store::{GraphStore, SymbolRow};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
     /// The reference denoted exactly one symbol.
-    Unique(SymbolRow),
+    Unique(Box<SymbolRow>),
     /// The reference denoted more than one symbol; the caller must narrow.
     Ambiguous(Vec<SymbolRow>),
     /// The reference denoted no symbol.
@@ -27,7 +27,7 @@ pub enum Resolution {
 pub fn resolve(store: &GraphStore, reference: &str) -> rusqlite::Result<Resolution> {
     // Identity form: an exact canonical-id match.
     if let Some(row) = store.symbol(&crate::identity::CanonicalId::from_raw(reference))? {
-        return Ok(Resolution::Unique(row));
+        return Ok(Resolution::Unique(Box::new(row)));
     }
 
     // Qualified-name form: contains a path separator but is not a full identity.
@@ -64,7 +64,7 @@ pub fn resolve(store: &GraphStore, reference: &str) -> rusqlite::Result<Resoluti
 fn classify(candidates: Vec<SymbolRow>) -> Resolution {
     match candidates.len() {
         0 => Resolution::None,
-        1 => Resolution::Unique(candidates.into_iter().next().expect("one candidate")),
+        1 => Resolution::Unique(Box::new(candidates.into_iter().next().expect("one candidate"))),
         _ => Resolution::Ambiguous(candidates),
     }
 }

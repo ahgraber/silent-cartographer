@@ -11,6 +11,7 @@ use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
 
 use super::chunk::ChunkParams;
 use super::join::{AlignmentRule, JoinAccounting};
+use super::range::{LineColumn, LineColumnSpan};
 use super::schema::{SCHEMA_SQL, SCHEMA_VERSION};
 
 /// An edge kind in the graph. All four kinds are contracted: `Contains` is enclosure; the three
@@ -159,6 +160,11 @@ pub struct SymbolRow {
     pub document_path: Option<String>,
     /// The definition span, if any: `(start, end)` byte offsets.
     pub span: Option<(usize, usize)>,
+    /// The definition span's line and column, present exactly when `span` is.
+    pub line_column: Option<LineColumnSpan>,
+    /// Where the symbol's header ends: the byte offset and its line and column. The header starts at
+    /// the definition span's start. `None` for a symbol without a span and for a document's own module.
+    pub header_end: Option<(usize, LineColumn)>,
     /// The exact source text of the definition span, if any.
     pub span_text: Option<String>,
     /// The signature tier: the declaration form without its body. `None` for externals and for
@@ -231,6 +237,8 @@ pub struct OccurrenceRow {
     pub document_path: String,
     /// The occurrence's byte span.
     pub span: (usize, usize),
+    /// The occurrence span's line and column.
+    pub line_column: Option<LineColumnSpan>,
     /// The role tag (`definition` or `reference`).
     pub role: String,
     /// The alignment rule that accepted the attribution (`exact`, `crate_root`, `operator_desugar`,
@@ -304,6 +312,8 @@ pub struct DiscrepancyRow {
     /// The byte span at the occurrence's location, or `None` when the occurrence's coordinates could
     /// not be normalized onto the source — typed absence, never a fabricated location.
     pub span: Option<(usize, usize)>,
+    /// The line and column of `span`, present exactly when `span` is.
+    pub line_column: Option<LineColumnSpan>,
     /// The outcome kind tag (`text_mismatch`, `semantic_only`, or `duplicate_ambiguous`).
     pub outcome: String,
     /// The expected name token.
@@ -1122,11 +1132,17 @@ impl GraphStore {
                 std::io::Error::other(violation),
             )));
         }
+        let [start_line, start_column, end_line, end_column] = line_column_values(row.line_column);
+        let header_end = row
+            .header_end
+            .map(|(offset, at)| (offset as i64, i64::from(at.line), i64::from(at.column)));
         self.conn.execute(
             "INSERT OR REPLACE INTO symbols
                 (canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                 signature_text, interface_text, duplicated, test_rule)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 signature_text, interface_text, duplicated, test_rule,
+                 start_line, start_column, end_line, end_column,
+                 header_end, header_end_line, header_end_column)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 row.canonical_id.as_str(),
                 row.display_name,
@@ -1140,6 +1156,13 @@ impl GraphStore {
                 row.interface_text,
                 row.duplicated as i64,
                 row.test_rule,
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                header_end.map(|h| h.0),
+                header_end.map(|h| h.1),
+                header_end.map(|h| h.2),
             ],
         )?;
         Ok(())
@@ -1147,10 +1170,12 @@ impl GraphStore {
 
     /// Insert an occurrence row.
     pub fn insert_occurrence(&self, row: &OccurrenceRow) -> rusqlite::Result<()> {
+        let [start_line, start_column, end_line, end_column] = line_column_values(row.line_column);
         self.conn.execute(
             "INSERT INTO occurrences
-                (symbol_id, document_path, span_start, span_end, role, rule, enclosing_id, locality)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (symbol_id, document_path, span_start, span_end, role, rule, enclosing_id, locality,
+                 start_line, start_column, end_line, end_column)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 row.symbol_id.as_str(),
                 row.document_path,
@@ -1160,6 +1185,10 @@ impl GraphStore {
                 row.rule,
                 row.enclosing_id.as_ref().map(|e| e.as_str().to_string()),
                 row.locality,
+                start_line,
+                start_column,
+                end_line,
+                end_column,
             ],
         )?;
         Ok(())
@@ -1186,11 +1215,13 @@ impl GraphStore {
     pub fn insert_discrepancies(&self, rows: &[DiscrepancyRow]) -> rusqlite::Result<()> {
         let mut stmt = self.conn.prepare(
             "INSERT INTO join_discrepancies
-                (document_path, span_start, span_end, outcome, expected_name, found_text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (document_path, span_start, span_end, outcome, expected_name, found_text,
+                 start_line, start_column, end_line, end_column)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for row in rows {
             let found = row.found_text.as_deref().map(truncate_on_boundary);
+            let [start_line, start_column, end_line, end_column] = line_column_values(row.line_column);
             stmt.execute(params![
                 row.document_path,
                 row.span.map(|s| s.0 as i64),
@@ -1198,6 +1229,10 @@ impl GraphStore {
                 row.outcome,
                 row.expected_name,
                 found,
+                start_line,
+                start_column,
+                end_line,
+                end_column,
             ])?;
         }
         Ok(())
@@ -1228,7 +1263,8 @@ impl GraphStore {
         // per-column aggregates — chosen deterministically, preferring a row with a real span so a
         // typed-absence span appears only when the whole group lacks locations.
         let mut exemplar_stmt = self.conn.prepare(
-            "SELECT document_path, span_start, span_end, outcome, expected_name, found_text
+            "SELECT document_path, span_start, span_end, outcome, expected_name, found_text,
+                    start_line, start_column, end_line, end_column
              FROM join_discrepancies
              WHERE outcome = ?1 AND expected_name = ?2
              ORDER BY span_start IS NULL, document_path, span_start, span_end
@@ -1266,7 +1302,8 @@ impl GraphStore {
     /// Every persisted discrepancy row, ordered deterministically — the explicit full listing.
     pub fn all_discrepancies(&self) -> rusqlite::Result<Vec<DiscrepancyRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT document_path, span_start, span_end, outcome, expected_name, found_text
+            "SELECT document_path, span_start, span_end, outcome, expected_name, found_text,
+                    start_line, start_column, end_line, end_column
              FROM join_discrepancies
              ORDER BY document_path, span_start, span_end, outcome, expected_name",
         )?;
@@ -1284,6 +1321,7 @@ impl GraphStore {
         Ok(DiscrepancyRow {
             document_path: r.get(0)?,
             span,
+            line_column: read_line_column(r, 6)?,
             outcome: r.get(3)?,
             expected_name: r.get(4)?,
             found_text: r.get(5)?,
@@ -1295,7 +1333,9 @@ impl GraphStore {
         self.conn
             .query_row(
                 "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                        signature_text, interface_text, duplicated, test_rule
+                        signature_text, interface_text, duplicated, test_rule,
+                        start_line, start_column, end_line, end_column,
+                        header_end, header_end_line, header_end_column
                  FROM symbols WHERE canonical_id = ?1",
                 params![id.as_str()],
                 Self::map_symbol,
@@ -1330,6 +1370,8 @@ impl GraphStore {
             class,
             document_path: r.get(4)?,
             span,
+            line_column: read_line_column(r, 12)?,
+            header_end: read_header_end(r, 16)?,
             span_text: r.get(7)?,
             signature_text: r.get(8)?,
             interface_text: r.get(9)?,
@@ -1353,7 +1395,9 @@ impl GraphStore {
     pub fn symbols_by_shortname(&self, shortname: &str) -> rusqlite::Result<Vec<SymbolRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated, test_rule
+                    signature_text, interface_text, duplicated, test_rule,
+                    start_line, start_column, end_line, end_column,
+                    header_end, header_end_line, header_end_column
              FROM symbols WHERE display_name = ?1 ORDER BY canonical_id",
         )?;
         let rows = stmt.query_map(params![shortname], Self::map_symbol)?;
@@ -1367,7 +1411,9 @@ impl GraphStore {
     pub fn symbols_by_fragment(&self, fragment: &str) -> rusqlite::Result<Vec<SymbolRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated, test_rule
+                    signature_text, interface_text, duplicated, test_rule,
+                    start_line, start_column, end_line, end_column,
+                    header_end, header_end_line, header_end_column
              FROM symbols WHERE display_name LIKE ?1 ESCAPE '\\'
              ORDER BY canonical_id",
         )?;
@@ -1382,7 +1428,9 @@ impl GraphStore {
         let suffix = format!("::{qualified}");
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated, test_rule
+                    signature_text, interface_text, duplicated, test_rule,
+                    start_line, start_column, end_line, end_column,
+                    header_end, header_end_line, header_end_column
              FROM symbols
              WHERE canonical_id = ?1 OR canonical_id LIKE ?2 ESCAPE '\\'
              ORDER BY canonical_id",
@@ -1406,7 +1454,9 @@ impl GraphStore {
     pub fn duplicated_groups(&self) -> rusqlite::Result<Vec<DuplicatedGroup>> {
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated, test_rule
+                    signature_text, interface_text, duplicated, test_rule,
+                    start_line, start_column, end_line, end_column,
+                    header_end, header_end_line, header_end_column
              FROM symbols WHERE class = 'in_workspace' AND duplicated = 1 ORDER BY canonical_id",
         )?;
         let rows: Vec<SymbolRow> = stmt.query_map([], Self::map_symbol)?.collect::<rusqlite::Result<_>>()?;
@@ -1431,7 +1481,8 @@ impl GraphStore {
     /// The occurrences of a symbol, ordered deterministically.
     pub fn occurrences_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<OccurrenceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id, locality
+            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id, locality,
+                    start_line, start_column, end_line, end_column
              FROM occurrences WHERE symbol_id = ?1
              ORDER BY document_path, span_start, span_end",
         )?;
@@ -1444,6 +1495,7 @@ impl GraphStore {
             symbol_id: CanonicalId::from_raw(r.get::<_, String>(0)?),
             document_path: r.get(1)?,
             span: (r.get::<_, i64>(2)? as usize, r.get::<_, i64>(3)? as usize),
+            line_column: read_line_column(r, 8)?,
             role: r.get(4)?,
             rule: r.get(5)?,
             enclosing_id: r.get::<_, Option<String>>(6)?.map(CanonicalId::from_raw),
@@ -1463,7 +1515,9 @@ impl GraphStore {
         self.conn
             .query_row(
                 "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                        signature_text, interface_text, duplicated, test_rule
+                        signature_text, interface_text, duplicated, test_rule,
+                        start_line, start_column, end_line, end_column,
+                        header_end, header_end_line, header_end_column
                  FROM symbols
                  WHERE document_path = ?1 AND span_start IS NOT NULL
                    AND span_start <= ?2 AND ?2 < span_end
@@ -1491,7 +1545,9 @@ impl GraphStore {
     ) -> rusqlite::Result<Vec<SymbolRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
-                    signature_text, interface_text, duplicated, test_rule
+                    signature_text, interface_text, duplicated, test_rule,
+                    start_line, start_column, end_line, end_column,
+                    header_end, header_end_line, header_end_column
              FROM symbols
              WHERE document_path = ?1 AND span_start IS NOT NULL AND span_start < ?3 AND ?2 < span_end
              ORDER BY span_start, span_end, canonical_id",
@@ -1523,7 +1579,9 @@ impl GraphStore {
         self.conn
             .query_row(
                 "SELECT s.canonical_id, s.display_name, s.kind, s.class, s.document_path, s.span_start, s.span_end,
-                        s.span_text, s.signature_text, s.interface_text, s.duplicated, s.test_rule
+                        s.span_text, s.signature_text, s.interface_text, s.duplicated, s.test_rule,
+                        s.start_line, s.start_column, s.end_line, s.end_column,
+                        s.header_end, s.header_end_line, s.header_end_column
                  FROM symbols s
                  LEFT JOIN occurrences o
                    ON o.symbol_id = s.canonical_id AND o.document_path = ?1 AND o.role = 'definition'
@@ -1821,7 +1879,8 @@ impl GraphStore {
     /// Every reference-role occurrence of `id`, ordered deterministically.
     pub fn references_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<OccurrenceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id, locality
+            "SELECT symbol_id, document_path, span_start, span_end, role, rule, enclosing_id, locality,
+                    start_line, start_column, end_line, end_column
              FROM occurrences WHERE symbol_id = ?1 AND role = 'reference'
              ORDER BY document_path, span_start, span_end",
         )?;
@@ -1905,6 +1964,47 @@ fn disambiguator_base(canonical_id: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// A span's line and column as the four nullable columns `start_line, start_column, end_line,
+/// end_column`; all NULL for an absent span.
+fn line_column_values(line_column: Option<LineColumnSpan>) -> [Option<i64>; 4] {
+    match line_column {
+        Some(s) => [s.start.line, s.start.column, s.end.line, s.end.column].map(|v| Some(i64::from(v))),
+        None => [None; 4],
+    }
+}
+
+/// Read the three header-end columns starting at `first`; any NULL among them reads as absent.
+fn read_header_end(r: &rusqlite::Row, first: usize) -> rusqlite::Result<Option<(usize, LineColumn)>> {
+    let offset: Option<i64> = r.get(first)?;
+    let line: Option<u32> = r.get(first + 1)?;
+    let column: Option<u32> = r.get(first + 2)?;
+    Ok(match (offset, line, column) {
+        (Some(offset), Some(line), Some(column)) => Some((offset as usize, LineColumn { line, column })),
+        _ => None,
+    })
+}
+
+/// Read the four line and column columns starting at `first`; any NULL among them reads as absent.
+fn read_line_column(r: &rusqlite::Row, first: usize) -> rusqlite::Result<Option<LineColumnSpan>> {
+    let mut values = [None; 4];
+    for (offset, value) in values.iter_mut().enumerate() {
+        *value = r.get::<_, Option<u32>>(first + offset)?;
+    }
+    Ok(match values {
+        [Some(start_line), Some(start_column), Some(end_line), Some(end_column)] => Some(LineColumnSpan {
+            start: LineColumn {
+                line: start_line,
+                column: start_column,
+            },
+            end: LineColumn {
+                line: end_line,
+                column: end_column,
+            },
+        }),
+        _ => None,
+    })
 }
 
 /// Truncate `s` to at most [`FOUND_TEXT_MAX_BYTES`] bytes, cutting on a UTF-8 character boundary so
@@ -2471,6 +2571,8 @@ mod tests {
             class: PersistedClass::InWorkspace,
             document_path: Some(document.to_string()),
             span: Some((start, end)),
+            line_column: None,
+            header_end: None,
             span_text: None,
             signature_text: None,
             interface_text: None,
@@ -2719,6 +2821,8 @@ mod tests {
             class: PersistedClass::External,
             document_path: None,
             span: None,
+            line_column: None,
+            header_end: None,
             span_text: None,
             signature_text: None,
             interface_text: None,

@@ -339,3 +339,398 @@ pub fn prepend_path(dirs: &[&std::path::Path]) -> std::ffi::OsString {
     }
     std::env::join_paths(parts).unwrap()
 }
+
+/// The source languages the build has a backend for. The exhaustive match in [`backend_provenance`]
+/// stops compiling when a backend is added without a case there.
+pub const LANGUAGES: [silent_cartographer::graph::syntax::Language; 2] = [
+    silent_cartographer::graph::syntax::Language::Rust,
+    silent_cartographer::graph::syntax::Language::Python,
+];
+
+/// The provenance a backend for `language` reports.
+pub fn backend_provenance(language: silent_cartographer::graph::syntax::Language) -> AnalyzerProvenance {
+    use silent_cartographer::graph::syntax::Language;
+    use silent_cartographer::semantic::python_adapter::PythonAdapter;
+    use silent_cartographer::semantic::rust_adapter::RustAdapter;
+    let analyzer_name = match language {
+        Language::Rust => RustAdapter::analyzer_name(),
+        Language::Python => PythonAdapter::analyzer_name(),
+    };
+    AnalyzerProvenance {
+        analyzer_name: analyzer_name.to_string(),
+        analyzer_version: "1.0.0".to_string(),
+    }
+}
+
+/// One declaration of a hand-built index: its descriptor path under the package `poscrate`, its kind,
+/// and the one place in the source its name sits.
+pub struct Decl<'a> {
+    pub segments: &'a [(&'a str, SegmentKind)],
+    pub kind: SymbolKind,
+    /// A substring occurring exactly once in the source that contains the declaration's name.
+    pub within: &'a str,
+}
+
+/// The identity of a [`Decl`] path under the package `poscrate`.
+pub fn decl_id(segments: &[(&str, SegmentKind)]) -> CanonicalId {
+    id_of_pkg("poscrate", segments)
+}
+
+/// A store built through `language`'s backend rules from `source` at `doc`, recording `decls` as
+/// definitions at their names plus the document's own module.
+pub fn declared_store(
+    language: silent_cartographer::graph::syntax::Language,
+    doc: &str,
+    source: &str,
+    decls: &[Decl],
+) -> GraphStore {
+    let index = declared_index(language, doc, source, decls);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    silent_cartographer::graph::ingest(
+        &mut store,
+        &ws(),
+        Some("/test-ws"),
+        &index,
+        &[(doc.to_string(), source.to_string())],
+    )
+    .unwrap();
+    store
+}
+
+/// The index [`declared_store`] ingests: `decls` as definitions at their names plus the document's
+/// own module, under `language`'s provenance.
+pub fn declared_index(
+    language: silent_cartographer::graph::syntax::Language,
+    doc: &str,
+    source: &str,
+    decls: &[Decl],
+) -> ExtractedIndex {
+    let mut symbols: Vec<ExtractedSymbol> = decls
+        .iter()
+        .map(|decl| {
+            assert_eq!(
+                source.matches(decl.within).count(),
+                1,
+                "{:?} must occur once",
+                decl.within
+            );
+            let name = decl.segments.last().unwrap().0;
+            let at = source.find(decl.within).unwrap() + decl.within.find(name).unwrap();
+            let (line, col) = line_col(source, at);
+            one_occ_symbol(
+                "poscrate",
+                decl.segments,
+                decl.kind,
+                SymbolClass::InWorkspace,
+                doc,
+                SourceRange::new(line, col, line, col + name.len() as u32),
+                OccurrenceRole::Definition,
+            )
+        })
+        .collect();
+    // A Rust file module is defined over the whole file; a Python module by a zero-width marker.
+    let module_range = match language {
+        silent_cartographer::graph::syntax::Language::Rust => {
+            let (end_line, end_col) = line_col(source, source.len());
+            SourceRange::new(0, 0, end_line, end_col)
+        }
+        silent_cartographer::graph::syntax::Language::Python => SourceRange::new(0, 0, 0, 0),
+    };
+    symbols.push(one_occ_symbol(
+        "poscrate",
+        &[("module", SegmentKind::Module)],
+        SymbolKind::Module,
+        SymbolClass::InWorkspace,
+        doc,
+        module_range,
+        OccurrenceRole::Definition,
+    ));
+    let mut index = one_doc_index(doc, symbols);
+    index.provenance = backend_provenance(language);
+    index
+}
+
+/// The 1-based line of the first occurrence of `needle` in `source`.
+pub fn line_number(source: &str, needle: &str) -> u32 {
+    line_col(source, source.find(needle).unwrap()).0 + 1
+}
+
+/// A source file holding the declaration shapes the header rule distinguishes, in one language, with
+/// the declarations an index records for it.
+pub struct HeaderFixture {
+    pub doc: &'static str,
+    pub source: &'static str,
+    pub decls: Vec<Decl<'static>>,
+}
+
+impl HeaderFixture {
+    /// The store a build over this fixture produces.
+    pub fn store(&self, language: silent_cartographer::graph::syntax::Language) -> GraphStore {
+        declared_store(language, self.doc, self.source, &self.decls)
+    }
+
+    /// A store file under `dir` built from this fixture, with its source written beside it so a
+    /// command handler can read both. Returns the store's path.
+    pub fn build_db(
+        &self,
+        language: silent_cartographer::graph::syntax::Language,
+        dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let doc_path = dir.join(self.doc);
+        std::fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
+        std::fs::write(&doc_path, self.source).unwrap();
+        let db = dir.join("index.db");
+        let index = declared_index(language, self.doc, self.source, &self.decls);
+        silent_cartographer::commands::build_from_index(
+            &db,
+            "poscrate-ws",
+            dir,
+            &index,
+            &[(self.doc.to_string(), self.source.to_string())],
+        )
+        .unwrap();
+        db
+    }
+
+    /// The identity of the declaration whose descriptor names are `path`.
+    pub fn id(&self, path: &[&str]) -> CanonicalId {
+        let decl = self
+            .decls
+            .iter()
+            .find(|d| d.segments.iter().map(|s| s.0).eq(path.iter().copied()))
+            .unwrap_or_else(|| panic!("no declaration {path:?}"));
+        decl_id(decl.segments)
+    }
+
+    /// The identity of the document's own module.
+    pub fn module_id(&self) -> CanonicalId {
+        decl_id(&[("module", SegmentKind::Module)])
+    }
+
+    /// The 1-based line of the first occurrence of `needle` in the source.
+    pub fn line(&self, needle: &str) -> u32 {
+        line_number(self.source, needle)
+    }
+}
+
+const RUST_HEADER_SOURCE: &str = "\
+#[derive(Debug)]
+pub struct P { pub x: u32, pub y: u32 }
+
+pub struct Q {
+    pub size: u32,
+}
+
+impl P {
+    pub fn get(&self, a: u32) -> u32 {
+        a + 1
+    }
+
+    pub fn wide(
+        &self,
+        a: u32,
+    ) -> u32 {
+        a + 2
+    }
+}
+
+pub const K: u32 = 1; pub static S: u32 = 2;
+
+pub fn alpha() {} pub fn beta() {}
+
+pub mod md {
+    pub fn inner() {}
+}
+";
+
+const PYTHON_HEADER_SOURCE: &str = "\
+LIMIT = 1
+ALPHA = 1; BETA = 2
+
+
+class P: x = 1; y = 2
+
+
+class Q:
+    size: int = 0
+
+    def plain(self, a, b=1):
+        return a
+
+    @property
+    @cached
+    def area(self):
+        return 1
+
+    async def wide(
+        self,
+        value: int,
+    ) -> None:
+        pass
+";
+
+/// The header-shape fixture for `language`; the exhaustive match stops compiling when a backend is
+/// added without one.
+pub fn header_fixture(language: silent_cartographer::graph::syntax::Language) -> HeaderFixture {
+    use SegmentKind::{Method, Module, Term, Type};
+    use silent_cartographer::graph::syntax::Language;
+    match language {
+        Language::Rust => HeaderFixture {
+            doc: "src/shapes.rs",
+            source: RUST_HEADER_SOURCE,
+            decls: vec![
+                Decl {
+                    segments: &[("P", Type)],
+                    kind: SymbolKind::Type,
+                    within: "struct P",
+                },
+                Decl {
+                    segments: &[("P", Type), ("x", Term)],
+                    kind: SymbolKind::Field,
+                    within: "x: u32,",
+                },
+                Decl {
+                    segments: &[("P", Type), ("y", Term)],
+                    kind: SymbolKind::Field,
+                    within: "y: u32 }",
+                },
+                Decl {
+                    segments: &[("Q", Type)],
+                    kind: SymbolKind::Type,
+                    within: "struct Q",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("size", Term)],
+                    kind: SymbolKind::Field,
+                    within: "size: u32",
+                },
+                Decl {
+                    segments: &[("P", Type), ("get", Method)],
+                    kind: SymbolKind::Method,
+                    within: "get(&self",
+                },
+                Decl {
+                    segments: &[("P", Type), ("wide", Method)],
+                    kind: SymbolKind::Method,
+                    within: "wide(",
+                },
+                Decl {
+                    segments: &[("K", Term)],
+                    kind: SymbolKind::Constant,
+                    within: "K: u32",
+                },
+                Decl {
+                    segments: &[("S", Term)],
+                    kind: SymbolKind::Constant,
+                    within: "S: u32",
+                },
+                Decl {
+                    segments: &[("alpha", Method)],
+                    kind: SymbolKind::Function,
+                    within: "alpha()",
+                },
+                Decl {
+                    segments: &[("beta", Method)],
+                    kind: SymbolKind::Function,
+                    within: "beta()",
+                },
+                Decl {
+                    segments: &[("md", Module)],
+                    kind: SymbolKind::Module,
+                    within: "md {",
+                },
+                Decl {
+                    segments: &[("md", Module), ("inner", Method)],
+                    kind: SymbolKind::Function,
+                    within: "inner()",
+                },
+            ],
+        },
+        Language::Python => HeaderFixture {
+            doc: "shapes.py",
+            source: PYTHON_HEADER_SOURCE,
+            decls: vec![
+                Decl {
+                    segments: &[("LIMIT", Term)],
+                    kind: SymbolKind::Constant,
+                    within: "LIMIT",
+                },
+                Decl {
+                    segments: &[("ALPHA", Term)],
+                    kind: SymbolKind::Constant,
+                    within: "ALPHA",
+                },
+                Decl {
+                    segments: &[("BETA", Term)],
+                    kind: SymbolKind::Constant,
+                    within: "BETA",
+                },
+                Decl {
+                    segments: &[("P", Type)],
+                    kind: SymbolKind::Type,
+                    within: "P:",
+                },
+                Decl {
+                    segments: &[("P", Type), ("x", Term)],
+                    kind: SymbolKind::Field,
+                    within: "x = 1",
+                },
+                Decl {
+                    segments: &[("P", Type), ("y", Term)],
+                    kind: SymbolKind::Field,
+                    within: "y = 2",
+                },
+                Decl {
+                    segments: &[("Q", Type)],
+                    kind: SymbolKind::Type,
+                    within: "Q:",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("size", Term)],
+                    kind: SymbolKind::Field,
+                    within: "size:",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("plain", Method)],
+                    kind: SymbolKind::Method,
+                    within: "plain(",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("plain", Method), ("self", Term)],
+                    kind: SymbolKind::Other,
+                    within: "self, a",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("plain", Method), ("a", Term)],
+                    kind: SymbolKind::Other,
+                    within: "a, b=1",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("plain", Method), ("b", Term)],
+                    kind: SymbolKind::Other,
+                    within: "b=1",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("area", Method)],
+                    kind: SymbolKind::Method,
+                    within: "area(",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("wide", Method)],
+                    kind: SymbolKind::Method,
+                    within: "wide(",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("wide", Method), ("self", Term)],
+                    kind: SymbolKind::Other,
+                    within: "self,\n        value",
+                },
+                Decl {
+                    segments: &[("Q", Type), ("wide", Method), ("value", Term)],
+                    kind: SymbolKind::Other,
+                    within: "value: int",
+                },
+            ],
+        },
+    }
+}

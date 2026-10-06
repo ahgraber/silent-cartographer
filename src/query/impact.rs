@@ -595,6 +595,8 @@ mod tests {
             class: PersistedClass::InWorkspace,
             document_path: Some(document.to_string()),
             span: Some((start, end)),
+            line_column: None,
+            header_end: None,
             span_text: None,
             signature_text: None,
             interface_text: None,

@@ -26,7 +26,9 @@
 /// Migration: version 17 stores a callable whose parent is not a type as `function` rather than
 /// `method`, and names a Python module by its module name rather than `__init__` (both stored
 /// columns, and both inputs to the passage render, so the corpus definition version moved with it)
-/// and computes the aggregate content hash with each path and text length-prefixed;
+/// and records each location's line and column beside its byte offsets (`symbols`, `occurrences`,
+/// `join_discrepancies`) and where each symbol's header ends (`symbols`), and computes the aggregate
+/// content hash with each path and text length-prefixed;
 /// version 16 replaced the twelve `aligned_*_count` columns with a single keyed
 /// `aligned_counts` JSON object, retiring the per-rule column, read, and write edits a new rule
 /// used to require;
@@ -89,6 +91,14 @@ CREATE TABLE IF NOT EXISTS index_metadata (
 -- `duplicated` marks a true same-descriptor twin: an in-workspace definition whose identical
 -- resolved descriptor is shared by at least one other definition. Distinct descriptors whose
 -- canonical projections merely collide (and so carry a `#<rank>` disambiguator) are NOT duplicated.
+-- `start_line`, `start_column`, `end_line`, and `end_column` locate the span in lines and columns
+-- from 1 (lines end at LF, CRLF, or a lone CR; columns count characters; the end is exclusive); they
+-- are NULL exactly when the span is. `occurrences` and `join_discrepancies` carry the same four.
+-- `header_end`, `header_end_line`, and `header_end_column` locate where the symbol's header ends: the
+-- byte offset where its declaration form is cut before the body, with its line and column. The header
+-- starts at the span's start. A symbol with no body distinct from its form, or stored with its name as
+-- its span, ends its header at the span's end. They are NULL for a document's own module and for a
+-- symbol without a span.
 -- `span_text`, `signature_text`, and `interface_text` are the three content tiers: the definition
 -- span's source verbatim, the declaration form without its body, and the signature together with the
 -- symbol's own documentation. The latter two are derived from the source; the body tier is the
@@ -112,6 +122,13 @@ CREATE TABLE IF NOT EXISTS symbols (
     document_path    TEXT,
     span_start       INTEGER,
     span_end         INTEGER,
+    start_line       INTEGER,
+    start_column     INTEGER,
+    end_line         INTEGER,
+    end_column       INTEGER,
+    header_end        INTEGER,
+    header_end_line   INTEGER,
+    header_end_column INTEGER,
     span_text        TEXT,
     signature_text   TEXT,
     interface_text   TEXT,
@@ -135,6 +152,10 @@ CREATE TABLE IF NOT EXISTS occurrences (
     document_path  TEXT    NOT NULL,
     span_start     INTEGER NOT NULL,
     span_end       INTEGER NOT NULL,
+    start_line     INTEGER,
+    start_column   INTEGER,
+    end_line       INTEGER,
+    end_column     INTEGER,
     role           TEXT    NOT NULL,
     rule           TEXT    NOT NULL,
     enclosing_id   TEXT    REFERENCES symbols(canonical_id),
@@ -170,6 +191,10 @@ CREATE TABLE IF NOT EXISTS join_discrepancies (
     document_path  TEXT    NOT NULL,
     span_start     INTEGER,
     span_end       INTEGER,
+    start_line     INTEGER,
+    start_column   INTEGER,
+    end_line       INTEGER,
+    end_column     INTEGER,
     outcome        TEXT    NOT NULL,
     expected_name  TEXT    NOT NULL,
     found_text     TEXT
