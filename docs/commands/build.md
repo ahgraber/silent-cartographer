@@ -41,6 +41,41 @@ Under `--json`, the answer carries `"rebuilt"`: `true` if the workspace was anal
 Anything the check cannot confirm causes a build rather than a skip — an absent index, an older schema version, a store recorded for a different workspace, or unreadable metadata.
 Use `--force` when you distrust the check itself.
 
+## Files that change during a build
+
+Analysis can take long enough for the workspace to change under it.
+After writing the store, `build` discovers the sources a second time and compares them with the files it indexed.
+A file edited, created, or deleted in between is reported, and the build still exits with success: the store describes the text that was indexed, and [`status`](status.md) reports it stale for those files.
+
+Under `--json`, the answer always carries `"changed_during_build"`, a list of `{"document_path", "change"}` objects sorted by path, where `change` is `changed`, `added`, or `removed`.
+The list is empty when nothing moved, and when the index was already current and nothing was analyzed.
+
+```json
+{
+  "changed_during_build": [
+    {
+      "change": "changed",
+      "document_path": "src/b.rs"
+    },
+    {
+      "change": "added",
+      "document_path": "src/f.rs"
+    }
+  ]
+}
+```
+
+The human answer prints one line per file after the accounting line:
+
+```text
+built: aligned=0 (...) text_mismatch=0 semantic_only=0 duplicate_ambiguous=0 syntax_only=0
+changed during build: src/b.rs
+added during build: src/f.rs
+```
+
+The list is not paged.
+An edit that is reverted before the second pass is not reported, and the index then matches the files again.
+
 ## Chunk parameters
 
 The values a build ran with are stored with the index and reported by [`status`](status.md), and the currency check compares them.
