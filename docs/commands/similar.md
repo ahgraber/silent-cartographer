@@ -4,7 +4,8 @@ Rank the indexed symbols most similar in content to a subject symbol.
 
 ```sh
 c10r similar with_backoff
-c10r similar --at src/lib.rs:1042
+c10r similar --at src/lib.rs:42:9
+c10r similar --at src/lib.rs:42
 ```
 
 Use it before writing a helper, to check whether one already exists, or around an existing symbol, to assess duplication.
@@ -17,13 +18,15 @@ Use it before writing a helper, to check whether one already exists, or around a
 
 ## Options
 
-| Flag                                              | Default     | Meaning                                                                                      |
-| ------------------------------------------------- | ----------- | -------------------------------------------------------------------------------------------- |
-| `--at <path:byte_offset>`                         | none        | Take the symbol enclosing this position as the subject. Cannot be combined with `REFERENCE`. |
-| `--detail <location\|signature\|interface\|body>` | `signature` | Project content onto each row                                                                |
-| `--max-lines <N>`                                 | `10`        | Cap the lines of content per row; `0` means unbounded                                        |
+| Flag                                              | Default     | Meaning                                                                               |
+| ------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------- |
+| `--at <path:line[:column]>`                       | none        | Take the symbol at this position as the subject. Cannot be combined with `REFERENCE`. |
+| `--detail <location\|signature\|interface\|body>` | `signature` | Project content onto each row                                                         |
+| `--max-lines <N>`                                 | `10`        | Cap the lines of content per row; `0` means unbounded                                 |
 
-See [common flags](common.md#shared-flags) for `--db`, `--workspace`, `--json`, `--color`, `--limit`, and `--cursor`.
+`--at` reads lines and columns by default and byte offsets under `--position byte`; see [positions](common.md#positions) for the forms and the line rule.
+
+See [common flags](common.md#shared-flags) for `--db`, `--workspace`, `--json`, `--color`, `--position`, `--limit`, and `--cursor`.
 
 ## Clone markers
 

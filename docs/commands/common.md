@@ -4,12 +4,13 @@ Flags and behavior shared by the whole command surface.
 
 ## Shared flags
 
-| Flag                            | Default                             | Meaning                                                    |
-| ------------------------------- | ----------------------------------- | ---------------------------------------------------------- |
-| `--db <PATH>`                   | `.c10r/index.db`                    | Path to the SQLite index                                   |
-| `--workspace <NAME>`            | the workspace root's directory name | The workspace identity that symbols are namespaced under   |
-| `--json`                        | off                                 | Print the structured answer instead of the human rendering |
-| `--color <auto\|always\|never>` | `auto`                              | `auto` styles only when standard output is a terminal      |
+| Flag                            | Default                             | Meaning                                                                  |
+| ------------------------------- | ----------------------------------- | ------------------------------------------------------------------------ |
+| `--db <PATH>`                   | `.c10r/index.db`                    | Path to the SQLite index                                                 |
+| `--workspace <NAME>`            | the workspace root's directory name | The workspace identity that symbols are namespaced under                 |
+| `--json`                        | off                                 | Print the structured answer instead of the human rendering               |
+| `--color <auto\|always\|never>` | `auto`                              | `auto` styles only when standard output is a terminal                    |
+| `--position <line\|byte>`       | `line`                              | The unit of printed locations and of `--at`; see [positions](#positions) |
 
 Result-bearing commands (`get`, `trace`, `find`, `search`, `similar`, `impact`) also take:
 
@@ -28,7 +29,55 @@ Result-bearing commands (`get`, `trace`, `find`, `search`, `similar`, `impact`) 
 
 An ambiguous reference returns the candidate set to choose from.
 
-`get` and `similar` also accept `--at path:byte_offset` instead of a reference, which resolves to the symbol enclosing that position.
+`get` and `similar` also accept `--at` instead of a reference, which resolves to a symbol by source position; see [positions](#positions).
+
+## Positions
+
+Every location in an answer is a file path plus a position in that file's text.
+`--position` selects the unit the human rendering prints and the unit `--at` reads.
+It does not change the `--json` answer, which carries both units.
+
+Under the default `--position line`, a location prints as `path:line:column`, the form editors and terminals open as a link:
+
+```text
+src/client.rs:12:5
+```
+
+Lines are numbered from 1 and end at LF, CRLF, or a lone CR, so the numbers match what an editor shows.
+Columns are numbered from 1 and count Unicode characters from the start of the line.
+A location's end is exclusive: it is the position after the last character.
+The human rendering prints only the start; `--json` carries the end.
+
+Under `--position byte`, a location prints as its byte span, `path:start-end`, and `--at` reads a byte offset:
+
+```text
+src/client.rs:240-318
+```
+
+Every location object in a `--json` answer carries both units: `span_start` and `span_end` are byte offsets, and `start_line`, `start_column`, `end_line`, and `end_column` are the line and column of the same two positions.
+Where a location has no byte offsets, the four line and column fields are `null` too.
+Lines and columns describe the text that was indexed, so in a stale answer they can differ from the file as it is now.
+
+### Reading `--at`
+
+Under `--position line`:
+
+| Form               | Resolves to                                                                                                                                                                |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path:line:column` | The innermost symbol whose span contains that position                                                                                                                     |
+| `path:line`        | The declaration whose header is on that line, else the innermost symbol enclosing the start of the line; several sibling declarations on the line return the candidate set |
+
+A header runs from the start of a declaration to where its body begins, so it covers decorators and every line of a multi-line parameter list.
+A line inside a function body has no header, and resolves to the function.
+A column past the end of its line resolves as the end of that line does.
+A zero line or column is a usage error that names the accepted forms.
+
+Under `--position byte`, `--at path:byte_offset` resolves to the innermost symbol enclosing that offset.
+
+The position is split from the right, so a path that contains `:` stays usable.
+A path whose own name ends in `:<digits>` is the exception: under `--position line`, `dir/a:12:5` reads as `dir/a`, line 12, column 5.
+
+A continuation token from a paged `--at` query is bound to the unit it was issued under and is refused under the other.
 
 ## Content detail
 
