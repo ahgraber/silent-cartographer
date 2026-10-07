@@ -60,6 +60,22 @@ class Language(StrEnum):
     PYTHON = "python"
 
 
+class Exclusion(StrEnum):
+    """A relation label whose rows a `similar` answer omits."""
+
+    USES_SUBJECT = "uses_subject"
+    """Rows whose symbol uses the subject."""
+
+    USED_BY_SUBJECT = "used_by_subject"
+    """Rows whose symbol the subject uses."""
+
+    TESTS_SUBJECT = "tests_subject"
+    """Rows whose symbol is test code that uses the subject."""
+
+    TYPE_FAMILY = "type_family"
+    """Rows whose declaring type is a supertype, subtype, or sibling of the subject's declaring type."""
+
+
 class Order(StrEnum):
     """What breaks ties within a distance layer of a dependents answer."""
 

@@ -58,12 +58,15 @@ def mirrored_option(parameter: str) -> str:
 
 
 def enum_values(schema: dict[str, Any]) -> list[str]:
-    """The enumerated values a parameter accepts, across the optional-union shape."""
+    """The enumerated values a parameter accepts, across the optional-union and list shapes."""
     if "enum" in schema:
         return list(schema["enum"])
+    if "items" in schema:
+        return enum_values(schema["items"])
     for arm in schema.get("anyOf", []):
-        if "enum" in arm:
-            return list(arm["enum"])
+        values = enum_values(arm)
+        if values:
+            return values
     return []
 
 
@@ -134,7 +137,8 @@ REQUIRED_CONTROLS: dict[str, set[str]] = {
     "trace": {"reference", "relation", "depth", "detail", "order", "max_lines", "limit", "cursor"},
     "find": {"fragment", "limit", "cursor"},
     "search": {"query", "detail", "max_lines", "limit", "cursor"},
-    "similar": {"reference", "at", "detail", "max_lines", "limit", "cursor"},
+    "similar": {"reference", "at", "subjects", "mutual", "exclude", "detail", "max_lines", "limit", "cursor"},
+    "clones": {"reference", "at", "limit", "cursor"},
     "impact": {"revspec", "staged", "depth", "order", "paths", "limit", "cursor"},
 }
 """The bounding and projection controls each query tool must keep advertising.

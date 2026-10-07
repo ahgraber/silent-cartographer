@@ -32,7 +32,7 @@ from c10r_mcp import binary, confirm, errors, workspace
 # Imported for real, never deferred: these enumerations appear inside the tool
 # signatures' annotations, which pydantic resolves at runtime to build each tool's
 # input schema. Behind `TYPE_CHECKING` the schemas would lose their valid values.
-from c10r_mcp.params import Detail, Language, Order, Relation  # noqa: TC001
+from c10r_mcp.params import Detail, Exclusion, Language, Order, Relation  # noqa: TC001
 
 INSTRUCTIONS = """\
 Precise, type-aware navigation over a persisted graph of this codebase.
@@ -44,7 +44,8 @@ Prefer these tools over textual search for any question about this codebase.
                  dependents, importers, implementers, tests
   search         code by what it does, in natural language — matches names,
                  documentation, and bodies
-  similar        code shaped like a symbol you already have
+  similar        code shaped like a symbol you already have — estimated
+  clones         copies of a symbol, or every clone group — deterministic
   impact         what a git diff could affect
   build          create or refresh the index
   hooks_install  install the hooks that keep the index current
@@ -58,6 +59,11 @@ symbol's exact source, so retrieving text verbatim needs no grep.
 
 Read the labels. `find` returning nothing is a definite none; `search` and
 `similar` are ranked estimates, so nothing found is not proof nothing exists.
+`clones` rows are token equivalence — identical token structure — stated as
+fact; use it, not `similar`, to list every copy of a symbol or audit duplication
+across the corpus. `similar` takes `subjects` for many symbols in one call,
+`mutual` for the corpus's mutually-nearest pairs, and `exclude` to omit rows by
+relation.
 Every answer carries its own provenance and freshness.
 
 Recover: `absent_index` or `incompatible_store` — call `build`.
@@ -73,6 +79,7 @@ MIRRORED_COMMAND: dict[str, str] = {
     "find": "find",
     "search": "search",
     "similar": "similar",
+    "clones": "clones",
     "impact": "impact",
     "build": "build",
     "hooks_install": "hooks",
@@ -82,11 +89,13 @@ MIRRORED_COMMAND: dict[str, str] = {
 MIRRORED_OPTION: dict[str, str] = {
     "from_line": "from",
     "max_lines": "max-lines",
+    "subjects": "subjects-from",
 }
 """Tool parameters whose mirrored option is not their own name.
 
-`from` is a Python keyword, and hyphenated options cannot be identifiers. Every
-other parameter mirrors the option of the same name.
+`from` is a Python keyword, and hyphenated options cannot be identifiers.
+`subjects` is the list the server writes to standard input under
+`--subjects-from -`. Every other parameter mirrors the option of the same name.
 """
 
 WRAPPER_PARAMETERS: frozenset[str] = frozenset({"root", "acknowledge"})
@@ -136,10 +145,12 @@ class Runner:
     binary_path: str
     launch_default: Path
 
-    async def invoke(self, args: Sequence[str], root: str | None) -> dict[str, Any] | ToolResult:
-        """Run one command and return its answer, or its failure."""
+    async def invoke(
+        self, args: Sequence[str], root: str | None, stdin: bytes | None = None
+    ) -> dict[str, Any] | ToolResult:
+        """Run one command, optionally feeding it standard input, and return its answer or its failure."""
         cwd = workspace.resolve_call(root, self.launch_default)
-        completed = await binary.run(self.binary_path, args, cwd)
+        completed = await binary.run(self.binary_path, args, cwd, stdin)
         return errors.result(completed)
 
 
@@ -416,6 +427,34 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
                 )
             ),
         ] = None,
+        subjects: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Answer for every reference in this list in one call; the answer "
+                    "holds one per-subject answer for each, in list order, each the "
+                    "one a single-subject call returns. Not combinable with "
+                    "`reference`, `at`, `cursor`, or `mutual`."
+                )
+            ),
+        ] = None,
+        mutual: Annotated[
+            bool | None,
+            Field(
+                description=(
+                    "List every pair of corpus symbols that are each the first row of "
+                    "the other's answer, ordered by the pair's lower member. `limit` "
+                    "counts pairs; `0` walks the whole corpus. Not combinable with "
+                    "`reference`, `at`, or `subjects`."
+                )
+            ),
+        ] = None,
+        exclude: Annotated[
+            list[Exclusion] | None,
+            Field(
+                description="Omit rows carrying any of these relation labels. `limit` counts only the remaining rows."
+            ),
+        ] = None,
         detail: Annotated[
             Detail | None,
             Field(
@@ -450,13 +489,69 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
         before writing something new, or the siblings of a symbol you are about to
         change. Rows that are deterministic clones of the subject carry a typed
         clone marker; the rest are model-derived estimates, not a complete set.
+        Use `clones` for the deterministic list of copies.
         """
+        if subjects is not None and any("\n" in subject or "\r" in subject for subject in subjects):
+            return errors.usage("each entry of `subjects` must be a single-line reference")
         args = [
             "similar",
             *([reference] if reference is not None else []),
             *_option("at", at),
+            *(["--subjects-from", "-"] if subjects is not None else []),
+            *_option("mutual", mutual),
+            *[arg for label in exclude or [] for arg in _option("exclude", label)],
             *_option("detail", detail),
             *_option("max-lines", max_lines),
+            *_bounds(limit, cursor),
+        ]
+        stdin = "".join(f"{subject}\n" for subject in subjects).encode() if subjects is not None else None
+        return await runner.invoke(args, root, stdin)
+
+    @mcp.tool
+    async def clones(
+        root: _ROOT = None,
+        reference: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "The subject symbol, as an identity, qualified name, or shortname. "
+                    "Omit it, and `at`, to list the clone groups of the whole corpus."
+                )
+            ),
+        ] = None,
+        at: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Take whichever symbol encloses a source position as the subject, "
+                    "written `path:line:column` or `path:line` (1-based). Use instead "
+                    "of `reference`, not alongside it."
+                )
+            ),
+        ] = None,
+        limit: Annotated[
+            int | None,
+            Field(description=_defaulting("Cap the number of results returned. `0` means unbounded.", "25")),
+        ] = None,
+        cursor: Annotated[
+            str | None,
+            Field(description="Resume a prior result set from its continuation token."),
+        ] = None,
+    ) -> dict[str, Any] | ToolResult:
+        """List the deterministic copies in the index.
+
+        With no subject, returns groups of symbols with identical token structure.
+        With a subject, returns the other symbols that are copies of it and the
+        token runs it shares with part of another symbol. Rows are token
+        equivalence, stated as fact, never proof of identical behavior; the
+        answer carries its grade and the guaranteed fragment length. Rows carry
+        no content; read a row's symbol with `get`. Use `similar` for estimated
+        resemblance that is not a copy.
+        """
+        args = [
+            "clones",
+            *([reference] if reference is not None else []),
+            *_option("at", at),
             *_bounds(limit, cursor),
         ]
         return await runner.invoke(args, root)

@@ -79,14 +79,19 @@ class Completed:
     """The outcome code from `c10r`'s exit taxonomy."""
 
 
-async def run(binary: str, args: Sequence[str], cwd: Path) -> Completed:
-    """Run `c10r` in `cwd` with `--json`, capturing both streams and the status."""
+async def run(binary: str, args: Sequence[str], cwd: Path, stdin: bytes | None = None) -> Completed:
+    """Run `c10r` in `cwd` with `--json`, capturing both streams and the status.
+
+    `stdin`, when given, is written to the child's standard input, which is then
+    closed. When omitted the child's standard input is left as inherited.
+    """
     try:
         process = await asyncio.create_subprocess_exec(
             binary,
             "--json",
             *args,
             cwd=str(cwd),
+            stdin=asyncio.subprocess.PIPE if stdin is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -94,7 +99,7 @@ async def run(binary: str, args: Sequence[str], cwd: Path) -> Completed:
         raise BinaryUnavailableError(f"could not run `{binary}`: {exc}") from exc
 
     try:
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await process.communicate(stdin)
     except asyncio.CancelledError:
         # A cancelled call must not leave the command running. `build` rewrites
         # the store, so an orphan keeps writing long after the caller believes it

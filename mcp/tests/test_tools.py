@@ -20,7 +20,7 @@ import pytest
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
-QUERY_TOOLS = {"get", "trace", "find", "search", "similar", "impact"}
+QUERY_TOOLS = {"get", "trace", "find", "search", "similar", "clones", "impact"}
 LIFECYCLE_TOOLS = {"build", "hooks_install"}
 
 INDEX_STATE_CATEGORIES = (

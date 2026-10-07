@@ -80,9 +80,9 @@
 
 ## Surfaces and versions
 
-- [ ] Bump `SURFACE_VERSION` in [src/manifest.rs](../../../src/manifest.rs) by one above the value on `main` at branch time, and confirm the surface index lists `clones` and the new `similar` flags with their values.
-- [ ] In [mcp/src/c10r_mcp/server.py](../../../mcp/src/c10r_mcp/server.py), add the `clones` tool and the `subjects`, `mutual`, and `exclude` parameters on `similar`, writing `subjects` to standard input with `--subjects-from -`; update the server instructions; move the pin in [mcp/src/c10r_mcp/surface.py](../../../mcp/src/c10r_mcp/surface.py).
-- [ ] MCP tests: the tool list names `clones`; one `similar` call with three subjects returns three answers in order; `exclude` removes labeled rows; the schema-against-surface tests pass.
+- [x] Bump `SURFACE_VERSION` in [src/manifest.rs](../../../src/manifest.rs) by one above the value on `main` at branch time, and confirm the surface index lists `clones` and the new `similar` flags with their values.
+- [x] In [mcp/src/c10r_mcp/server.py](../../../mcp/src/c10r_mcp/server.py), add the `clones` tool and the `subjects`, `mutual`, and `exclude` parameters on `similar`, writing `subjects` to standard input with `--subjects-from -`; update the server instructions; move the pin in [mcp/src/c10r_mcp/surface.py](../../../mcp/src/c10r_mcp/surface.py).
+- [x] MCP tests: the tool list names `clones`; one `similar` call with three subjects returns three answers in order; `exclude` removes labeled rows; the schema-against-surface tests pass.
 
 ## Documentation
 
