@@ -766,6 +766,9 @@ pub fn ingest_with_params(
         let tokens = doc.tree.spelled_tokens(ByteSpan { start, end });
         if let Some(keys) = clone::clone_keys(&tokens) {
             store.set_clone_keys(source.canonical_id, &keys.formatting_key, &keys.substitution_key)?;
+            store.set_clone_token_count(source.canonical_id, tokens.len())?;
+            let (k, w) = (clone::FRAGMENT_KGRAM_LENGTH, clone::FRAGMENT_WINDOW);
+            store.write_clone_fingerprints(source.canonical_id, &clone::winnow(&tokens, k, w))?;
         }
     }
 

@@ -564,3 +564,146 @@ fn persisted_chunk_vectors_match_the_header_carrying_chunks() {
         );
     }
 }
+
+const FRAGMENT_PACKAGE: &str = "fragcrate";
+
+/// A type holding a short method and a method long enough to carry fingerprints; `operator` is the
+/// operator spelled in every statement of the long method.
+fn fragment_source(operator: &str) -> String {
+    let statements: String = (0..8)
+        .map(|i| format!("        let v{i} = 1 {operator} 2;\n"))
+        .collect();
+    format!(
+        "pub struct Holder;\nimpl Holder {{\n    pub fn tiny(&self) {{}}\n    pub fn long(&self) {{\n{statements}    }}\n}}\n"
+    )
+}
+
+fn fragment_id(segments: &[(&str, SegmentKind)]) -> CanonicalId {
+    crate::support::id_of_pkg(FRAGMENT_PACKAGE, segments)
+}
+
+fn holder_id() -> CanonicalId {
+    fragment_id(&[("Holder", SegmentKind::Type)])
+}
+
+fn tiny_id() -> CanonicalId {
+    fragment_id(&[("Holder", SegmentKind::Type), ("tiny", SegmentKind::Method)])
+}
+
+fn long_id() -> CanonicalId {
+    fragment_id(&[("Holder", SegmentKind::Type), ("long", SegmentKind::Method)])
+}
+
+/// Ingest `source` as the fragment fixture into `store`.
+fn ingest_fragment_source(store: &mut GraphStore, source: &str) {
+    use silent_cartographer::semantic::model::{OccurrenceRole, SourceRange, SymbolClass, SymbolKind};
+
+    use crate::support::{line_col, one_doc_index, one_occ_symbol};
+
+    let doc = "holder.rs";
+    let sym = |segments: &[(&str, SegmentKind)], kind| {
+        let name = segments.last().unwrap().0;
+        let (line, col) = line_col(source, source.find(name).unwrap());
+        one_occ_symbol(
+            FRAGMENT_PACKAGE,
+            segments,
+            kind,
+            SymbolClass::InWorkspace,
+            doc,
+            SourceRange::new(line, col, line, col + name.len() as u32),
+            OccurrenceRole::Definition,
+        )
+    };
+    let holder = [("Holder", SegmentKind::Type)];
+    let tiny = [("Holder", SegmentKind::Type), ("tiny", SegmentKind::Method)];
+    let long = [("Holder", SegmentKind::Type), ("long", SegmentKind::Method)];
+    let index = one_doc_index(
+        doc,
+        vec![
+            sym(&holder, SymbolKind::Type),
+            sym(&tiny, SymbolKind::Method),
+            sym(&long, SymbolKind::Method),
+        ],
+    );
+    ingest(
+        store,
+        &ws(),
+        Some(WS_ROOT),
+        &index,
+        &[(doc.to_string(), source.to_string())],
+    )
+    .unwrap();
+}
+
+fn fragment_store(operator: &str) -> GraphStore {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest_fragment_source(&mut store, &fragment_source(operator));
+    store
+}
+
+// _(A leaf contributes evidence; a container contributes none)_ — a long method holds
+// fingerprints; the containing type and a method shorter than the guaranteed length hold none,
+// though the short method still records its token count beside its keys.
+#[test]
+fn only_long_leaves_hold_fragment_fingerprints() {
+    let store = fragment_store("+");
+    assert!(!store.clone_fingerprints_of(&long_id()).unwrap().is_empty());
+    assert!(store.clone_fingerprints_of(&holder_id()).unwrap().is_empty());
+    assert!(store.clone_fingerprints_of(&tiny_id()).unwrap().is_empty());
+    assert!(store.clone_token_count_of(&tiny_id()).unwrap().is_some());
+    assert_eq!(store.clone_token_count_of(&holder_id()).unwrap(), None);
+}
+
+// _(Rebuild is idempotent; a changed leaf's evidence is replaced)_ — a second build over the same
+// source yields identical rows; after the source changes, the rows equal a fresh build of the new
+// source and differ from the old ones.
+#[test]
+fn fragment_fingerprints_follow_the_build() {
+    let mut store = fragment_store("+");
+    let first = store.clone_fingerprints_of(&long_id()).unwrap();
+    ingest_fragment_source(&mut store, &fragment_source("+"));
+    assert_eq!(store.clone_fingerprints_of(&long_id()).unwrap(), first);
+
+    ingest_fragment_source(&mut store, &fragment_source("*"));
+    let second = store.clone_fingerprints_of(&long_id()).unwrap();
+    assert_ne!(second, first);
+    assert_eq!(second, fragment_store("*").clone_fingerprints_of(&long_id()).unwrap());
+    let (hash, ordinal) = first[0];
+    assert!(
+        !store
+            .passages_with_fingerprint(hash)
+            .unwrap()
+            .contains(&(long_id(), ordinal)),
+        "no row from the prior source remains"
+    );
+}
+
+// _(A failed build leaves prior evidence authoritative)_ — a build abandoned after clearing rolls
+// back, as for the representations.
+#[test]
+fn failed_build_leaves_prior_fingerprints_authoritative() {
+    let store = fragment_store("+");
+    let before = store.clone_fingerprints_of(&long_id()).unwrap();
+    assert!(!before.is_empty());
+
+    {
+        let tx = store.begin_build().unwrap();
+        store.clear_derived().unwrap();
+        assert!(store.clone_fingerprints_of(&long_id()).unwrap().is_empty());
+        drop(tx);
+    }
+
+    assert_eq!(store.clone_fingerprints_of(&long_id()).unwrap(), before);
+}
+
+// _(The build records the parameters its evidence was derived under)_.
+#[test]
+fn fragment_parameters_are_recorded() {
+    use silent_cartographer::graph::clone::{FRAGMENT_KGRAM_LENGTH, FRAGMENT_WINDOW};
+
+    let store = fragment_store("+");
+    assert_eq!(
+        store.fragment_parameters().unwrap(),
+        Some((FRAGMENT_KGRAM_LENGTH, FRAGMENT_WINDOW))
+    );
+}

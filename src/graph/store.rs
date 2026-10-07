@@ -823,6 +823,7 @@ impl GraphStore {
         self.conn.execute("DELETE FROM join_discrepancies", [])?;
         self.conn.execute("DELETE FROM semantic_lexical", [])?;
         self.conn.execute("DELETE FROM semantic_vectors", [])?;
+        self.conn.execute("DELETE FROM clone_fingerprints", [])?;
         self.conn.execute("DELETE FROM semantic_corpus", [])?;
         self.conn.execute("DELETE FROM symbols", [])?;
         Ok(())
@@ -878,8 +879,9 @@ impl GraphStore {
                 (id, schema_version, workspace_id, workspace_root, analyzer_name, analyzer_version, environment,
                  content_hash, aligned_counts,
                  text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count,
-                 semantic_model_identity, corpus_definition_version, chunk_size, chunk_overlap)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 semantic_model_identity, corpus_definition_version, chunk_size, chunk_overlap,
+                 fragment_kgram_length, fragment_window)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 SCHEMA_VERSION,
                 meta.workspace_id.as_str(),
@@ -897,6 +899,8 @@ impl GraphStore {
                 crate::graph::corpus::CORPUS_DEFINITION_VERSION as i64,
                 meta.chunk_params.chunk_size as i64,
                 meta.chunk_params.overlap as i64,
+                crate::graph::clone::FRAGMENT_KGRAM_LENGTH as i64,
+                crate::graph::clone::FRAGMENT_WINDOW as i64,
             ],
         )?;
         Ok(())
@@ -1153,6 +1157,83 @@ impl GraphStore {
                 Some((Some(f), Some(s))) => Some((f, s)),
                 _ => None,
             })
+    }
+
+    /// Record the length of a leaf's spelled token sequence.
+    pub fn set_clone_token_count(&self, id: &CanonicalId, token_count: usize) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE symbols SET clone_token_count = ?2 WHERE canonical_id = ?1",
+            params![id.as_str(), token_count as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The length of the token sequence behind a symbol's clone keys, or `None` when it carries none.
+    pub fn clone_token_count_of(&self, id: &CanonicalId) -> rusqlite::Result<Option<usize>> {
+        self.conn
+            .query_row(
+                "SELECT clone_token_count FROM symbols WHERE canonical_id = ?1",
+                params![id.as_str()],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(|count| count.flatten().map(|count| count as usize))
+    }
+
+    /// Record a leaf's `(hash, token_ordinal)` fingerprints against its passage.
+    ///
+    /// The leaf's passage must already be inserted; a leaf without one records nothing.
+    pub fn write_clone_fingerprints(&self, id: &CanonicalId, fingerprints: &[(i64, usize)]) -> rusqlite::Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO clone_fingerprints (hash, passage_id, token_ordinal)
+             SELECT ?2, id, ?3 FROM semantic_corpus WHERE symbol_id = ?1",
+        )?;
+        for &(hash, token_ordinal) in fingerprints {
+            stmt.execute(params![id.as_str(), hash, token_ordinal as i64])?;
+        }
+        Ok(())
+    }
+
+    /// A symbol's `(hash, token_ordinal)` fingerprints in token order; empty when it holds none.
+    pub fn clone_fingerprints_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<(i64, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.hash, f.token_ordinal
+             FROM clone_fingerprints f JOIN semantic_corpus c ON c.id = f.passage_id
+             WHERE c.symbol_id = ?1
+             ORDER BY f.token_ordinal",
+        )?;
+        let rows = stmt.query_map(params![id.as_str()], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)))?;
+        rows.collect()
+    }
+
+    /// The passages holding a fingerprint hash, as `(symbol, token_ordinal)` ordered by symbol
+    /// identity then ordinal.
+    pub fn passages_with_fingerprint(&self, hash: i64) -> rusqlite::Result<Vec<(CanonicalId, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.symbol_id, f.token_ordinal
+             FROM clone_fingerprints f JOIN semantic_corpus c ON c.id = f.passage_id
+             WHERE f.hash = ?1
+             ORDER BY c.symbol_id, f.token_ordinal",
+        )?;
+        let rows = stmt.query_map(params![hash], |r| {
+            Ok((
+                CanonicalId::from_raw(r.get::<_, String>(0)?),
+                r.get::<_, i64>(1)? as usize,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// The `(k-gram length, window)` the persisted build's fingerprints were derived under, if a
+    /// build has been persisted.
+    pub fn fragment_parameters(&self) -> rusqlite::Result<Option<(usize, usize)>> {
+        self.conn
+            .query_row(
+                "SELECT fragment_kgram_length, fragment_window FROM index_metadata WHERE id = 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize)),
+            )
+            .optional()
     }
 
     /// Insert a symbol row.

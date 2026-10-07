@@ -8,19 +8,19 @@
 
 ## Store schema
 
-- [ ] In [src/graph/schema.rs](../../../src/graph/schema.rs), add `clone_token_count INTEGER` to `symbols`, an index on `clone_substitution_key`, and the `clone_fingerprints(hash, passage_id, token_ordinal)` table with an index on `hash`, and the `fragment_kgram_length` and `fragment_window` columns to `index_metadata` (design.md § FragmentEvidenceStorage).
-- [ ] Bump `SCHEMA_VERSION` by one above the value on `main` at branch time and add the migration note (design.md § Versions); update store tests only where they assert the literal version.
-- [ ] Add store functions to write fingerprints and token counts in the build transaction, to read a symbol's fingerprints, to look up the passages holding a hash, and to clear both in `clear_derived`.
+- [x] In [src/graph/schema.rs](../../../src/graph/schema.rs), add `clone_token_count INTEGER` to `symbols`, an index on `clone_substitution_key`, and the `clone_fingerprints(hash, passage_id, token_ordinal)` table with an index on `hash`, and the `fragment_kgram_length` and `fragment_window` columns to `index_metadata` (design.md § FragmentEvidenceStorage).
+- [x] Bump `SCHEMA_VERSION` by one above the value on `main` at branch time and add the migration note (design.md § Versions); update store tests only where they assert the literal version.
+- [x] Add store functions to write fingerprints and token counts in the build transaction, to read a symbol's fingerprints, to look up the passages holding a hash, and to clear both in `clear_derived`.
 
 ## Fragment evidence at build
 
-- [ ] Add a winnowing function in [src/graph/clone.rs](../../../src/graph/clone.rs) over placeholder tokens with k and w as parameters, the SHA-256 k-gram hash, and rightmost-minimum selection; return nothing for a sequence shorter than the guaranteed length.
+- [x] Add a winnowing function in [src/graph/clone.rs](../../../src/graph/clone.rs) over placeholder tokens with k and w as parameters, the SHA-256 k-gram hash, and rightmost-minimum selection; return nothing for a sequence shorter than the guaranteed length.
   Define k = 20 and w = 21 as two named constants in one place.
-- [ ] Unit tests: two sequences sharing a run of exactly the guaranteed length share a fingerprint at the same diagonal; the same input yields the same fingerprints on repeated calls; a sequence shorter than the guaranteed length yields none.
-- [ ] In the build ([src/graph/mod.rs](../../../src/graph/mod.rs)), write each leaf's token count and fingerprints next to its keys, and record k and w in `index_metadata`.
-- [ ] Test: a built fixture holds fingerprints for a long function and none for a container type or a short function.
-- [ ] Test: rebuilding the same fixture yields identical `clone_fingerprints` rows; after a leaf's source changes, its rows derive from the new source.
-- [ ] Test: a build that fails after the store opens leaves the prior build's fingerprint rows unchanged.
+- [x] Unit tests: two sequences sharing a run of exactly the guaranteed length share a fingerprint at the same diagonal; the same input yields the same fingerprints on repeated calls; a sequence shorter than the guaranteed length yields none.
+- [x] In the build ([src/graph/mod.rs](../../../src/graph/mod.rs)), write each leaf's token count and fingerprints next to its keys, and record k and w in `index_metadata`.
+- [x] Test: a built fixture holds fingerprints for a long function and none for a container type or a short function.
+- [x] Test: rebuilding the same fixture yields identical `clone_fingerprints` rows; after a leaf's source changes, its rows derive from the new source.
+- [x] Test: a build that fails after the store opens leaves the prior build's fingerprint rows unchanged.
 
 ## Similar internals
 

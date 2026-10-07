@@ -23,7 +23,11 @@
 /// merely missing a count. The keyed `aligned_counts` column spares that change any DDL and any
 /// per-rule read/write edit — it does not spare it the version bump.
 ///
-/// Migration: version 17 stores a callable whose parent is not a type as `function` rather than
+/// Migration: version 18 leaves documentation out of the spelled token sequence the clone keys read
+/// (a documented Python leaf's stored keys change) and adds the shared-fragment evidence —
+/// `clone_fingerprints`, `symbols.clone_token_count`, an index on `symbols.clone_substitution_key`,
+/// and the fragment parameters in `index_metadata`;
+/// version 17 stores a callable whose parent is not a type as `function` rather than
 /// `method`, and names a Python module by its module name rather than `__init__` (both stored
 /// columns, and both inputs to the passage render, so the corpus definition version moved with it)
 /// and records each location's line and column beside its byte offsets (`symbols`, `occurrences`,
@@ -39,7 +43,7 @@
 /// columns on `symbols`, and the semantic-index identity in `index_metadata`. The index is derived,
 /// replayable data, so rebuild is the migration — a build replaces an older store of its own
 /// wholesale and a query refuses it with recovery guidance (the replace-or-refuse contract).
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -66,7 +70,8 @@ PRAGMA foreign_keys = ON;
 -- binary), the corpus/render definition, and the chunk parameters that produced the build's
 -- semantic representations — retrievable as provenance. The chunk parameters are the operator's
 -- values, so a build compares them when deciding whether stored vectors still describe the
--- workspace.
+-- workspace. `fragment_kgram_length` and `fragment_window` are the winnowing parameters the build's
+-- clone fingerprints were derived under; a reader applies the recorded values, not the binary's.
 CREATE TABLE IF NOT EXISTS index_metadata (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version      INTEGER NOT NULL,
@@ -79,6 +84,8 @@ CREATE TABLE IF NOT EXISTS index_metadata (
     corpus_definition_version INTEGER NOT NULL,
     chunk_size                INTEGER NOT NULL,
     chunk_overlap             INTEGER NOT NULL,
+    fragment_kgram_length     INTEGER NOT NULL,
+    fragment_window           INTEGER NOT NULL,
     content_hash                   TEXT    NOT NULL,
     aligned_counts                 TEXT    NOT NULL DEFAULT '{}',
     text_mismatch_count            INTEGER NOT NULL DEFAULT 0,
@@ -143,8 +150,22 @@ CREATE TABLE IF NOT EXISTS symbols (
     duplicated       INTEGER NOT NULL DEFAULT 0,
     test_rule        TEXT,
     clone_formatting_key    TEXT,
-    clone_substitution_key  TEXT
+    clone_substitution_key  TEXT,
+    clone_token_count       INTEGER
 );
+CREATE INDEX IF NOT EXISTS symbols_by_clone_substitution_key ON symbols(clone_substitution_key);
+
+-- Shared-fragment evidence: the winnowed fingerprints of a leaf's placeholder token sequence, one row
+-- per selected k-gram. `passage_id` is the leaf's `semantic_corpus` rowid and `token_ordinal` is the
+-- k-gram's start index in the leaf's spelled token sequence. A leaf shorter than the guaranteed
+-- fragment length holds none. `symbols.clone_token_count` is the length of that sequence, set for
+-- every leaf carrying clone keys.
+CREATE TABLE IF NOT EXISTS clone_fingerprints (
+    hash           INTEGER NOT NULL,
+    passage_id     INTEGER NOT NULL,
+    token_ordinal  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS clone_fingerprints_by_hash ON clone_fingerprints(hash);
 
 -- One row per occurrence of a symbol. `role` is 'definition' or 'reference'. `rule` is the
 -- alignment rule that accepted the attribution ('exact', 'crate_root', 'operator_desugar',

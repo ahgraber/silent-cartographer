@@ -93,7 +93,8 @@ Storage is a fraction of the token count, and the build adds one pass over token
 **Chosen:** A new table `clone_fingerprints(hash INTEGER NOT NULL, passage_id INTEGER NOT NULL, token_ordinal INTEGER NOT NULL)` with an index on `hash`, and a new `clone_token_count INTEGER` column on `symbols`, set where the keys are set.
 The build writes them in the build transaction, after the keys, for every leaf with keys whose token count is at least the guaranteed length.
 Parameters: k = 20 tokens, w = 21 k-grams, so the guaranteed length is w + k - 1 = 40 tokens, about five Python lines.
-The k-gram hash is the first 8 bytes of SHA-256 over the length-prefixed placeholder tokens, read as a signed 64-bit integer.
+The k-gram hash is the first 8 bytes of SHA-256 over each placeholder token's class tag and length-prefixed text, read as a signed 64-bit integer.
+The class tag keeps a structural token from hashing like an identifier or literal placeholder.
 Selection is robust winnowing: the rightmost minimum hash in each window, recorded once per selected position.
 The values of k and w are two named constants in one place.
 Each build records them in `index_metadata`, in new columns `fragment_kgram_length` and `fragment_window`, as it records the chunk size and overlap.

@@ -77,6 +77,66 @@ fn hash_sequence<'a>(tokens: impl Iterator<Item = &'a str>) -> String {
     hex
 }
 
+/// Tokens in each fingerprinted k-gram.
+pub const FRAGMENT_KGRAM_LENGTH: usize = 20;
+
+/// K-grams in each winnowing window.
+pub const FRAGMENT_WINDOW: usize = 21;
+
+/// The shortest shared token run that is guaranteed to share a fingerprint under k-gram length `k`
+/// and window `w`.
+pub const fn guaranteed_fragment_length(k: usize, w: usize) -> usize {
+    w + k - 1
+}
+
+/// Winnow a token sequence into fingerprints: `(hash, token_ordinal)` pairs, where `token_ordinal`
+/// is the selected k-gram's start index in `tokens`.
+///
+/// Every identifier is one placeholder and every literal another, so a consistently or
+/// inconsistently renamed copy fingerprints alike. Any run of at least
+/// [`guaranteed_fragment_length`]`(k, w)` tokens shared by two sequences yields a shared
+/// fingerprint at the same offset within the run in both. A sequence shorter than that length
+/// yields none.
+pub fn winnow(tokens: &[SpelledToken], k: usize, w: usize) -> Vec<(i64, usize)> {
+    if tokens.len() < guaranteed_fragment_length(k, w) {
+        return Vec::new();
+    }
+    let hashes: Vec<i64> = tokens.windows(k).map(kgram_hash).collect();
+    let mut selected: Vec<(i64, usize)> = Vec::new();
+    for (window_start, window) in hashes.windows(w).enumerate() {
+        // The rightmost minimum: `<=` lets a later equal hash displace an earlier one.
+        let (offset, &hash) = window
+            .iter()
+            .enumerate()
+            .reduce(|best, next| if next.1 <= best.1 { next } else { best })
+            .expect("a window holds w >= 1 hashes");
+        let position = window_start + offset;
+        if selected.last().is_none_or(|&(_, last)| last != position) {
+            selected.push((hash, position));
+        }
+    }
+    selected
+}
+
+/// Hash one k-gram of placeholder tokens: the first 8 bytes of SHA-256 over each token's class tag
+/// and length-prefixed text, read as a signed integer. Identifiers and literals contribute their
+/// class tag only, so no source text of either reaches the hash.
+fn kgram_hash(kgram: &[SpelledToken]) -> i64 {
+    let mut hasher = Sha256::new();
+    for token in kgram {
+        let (tag, text) = match token.class {
+            TokenClass::Identifier => (0u8, ""),
+            TokenClass::Literal => (1u8, ""),
+            TokenClass::Other => (2u8, token.text.as_str()),
+        };
+        hasher.update([tag]);
+        hasher.update((text.len() as u64).to_le_bytes());
+        hasher.update(text.as_bytes());
+    }
+    let digest = hasher.finalize();
+    i64::from_le_bytes(digest[..8].try_into().expect("a SHA-256 digest holds 32 bytes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::syntax::{Language, SyntaxTree};
@@ -206,5 +266,72 @@ mod tests {
         let a = python_keys_of("def f(x):\n    if x:\n        \"first note\"\n    return x\n");
         let b = python_keys_of("def f(x):\n    if x:\n        \"second note\"\n    return x\n");
         assert_ne!(a.formatting_key, b.formatting_key);
+    }
+
+    const K: usize = FRAGMENT_KGRAM_LENGTH;
+    const W: usize = FRAGMENT_WINDOW;
+
+    /// `count` distinct tokens of `class` whose texts begin with `tag`.
+    fn tokens(class: TokenClass, tag: &str, count: usize) -> Vec<SpelledToken> {
+        (0..count)
+            .map(|i| SpelledToken {
+                class,
+                text: format!("{tag}{i}"),
+                start: i,
+            })
+            .collect()
+    }
+
+    /// Two sequences sharing a run of exactly the guaranteed length share a fingerprint at the
+    /// same offset from the run's start in both.
+    #[test]
+    fn a_shared_run_of_the_guaranteed_length_shares_a_fingerprint_on_one_diagonal() {
+        let run = tokens(TokenClass::Other, "run", guaranteed_fragment_length(K, W));
+        let a = [
+            tokens(TokenClass::Other, "a", 7),
+            run.clone(),
+            tokens(TokenClass::Other, "after_a", 5),
+        ]
+        .concat();
+        let b = [
+            tokens(TokenClass::Other, "b", 13),
+            run,
+            tokens(TokenClass::Other, "after_b", 30),
+        ]
+        .concat();
+        let from_a = winnow(&a, K, W);
+        let from_b = winnow(&b, K, W);
+        let shared_on_diagonal = from_a.iter().any(|&(hash_a, ordinal_a)| {
+            from_b
+                .iter()
+                .any(|&(hash_b, ordinal_b)| hash_a == hash_b && ordinal_a as i64 - 7 == ordinal_b as i64 - 13)
+        });
+        assert!(shared_on_diagonal);
+    }
+
+    /// Identifier and literal text does not reach the fingerprints: a renamed copy fingerprints alike.
+    #[test]
+    fn identifier_and_literal_text_does_not_reach_the_fingerprints() {
+        let length = guaranteed_fragment_length(K, W);
+        for class in [TokenClass::Identifier, TokenClass::Literal] {
+            assert_eq!(
+                winnow(&tokens(class, "x", length), K, W),
+                winnow(&tokens(class, "renamed", length), K, W)
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_calls_give_identical_fingerprints() {
+        let input = tokens(TokenClass::Other, "t", 200);
+        let first = winnow(&input, K, W);
+        assert!(!first.is_empty());
+        assert_eq!(first, winnow(&input, K, W));
+    }
+
+    #[test]
+    fn a_sequence_shorter_than_the_guaranteed_length_yields_none() {
+        let input = tokens(TokenClass::Other, "t", guaranteed_fragment_length(K, W) - 1);
+        assert!(winnow(&input, K, W).is_empty());
     }
 }
