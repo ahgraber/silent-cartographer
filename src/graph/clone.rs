@@ -84,11 +84,20 @@ mod tests {
 
     /// The clone keys of the sole function declared in `source`.
     fn keys_of(source: &str) -> CloneKeys {
-        let tree = SyntaxTree::parse(source, Language::Rust).expect("fixture parses");
+        function_keys(source, Language::Rust, "function_item")
+    }
+
+    /// The clone keys of the sole function declared in the Python `source`.
+    fn python_keys_of(source: &str) -> CloneKeys {
+        function_keys(source, Language::Python, "function_definition")
+    }
+
+    fn function_keys(source: &str, language: Language, function_kind: &str) -> CloneKeys {
+        let tree = SyntaxTree::parse(source, language).expect("fixture parses");
         let decl = tree
             .all_declarations()
             .into_iter()
-            .find(|d| d.node_kind == "function_item")
+            .find(|d| d.node_kind == function_kind)
             .expect("fixture declares a function");
         clone_keys(&tree.spelled_tokens(decl.full_span)).expect("a function spells tokens")
     }
@@ -145,5 +154,57 @@ mod tests {
         let a = keys_of("fn f() -> u32 { 1 }");
         let b = keys_of("/// Documented.\nfn f() -> u32 {\n    // inner note\n    1\n}");
         assert_eq!(a.formatting_key, b.formatting_key);
+    }
+
+    /// Rust doc comments with different text spell the same sequence.
+    #[test]
+    fn rust_doc_comment_text_is_disregarded() {
+        let a = keys_of("/// Adds one.\nfn f(x: u32) -> u32 { x + 1 }");
+        let b = keys_of("/// Increments the input.\nfn f(x: u32) -> u32 { x + 1 }");
+        assert_eq!(a.formatting_key, b.formatting_key);
+    }
+
+    /// Python docstrings with different text spell the same sequence.
+    #[test]
+    fn python_docstring_text_is_disregarded() {
+        let a = python_keys_of("def f(x):\n    \"\"\"Add one.\"\"\"\n    return x + 1\n");
+        let b = python_keys_of("def f(x):\n    \"\"\"Increment the input.\"\"\"\n    return x + 1\n");
+        assert_eq!(a.formatting_key, b.formatting_key);
+    }
+
+    /// A Python docstring present in only one copy is disregarded.
+    #[test]
+    fn python_docstring_in_one_copy_is_disregarded() {
+        let a = python_keys_of("def f(x):\n    return x + 1\n");
+        let b = python_keys_of("def f(x):\n    \"\"\"Add one.\"\"\"\n    return x + 1\n");
+        assert_eq!(a.formatting_key, b.formatting_key);
+    }
+
+    /// A renamed Python test with a docstring in one copy only shares only the substitution key.
+    #[test]
+    fn renamed_python_copy_with_one_docstring_shares_only_the_substitution_key() {
+        let a = python_keys_of("def test_add():\n    total = add(1, 2)\n    assert total == 3\n");
+        let b = python_keys_of(
+            "def test_plus():\n    \"\"\"Plus sums two numbers.\"\"\"\n    result = plus(1, 2)\n    assert result == 3\n",
+        );
+        assert_ne!(a.formatting_key, b.formatting_key);
+        assert_eq!(a.substitution_key, b.substitution_key);
+    }
+
+    /// A bare string statement after the first statement is not a docstring: it stays a literal.
+    #[test]
+    fn python_string_after_the_first_statement_stays_a_literal() {
+        let a = python_keys_of("def f(x):\n    y = x + 1\n    \"first note\"\n    return y\n");
+        let b = python_keys_of("def f(x):\n    y = x + 1\n    \"second note\"\n    return y\n");
+        assert_ne!(a.formatting_key, b.formatting_key);
+        assert_eq!(a.substitution_key, b.substitution_key);
+    }
+
+    /// A string opening a nested block is not a docstring: it stays a literal.
+    #[test]
+    fn python_string_opening_a_nested_block_stays_a_literal() {
+        let a = python_keys_of("def f(x):\n    if x:\n        \"first note\"\n    return x\n");
+        let b = python_keys_of("def f(x):\n    if x:\n        \"second note\"\n    return x\n");
+        assert_ne!(a.formatting_key, b.formatting_key);
     }
 }

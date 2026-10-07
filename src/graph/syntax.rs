@@ -908,14 +908,15 @@ impl SyntaxTree {
         }
     }
 
-    /// The spelled token sequence within `span`, comments excluded — the input to the
-    /// clone-equivalence keys.
+    /// The spelled token sequence within `span`, comments and documentation excluded — the input to
+    /// the clone-equivalence keys.
     ///
     /// Every token carries its class: an identifier (a name a consistent renaming may substitute),
     /// a literal (a value a consistent substitution may replace, emitted whole — a string literal
     /// is one token, not its quote and content pieces), or plain structure (keywords, punctuation,
-    /// operators). Whitespace never appears (the tree carries none) and comment nodes are skipped,
-    /// so two sources differing only in layout or comments spell the same sequence.
+    /// operators). Whitespace never appears (the tree carries none), and comment nodes and Python
+    /// docstrings are skipped, so two sources differing only in layout, comments, or documentation
+    /// spell the same sequence.
     pub fn spelled_tokens(&self, span: ByteSpan) -> Vec<SpelledToken> {
         let root = self.tree.root_node();
         let mut out = Vec::new();
@@ -927,6 +928,12 @@ impl SyntaxTree {
             }
             let kind = node.kind();
             if comment_kinds(self.language).contains(&kind) {
+                continue;
+            }
+            if self.language == Language::Python
+                && matches!(kind, "string" | "concatenated_string")
+                && is_python_docstring(node)
+            {
                 continue;
             }
             if literal_kinds(self.language).contains(&kind) {
@@ -1107,7 +1114,7 @@ fn name_token(node: Node) -> Option<Node> {
 
 /// The comment node kinds for `language` — excluded from the spelled token sequence. Rust doc
 /// comments are comment nodes, so they are excluded with the rest; a Python docstring is a string
-/// literal and stays in the sequence as a literal.
+/// node, excluded separately by [`is_python_docstring`].
 fn comment_kinds(language: Language) -> &'static [&'static str] {
     match language {
         Language::Rust => &["line_comment", "block_comment"],
@@ -1351,6 +1358,22 @@ fn python_leading_docstring(container: Node) -> Option<Node> {
     let mut inner_cursor = first.walk();
     let inner = first.named_children(&mut inner_cursor).next()?;
     matches!(inner.kind(), "string" | "concatenated_string").then_some(inner)
+}
+
+/// Whether `node` is the docstring of a Python module, function, or class body. A string opening
+/// any other block, such as an `if` or `for` body, is not documentation and stays a literal.
+fn is_python_docstring(node: Node) -> bool {
+    let Some(container) = node.parent().and_then(|statement| statement.parent()) else {
+        return false;
+    };
+    let documented = match container.kind() {
+        "module" => true,
+        "block" => container
+            .parent()
+            .is_some_and(|owner| matches!(owner.kind(), "function_definition" | "class_definition")),
+        _ => false,
+    };
+    documented && python_leading_docstring(container) == Some(node)
 }
 
 #[cfg(test)]

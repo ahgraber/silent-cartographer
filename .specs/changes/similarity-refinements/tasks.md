@@ -2,9 +2,9 @@
 
 ## Documentation-blind token sequence
 
-- [ ] In `spelled_tokens` ([src/graph/syntax.rs](../../../src/graph/syntax.rs)), skip the node `python_leading_docstring` returns for every Python function, class, and module body inside the span (design.md § DocumentationLeavesTheTokenSequence); update the `comment_kinds` doc comment, which states that a docstring stays in the sequence.
-- [ ] Unit tests in [src/graph/clone.rs](../../../src/graph/clone.rs): two Python functions differing only in docstring text share the formatting-insensitive key; a docstring present in one copy only is disregarded; a renamed copy with a docstring in one copy only shares only the substitution-insensitive key; a bare string statement after the first statement stays a literal; two Rust functions differing only in doc comments share the formatting-insensitive key.
-- [ ] Run the existing clone-key tests unchanged to confirm the other key scenarios still hold.
+- [x] In `spelled_tokens` ([src/graph/syntax.rs](../../../src/graph/syntax.rs)), skip the node `python_leading_docstring` returns for every Python function, class, and module body inside the span (design.md § DocumentationLeavesTheTokenSequence); update the `comment_kinds` doc comment, which states that a docstring stays in the sequence.
+- [x] Unit tests in [src/graph/clone.rs](../../../src/graph/clone.rs): two Python functions differing only in docstring text share the formatting-insensitive key; a docstring present in one copy only is disregarded; a renamed copy with a docstring in one copy only shares only the substitution-insensitive key; a bare string statement after the first statement stays a literal; two Rust functions differing only in doc comments share the formatting-insensitive key.
+- [x] Run the existing clone-key tests unchanged to confirm the other key scenarios still hold.
 
 ## Store schema
 
