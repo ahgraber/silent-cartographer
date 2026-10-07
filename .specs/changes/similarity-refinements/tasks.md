@@ -58,10 +58,10 @@
 
 ## Corpus clone groups
 
-- [ ] Add the `clones` command to [src/cli.rs](../../../src/cli.rs) and [src/commands.rs](../../../src/commands.rs) with an optional reference, `--at`, `--limit`, and `--cursor` (design.md § Surfaces).
-- [ ] Implement the grouped key query and group ordering in the query engine (design.md § CorpusCloneGroups).
-- [ ] Tests: three exact copies form one exact group; a variant group identifies its exact subset; a unique function is in no group; a long-function group precedes a short-function group; a corpus with no shared key is typed-empty.
-- [ ] Test: paging the groups to the end yields the unbounded answer.
+- [x] Add the `clones` command to [src/cli.rs](../../../src/cli.rs) and [src/commands.rs](../../../src/commands.rs) with an optional reference, `--at`, `--limit`, and `--cursor` (design.md § Surfaces).
+- [x] Implement the grouped key query and group ordering in the query engine (design.md § CorpusCloneGroups).
+- [x] Tests: three exact copies form one exact group; a variant group identifies its exact subset; a unique function is in no group; a long-function group precedes a short-function group; a corpus with no shared key is typed-empty.
+- [x] Test: paging the groups to the end yields the unbounded answer.
 
 ## Shared fragments
 
@@ -75,8 +75,8 @@
 
 ## Clone answer labeling
 
-- [ ] Emit `grade: "token_equivalence"` and `guaranteed_fragment_length` on the group answer, the subject answer, the typed-empty answer, and the `not_comparable` answer, and state token equivalence in the human rendering.
-- [ ] Tests: group and subject answers carry the marker and the length and no estimation marker; a typed-empty answer carries the marker; an ambiguous subject carries no marker; a stale answer carries both the staleness flag and the marker.
+- [x] Emit `grade: "token_equivalence"` and `guaranteed_fragment_length` on the group answer, the subject answer, the typed-empty answer, and the `not_comparable` answer, and state token equivalence in the human rendering.
+- [x] Tests: group and subject answers carry the marker and the length and no estimation marker; a typed-empty answer carries the marker; an ambiguous subject carries no marker; a stale answer carries both the staleness flag and the marker.
 
 ## Surfaces and versions
 

@@ -110,6 +110,21 @@ pub enum Classification {
     },
 }
 
+/// The grade and guaranteed fragment length every `clones` answer that reaches the clone evidence
+/// carries: its rows are deterministic token equivalence, never behavioral equivalence.
+///
+/// Flattened into the answer, so `grade` and `guaranteed_fragment_length` are sibling keys. Absent
+/// from every other command's answers, and from a `clones` answer that ends at reference
+/// resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TokenEquivalence {
+    /// Always `token_equivalence`.
+    pub grade: &'static str,
+    /// The length, in tokens, of the shortest shared run the store's recorded fingerprint
+    /// parameters guarantee to find.
+    pub guaranteed_fragment_length: usize,
+}
+
 /// The identity+name view of a symbol carried in every answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SymbolView {
@@ -196,6 +211,9 @@ pub enum Outcome<T> {
     },
     /// A definite "none" — the query succeeded and found nothing, distinct from a failure.
     Absent,
+    /// The subject carries no comparable content, so no comparison was possible — distinct from
+    /// `Empty`, where the comparison ran and found no instance. Produced only by `clones`.
+    NotComparable,
     /// The relation exists but the subject stands in no instance of it — a definite empty set.
     Empty,
 }
@@ -244,6 +262,10 @@ pub struct Answer<T> {
     /// unchanged. Rides independently of provenance and freshness, never replacing either.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub classification: Option<Classification>,
+    /// The token-equivalence grade and guaranteed fragment length of a `clones` answer; absent on
+    /// every other answer.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub token_equivalence: Option<TokenEquivalence>,
     /// The workspace-relationship disclosure: present when the store describes a different workspace
     /// than the one queried, or when that comparison could not be evaluated; absent on a match, so a
     /// matched answer's shape is unchanged. Rides independently of freshness — a store can be current
@@ -299,6 +321,11 @@ impl<T> Answer<T> {
         Self::wrap(Outcome::Empty, provenance, freshness)
     }
 
+    /// An answer stating the subject has no comparable content.
+    pub fn not_comparable(provenance: Provenance, freshness: Freshness) -> Self {
+        Self::wrap(Outcome::NotComparable, provenance, freshness)
+    }
+
     fn wrap(outcome: Outcome<T>, provenance: Provenance, freshness: Freshness) -> Self {
         Self {
             provenance,
@@ -306,6 +333,7 @@ impl<T> Answer<T> {
             stale: freshness.is_stale(),
             refresh: None,
             classification: None,
+            token_equivalence: None,
             workspace_relation: None,
             ordering: None,
             excluded_relations: None,
@@ -329,6 +357,16 @@ impl<T> Answer<T> {
     /// an answer carrying the marker always names it.
     pub fn estimated(mut self, semantic_index: SemanticIndexView) -> Self {
         self.classification = Some(Classification::Estimation { semantic_index });
+        self
+    }
+
+    /// Mark the answer as deterministic token equivalence and state the guaranteed fragment length
+    /// in effect — the pair every `clones` answer that reached the clone evidence carries.
+    pub fn with_token_equivalence(mut self, guaranteed_fragment_length: usize) -> Self {
+        self.token_equivalence = Some(TokenEquivalence {
+            grade: "token_equivalence",
+            guaranteed_fragment_length,
+        });
         self
     }
 

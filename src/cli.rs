@@ -102,6 +102,12 @@ pub enum Command {
     /// (token-identical, or identical up to consistently renamed identifiers and substituted
     /// literal values) carry a typed clone marker and rank ahead of the estimate.
     Similar(SimilarArgs),
+    /// List deterministic clones: with no subject, every group of symbols whose token sequences are
+    /// identical up to consistently renamed identifiers and substituted literal values; with a
+    /// subject, the other symbols that are such copies of it.
+    ///
+    /// Rows are token equivalence — identical token structure — never proof of identical behavior.
+    Clones(ClonesArgs),
     /// Assess what a change could affect: the dependents of every symbol the change touched, seeded
     /// from a git diff rather than from a symbol the caller names.
     Impact(ImpactArgs),
@@ -392,6 +398,26 @@ pub struct SimilarArgs {
     /// the remaining rows.
     #[arg(long, value_enum)]
     pub exclude: Vec<RelationLabelArg>,
+
+    #[command(flatten)]
+    pub paging: PageArgs,
+}
+
+/// Arguments for `clones`.
+///
+/// `clones` carries no `--detail`/`--max-lines`: it projects no content onto its rows.
+#[derive(Debug, Args)]
+pub struct ClonesArgs {
+    /// The subject symbol reference (identity, qualified name, or shortname). Omit for the clone
+    /// groups of the whole corpus, or when using `--at`.
+    #[arg(conflicts_with = "at")]
+    pub reference: Option<String>,
+
+    /// Take the symbol enclosing a source position as the subject, given as `path:line:column` or
+    /// `path:line` (`path:byte_offset` under `--position byte`). Mutually exclusive with a positional
+    /// reference.
+    #[arg(long)]
+    pub at: Option<String>,
 
     #[command(flatten)]
     pub paging: PageArgs,

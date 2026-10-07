@@ -1,6 +1,7 @@
 //! The query surface over the code graph: reference resolution, symbol retrieval at a chosen
 //! detail, relationship tracing, and the calibrated output contract every answer carries.
 
+pub mod clones;
 pub mod diff;
 pub mod impact;
 pub mod output;
@@ -138,6 +139,11 @@ pub enum QueryError {
     /// honest answer to give — an invariant violation, since a completed build always records one.
     #[error("store corruption: no semantic-index identity recorded; rebuild the index")]
     MissingSemanticIndex,
+    /// A `clones` query was asked of a store recording no fragment parameters, so the guaranteed
+    /// fragment length its answer must state is unknown — an invariant violation, since a completed
+    /// build always records them.
+    #[error("store corruption: no fragment parameters recorded; rebuild the index")]
+    MissingFragmentParameters,
 }
 
 /// The query engine over a store, carrying the analyzer provenance, content hash, and declared

@@ -1898,6 +1898,79 @@ pub fn run_similar(
     Ok(render(&answer, json, styled, position))
 }
 
+/// `clones`: the groups of deterministic token-equivalent symbols across the corpus, or, given a
+/// subject named by reference or by source position, the other symbols that are such copies of it.
+///
+/// The answer is computed whole and then paged, so the limit counts groups (no subject) or rows
+/// (subject) and the page block carries the total.
+#[allow(clippy::too_many_arguments)] // the CLI's flat query-command surface travels together
+pub fn run_clones(
+    db: &Path,
+    root: &Path,
+    rust_analyzer: &str,
+    reference: Option<&str>,
+    at: Option<&str>,
+    limit: usize,
+    cursor: Option<&str>,
+    json: bool,
+    styled: bool,
+    position: PositionUnit,
+) -> Result<String> {
+    // A malformed position and a malformed cursor are usage errors even against an absent index.
+    let at_position = at.map(|arg| parse_position(arg, position)).transpose()?;
+    let effective_limit = (limit != 0).then_some(limit);
+    precheck_cursor(cursor, effective_limit)?;
+    let store = open_query_store(db)?;
+    let index_hash = recorded_index_hash(&store)?;
+    let relation = workspace_relation(&store, root)?;
+    let meta = store
+        .read_metadata()?
+        .expect("open_query_store guarantees recorded metadata");
+    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
+    let identity = |command: &'static str, reference: String, position_unit: Option<&'static str>| PageIdentity {
+        command,
+        reference,
+        relation: None,
+        detail: None,
+        depth: None,
+        ordering: None,
+        limit: effective_limit,
+        max_lines: None,
+        from: None,
+        position_unit,
+        source_hash: None,
+        excluded_relations: Vec::new(),
+        index_hash: index_hash.clone(),
+    };
+    match (&at_position, at, reference) {
+        (Some((document, parsed)), Some(raw), _) => {
+            let answer = engine.clones_by_position(document, *parsed)?;
+            let identity = identity("clones", raw.to_string(), Some(position.label()));
+            let answer =
+                apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+            let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
+            Ok(render(&answer, json, styled, position))
+        }
+        (_, _, Some(reference)) => {
+            let answer = engine.clones(reference)?;
+            let identity = identity("clones", reference.to_string(), None);
+            let answer =
+                apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+            let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
+            Ok(render(&answer, json, styled, position))
+        }
+        _ => {
+            let answer = engine.clone_groups()?;
+            let identity = identity("clones-groups", String::new(), None);
+            let answer =
+                apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+            let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
+            Ok(render(&answer, json, styled, position))
+        }
+    }
+}
+
 /// Read a `similar` subject list from `source`: a file path, or `-` for `stdin`.
 ///
 /// One reference per line, surrounding whitespace trimmed, blank lines skipped. A list that cannot

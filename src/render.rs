@@ -11,6 +11,7 @@
 //! text is always plain.
 
 use crate::cli::{ColorArg, PositionUnit};
+use crate::query::clones::{CloneGroup, CloneItem, CloneKind};
 use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
 use crate::query::output::{
     Answer, Classification, ContentLines, Location, Outcome, PageInfo, SymbolView, WorkspaceRelation,
@@ -121,6 +122,16 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool, unit: Position
             semantic.corpus_definition_version
         ));
     }
+    if let Some(grade) = &answer.token_equivalence {
+        lines.push(
+            "grade: token equivalence — rows are identical token structure, not proof of identical behavior"
+                .to_string(),
+        );
+        lines.push(format!(
+            "guaranteed fragment length: {} tokens",
+            grade.guaranteed_fragment_length
+        ));
+    }
     if let Some(excluded) = &answer.excluded_relations {
         let tags: Vec<&str> = excluded.iter().map(|label| label.tag()).collect();
         lines.push(format!("excluded relations: {}", tags.join(", ")));
@@ -169,15 +180,21 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool, unit: Position
         // corpus offered no candidates — never that no relevant code exists; a convention-marked
         // empty says no convention-classified site was found — never that nothing tests the subject.
         Outcome::Absent => lines.push("absent: nothing resolved (a definite none, not a failure)".to_string()),
-        Outcome::Empty => lines.push(match &answer.classification {
-            Some(Classification::Estimation { .. }) => {
+        Outcome::NotComparable => lines.push(
+            "not comparable: the subject has no comparable content (not the same as finding no clone)".to_string(),
+        ),
+        Outcome::Empty => lines.push(match (&answer.classification, &answer.token_equivalence) {
+            (_, Some(_)) => {
+                "empty: no clones found (a definite empty set; clones are token-identical copies only)".to_string()
+            }
+            (Some(Classification::Estimation { .. }), None) => {
                 "empty: the semantic corpus offered no candidates (not proof that no relevant code exists)".to_string()
             }
-            Some(Classification::Convention) => {
+            (Some(Classification::Convention), None) => {
                 "empty: no convention-classified test reference found (not proof that nothing tests the subject)"
                     .to_string()
             }
-            None => "empty: the relation holds no instances (a definite empty set)".to_string(),
+            (None, None) => "empty: the relation holds no instances (a definite empty set)".to_string(),
         }),
     }
     if let Some(page) = &answer.page {
@@ -344,6 +361,52 @@ impl HumanRender for SimilarItem {
                 push_content(lines, Some(text));
             }
             push_truncation(lines, item.content_truncated);
+        }
+    }
+}
+
+impl HumanRender for CloneGroup {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
+        lines.push(results_header(results.len(), styled));
+        for group in results {
+            lines.push(format!(
+                "  group of {} symbols, {} tokens{}",
+                group.members.len(),
+                group.token_count,
+                certainty_text(Some(group.certainty))
+            ));
+            for member in &group.members {
+                lines.push(format!(
+                    "    {}  {}  [{}]{} at {}  exact set {}",
+                    sanitize(member.symbol.canonical_id.as_str()),
+                    sanitize(&member.symbol.name),
+                    sanitize(&member.symbol.kind),
+                    external_tag(member.symbol.external),
+                    location_at(member.location.as_ref(), unit),
+                    member.exact_set
+                ));
+            }
+        }
+    }
+}
+
+impl HumanRender for CloneItem {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
+        lines.push(results_header(results.len(), styled));
+        for item in results {
+            lines.push(format!(
+                "  {}  {}  [{}]{} at {}{}  [{}]",
+                sanitize(item.symbol.canonical_id.as_str()),
+                sanitize(&item.symbol.name),
+                sanitize(&item.symbol.kind),
+                external_tag(item.symbol.external),
+                location_at(item.location.as_ref(), unit),
+                certainty_text(Some(item.certainty)),
+                match item.kind {
+                    CloneKind::WholeSymbol => "whole symbol",
+                    CloneKind::Fragment => "fragment",
+                }
+            ));
         }
     }
 }

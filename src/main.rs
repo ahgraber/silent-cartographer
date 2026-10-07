@@ -298,6 +298,18 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             styled,
             cli.position,
         ),
+        Command::Clones(args) => commands::run_clones(
+            &cli.db,
+            &root,
+            DEFAULT_ANALYZER,
+            args.reference.as_deref(),
+            args.at.as_deref(),
+            args.paging.limit,
+            args.paging.cursor.as_deref(),
+            cli.json,
+            styled,
+            cli.position,
+        ),
         Command::Impact(args) => commands::run_impact(
             &cli.db,
             &root,

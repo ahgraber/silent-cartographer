@@ -1187,6 +1187,31 @@ impl GraphStore {
         rows.collect()
     }
 
+    /// Every symbol whose substitution-insensitive key at least one other symbol shares, as
+    /// `(canonical_id, formatting_key, substitution_key, token_count)` rows ordered by
+    /// substitution key, then canonical identity — one grouped pass over the key index.
+    pub fn clone_key_sharers(&self) -> rusqlite::Result<Vec<(CanonicalId, String, String, usize)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT canonical_id, clone_formatting_key, clone_substitution_key, clone_token_count
+             FROM symbols
+             WHERE clone_formatting_key IS NOT NULL
+               AND clone_substitution_key IN (
+                   SELECT clone_substitution_key FROM symbols
+                   WHERE clone_substitution_key IS NOT NULL
+                   GROUP BY clone_substitution_key HAVING COUNT(*) > 1)
+             ORDER BY clone_substitution_key, canonical_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                CanonicalId::from_raw(r.get::<_, String>(0)?),
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?.unwrap_or(0) as usize,
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// Record the length of a leaf's spelled token sequence.
     pub fn set_clone_token_count(&self, id: &CanonicalId, token_count: usize) -> rusqlite::Result<()> {
         self.conn.execute(

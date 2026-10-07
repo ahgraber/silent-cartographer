@@ -66,6 +66,7 @@ fn derived_structure_enumerates_commands_args_flags_and_carries_a_surface_versio
             "find",
             "search",
             "similar",
+            "clones",
             "impact",
             "build",
             "status",
