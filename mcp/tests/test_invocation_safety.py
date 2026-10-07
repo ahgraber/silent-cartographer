@@ -8,8 +8,10 @@ and the process lifetime the server's problem rather than the shell's.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 import subprocess
+import sys
 
 from c10r_mcp import binary
 from conftest import write_fixture_crate
@@ -94,3 +96,31 @@ async def test_a_cancelled_invocation_stops_the_command(tmp_path: Path, c10r_bin
 
     await asyncio.sleep(3.0)
     assert not store.exists(), "the cancelled build went on to write the store"
+
+
+async def test_a_call_without_input_gives_the_command_no_standard_input(tmp_path: Path) -> None:
+    """The command never reads the server's own standard input.
+
+    Under the stdio transport that stream carries the protocol, so a child that
+    inherited it could consume the host's messages. The server's standard input
+    is pointed at a pipe here, so an inherited stream is observable.
+    """
+    probe = tmp_path / "probe"
+    probe.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "seen, null = os.fstat(0), os.stat(os.devnull)\n"
+        "print('null' if (seen.st_dev, seen.st_ino) == (null.st_dev, null.st_ino) else 'inherited')\n"
+    )
+    probe.chmod(0o755)
+    saved = os.dup(0)
+    read_end, write_end = os.pipe()
+    try:
+        os.dup2(read_end, 0)
+        completed = await binary.run(str(probe), [], tmp_path)
+    finally:
+        os.dup2(saved, 0)
+        for fd in (saved, read_end, write_end):
+            os.close(fd)
+
+    assert completed.stdout.decode().strip() == "null"

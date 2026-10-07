@@ -83,7 +83,9 @@ async def run(binary: str, args: Sequence[str], cwd: Path, stdin: bytes | None =
     """Run `c10r` in `cwd` with `--json`, capturing both streams and the status.
 
     `stdin`, when given, is written to the child's standard input, which is then
-    closed. When omitted the child's standard input is left as inherited.
+    closed. When omitted the child reads end-of-file at once: under the stdio
+    transport the server's own standard input carries the protocol, and a child
+    that inherited it could consume the host's messages.
     """
     try:
         process = await asyncio.create_subprocess_exec(
@@ -91,7 +93,7 @@ async def run(binary: str, args: Sequence[str], cwd: Path, stdin: bytes | None =
             "--json",
             *args,
             cwd=str(cwd),
-            stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
