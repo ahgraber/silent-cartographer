@@ -142,7 +142,7 @@ The shared flags, the symbol reference forms, and the index store are documented
 The server lets an agent in an MCP host call `c10r` as named tools instead of composing shell commands.
 It lives in `mcp/`, runs over stdio, and runs the `c10r` binary you installed.
 
-It advertises eight tools, one per command: `get`, `trace`, `find`, `search`, `similar`, `impact`, `build`, and `hooks_install`.
+It advertises nine tools, one per command: `get`, `trace`, `find`, `search`, `similar`, `clones`, `impact`, `build`, and `hooks_install`.
 Each returns that command's structured answer unmodified, so provenance, freshness, typed absence, and heuristic labels arrive intact.
 A command failure arrives as a tool error carrying the exit category and `c10r`'s diagnostic.
 `cache` is deliberately absent: no tool on this surface removes an index store.

@@ -7,6 +7,20 @@ It bundles no binary and changes nothing about the CLI.
 
 See the [repository README](../README.md#mcp-server) for installation, client configuration, and the consent model.
 
+## Duplication tools
+
+`clones` is the deterministic duplication tool: its rows are token equivalence, stated as fact.
+It takes `reference` or `at` for the copies of one symbol, or neither for the clone groups of the whole corpus, with `limit` and `cursor`.
+`similar` is the estimated one, and it takes three further parameters:
+
+- `subjects` is a list of references answered in one call.
+  The server runs `similar --subjects-from -` and writes the references, one per line, to the command's standard input.
+- `mutual` lists the pairs of symbols that are each the first row of the other's answer.
+- `exclude` is a list of relation labels (`uses_subject`, `used_by_subject`, `tests_subject`, `type_family`) whose rows are omitted.
+
+`subjects` cannot be combined with `reference`, `at`, `cursor`, or `mutual`, and `mutual` cannot be combined with `reference`, `at`, or `subjects`.
+`c10r` rejects these combinations and the server reports its usage error.
+
 ## Layout
 
 | Module         | Responsibility                                                             |
