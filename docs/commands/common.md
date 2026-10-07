@@ -12,7 +12,7 @@ Flags and behavior shared by the whole command surface.
 | `--color <auto\|always\|never>` | `auto`                              | `auto` styles only when standard output is a terminal                    |
 | `--position <line\|byte>`       | `line`                              | The unit of printed locations and of `--at`; see [positions](#positions) |
 
-Result-bearing commands (`get`, `trace`, `find`, `search`, `similar`, `impact`) also take:
+Result-bearing commands (`get`, `trace`, `find`, `search`, `similar`, `clones`, `impact`) also take:
 
 | Flag               | Default | Meaning                                                       |
 | ------------------ | ------- | ------------------------------------------------------------- |
@@ -21,7 +21,7 @@ Result-bearing commands (`get`, `trace`, `find`, `search`, `similar`, `impact`) 
 
 ## Naming a symbol
 
-`get`, `trace`, and `similar` take a symbol reference in any of three forms:
+`get`, `trace`, `similar`, and `clones` take a symbol reference in any of three forms:
 
 - a short name — `connect`
 - a qualified name — `Client::connect`
@@ -29,7 +29,7 @@ Result-bearing commands (`get`, `trace`, `find`, `search`, `similar`, `impact`) 
 
 An ambiguous reference returns the candidate set to choose from.
 
-`get` and `similar` also accept `--at` instead of a reference, which resolves to a symbol by source position; see [positions](#positions).
+`get`, `similar`, and `clones` also accept `--at` instead of a reference, which resolves to a symbol by source position; see [positions](#positions).
 
 ## Positions
 

@@ -113,6 +113,7 @@ Agents should start with `c10r manifest`, which prints the whole command surface
 | [`find`](docs/commands/find.md)               | Which symbols have this fragment in their name?                                                                 |
 | [`search`](docs/commands/search.md)           | Which code matches this natural-language description?                                                           |
 | [`similar`](docs/commands/similar.md)         | Which code is most similar to this symbol, and is any of it a clone?                                            |
+| [`clones`](docs/commands/clones.md)           | Which symbols are token-for-token copies of one another, corpus-wide or of this symbol?                         |
 | [`impact`](docs/commands/impact.md)           | What could this git diff break?                                                                                 |
 | [`build`](docs/commands/build.md)             | (Re)index the workspace.                                                                                        |
 | [`status`](docs/commands/status.md)           | What does the index know, and how well did indexing align?                                                      |
