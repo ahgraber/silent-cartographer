@@ -1,6 +1,6 @@
 # c10r clones
 
-List the deterministic copies in the index: groups of symbols with identical token structure, or the copies of one symbol.
+List the deterministic copies in the index: groups of symbols with identical token structure, or the copies of one symbol and the token runs it shares with other symbols.
 
 ```sh
 c10r clones
@@ -8,8 +8,8 @@ c10r clones with_backoff
 c10r clones --at src/lib.rs:42:9
 ```
 
-Use it to audit duplication across the whole corpus, or to list every copy of a symbol before changing it.
-Unlike [`similar`](similar.md), which estimates, every row here follows from the stored equivalence keys.
+Use it to audit duplication across the whole corpus, or to list every copy of a symbol, and every copy of a part of it, before changing it.
+Unlike [`similar`](similar.md), which estimates, every row here follows from the stored equivalence keys and the indexed text.
 
 ## Arguments
 
@@ -35,7 +35,7 @@ The grade says the rows have identical token structure, not that the symbols beh
 Two symbols are token equivalent when they differ only in whitespace, comments, and documentation (`exact_clone`), or also in identifiers and literal values substituted consistently one for one (`variant_clone`).
 
 `guaranteed_fragment_length` is the number of tokens, taken from the parameters the index was built under, at which a shared run of tokens is guaranteed to be found.
-Fragments that this command will report later are at least this long, and a shorter shared run may be missed.
+Every shared run at least this long lies within a reported fragment, and no reported run is shorter.
 An answer carries no estimation label, no semantic-index identity, and no score.
 An ambiguous or unresolved reference ends before the clone evidence is read, so its answer carries neither field.
 
@@ -59,15 +59,39 @@ A corpus in which no two symbols share a key yields a typed-empty answer, which 
 
 ## Clones of a subject
 
-With a subject, each row is another symbol that shares the subject's substitution-insensitive key as a whole.
-A row carries its `kind` (`whole_symbol`), its `certainty` (`exact_clone` when the symbol also shares the subject's formatting-insensitive key, `variant_clone` otherwise), and the symbol with its location.
-Rows are ordered `exact_clone` first, then by canonical identity, and the subject never appears in its own answer.
-The same command will also report the token runs the subject shares with other symbols, as rows of kind `fragment`.
+With a subject, the answer lists whole-symbol clones first, then shared fragments.
+The subject never appears in its own answer, even when it repeats a block within itself.
+
+A `whole_symbol` row is another symbol that shares the subject's substitution-insensitive key as a whole.
+It carries its `kind` (`whole_symbol`), its `certainty` (`exact_clone` when the symbol also shares the subject's formatting-insensitive key, `variant_clone` otherwise), and the symbol with its location.
+These rows are ordered `exact_clone` first, then by canonical identity.
+
+A `fragment` row is a pair of token runs, one in the subject and one in another symbol, that are identical, or identical under a consistent one-to-one substitution of identifiers and literal values within the runs.
+Whitespace, comments, and documentation are not tokens, so a docstring or doc comment inside a shared block does not break the run.
+
+| Field                   | Meaning                                                                                        |
+| ----------------------- | ---------------------------------------------------------------------------------------------- |
+| `kind`                  | `fragment`                                                                                     |
+| `certainty`             | `exact_clone` when the two runs are spelled alike, `variant_clone` when names or values differ |
+| `symbol`, `location`    | The other symbol and its definition location                                                   |
+| `fragment.token_length` | The length of each run in tokens                                                               |
+| `fragment.subject_run`  | The run's location in the subject: document, byte span, and line and column span               |
+| `fragment.other_run`    | The run's location in the other symbol, in the same form                                       |
+
+A pair contained in another pair for the same two symbols, in the subject and in the other symbol at once, is not reported.
+A symbol reported as a whole-symbol clone has no fragment rows.
+One symbol can have several fragment rows, one for each separate run it shares with the subject.
+
+Fragment rows are ordered by `token_length` descending, then by the other symbol's canonical identity, then by the start of the subject run, then by the start of the other run.
+The human rendering prints each run's span under its row, in the unit `--position` selects.
+
+Runs are read from the text the index was built from, not from the files in the workspace.
+After a file changes without a rebuild, the answer still reports the runs of the indexed text and is marked stale.
 
 | Outcome          | Means                                                                                                       |
 | ---------------- | ----------------------------------------------------------------------------------------------------------- |
-| `found`          | The subject has clones                                                                                      |
-| `empty`          | The subject has comparable content and no clone                                                             |
+| `found`          | The subject has whole-symbol clones or shared fragments                                                     |
+| `empty`          | The subject has comparable content, no whole-symbol clone, and no shared run of the guaranteed length       |
 | `not_comparable` | The subject has no comparable content, as a type that contains methods has none; no comparison was possible |
 | `ambiguous`      | The reference names several symbols; the answer lists the candidates                                        |
 | `absent`         | Nothing resolved                                                                                            |
