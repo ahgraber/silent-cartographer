@@ -22,13 +22,13 @@ use crate::graph::{SourceChange, SourceDifference, compare_source_files, content
 use crate::identity::WorkspaceId;
 use crate::query::diff::{self, FileChange};
 use crate::query::impact::{ImpactRequest, shell_quote};
-use crate::query::output::{Answer, FreshnessLabel, LineColumns, WorkspaceRelation};
+use crate::query::output::{Answer, FreshnessLabel, LineColumns, Outcome, WorkspaceRelation};
 use crate::query::page::{
     OrderingIdentity, PageIdentity, apply_dependents_pagination, apply_impact_pagination, apply_pagination, page_rows,
-    precheck_cursor,
+    precheck_cursor, resolve_walk_resume, walk_page,
 };
 use crate::query::resolve::SourcePosition;
-use crate::query::search::{RelationLabel, SimilarItem, exclude_relations};
+use crate::query::search::{MutualPair, RelationLabel, SimilarItem, exclude_relations};
 use crate::query::{Detail, OrderMode, QueryEngine, Relation};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
 use crate::semantic::probe::PROBE_DEADLINE;
@@ -1796,6 +1796,69 @@ impl<'a> SimilarSession<'a> {
         let answer = answer.with_excluded_relations(&controls.excluded);
         Ok(answer.with_refresh(|| refresh_command(&self.meta, self.db, self.environment.as_ref())))
     }
+}
+
+impl SimilarSession<'_> {
+    /// The mutual-pair answer for the controls and cursor: walked, paged by walk position, and
+    /// stamped, ready to render.
+    fn mutual_answer(&self, cursor: Option<&str>) -> Result<Answer<MutualPair>> {
+        let controls = &self.controls;
+        let identity = PageIdentity {
+            command: "similar-mutual",
+            reference: String::new(),
+            relation: None,
+            detail: Some(detail_label(controls.detail)),
+            depth: None,
+            ordering: None,
+            limit: controls.limit,
+            max_lines: controls.max_lines,
+            from: None,
+            position_unit: None,
+            source_hash: None,
+            excluded_relations: controls.excluded.clone(),
+            index_hash: self.index_hash.clone(),
+        };
+        let resume = resolve_walk_resume(cursor, controls.limit, &identity)?;
+        let walk = self.engine.mutual_pairs(
+            resume.after.as_ref(),
+            controls.limit,
+            &controls.excluded,
+            controls.detail,
+            controls.max_lines,
+        )?;
+        let mut answer = walk.answer;
+        if let Outcome::Found { results } = &answer.outcome {
+            answer.page = walk_page(results.len(), resume.page_index, walk.resume_after.as_ref(), &identity);
+        }
+        let answer = answer
+            .with_workspace_relation(self.relation.clone())
+            .with_excluded_relations(&controls.excluded);
+        Ok(answer.with_refresh(|| refresh_command(&self.meta, self.db, self.environment.as_ref())))
+    }
+}
+
+/// `similar --mutual`: the pairs of corpus symbols that are each the first `similar` row of the other,
+/// paged by walk position.
+#[allow(clippy::too_many_arguments)] // the CLI's flat query-command surface travels together
+pub fn run_similar_mutual(
+    db: &Path,
+    root: &Path,
+    rust_analyzer: &str,
+    detail: Detail,
+    max_lines: usize,
+    max_lines_explicit: bool,
+    exclude: &[RelationLabel],
+    limit: usize,
+    cursor: Option<&str>,
+    json: bool,
+    styled: bool,
+    position: PositionUnit,
+) -> Result<String> {
+    let controls = SimilarControls::new(detail, max_lines, max_lines_explicit, exclude, limit, position)?;
+    precheck_cursor(cursor, controls.limit)?;
+    let store = open_query_store(db)?;
+    let session = SimilarSession::open(&store, db, root, rust_analyzer, controls)?;
+    Ok(render(&session.mutual_answer(cursor)?, json, styled, position))
 }
 
 /// `similar`: the corpus symbols most similar in content to a subject symbol, the subject named by

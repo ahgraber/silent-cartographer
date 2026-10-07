@@ -213,6 +213,10 @@ When f(a) = b and b sorts after a, it computes f(b), and emits (a, b) when f(b) 
 When b sorts before a, the pair was already decided when the walk visited b.
 Results are memoized within the process.
 Pairs come out ordered by their lower member, so a page ends at a walk position, and the continuation token records the last visited symbol together with the index identity and the exclusion set.
+The walk stops once it holds one pair more than the limit, so it knows that more pairs remain without walking the rest of the corpus.
+A mutual answer therefore reports no total: its page disclosure omits `total`, and every other answer keeps it.
+A limit of 0 walks the whole corpus once.
+For each visited symbol, the walk ranks the candidates and labels them only until it reaches the first candidate that no exclusion removes; it builds no other rows.
 The corpus clone groups use a grouping on the clone keys, with no vector work.
 
 Comparison for the corpus-wide problems:
@@ -245,6 +249,8 @@ Paging lets a caller stop early.
 **Alternatives considered:** as in the table.
 The in-memory matrix product is deferred: it could cut the vector cost by a large factor, but distances summed in a different order can swap near-ties, and then a per-subject answer would differ from `similar`.
 It is worth revisiting only if it can reproduce sqlite-vec's distances exactly.
+Storing each symbol's ranked first candidates at build time is also deferred: it adds a full `similar` pass to every build, including builds whose users never ask for mutual pairs.
+A full walk computed on every page was rejected: each page of a mutual answer would cost a full walk, the cost the audit set out to remove.
 
 ### Decision: CorpusCloneGroups
 
@@ -268,6 +274,7 @@ Longest-first puts substantial copies ahead of the many small groups of trivial 
 - A subject row carries `kind` (`whole_symbol` or `fragment`), `certainty`, the other symbol's view, and for a fragment the run's location in the subject and in the other symbol and its token length.
 - A keyless subject yields a new answer state, `not_comparable`, distinct from `empty`.
 - No answer carries a distance, score, or fusion value.
+- A mutual answer's page disclosure omits `total`; `page.total` is optional in the answer shape and present on every other answer.
 
 **Rationale:** Adding fields breaks no JSON consumer.
 A separate `not_comparable` state keeps a container subject from reading as "no clones exist".

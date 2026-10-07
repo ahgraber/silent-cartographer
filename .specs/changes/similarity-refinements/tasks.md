@@ -50,11 +50,11 @@
 
 ## Mutual nearest pairs
 
-- [ ] Add `--mutual` to `SimilarArgs` with its conflicts, and implement the memoized identity-order walk with the walk-position continuation token (design.md § AllPairsDiscovery).
-- [ ] Tests: a mutual pair appears once; a one-sided nearest neighbor is not a pair; an exact-clone pair carries the marker and both label sets; excluding `tests_subject` drops a test and subject pair.
-- [ ] Test: paging a fixture with more pairs than the limit to the end yields the unbounded answer.
-- [ ] Test: for every pair of a fixture, each member's single-subject `similar` first row is the other member.
-- [ ] Test: the mutual answer carries the estimation marker and the semantic-index identity.
+- [x] Add `--mutual` to `SimilarArgs` with its conflicts, and implement the memoized identity-order walk with the walk-position continuation token (design.md § AllPairsDiscovery).
+- [x] Tests: a mutual pair appears once; a one-sided nearest neighbor is not a pair; an exact-clone pair carries the marker and both label sets; excluding `tests_subject` drops a test and subject pair.
+- [x] Test: paging a fixture with more pairs than the limit to the end yields the unbounded answer.
+- [x] Test: for every pair of a fixture, each member's single-subject `similar` first row is the other member.
+- [x] Test: the mutual answer carries the estimation marker and the semantic-index identity.
 
 ## Corpus clone groups
 

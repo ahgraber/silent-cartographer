@@ -268,6 +268,20 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
                 cli.position,
             )
         }
+        Command::Similar(args) if args.mutual => commands::run_similar_mutual(
+            &cli.db,
+            &root,
+            DEFAULT_ANALYZER,
+            args.detail.into(),
+            args.max_lines,
+            flag_explicit(matches, "max_lines"),
+            &args.exclude.iter().map(|label| (*label).into()).collect::<Vec<_>>(),
+            args.paging.limit,
+            args.paging.cursor.as_deref(),
+            cli.json,
+            styled,
+            cli.position,
+        ),
         Command::Similar(args) => commands::run_similar(
             &cli.db,
             &root,

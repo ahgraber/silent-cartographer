@@ -215,8 +215,10 @@ pub struct PageInfo {
     pub page_index: usize,
     /// How many results this page carries.
     pub returned: usize,
-    /// How many results matched in total, across every page.
-    pub total: usize,
+    /// How many results matched in total, across every page; absent on an answer whose walk stops
+    /// before it knows the count (`similar --mutual`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
     /// The opaque continuation token that resumes the next page, present only when `truncated`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,

@@ -1059,6 +1059,18 @@ impl GraphStore {
             .optional()
     }
 
+    /// The corpus-contributing symbols in ascending canonical-identity order, restricted to those
+    /// after `after` when one is given.
+    pub fn corpus_symbol_ids_after(&self, after: Option<&CanonicalId>) -> rusqlite::Result<Vec<CanonicalId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT symbol_id FROM semantic_corpus WHERE symbol_id > ?1 ORDER BY symbol_id")?;
+        let rows = stmt.query_map(params![after.map_or("", CanonicalId::as_str)], |r| {
+            r.get::<_, String>(0).map(CanonicalId::from_raw)
+        })?;
+        rows.collect()
+    }
+
     /// The number of passages in the persisted build.
     pub fn corpus_size(&self) -> rusqlite::Result<u64> {
         self.conn

@@ -1947,4 +1947,432 @@ class Right(Base):
         assert_eq!(classify(&err), ExitCode::Usage);
         assert!(err.to_string().contains("standard input"), "{err}");
     }
+
+    // ---- Mutual nearest pairs ----
+
+    mod mutual {
+        use super::*;
+        use silent_cartographer::query::search::MutualWalk;
+
+        /// Two sibling methods with identical bodies beside a base method that differs only in a
+        /// literal: the siblings are exact clones and type-family relatives of each other, the base
+        /// method a variant clone of both.
+        fn clone_family(language: Language) -> Fixture {
+            match language {
+                Language::Rust => Fixture {
+                    language,
+                    doc: "src/fam.rs",
+                    source: "\
+pub trait Shape {
+    fn describe(&self) -> u32 { 1 }
+}
+pub struct Square;
+pub struct Circle;
+impl Shape for Square {
+    fn describe(&self) -> u32 { 7 }
+}
+impl Shape for Circle {
+    fn describe(&self) -> u32 { 7 }
+}
+pub fn plain(x: u32) -> u32 { x - 7 }
+",
+                    decls: vec![
+                        decl(SHAPE, SymbolKind::Trait, "trait Shape"),
+                        decl(SHAPE_DESCRIBE, SymbolKind::Method, "fn describe(&self) -> u32 { 1 }"),
+                        decl(SQUARE, SymbolKind::Type, "struct Square"),
+                        decl(CIRCLE, SymbolKind::Type, "struct Circle"),
+                        decl(
+                            SQUARE_DESCRIBE,
+                            SymbolKind::Method,
+                            "impl Shape for Square {\n    fn describe(&self) -> u32 { 7 }",
+                        ),
+                        decl(
+                            CIRCLE_DESCRIBE,
+                            SymbolKind::Method,
+                            "impl Shape for Circle {\n    fn describe(&self) -> u32 { 7 }",
+                        ),
+                        decl(PLAIN, SymbolKind::Function, "pub fn plain(x: u32)"),
+                    ],
+                    references: vec![
+                        reference(SHAPE, "impl Shape for Square", "Shape"),
+                        reference(SHAPE, "impl Shape for Circle", "Shape"),
+                        reference(SQUARE, "impl Shape for Square", "Square"),
+                        reference(CIRCLE, "impl Shape for Circle", "Circle"),
+                    ],
+                    external: None,
+                },
+                Language::Python => Fixture {
+                    language,
+                    doc: "fam.py",
+                    source: "\
+class Shape:
+    def describe(self):
+        return 1
+
+
+class Square(Shape):
+    def describe(self):
+        return 7
+
+
+class Circle(Shape):
+    def describe(self):
+        return 7
+
+
+def plain(x):
+    return x - 7
+",
+                    decls: vec![
+                        decl(SHAPE, SymbolKind::Type, "class Shape:"),
+                        decl(
+                            SHAPE_DESCRIBE,
+                            SymbolKind::Method,
+                            "def describe(self):\n        return 1",
+                        ),
+                        decl(SQUARE, SymbolKind::Type, "class Square(Shape)"),
+                        decl(CIRCLE, SymbolKind::Type, "class Circle(Shape)"),
+                        decl(
+                            SQUARE_DESCRIBE,
+                            SymbolKind::Method,
+                            "class Square(Shape):\n    def describe(self):\n        return 7",
+                        ),
+                        decl(
+                            CIRCLE_DESCRIBE,
+                            SymbolKind::Method,
+                            "class Circle(Shape):\n    def describe(self):\n        return 7",
+                        ),
+                        decl(PLAIN, SymbolKind::Function, "def plain(x)"),
+                    ],
+                    references: vec![
+                        reference(SHAPE, "class Square(Shape)", "Shape"),
+                        reference(SHAPE, "class Circle(Shape)", "Shape"),
+                    ],
+                    external: None,
+                },
+            }
+        }
+
+        /// [`python_test_relations`] in Rust, where an attribute classifies the test.
+        fn rust_test_relations() -> Fixture {
+            Fixture {
+                language: Language::Rust,
+                doc: "src/test_core.rs",
+                source: "\
+pub fn core(x: u32) -> u32 { x + 1 }
+#[test]
+fn verifies_core() { core(1); }
+pub fn plain(text: &str) -> usize { text.len() }
+",
+                decls: vec![
+                    decl(CORE, SymbolKind::Function, "pub fn core(x: u32)"),
+                    decl(CHECKS, SymbolKind::Function, "fn verifies_core()"),
+                    decl(PLAIN, SymbolKind::Function, "pub fn plain(text: &str)"),
+                ],
+                references: vec![reference(CORE, "{ core(1); }", "core")],
+                external: None,
+            }
+        }
+
+        fn walk(
+            fixture: &Fixture,
+            after: Option<&CanonicalId>,
+            limit: Option<usize>,
+            excluded: &[RelationLabel],
+        ) -> MutualWalk {
+            let store = fixture.store();
+            engine_over(&store, &fixture.sources())
+                .mutual_pairs(after, limit, excluded, Detail::Location, None)
+                .unwrap()
+        }
+
+        /// The `(lower, upper)` identities of the pairs of a found walk, in answer order.
+        fn pair_ids(walk: &MutualWalk) -> Vec<(CanonicalId, CanonicalId)> {
+            match &walk.answer.outcome {
+                Outcome::Found { results } => results
+                    .iter()
+                    .map(|pair| {
+                        (
+                            pair.lower.symbol.canonical_id.clone(),
+                            pair.upper.symbol.canonical_id.clone(),
+                        )
+                    })
+                    .collect(),
+                other => panic!("expected found pairs, got {other:?}"),
+            }
+        }
+
+        fn pair_of(path_a: Path, path_b: Path) -> (CanonicalId, CanonicalId) {
+            let mut ids = [decl_id(path_a), decl_id(path_b)];
+            ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            let [lower, upper] = ids;
+            (lower, upper)
+        }
+
+        // _(A mutual pair is listed once; a pair carries its marker and labels; a one-sided
+        // nearest neighbor is not a pair)_ — two exact-clone siblings are each other's first row;
+        // the base method's first row is one of them, whose own first row is the other sibling.
+        #[test]
+        fn a_mutual_pair_is_listed_once_with_its_marker_and_both_label_sets() {
+            for language in support::LANGUAGES {
+                let fixture = clone_family(language);
+                let walk = walk(&fixture, None, None, &[]);
+                let (lower, upper) = pair_of(SQUARE_DESCRIBE, CIRCLE_DESCRIBE);
+                let pairs = pair_ids(&walk);
+                assert_eq!(
+                    pairs
+                        .iter()
+                        .filter(|pair| **pair == (lower.clone(), upper.clone()))
+                        .count(),
+                    1,
+                    "{language:?}: {pairs:?}"
+                );
+                let Outcome::Found { results } = &walk.answer.outcome else {
+                    unreachable!()
+                };
+                let sibling = results
+                    .iter()
+                    .find(|pair| pair.lower.symbol.canonical_id == lower)
+                    .unwrap();
+                assert_eq!(
+                    sibling.clone_certainty,
+                    Some(CloneCertainty::ExactClone),
+                    "{language:?}"
+                );
+                for member in [&sibling.lower, &sibling.upper] {
+                    let labels: Vec<_> = member.relations.iter().map(|r| r.label).collect();
+                    assert_eq!(labels, [RelationLabel::TypeFamily], "{language:?}");
+                }
+
+                let base = decl_id(SHAPE_DESCRIBE);
+                let store = fixture.store();
+                let engine = engine_over(&store, &fixture.sources());
+                let first_of = |id: &CanonicalId| {
+                    let answer = engine.similar(id.as_str(), Detail::Location, None).unwrap();
+                    let Outcome::Found { results } = answer.outcome else {
+                        panic!("expected found rows")
+                    };
+                    results[0].symbol.canonical_id.clone()
+                };
+                let base_first = first_of(&base);
+                assert_ne!(
+                    first_of(&base_first),
+                    base,
+                    "{language:?}: the base's neighbor is one-sided"
+                );
+                assert!(
+                    pairs.iter().all(|(a, b)| *a != base && *b != base),
+                    "{language:?}: no pair joins the base method: {pairs:?}"
+                );
+            }
+        }
+
+        // _(An exclusion changes the first rows)_ — a test and the subject it calls are each
+        // other's first row until `tests_subject` is excluded.
+        #[test]
+        fn excluding_tests_subject_drops_a_test_and_subject_pair() {
+            for fixture in [python_test_relations(), rust_test_relations()] {
+                let lang = fixture.language;
+                let pair = pair_of(CORE, CHECKS);
+                assert!(
+                    pair_ids(&walk(&fixture, None, None, &[])).contains(&pair),
+                    "{lang:?}: the test and its subject are a mutual pair"
+                );
+                assert!(
+                    !pair_ids(&walk(&fixture, None, None, &[RelationLabel::TestsSubject])).contains(&pair),
+                    "{lang:?}: the exclusion drops the pair"
+                );
+            }
+        }
+
+        /// Run `similar --mutual` over `db`.
+        fn mutual(
+            db: &std::path::Path,
+            root: &std::path::Path,
+            exclude: &[RelationLabel],
+            limit: usize,
+            cursor: Option<&str>,
+            json: bool,
+        ) -> anyhow::Result<String> {
+            silent_cartographer::commands::run_similar_mutual(
+                db,
+                root,
+                "rust-analyzer",
+                Detail::Location,
+                10,
+                false,
+                exclude,
+                limit,
+                cursor,
+                json,
+                false,
+                PositionUnit::Line,
+            )
+        }
+
+        fn mutual_json(
+            db: &std::path::Path,
+            root: &std::path::Path,
+            exclude: &[RelationLabel],
+            limit: usize,
+            cursor: Option<&str>,
+        ) -> serde_json::Value {
+            serde_json::from_str(&mutual(db, root, exclude, limit, cursor, true).unwrap()).unwrap()
+        }
+
+        fn json_pairs(answer: &serde_json::Value) -> Vec<serde_json::Value> {
+            answer["outcome"]["results"].as_array().unwrap().clone()
+        }
+
+        fn member_id(pair: &serde_json::Value, side: &str) -> String {
+            pair[side]["symbol"]["canonical_id"].as_str().unwrap().to_string()
+        }
+
+        // _(Pages resume deterministically)_ — the pages carry no total, each carries a walk token,
+        // and their concatenation is the unbounded answer.
+        #[test]
+        fn paging_to_the_end_yields_the_unbounded_answer() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = built_db(dir.path());
+            let all = mutual_json(&db, dir.path(), &[], 0, None);
+            assert!(all.get("page").is_none(), "an unbounded answer carries no page block");
+            let expected = json_pairs(&all);
+            assert!(expected.len() > 2, "the fixture has more pairs than the page limit");
+
+            let mut pages = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let page = mutual_json(&db, dir.path(), &[], 2, cursor.as_deref());
+                pages.extend(json_pairs(&page));
+                let info = page.get("page");
+                assert!(
+                    info.is_none_or(|info| info.get("total").is_none()),
+                    "no total: {info:?}"
+                );
+                cursor = info.and_then(|info| info["cursor"].as_str()).map(str::to_string);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(pages, expected);
+        }
+
+        // _(The answer is labeled as estimation)_.
+        #[test]
+        fn the_answer_carries_the_estimation_marker_and_the_semantic_index_identity() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = built_db(dir.path());
+            let answer = mutual_json(&db, dir.path(), &[], 0, None);
+            assert_eq!(answer["classification"], "estimation");
+            assert_eq!(answer["semantic_index"]["model_identity"], MODEL_ID);
+            assert_eq!(answer["outcome"]["outcome"], "found");
+            for pair in json_pairs(&answer) {
+                assert!(pair.get("score").is_none() && pair["lower"].get("score").is_none());
+            }
+        }
+
+        // _(An empty result is typed-empty)_ — a corpus offering no neighbor yields no pair, and the
+        // answer keeps the marker.
+        #[test]
+        fn a_corpus_with_no_pair_is_typed_empty_with_the_marker() {
+            let (store, srcs) = store_over("one.rs", "pub fn only() -> u32 { 1 }\n", &["only"]);
+            let walk = engine_over(&store, &srcs)
+                .mutual_pairs(None, None, &[], Detail::Location, None)
+                .unwrap();
+            assert_eq!(walk.answer.outcome, Outcome::Empty);
+            assert!(matches!(
+                walk.answer.classification,
+                Some(Classification::Estimation { .. })
+            ));
+            assert!(walk.resume_after.is_none());
+        }
+
+        // _(A token under another exclusion is refused)_ — the token binds the exclusion set, and a
+        // page token from a single-subject query is not a walk token.
+        #[test]
+        fn a_token_issued_under_one_exclusion_is_refused_under_another() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = built_db(dir.path());
+            let page = mutual_json(&db, dir.path(), &[], 1, None);
+            let cursor = page["page"]["cursor"]
+                .as_str()
+                .expect("a truncated page carries a cursor");
+
+            let err = mutual(&db, dir.path(), &[RelationLabel::TestsSubject], 1, Some(cursor), true)
+                .expect_err("the token is bound to its exclusion");
+            assert_eq!(classify(&err), ExitCode::Usage);
+            assert!(err.to_string().contains("different query parameters"), "{err}");
+
+            let single = single_json(&db, dir.path(), decl_id(CORE).as_str(), &[], 1, None);
+            let page_token = single["page"]["cursor"].as_str().unwrap();
+            let err = mutual(&db, dir.path(), &[], 1, Some(page_token), true)
+                .expect_err("a single-subject token does not resume a walk");
+            assert_eq!(classify(&err), ExitCode::Usage);
+        }
+
+        // _(Each member is the other's first row)_ — checked through the single-subject path under
+        // the same exclusion, on every backend.
+        #[test]
+        fn each_member_of_a_pair_is_the_first_row_of_the_other_through_the_single_path() {
+            let fixtures = [
+                rust_relations(),
+                python_relations(),
+                python_test_relations(),
+                clone_family(Language::Rust),
+                clone_family(Language::Python),
+            ];
+            for fixture in fixtures {
+                let dir = tempfile::tempdir().unwrap();
+                let db = db_for(&fixture, dir.path());
+                for exclude in [&[][..], &[RelationLabel::TestsSubject][..]] {
+                    let answer = mutual_json(&db, dir.path(), exclude, 0, None);
+                    let pairs = json_pairs(&answer);
+                    if exclude.is_empty() {
+                        assert!(!pairs.is_empty(), "{:?}: a corpus has a nearest pair", fixture.language);
+                    }
+                    for pair in pairs {
+                        let (lower, upper) = (member_id(&pair, "lower"), member_id(&pair, "upper"));
+                        assert!(lower < upper);
+                        for (subject, expected) in [(&lower, &upper), (&upper, &lower)] {
+                            let single = single_json(&db, dir.path(), subject, exclude, 1, None);
+                            let first = &single["outcome"]["results"][0]["symbol"]["canonical_id"];
+                            assert_eq!(first, expected.as_str(), "{:?}: {subject}", fixture.language);
+                        }
+                    }
+                }
+            }
+        }
+
+        // _(The human rendering)_ — one line per pair naming both members, and a page disclosure
+        // without a total.
+        #[test]
+        fn the_human_render_lists_one_line_per_pair_and_discloses_no_total() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = built_db(dir.path());
+            let out = mutual(&db, dir.path(), &[], 1, None, false).unwrap();
+            assert_eq!(out.lines().filter(|line| line.contains("  <->  ")).count(), 1, "{out}");
+            assert!(out.contains("page 0: 1 results (truncated)"), "{out}");
+            assert!(out.contains("resume with --cursor"), "{out}");
+        }
+
+        // _(`--mutual` takes no subject)_ — it conflicts with a reference, `--at`, and `--subjects-from`.
+        #[test]
+        fn mutual_conflicts_with_every_subject_form() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = built_db(dir.path());
+            for extra in [
+                &["core"][..],
+                &["--at", "src/rel.rs:1"][..],
+                &["--subjects-from", "-"][..],
+            ] {
+                let out = c10r(&db)
+                    .current_dir(dir.path())
+                    .args(["similar", "--mutual"])
+                    .args(extra)
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.code(), Some(ExitCode::Usage.code()), "{extra:?}");
+            }
+        }
+    }
 }

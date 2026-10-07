@@ -371,6 +371,13 @@ pub struct SimilarArgs {
     #[arg(long, value_name = "PATH|-", conflicts_with_all = ["reference", "at", "cursor"])]
     pub subjects_from: Option<String>,
 
+    /// List every pair of corpus symbols that are each the first row of the other's answer, under
+    /// `--exclude`, ordered by the pair's lower member. The limit counts pairs; the answer carries no
+    /// total, and `--limit 0` walks the whole corpus. Mutually exclusive with a positional
+    /// reference, `--at`, and `--subjects-from`.
+    #[arg(long, conflicts_with_all = ["reference", "at", "subjects_from"])]
+    pub mutual: bool,
+
     /// Project each result row's content at this detail. Never changes which symbols are
     /// returned or their order.
     #[arg(long, value_enum, default_value = "signature")]

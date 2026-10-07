@@ -460,6 +460,8 @@ fn clap_tree_matches_the_recorded_flag_vocabulary() {
         "exclude",
         // `similar`'s subject list for a batch invocation.
         "subjects-from",
+        // `similar`'s corpus-wide mode.
+        "mutual",
         // The dependents order selector on `trace` and `impact`.
         "order",
         // `impact`'s seed-mode selector.

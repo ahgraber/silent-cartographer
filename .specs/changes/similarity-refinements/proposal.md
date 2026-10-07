@@ -113,4 +113,5 @@ The build records the fragment parameters in the store, so tuning them later nee
 
 - 2026-10-06: the guaranteed fragment length is 40 tokens, and the fragment parameters stay cheap to tune (`design.md` § FragmentEvidenceStorage).
 - 2026-10-06: `--mutual` is in this change.
+- 2026-10-07: a mutual answer pages by walk position and reports no total, so a page costs only the walk it needs (`design.md` § AllPairsDiscovery).
 - 2026-10-06: the names `clones`, `--subjects-from`, `--mutual`, `--exclude`, and the four relation labels stand as specified.

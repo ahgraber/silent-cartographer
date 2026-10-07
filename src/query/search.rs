@@ -472,6 +472,191 @@ impl SubjectRelations {
     }
 }
 
+/// One member of a mutual nearest pair.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MutualMember {
+    /// The member's identity and name.
+    pub symbol: SymbolView,
+    /// The relation labels this member carries as the other member's first `similar` row, in label
+    /// order; empty when none holds.
+    pub relations: Vec<RelationView>,
+    /// The member's definition location.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
+    /// The member's content at the requested detail; absent at location detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Whether that content was truncated by the `--max-lines` bound.
+    #[serde(skip_serializing_if = "super::is_false")]
+    pub content_truncated: bool,
+}
+
+/// One mutual nearest pair: two corpus symbols that are each the first `similar` row of the other,
+/// under the same relation-label exclusion. Carries no similarity score.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MutualPair {
+    /// The member whose canonical identity sorts first.
+    pub lower: MutualMember,
+    /// The member whose canonical identity sorts last.
+    pub upper: MutualMember,
+    /// The deterministic clone-certainty marker between the members; absent when they share no key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clone_certainty: Option<CloneCertainty>,
+}
+
+/// One page of the mutual-pair walk.
+pub struct MutualWalk {
+    /// The pairs found, carrying no page disclosure yet.
+    pub answer: Answer<MutualPair>,
+    /// The lower member of the last returned pair when the walk stopped with pairs remaining;
+    /// `None` when it reached the end of the corpus.
+    pub resume_after: Option<CanonicalId>,
+}
+
+/// The first row of a symbol's `similar` answer under an exclusion.
+#[derive(Debug, Clone)]
+struct FirstRow {
+    id: CanonicalId,
+    clone_certainty: Option<CloneCertainty>,
+    /// The labels the row carries against the symbol.
+    relations: Vec<RelationView>,
+}
+
+/// The first `similar` row of `subject` that carries none of `excluded`, found by labeling the ranked
+/// candidates in order only until one survives; `None` when every candidate is excluded or the
+/// subject has none.
+fn first_similar_row(
+    store: &GraphStore,
+    subject: &SymbolRow,
+    excluded: &[RelationLabel],
+) -> Result<Option<FirstRow>, QueryError> {
+    let candidates = similar_candidates(store, subject)?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut relations = SubjectRelations::new(store, subject)?;
+    for candidate in candidates {
+        let Some(row) = store.symbol(&candidate.id)? else {
+            return Err(QueryError::MissingSymbol(candidate.id));
+        };
+        let labels = relations.labels(store, &row)?;
+        if labels.iter().all(|relation| !excluded.contains(&relation.label)) {
+            return Ok(Some(FirstRow {
+                id: candidate.id,
+                clone_certainty: candidate.clone_certainty,
+                relations: labels,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// [`first_similar_row`] memoized by subject, for the lifetime of one walk.
+struct FirstRows<'a> {
+    store: &'a GraphStore,
+    excluded: &'a [RelationLabel],
+    known: HashMap<CanonicalId, Option<FirstRow>>,
+}
+
+impl FirstRows<'_> {
+    fn of(&mut self, id: &CanonicalId) -> Result<Option<FirstRow>, QueryError> {
+        if let Some(known) = self.known.get(id) {
+            return Ok(known.clone());
+        }
+        let Some(subject) = self.store.symbol(id)? else {
+            return Err(QueryError::MissingSymbol(id.clone()));
+        };
+        let first = first_similar_row(self.store, &subject, self.excluded)?;
+        self.known.insert(id.clone(), first.clone());
+        Ok(first)
+    }
+}
+
+impl QueryEngine<'_> {
+    /// `similar --mutual`: the unordered pairs of corpus symbols that are each the first `similar`
+    /// row of the other under `excluded`, ordered by the canonical identity of the lower member.
+    ///
+    /// The walk visits corpus symbols in identity order, beginning after `after` when resuming. It
+    /// stops once it holds one pair more than `limit`, so a page costs only the symbols it reaches;
+    /// no `limit` walks the whole corpus. A pair is decided when the walk visits its lower member.
+    pub fn mutual_pairs(
+        &self,
+        after: Option<&CanonicalId>,
+        limit: Option<usize>,
+        excluded: &[RelationLabel],
+        detail: Detail,
+        max_lines: Option<usize>,
+    ) -> Result<MutualWalk, QueryError> {
+        let (provenance, freshness) = self.provenance_and_freshness()?;
+        let semantic_index = self.semantic_index_view()?;
+        let mut firsts = FirstRows {
+            store: self.store,
+            excluded,
+            known: HashMap::new(),
+        };
+        // Each entry is a pair's lower member with the first rows of the lower and of the upper.
+        let mut found: Vec<(CanonicalId, FirstRow, FirstRow)> = Vec::new();
+        for lower in self.store.corpus_symbol_ids_after(after)? {
+            let Some(of_lower) = firsts.of(&lower)? else { continue };
+            // A partner sorting before the lower member decided this pair when the walk visited it.
+            if of_lower.id.as_str() < lower.as_str() {
+                continue;
+            }
+            let Some(of_upper) = firsts.of(&of_lower.id)? else {
+                continue;
+            };
+            if of_upper.id != lower {
+                continue;
+            }
+            found.push((lower, of_lower, of_upper));
+            if limit.is_some_and(|limit| found.len() > limit) {
+                break;
+            }
+        }
+        let mut resume_after = None;
+        if let Some(limit) = limit
+            && found.len() > limit
+        {
+            found.truncate(limit);
+            resume_after = found.last().map(|(lower, ..)| lower.clone());
+        }
+        if found.is_empty() {
+            return Ok(MutualWalk {
+                answer: Answer::empty(provenance, freshness).estimated(semantic_index),
+                resume_after,
+            });
+        }
+        let member = |id: &CanonicalId, relations: Vec<RelationView>| -> Result<MutualMember, QueryError> {
+            let Some(row) = self.store.symbol(id)? else {
+                return Err(QueryError::MissingSymbol(id.clone()));
+            };
+            let (content, content_truncated) = projected_row_content(&row, detail, max_lines);
+            Ok(MutualMember {
+                symbol: symbol_view(&row),
+                relations,
+                location: location_of(&row),
+                content,
+                content_truncated,
+            })
+        };
+        let pairs = found
+            .into_iter()
+            .map(|(lower, of_lower, of_upper)| {
+                Ok(MutualPair {
+                    // A member's labels are those its own row carries in the other's answer.
+                    lower: member(&lower, of_upper.relations)?,
+                    upper: member(&of_lower.id, of_lower.relations)?,
+                    clone_certainty: of_lower.clone_certainty,
+                })
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?;
+        Ok(MutualWalk {
+            answer: Answer::found(pairs, provenance, freshness).estimated(semantic_index),
+            resume_after,
+        })
+    }
+}
+
 /// The `similar` answer without the rows that carry any of `excluded`, the remaining rows in their
 /// original order. An answer left with no rows is typed-empty. Applied before paging, so the result
 /// limit and continuation token count only the remaining rows.

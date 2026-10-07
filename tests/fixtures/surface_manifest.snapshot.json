@@ -356,6 +356,11 @@
           "global": false
         },
         {
+          "name": "mutual",
+          "takes_value": false,
+          "global": false
+        },
+        {
           "name": "detail",
           "takes_value": true,
           "values": [

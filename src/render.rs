@@ -15,7 +15,7 @@ use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
 use crate::query::output::{
     Answer, Classification, ContentLines, Location, Outcome, PageInfo, SymbolView, WorkspaceRelation,
 };
-use crate::query::search::{CloneCertainty, SearchItem, SimilarItem};
+use crate::query::search::{CloneCertainty, MutualMember, MutualPair, RelationView, SearchItem, SimilarItem};
 use crate::query::{DependentsReport, FindItem, HorizonDisclosure, OrderMode, SymbolDetail, TraceItem};
 
 const BOLD: &str = "\x1b[1m";
@@ -189,12 +189,13 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool, unit: Position
 /// Append the result-set paging disclosure: which page was returned and how much of the total, and,
 /// when truncated, the continuation token a human can pass back through `--cursor` to resume.
 fn push_page(lines: &mut Vec<String>, page: &PageInfo, styled: bool) {
+    let of_total = page.total.map_or(String::new(), |total| format!(" of {total}"));
     lines.push(bold(
         &format!(
-            "page {}: {} of {} results{}",
+            "page {}: {}{} results{}",
             page.page_index,
             page.returned,
-            page.total,
+            of_total,
             if page.truncated { " (truncated)" } else { "" }
         ),
         styled,
@@ -327,24 +328,8 @@ impl HumanRender for SimilarItem {
         for item in results {
             // The clone marker renders on the row as deterministic fact — the certainty class above
             // the estimated ranking — never as part of the estimation grade.
-            let certainty = match item.clone_certainty {
-                Some(CloneCertainty::ExactClone) => "  [exact clone: identical token sequence]",
-                Some(CloneCertainty::VariantClone) => {
-                    "  [variant clone: identical token structure, names/literals substituted — not behavioral \
-                     equivalence]"
-                }
-                None => "",
-            };
-            // Relation labels state graph facts about the row and the subject; a test label names
-            // the convention rule that classified the row.
-            let relations: String = item
-                .relations
-                .iter()
-                .map(|relation| match &relation.rule {
-                    Some(rule) => format!("  [{} (rule: {})]", relation.label.tag(), sanitize(rule)),
-                    None => format!("  [{}]", relation.label.tag()),
-                })
-                .collect();
+            let certainty = certainty_text(item.clone_certainty);
+            let relations = relations_text(&item.relations);
             lines.push(format!(
                 "  {}  {}  [{}]{} at {}{}{}",
                 sanitize(item.symbol.canonical_id.as_str()),
@@ -361,6 +346,62 @@ impl HumanRender for SimilarItem {
             push_truncation(lines, item.content_truncated);
         }
     }
+}
+
+impl HumanRender for MutualPair {
+    fn render_found(results: &[Self], lines: &mut Vec<String>, styled: bool, unit: PositionUnit) {
+        lines.push(results_header(results.len(), styled));
+        for pair in results {
+            let side = |member: &MutualMember| {
+                format!(
+                    "{}  {}  [{}]{} at {}{}",
+                    sanitize(member.symbol.canonical_id.as_str()),
+                    sanitize(&member.symbol.name),
+                    sanitize(&member.symbol.kind),
+                    external_tag(member.symbol.external),
+                    location_at(member.location.as_ref(), unit),
+                    relations_text(&member.relations)
+                )
+            };
+            lines.push(format!(
+                "  {}  <->  {}{}",
+                side(&pair.lower),
+                side(&pair.upper),
+                certainty_text(pair.clone_certainty)
+            ));
+            for member in [&pair.lower, &pair.upper] {
+                if let Some(text) = &member.content {
+                    push_content(lines, Some(text));
+                }
+                push_truncation(lines, member.content_truncated);
+            }
+        }
+    }
+}
+
+/// The clone marker as it renders on a row: deterministic fact — the certainty class above the
+/// estimated ranking — never part of the estimation grade.
+fn certainty_text(certainty: Option<CloneCertainty>) -> &'static str {
+    match certainty {
+        Some(CloneCertainty::ExactClone) => "  [exact clone: identical token sequence]",
+        Some(CloneCertainty::VariantClone) => {
+            "  [variant clone: identical token structure, names/literals substituted — not behavioral \
+             equivalence]"
+        }
+        None => "",
+    }
+}
+
+/// Relation labels state graph facts about a row and its subject; a test label names the convention
+/// rule that classified the row.
+fn relations_text(relations: &[RelationView]) -> String {
+    relations
+        .iter()
+        .map(|relation| match &relation.rule {
+            Some(rule) => format!("  [{} (rule: {})]", relation.label.tag(), sanitize(rule)),
+            None => format!("  [{}]", relation.label.tag()),
+        })
+        .collect()
 }
 
 impl HumanRender for DependentsReport {

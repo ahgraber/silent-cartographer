@@ -10,6 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::exit::Failure;
+use crate::identity::CanonicalId;
 
 use super::impact::ImpactReport;
 use super::output::{Answer, Outcome, PageInfo};
@@ -365,7 +366,7 @@ fn slice_page<T>(
         truncated,
         page_index,
         returned,
-        total,
+        total: Some(total),
         cursor,
     });
     Ok((page_rows, page))
@@ -411,7 +412,17 @@ pub fn apply_impact_pagination(
 /// Resolve which page a request names: page 0 with no cursor, or the cursor's page after validating
 /// its identity against `param_hash`.
 fn resolve_page_index(cursor: Option<&str>, limit: Option<usize>, param_hash: &str) -> anyhow::Result<usize> {
-    let Some(token) = cursor else { return Ok(0) };
+    Ok(resolve_resume(cursor, limit, param_hash)?.map_or(0, |(page, _)| page))
+}
+
+/// Validate `cursor` against `param_hash` and return the page index and walk position it carries, or
+/// `None` when there is no cursor.
+fn resolve_resume(
+    cursor: Option<&str>,
+    limit: Option<usize>,
+    param_hash: &str,
+) -> anyhow::Result<Option<(usize, Option<String>)>> {
+    let Some(token) = cursor else { return Ok(None) };
     // A cursor resumes into a bounded page; an unbounded set (`--limit 0`) has no pages to resume.
     if limit.is_none() {
         return Err(Failure::Usage(
@@ -419,7 +430,7 @@ fn resolve_page_index(cursor: Option<&str>, limit: Option<usize>, param_hash: &s
         )
         .into());
     }
-    let (token_hash, page) = decode_token(token).ok_or_else(|| {
+    let (token_hash, page, position) = decode_token(token).ok_or_else(|| {
         Failure::Usage("the continuation token is malformed; re-issue the query without --cursor".to_string())
     })?;
     if token_hash != param_hash {
@@ -430,7 +441,58 @@ fn resolve_page_index(cursor: Option<&str>, limit: Option<usize>, param_hash: &s
         )
         .into());
     }
-    Ok(page)
+    Ok(Some((page, position)))
+}
+
+/// Where a walk-paged answer (`similar --mutual`) resumes: the page index the token names and the
+/// last visited symbol, `None` for a first page.
+pub struct WalkResume {
+    /// The zero-based index of the page the cursor asks for.
+    pub page_index: usize,
+    /// The symbol after which the walk continues.
+    pub after: Option<CanonicalId>,
+}
+
+/// Resolve the walk position `cursor` names, after validating it against `identity`. A token that
+/// carries no walk position, as every ordinary page token, is malformed here.
+pub fn resolve_walk_resume(
+    cursor: Option<&str>,
+    limit: Option<usize>,
+    identity: &PageIdentity,
+) -> anyhow::Result<WalkResume> {
+    match resolve_resume(cursor, limit, &identity.hash())? {
+        None => Ok(WalkResume {
+            page_index: 0,
+            after: None,
+        }),
+        Some((page_index, Some(position))) => Ok(WalkResume {
+            page_index,
+            after: Some(CanonicalId::from_raw(position)),
+        }),
+        Some((_, None)) => Err(Failure::Usage(
+            "the continuation token is malformed; re-issue the query without --cursor".to_string(),
+        )
+        .into()),
+    }
+}
+
+/// The paging disclosure of a walk-paged answer, which cannot state a total. Attached only when the
+/// walk stopped with results remaining (`resume_after`) or resumed a later page, matching
+/// [`slice_page`]'s rule.
+pub fn walk_page(
+    returned: usize,
+    page_index: usize,
+    resume_after: Option<&CanonicalId>,
+    identity: &PageIdentity,
+) -> Option<PageInfo> {
+    let truncated = resume_after.is_some();
+    (truncated || page_index > 0).then(|| PageInfo {
+        truncated,
+        page_index,
+        returned,
+        total: None,
+        cursor: resume_after.map(|after| encode_walk_token(&identity.hash(), page_index + 1, after)),
+    })
 }
 
 /// The usage error for a page beyond the last, naming the valid range.
@@ -447,14 +509,23 @@ fn encode_token(param_hash: &str, page: usize) -> String {
     to_hex(format!("{param_hash}:{page}").as_bytes())
 }
 
-/// Decode a continuation token back to its `(parameter-hash, page-index)`, or `None` when it is not a
-/// well-formed token.
-fn decode_token(token: &str) -> Option<(String, usize)> {
+/// Encode a walk-paged continuation token: `parameter-hash:page-index:last-visited-symbol`, hex-encoded
+/// as an ordinary token is. The symbol identity may itself contain `:`, so it comes last.
+fn encode_walk_token(param_hash: &str, page: usize, after: &CanonicalId) -> String {
+    to_hex(format!("{param_hash}:{page}:{}", after.as_str()).as_bytes())
+}
+
+/// Decode a continuation token back to its `(parameter-hash, page-index, walk position)`, or `None`
+/// when it is not a well-formed token. The walk position is present only on a walk-paged token.
+fn decode_token(token: &str) -> Option<(String, usize, Option<String>)> {
     let raw = from_hex(token)?;
     let text = String::from_utf8(raw).ok()?;
-    let (hash, page) = text.rsplit_once(':')?;
-    let page: usize = page.parse().ok()?;
-    Some((hash.to_string(), page))
+    let (hash, rest) = text.split_once(':')?;
+    let (page, position) = match rest.split_once(':') {
+        Some((page, position)) => (page, Some(position.to_string())),
+        None => (rest, None),
+    };
+    Some((hash.to_string(), page.parse().ok()?, position))
 }
 
 /// Lowercase-hex encode a byte slice.
