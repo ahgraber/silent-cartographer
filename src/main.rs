@@ -249,6 +249,25 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             styled,
             cli.position,
         ),
+        Command::Similar(args) if args.subjects_from.is_some() => {
+            let source = args.subjects_from.as_deref().expect("guarded by is_some");
+            let stdin = std::io::stdin();
+            let references = commands::read_subject_list(source, &mut stdin.lock(), stdin.is_terminal())?;
+            commands::run_similar_batch(
+                &cli.db,
+                &root,
+                DEFAULT_ANALYZER,
+                &references,
+                args.detail.into(),
+                args.max_lines,
+                flag_explicit(matches, "max_lines"),
+                &args.exclude.iter().map(|label| (*label).into()).collect::<Vec<_>>(),
+                args.paging.limit,
+                cli.json,
+                styled,
+                cli.position,
+            )
+        }
         Command::Similar(args) => commands::run_similar(
             &cli.db,
             &root,

@@ -41,12 +41,12 @@
 
 ## Batch similar
 
-- [ ] Add `--subjects-from <path|->` to `SimilarArgs` with its conflicts, read and validate the list at the boundary (unreadable path, invalid UTF-8, `-` on a terminal), and emit the `answers` array and the human headings (design.md § BatchSimilar).
-- [ ] Test: three references yield three answers in order.
-- [ ] Test: for each of a resolved, an ambiguous, and an unresolved reference, the per-subject JSON equals the single-subject `similar --json` output byte for byte.
-- [ ] Test: a truncated per-subject answer's token resumes a single-subject query.
-- [ ] Tests: standard input supplies the list; an empty list is typed-empty; a missing path fails with the usage exit code and names the path; `-` with a terminal on standard input is refused.
-- [ ] Tests (batch path): rows carry relation labels, and `--exclude` removes labeled rows, exactly as on the single path.
+- [x] Add `--subjects-from <path|->` to `SimilarArgs` with its conflicts, read and validate the list at the boundary (unreadable path, invalid UTF-8, `-` on a terminal), and emit the `answers` array and the human headings (design.md § BatchSimilar).
+- [x] Test: three references yield three answers in order.
+- [x] Test: for each of a resolved, an ambiguous, and an unresolved reference, the per-subject JSON equals the single-subject `similar --json` output byte for byte.
+- [x] Test: a truncated per-subject answer's token resumes a single-subject query.
+- [x] Tests: standard input supplies the list; an empty list is typed-empty; a missing path fails with the usage exit code and names the path; `-` with a terminal on standard input is refused.
+- [x] Tests (batch path): rows carry relation labels, and `--exclude` removes labeled rows, exactly as on the single path.
 
 ## Mutual nearest pairs
 

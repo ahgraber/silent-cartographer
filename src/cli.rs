@@ -365,6 +365,12 @@ pub struct SimilarArgs {
     #[arg(long)]
     pub at: Option<String>,
 
+    /// Answer for every reference in a list, one per line, read from this file or from standard
+    /// input when `-`. Each answer is the one a single-subject invocation returns. Mutually
+    /// exclusive with a positional reference, `--at`, and `--cursor`.
+    #[arg(long, value_name = "PATH|-", conflicts_with_all = ["reference", "at", "cursor"])]
+    pub subjects_from: Option<String>,
+
     /// Project each result row's content at this detail. Never changes which symbols are
     /// returned or their order.
     #[arg(long, value_enum, default_value = "signature")]

@@ -458,6 +458,8 @@ fn clap_tree_matches_the_recorded_flag_vocabulary() {
         "depth",
         // `similar`'s relation-label exclusion.
         "exclude",
+        // `similar`'s subject list for a batch invocation.
+        "subjects-from",
         // The dependents order selector on `trace` and `impact`.
         "order",
         // `impact`'s seed-mode selector.

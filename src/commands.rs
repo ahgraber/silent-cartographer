@@ -28,7 +28,7 @@ use crate::query::page::{
     precheck_cursor,
 };
 use crate::query::resolve::SourcePosition;
-use crate::query::search::{RelationLabel, exclude_relations};
+use crate::query::search::{RelationLabel, SimilarItem, exclude_relations};
 use crate::query::{Detail, OrderMode, QueryEngine, Relation};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
 use crate::semantic::probe::PROBE_DEADLINE;
@@ -1677,6 +1677,127 @@ pub fn run_search(
     Ok(render(&answer, json, styled, position))
 }
 
+/// The controls every `similar` answer in one invocation shares, validated and normalized once.
+struct SimilarControls {
+    detail: Detail,
+    max_lines: Option<usize>,
+    limit: Option<usize>,
+    /// Sorted and de-duplicated, so a continuation token binds the set rather than its spelling.
+    excluded: Vec<RelationLabel>,
+    position: PositionUnit,
+}
+
+impl SimilarControls {
+    fn new(
+        detail: Detail,
+        max_lines: usize,
+        max_lines_explicit: bool,
+        exclude: &[RelationLabel],
+        limit: usize,
+        position: PositionUnit,
+    ) -> Result<Self> {
+        let content_bearing = matches!(detail, Detail::Signature | Detail::Interface | Detail::Body);
+        if !content_bearing && max_lines_explicit {
+            return Err(content_bound_misuse("--max-lines").into());
+        }
+        let mut excluded = exclude.to_vec();
+        excluded.sort();
+        excluded.dedup();
+        Ok(Self {
+            detail,
+            max_lines: (max_lines != 0).then_some(max_lines),
+            limit: (limit != 0).then_some(limit),
+            excluded,
+            position,
+        })
+    }
+}
+
+/// How a `similar` subject is named.
+enum SimilarSubject<'a> {
+    Reference(&'a str),
+    /// The raw `--at` argument and its parsed position.
+    Position(&'a str, &'a (String, SourcePosition)),
+}
+
+/// One opened store and the state read from it, from which any number of `similar` answers are
+/// built. The single-subject and the batch invocation build every answer here, so a batched answer
+/// is the answer a single invocation returns.
+struct SimilarSession<'a> {
+    engine: QueryEngine<'a>,
+    db: &'a Path,
+    meta: IndexMetadata,
+    environment: Option<EnvironmentFacts>,
+    relation: Option<WorkspaceRelation>,
+    index_hash: String,
+    controls: SimilarControls,
+}
+
+impl<'a> SimilarSession<'a> {
+    fn open(
+        store: &'a GraphStore,
+        db: &'a Path,
+        root: &Path,
+        rust_analyzer: &str,
+        controls: SimilarControls,
+    ) -> Result<Self> {
+        let index_hash = recorded_index_hash(store)?;
+        let relation = workspace_relation(store, root)?;
+        let meta = store
+            .read_metadata()?
+            .expect("open_query_store guarantees recorded metadata");
+        let (provenance, hash, environment) = current_state(store, root, rust_analyzer)?;
+        let engine = QueryEngine::new(store, provenance, hash, environment.clone());
+        Ok(Self {
+            engine,
+            db,
+            meta,
+            environment,
+            relation,
+            index_hash,
+            controls,
+        })
+    }
+
+    /// The answer for one subject: resolved, excluded, paged, and stamped, ready to render.
+    fn answer(&self, subject: &SimilarSubject, cursor: Option<&str>) -> Result<Answer<SimilarItem>> {
+        let controls = &self.controls;
+        let (answer, named, position_unit) = match subject {
+            SimilarSubject::Position(raw, (doc, at)) => (
+                self.engine
+                    .similar_by_position(doc, *at, controls.detail, controls.max_lines)?,
+                *raw,
+                Some(controls.position.label()),
+            ),
+            SimilarSubject::Reference(reference) => (
+                self.engine.similar(reference, controls.detail, controls.max_lines)?,
+                *reference,
+                None,
+            ),
+        };
+        let answer = exclude_relations(answer, &controls.excluded);
+        let identity = PageIdentity {
+            command: "similar",
+            reference: named.to_string(),
+            relation: None,
+            detail: Some(detail_label(controls.detail)),
+            depth: None,
+            ordering: None,
+            limit: controls.limit,
+            max_lines: controls.max_lines,
+            from: None,
+            position_unit,
+            source_hash: None,
+            excluded_relations: controls.excluded.clone(),
+            index_hash: self.index_hash.clone(),
+        };
+        let answer = apply_pagination(answer, controls.limit, cursor, &identity)?
+            .with_workspace_relation(self.relation.clone());
+        let answer = answer.with_excluded_relations(&controls.excluded);
+        Ok(answer.with_refresh(|| refresh_command(&self.meta, self.db, self.environment.as_ref())))
+    }
+}
+
 /// `similar`: the corpus symbols most similar in content to a subject symbol, the subject named by
 /// reference or by source position, with deterministic clone-certainty markers above the estimated
 /// ranking.
@@ -1700,62 +1821,108 @@ pub fn run_similar(
     // The invocation's shape is validated before the store is opened, so a malformed `similar` is a
     // usage error even against an absent index.
     let at_position = at.map(|arg| parse_position(arg, position)).transpose()?;
-    let reference = match at_position {
-        Some(_) => None,
-        None => Some(
+    let subject = match (&at_position, at) {
+        (Some(parsed), Some(raw)) => SimilarSubject::Position(raw, parsed),
+        _ => SimilarSubject::Reference(
             reference.ok_or_else(|| Failure::Usage("similar requires a reference or --at position".to_string()))?,
         ),
     };
-    let content_bearing = matches!(detail, Detail::Signature | Detail::Interface | Detail::Body);
-    if !content_bearing && max_lines_explicit {
-        return Err(content_bound_misuse("--max-lines").into());
-    }
-    let effective_limit = (limit != 0).then_some(limit);
-    let effective_max_lines = (max_lines != 0).then_some(max_lines);
-    let subject = reference
-        .map(str::to_string)
-        .or_else(|| at.map(str::to_string))
-        .unwrap_or_default();
-    let mut excluded = exclude.to_vec();
-    excluded.sort();
-    excluded.dedup();
-    precheck_cursor(cursor, effective_limit)?;
+    let controls = SimilarControls::new(detail, max_lines, max_lines_explicit, exclude, limit, position)?;
+    precheck_cursor(cursor, controls.limit)?;
     let store = open_query_store(db)?;
-    let index_hash = recorded_index_hash(&store)?;
-    let relation = workspace_relation(&store, root)?;
-    let meta = store
-        .read_metadata()?
-        .expect("open_query_store guarantees recorded metadata");
-    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
-    let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
-    let answer = match &at_position {
-        Some((doc, at)) => engine.similar_by_position(doc, *at, detail, effective_max_lines)?,
-        None => engine.similar(
-            reference.expect("required when --at is absent"),
-            detail,
-            effective_max_lines,
-        )?,
-    };
-    let answer = exclude_relations(answer, &excluded);
-    let identity = PageIdentity {
-        command: "similar",
-        reference: subject,
-        relation: None,
-        detail: Some(detail_label(detail)),
-        depth: None,
-        ordering: None,
-        limit: effective_limit,
-        max_lines: effective_max_lines,
-        from: None,
-        position_unit: at.map(|_| position.label()),
-        source_hash: None,
-        excluded_relations: excluded.clone(),
-        index_hash,
-    };
-    let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
-    let answer = answer.with_excluded_relations(&excluded);
-    let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
+    let session = SimilarSession::open(&store, db, root, rust_analyzer, controls)?;
+    let answer = session.answer(&subject, cursor)?;
     Ok(render(&answer, json, styled, position))
+}
+
+/// Read a `similar` subject list from `source`: a file path, or `-` for `stdin`.
+///
+/// One reference per line, surrounding whitespace trimmed, blank lines skipped. A list that cannot
+/// be read, is not UTF-8, or is requested from a terminal is a usage error naming its source.
+/// `stdin_is_terminal` and `stdin` are parameters so the terminal refusal is testable without a
+/// terminal.
+pub fn read_subject_list(source: &str, stdin: &mut dyn std::io::Read, stdin_is_terminal: bool) -> Result<Vec<String>> {
+    let (name, bytes) = if source == "-" {
+        if stdin_is_terminal {
+            return Err(Failure::Usage(
+                "`--subjects-from -` reads the list from standard input, which is a terminal".to_string(),
+            )
+            .into());
+        }
+        let mut bytes = Vec::new();
+        stdin
+            .read_to_end(&mut bytes)
+            .map_err(|e| Failure::Usage(format!("cannot read the subject list from standard input: {e}")))?;
+        ("standard input", bytes)
+    } else {
+        let bytes = std::fs::read(source)
+            .map_err(|e| Failure::Usage(format!("cannot read the subject list {source}: {e}")))?;
+        (source, bytes)
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| Failure::Usage(format!("the subject list from {name} is not valid UTF-8")))?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// `similar` for every reference in `references`, on one store connection.
+///
+/// Each per-subject answer is the one [`run_similar`] returns for that reference under the same
+/// controls, including an ambiguous or absent outcome, which never fails the invocation. No
+/// continuation token is accepted: a per-subject token resumes a single-subject query.
+#[allow(clippy::too_many_arguments)] // the CLI's flat query-command surface travels together
+pub fn run_similar_batch(
+    db: &Path,
+    root: &Path,
+    rust_analyzer: &str,
+    references: &[String],
+    detail: Detail,
+    max_lines: usize,
+    max_lines_explicit: bool,
+    exclude: &[RelationLabel],
+    limit: usize,
+    json: bool,
+    styled: bool,
+    position: PositionUnit,
+) -> Result<String> {
+    let controls = SimilarControls::new(detail, max_lines, max_lines_explicit, exclude, limit, position)?;
+    let store = open_query_store(db)?;
+    let session = SimilarSession::open(&store, db, root, rust_analyzer, controls)?;
+    let answers = references
+        .iter()
+        .map(|reference| session.answer(&SimilarSubject::Reference(reference), None))
+        .collect::<Result<Vec<_>>>()?;
+    if json {
+        let entries = references
+            .iter()
+            .zip(&answers)
+            .map(|(reference, answer)| {
+                Ok(serde_json::json!({ "reference": reference, "answer": serde_json::to_value(answer)? }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(serde_json::to_string_pretty(
+            &serde_json::json!({ "answers": entries }),
+        )?);
+    }
+    if answers.is_empty() {
+        return Ok("empty: no subjects were given (a definite empty set)".to_string());
+    }
+    let sections: Vec<String> = references
+        .iter()
+        .zip(&answers)
+        .map(|(reference, answer)| {
+            format!(
+                "# {}\n{}",
+                crate::render::sanitize(reference),
+                render(answer, false, styled, position)
+            )
+        })
+        .collect();
+    Ok(sections.join("\n\n"))
 }
 
 /// `impact`: the reverse-reachability impact of a change, seeded from a git diff rather than from a

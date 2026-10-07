@@ -1716,4 +1716,235 @@ class Right(Base):
         let resumed = core_json(&db, dir.path(), &exclude, limit, Some(cursor));
         assert_eq!(ids_without(&resumed, ""), remaining[limit..]);
     }
+
+    // ---- Batch ----
+
+    /// A store built from `fixture` at `dir`, with the subject reference for each backend's `core`.
+    fn db_for(fixture: &Fixture, dir: &std::path::Path) -> std::path::PathBuf {
+        let db = dir.join("index.db");
+        silent_cartographer::commands::build_from_index(&db, "test-ws", dir, &fixture.index(), &fixture.sources())
+            .unwrap();
+        db
+    }
+
+    fn single_json(
+        db: &std::path::Path,
+        root: &std::path::Path,
+        reference: &str,
+        exclude: &[RelationLabel],
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> serde_json::Value {
+        let out = silent_cartographer::commands::run_similar(
+            db,
+            root,
+            "rust-analyzer",
+            Some(reference),
+            None,
+            Detail::Location,
+            10,
+            false,
+            exclude,
+            limit,
+            cursor,
+            true,
+            false,
+            PositionUnit::Line,
+        )
+        .unwrap();
+        serde_json::from_str(&out).unwrap()
+    }
+
+    fn batch(
+        db: &std::path::Path,
+        root: &std::path::Path,
+        references: &[&str],
+        exclude: &[RelationLabel],
+        limit: usize,
+        json: bool,
+    ) -> String {
+        let references: Vec<String> = references.iter().map(|r| r.to_string()).collect();
+        silent_cartographer::commands::run_similar_batch(
+            db,
+            root,
+            "rust-analyzer",
+            &references,
+            Detail::Location,
+            10,
+            false,
+            exclude,
+            limit,
+            json,
+            false,
+            PositionUnit::Line,
+        )
+        .unwrap()
+    }
+
+    fn batch_json(
+        db: &std::path::Path,
+        root: &std::path::Path,
+        references: &[&str],
+        exclude: &[RelationLabel],
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        let answer: serde_json::Value =
+            serde_json::from_str(&batch(db, root, references, exclude, limit, true)).unwrap();
+        answer["answers"].as_array().unwrap().clone()
+    }
+
+    // _(Each subject gets its own answer in order; a per-subject answer equals the single answer; an
+    // unresolved or ambiguous reference does not fail the batch)_ — a resolved, an ambiguous, and an
+    // unresolved reference on every backend. The nested answer is re-indented, so the parsed values
+    // are compared.
+    #[test]
+    fn a_batch_answers_each_subject_as_a_single_invocation_does() {
+        for fixture in fixtures() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = db_for(&fixture, dir.path());
+            let core = decl_id(CORE);
+            let references = [core.as_str(), "describe", "no_such_symbol_anywhere"];
+            let answers = batch_json(&db, dir.path(), &references, &[], 0);
+            assert_eq!(answers.len(), 3);
+            let outcomes: Vec<&str> = answers
+                .iter()
+                .map(|entry| entry["answer"]["outcome"]["outcome"].as_str().unwrap())
+                .collect();
+            assert_eq!(outcomes, ["found", "ambiguous", "absent"], "{:?}", fixture.language);
+            for (entry, reference) in answers.iter().zip(references) {
+                assert_eq!(entry["reference"], reference);
+                assert_eq!(
+                    entry["answer"],
+                    single_json(&db, dir.path(), reference, &[], 0, None),
+                    "{:?}: {reference}",
+                    fixture.language
+                );
+            }
+        }
+    }
+
+    // _(A per-subject token resumes a single query)_.
+    #[test]
+    fn a_batch_continuation_token_resumes_a_single_subject_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_for(&rust_relations(), dir.path());
+        let core = decl_id(CORE);
+        let answers = batch_json(&db, dir.path(), &[core.as_str()], &[], 2);
+        let page = &answers[0]["answer"];
+        let cursor = page["page"]["cursor"]
+            .as_str()
+            .expect("a truncated page carries a token");
+        let resumed = single_json(&db, dir.path(), core.as_str(), &[], 2, Some(cursor));
+        let all = ids_without(&single_json(&db, dir.path(), core.as_str(), &[], 0, None), "");
+        let resumed = ids_without(&resumed, "");
+        assert!(!resumed.is_empty());
+        assert_eq!(resumed, all[2..2 + resumed.len()]);
+    }
+
+    // _(Rows carry labels and `--exclude` removes them, on the batch path)_.
+    #[test]
+    fn the_batch_path_labels_rows_and_honors_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = built_db(dir.path());
+        let core = decl_id(CORE);
+        let all = batch_json(&db, dir.path(), &[core.as_str()], &[], 0);
+        let labeled = all[0]["answer"]["outcome"]["results"].as_array().unwrap();
+        assert!(
+            labeled
+                .iter()
+                .any(|row| !row["relations"].as_array().unwrap().is_empty())
+        );
+        let excluded = batch_json(&db, dir.path(), &[core.as_str()], &[RelationLabel::TestsSubject], 0);
+        assert_eq!(
+            ids_without(&excluded[0]["answer"], ""),
+            ids_without(&all[0]["answer"], "tests_subject")
+        );
+        assert_eq!(
+            excluded[0]["answer"]["excluded_relations"],
+            serde_json::json!(["tests_subject"])
+        );
+    }
+
+    // _(An empty list is typed absence)_ — a definite none, not a failure, in both renderings.
+    #[test]
+    fn an_empty_batch_is_a_definite_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = built_db(dir.path());
+        assert!(batch_json(&db, dir.path(), &[], &[], 0).is_empty());
+        assert!(batch(&db, dir.path(), &[], &[], 0, false).starts_with("empty: no subjects"));
+    }
+
+    #[test]
+    fn the_human_batch_headings_precede_each_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = built_db(dir.path());
+        let out = batch(
+            &db,
+            dir.path(),
+            &["no_such_symbol_anywhere", "also_missing"],
+            &[],
+            0,
+            false,
+        );
+        let first = out.find("# no_such_symbol_anywhere\n").expect("first heading");
+        let second = out.find("\n\n# also_missing\n").expect("second heading");
+        assert!(first < second, "{out}");
+        assert_eq!(out.matches("absent: nothing resolved").count(), 2, "{out}");
+    }
+
+    // _(Standard input supplies the list; an unreadable list is a usage error naming the source)_ —
+    // through the built binary.
+    #[test]
+    fn the_list_comes_from_standard_input_and_a_missing_path_is_a_usage_error() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = built_db(dir.path());
+        let core = decl_id(CORE);
+        let run = |source: &str, input: &str| {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_c10r"))
+                .current_dir(dir.path())
+                .args([
+                    "--db",
+                    db.to_str().unwrap(),
+                    "--json",
+                    "similar",
+                    "--subjects-from",
+                    source,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let input = format!("  {}  \n\n{}\n", core.as_str(), "no_such_symbol_anywhere");
+        let out = run("-", &input);
+        assert_eq!(out.status.code(), Some(0));
+        let answer: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(answer["answers"].as_array().unwrap().len(), 2);
+        assert_eq!(answer["answers"][0]["reference"], core.as_str());
+
+        let out = run("no/such/list.txt", "");
+        assert_eq!(out.status.code(), Some(ExitCode::Usage.code()));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no/such/list.txt"));
+    }
+
+    // _(`-` is refused on a terminal; a list that is not UTF-8 is refused naming standard input)_ —
+    // through the reader's seam, since a test cannot attach a terminal.
+    #[test]
+    fn the_list_reader_refuses_a_terminal_and_invalid_utf8() {
+        use silent_cartographer::commands::read_subject_list;
+
+        let err = read_subject_list("-", &mut std::io::empty(), true).expect_err("a terminal is refused");
+        assert_eq!(classify(&err), ExitCode::Usage);
+        assert!(err.to_string().contains("terminal"), "{err}");
+
+        let err = read_subject_list("-", &mut &[0xff, 0xfe][..], false).expect_err("invalid UTF-8 is refused");
+        assert_eq!(classify(&err), ExitCode::Usage);
+        assert!(err.to_string().contains("standard input"), "{err}");
+    }
 }

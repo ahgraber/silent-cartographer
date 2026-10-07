@@ -351,6 +351,11 @@
           "global": false
         },
         {
+          "name": "subjects-from",
+          "takes_value": true,
+          "global": false
+        },
+        {
           "name": "detail",
           "takes_value": true,
           "values": [
