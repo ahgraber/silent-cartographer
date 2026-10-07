@@ -104,7 +104,8 @@ pub enum Command {
     Similar(SimilarArgs),
     /// List deterministic clones: with no subject, every group of symbols whose token sequences are
     /// identical up to consistently renamed identifiers and substituted literal values; with a
-    /// subject, the other symbols that are such copies of it.
+    /// subject, the other symbols that are such copies of it and the token runs it shares with part
+    /// of another symbol.
     ///
     /// Rows are token equivalence — identical token structure — never proof of identical behavior.
     Clones(ClonesArgs),

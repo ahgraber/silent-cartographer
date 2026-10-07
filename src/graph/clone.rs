@@ -13,6 +13,8 @@
 //! pattern, so an inconsistent substitution never collides. The keys assert token structure only —
 //! never behavioral equivalence: a substituted literal changes behavior.
 
+use std::collections::HashMap;
+
 use sha2::{Digest, Sha256};
 
 use super::syntax::{SpelledToken, TokenClass};
@@ -135,6 +137,171 @@ fn kgram_hash(kgram: &[SpelledToken]) -> i64 {
     }
     let digest = hasher.finalize();
     i64::from_le_bytes(digest[..8].try_into().expect("a SHA-256 digest holds 32 bytes"))
+}
+
+/// A pair of token runs, one in each of two sequences, identical under a consistent one-to-one
+/// substitution of identifiers and literal values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedRun {
+    /// The run's first token ordinal in the first sequence.
+    pub a_start: usize,
+    /// The run's first token ordinal in the second sequence.
+    pub b_start: usize,
+    /// The run's length in tokens, equal in both sequences.
+    pub length: usize,
+    /// Whether the two runs are identical as spelled.
+    pub exact: bool,
+}
+
+/// The maximal pairs of runs of `a` and `b`, each at least `min_length` tokens, that are identical
+/// under a consistent one-to-one substitution, one substitution per token class, and whose
+/// placeholder-equal run on the same diagonal holds a seed. No returned pair lies within another,
+/// in both sequences at once.
+///
+/// `seeds` are `(ordinal in a, ordinal in b)` positions of shared fingerprints; a seed out of range
+/// or on unequal placeholder tokens (a hash collision) contributes nothing, so every returned pair
+/// is verified token by token.
+///
+/// Completeness: given the winnowed fingerprints of both sequences as seeds and `min_length` at
+/// least the guaranteed fragment length, every consistent pair of at least `min_length` tokens lies
+/// within a returned pair. A consistent pair maps every identifier to an identifier, every literal
+/// to a literal, and every other token to itself, so it lies within one maximal placeholder-equal
+/// run on its diagonal. Winnowing places a shared fingerprint at the same offset in both runs of the
+/// pair, so that run holds a seed. Consistency holds for every sub-interval of a consistent
+/// interval, so the scan of that run finds every maximal consistent interval, and the pair lies
+/// within one.
+pub fn shared_runs(
+    a: &[SpelledToken],
+    b: &[SpelledToken],
+    seeds: &[(usize, usize)],
+    min_length: usize,
+) -> Vec<SharedRun> {
+    let placeholder_equal =
+        |i: usize, j: usize| a[i].class == b[j].class && (a[i].class != TokenClass::Other || a[i].text == b[j].text);
+    let diagonal = |&(i, j): &(usize, usize)| i as i64 - j as i64;
+    let mut seeds: Vec<(usize, usize)> = seeds
+        .iter()
+        .copied()
+        .filter(|&(i, j)| i < a.len() && j < b.len() && placeholder_equal(i, j))
+        .collect();
+    seeds.sort_by_key(|seed| (diagonal(seed), seed.0));
+    seeds.dedup();
+
+    let mut runs: Vec<SharedRun> = Vec::new();
+    // The diagonal and end ordinal in `a` of the last run extended: a later seed inside it adds nothing.
+    let mut covered: Option<(i64, usize)> = None;
+    for seed in seeds {
+        let (i, j) = seed;
+        if covered.is_some_and(|(d, end)| d == diagonal(&seed) && i < end) {
+            continue;
+        }
+        let back = (1..=i.min(j))
+            .take_while(|&step| placeholder_equal(i - step, j - step))
+            .count();
+        let forward = (0..(a.len() - i).min(b.len() - j))
+            .take_while(|&step| placeholder_equal(i + step, j + step))
+            .count();
+        let (run_a, run_b, length) = (i - back, j - back, back + forward);
+        covered = Some((diagonal(&seed), run_a + length));
+        let (a_run, b_run) = (&a[run_a..run_a + length], &b[run_b..run_b + length]);
+        // Spelling mismatches before each offset, so an interval's exactness is one subtraction.
+        let mut mismatches = vec![0usize; length + 1];
+        for k in 0..length {
+            mismatches[k + 1] = mismatches[k] + usize::from(a_run[k].text != b_run[k].text);
+        }
+        for (start, end) in consistent_intervals(a_run, b_run) {
+            if end - start >= min_length {
+                runs.push(SharedRun {
+                    a_start: run_a + start,
+                    b_start: run_b + start,
+                    length: end - start,
+                    exact: mismatches[end] == mismatches[start],
+                });
+            }
+        }
+    }
+    drop_contained(runs)
+}
+
+/// `runs` without every run lying within another in both sequences, longest first.
+fn drop_contained(mut runs: Vec<SharedRun>) -> Vec<SharedRun> {
+    runs.sort_by_key(|run| (std::cmp::Reverse(run.length), run.a_start, run.b_start));
+    let within = |inner: &SharedRun, outer: &SharedRun| {
+        outer.a_start <= inner.a_start
+            && inner.a_start + inner.length <= outer.a_start + outer.length
+            && outer.b_start <= inner.b_start
+            && inner.b_start + inner.length <= outer.b_start + outer.length
+    };
+    let mut kept: Vec<SharedRun> = Vec::new();
+    for run in runs {
+        if !kept.iter().any(|outer| within(&run, outer)) {
+            kept.push(run);
+        }
+    }
+    kept
+}
+
+/// The maximal `[start, end)` intervals over which the placeholder-equal runs `a` and `b` (of equal
+/// length) are identical under a consistent one-to-one substitution, one per token class, in order
+/// of start. Linear in the run length: each position enters and leaves the window once.
+fn consistent_intervals(a: &[SpelledToken], b: &[SpelledToken]) -> Vec<(usize, usize)> {
+    let slot = |class: TokenClass| match class {
+        TokenClass::Identifier => Some(0),
+        TokenClass::Literal => Some(1),
+        TokenClass::Other => None,
+    };
+    let mut maps: [Bijection; 2] = Default::default();
+    let mut intervals = Vec::new();
+    let mut left = 0;
+    for right in 0..a.len() {
+        let Some(at) = slot(a[right].class) else {
+            continue;
+        };
+        let (x, y) = (a[right].text.as_str(), b[right].text.as_str());
+        if maps[at].conflicts(x, y) {
+            intervals.push((left, right));
+            while maps[at].conflicts(x, y) {
+                if let Some(leaving) = slot(a[left].class) {
+                    maps[leaving].remove(&a[left].text, &b[left].text);
+                }
+                left += 1;
+            }
+        }
+        maps[at].insert(x, y);
+    }
+    intervals.push((left, a.len()));
+    intervals
+}
+
+/// A one-to-one pairing of texts within a window, each pair counted by its occurrences so it leaves
+/// with its last one.
+#[derive(Default)]
+struct Bijection<'t> {
+    forward: HashMap<&'t str, (&'t str, usize)>,
+    backward: HashMap<&'t str, (&'t str, usize)>,
+}
+
+impl<'t> Bijection<'t> {
+    /// Whether pairing `x` with `y` contradicts a pair already in the window, in either direction.
+    fn conflicts(&self, x: &str, y: &str) -> bool {
+        self.forward.get(x).is_some_and(|&(partner, _)| partner != y)
+            || self.backward.get(y).is_some_and(|&(partner, _)| partner != x)
+    }
+
+    fn insert(&mut self, x: &'t str, y: &'t str) {
+        self.forward.entry(x).or_insert((y, 0)).1 += 1;
+        self.backward.entry(y).or_insert((x, 0)).1 += 1;
+    }
+
+    fn remove(&mut self, x: &str, y: &str) {
+        for (map, key) in [(&mut self.forward, x), (&mut self.backward, y)] {
+            let count = &mut map.get_mut(key).expect("a pair in the window is counted").1;
+            *count -= 1;
+            if *count == 0 {
+                map.remove(key);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -333,5 +500,69 @@ mod tests {
     fn a_sequence_shorter_than_the_guaranteed_length_yields_none() {
         let input = tokens(TokenClass::Other, "t", guaranteed_fragment_length(K, W) - 1);
         assert!(winnow(&input, K, W).is_empty());
+    }
+
+    /// Space-separated tokens: lowercase words are identifiers, digit strings literals, and
+    /// anything else structure.
+    fn spelled(text: &str) -> Vec<SpelledToken> {
+        text.split(' ')
+            .enumerate()
+            .map(|(start, word)| SpelledToken {
+                class: if word.chars().all(|c| c.is_ascii_lowercase()) {
+                    TokenClass::Identifier
+                } else if word.chars().all(|c| c.is_ascii_digit()) {
+                    TokenClass::Literal
+                } else {
+                    TokenClass::Other
+                },
+                text: word.to_string(),
+                start,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_consistently_renamed_run_is_one_interval() {
+        let a = spelled("x = y + 1 ; x = x * 1");
+        let b = spelled("p = q + 2 ; p = p * 2");
+        assert_eq!(consistent_intervals(&a, &b), vec![(0, a.len())]);
+    }
+
+    /// Two identifiers of one run merged into one name in the other: the scan splits at each
+    /// conflict, and every interval is maximal.
+    #[test]
+    fn a_merged_identifier_splits_the_run_at_the_conflict() {
+        let a = spelled("x + y ; x");
+        let b = spelled("p + p ; p");
+        assert_eq!(consistent_intervals(&a, &b), vec![(0, 2), (1, 4), (3, 5)]);
+    }
+
+    #[test]
+    fn an_identical_run_is_exact() {
+        let a = spelled("{ x = y + 1 ; }");
+        assert_eq!(
+            shared_runs(&a, &a, &[(2, 2)], 3),
+            vec![SharedRun {
+                a_start: 0,
+                b_start: 0,
+                length: a.len(),
+                exact: true
+            }]
+        );
+    }
+
+    #[test]
+    fn a_renamed_run_is_variant() {
+        let a = spelled("{ x = y + 1 ; }");
+        let b = spelled("( ( { p = q + 2 ; }");
+        assert_eq!(
+            shared_runs(&a, &b, &[(1, 3)], 3),
+            vec![SharedRun {
+                a_start: 0,
+                b_start: 2,
+                length: a.len(),
+                exact: false
+            }]
+        );
     }
 }

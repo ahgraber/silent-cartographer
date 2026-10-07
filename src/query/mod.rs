@@ -144,6 +144,15 @@ pub enum QueryError {
     /// build always records them.
     #[error("store corruption: no fragment parameters recorded; rebuild the index")]
     MissingFragmentParameters,
+    /// A `clones` query needed the indexed text behind a symbol holding fragment evidence, and the
+    /// store holds none for its document — an invariant violation, since a build fingerprints only
+    /// symbols of documents it indexed whole.
+    #[error("store corruption: no indexed text for {0}; rebuild the index")]
+    MissingIndexedText(String),
+    /// The store records an analyzer whose language no backend parses — an invariant violation,
+    /// since a build refuses such an analyzer.
+    #[error("store corruption: unrecognized analyzer {0}; rebuild the index")]
+    UnknownAnalyzer(String),
 }
 
 /// The query engine over a store, carrying the analyzer provenance, content hash, and declared

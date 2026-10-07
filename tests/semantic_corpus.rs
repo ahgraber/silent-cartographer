@@ -671,7 +671,7 @@ fn fragment_fingerprints_follow_the_build() {
     let (hash, ordinal) = first[0];
     assert!(
         !store
-            .passages_with_fingerprint(hash)
+            .symbols_with_fingerprint(hash)
             .unwrap()
             .contains(&(long_id(), ordinal)),
         "no row from the prior source remains"

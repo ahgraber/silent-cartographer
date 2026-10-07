@@ -407,6 +407,14 @@ impl HumanRender for CloneItem {
                     CloneKind::Fragment => "fragment",
                 }
             ));
+            if let Some(fragment) = &item.fragment {
+                lines.push(format!(
+                    "    {} tokens: subject {} = other {}",
+                    fragment.token_length,
+                    span_location_text(&fragment.subject_run, unit),
+                    span_location_text(&fragment.other_run, unit)
+                ));
+            }
         }
     }
 }
@@ -782,6 +790,24 @@ fn location_text(location: &Location, unit: PositionUnit) -> String {
     match (unit, location.line_column.start_line, location.line_column.start_column) {
         (PositionUnit::Line, Some(line), Some(column)) => format!("{path}:{line}:{column}"),
         _ => format!("{path}:{}-{}", location.span_start, location.span_end),
+    }
+}
+
+/// A location's whole span in the selected unit: `path:line:column-line:column` or `path:start-end`.
+fn span_location_text(location: &Location, unit: PositionUnit) -> String {
+    let lines = location.line_column;
+    match (
+        unit,
+        lines.start_line,
+        lines.start_column,
+        lines.end_line,
+        lines.end_column,
+    ) {
+        (PositionUnit::Line, Some(start_line), Some(start_column), Some(end_line), Some(end_column)) => format!(
+            "{}:{start_line}:{start_column}-{end_line}:{end_column}",
+            sanitize(&location.document_path)
+        ),
+        _ => location_text(location, PositionUnit::Byte),
     }
 }
 

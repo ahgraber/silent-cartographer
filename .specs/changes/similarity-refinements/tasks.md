@@ -65,13 +65,13 @@
 
 ## Shared fragments
 
-- [ ] Implement the per-subject answer: whole-symbol clones by key, then fingerprint candidates verified by diagonal extension and consistent-interval scanning over tokens re-spelled from the indexed module text (design.md § FragmentVerification).
-- [ ] Unit tests for the consistent-interval scan: a fully consistent run; a run with one merged identifier, split at the conflict; an exact run marked exact; a renamed run marked variant.
-- [ ] Tests: a block copied into a long method is found from the shorter function; a renamed block is a variant fragment; an inconsistently renamed block with no consistent run of the guaranteed length is not reported; a shorter shared run is not reported; an exact whole copy has no fragment rows; a docstring difference does not break a run; a Rust fixture reports a shared block.
-- [ ] Tests: a container subject yields `not_comparable`; a function with no shared run or key yields typed-empty; `--at` inside a method takes the method; an ambiguous reference yields the candidate set.
-- [ ] Test: no reported pair is contained in another pair for the same two symbols, over a fixture with an overlapping repeated block.
-- [ ] Test: after a source file changes on disk without a rebuild, the fragment answer still reports runs from the indexed text and is marked stale.
-- [ ] Test: on a store whose recorded k and w give a guaranteed length different from the binary's constants, the subject answer filters runs by the recorded length and reports it.
+- [x] Implement the per-subject answer: whole-symbol clones by key, then fingerprint candidates verified by diagonal extension and consistent-interval scanning over tokens re-spelled from the indexed module text (design.md § FragmentVerification).
+- [x] Unit tests for the consistent-interval scan: a fully consistent run; a run with one merged identifier, split at the conflict; an exact run marked exact; a renamed run marked variant.
+- [x] Tests: a block copied into a long method is found from the shorter function; a renamed block is a variant fragment; an inconsistently renamed block with no consistent run of the guaranteed length is not reported; a shorter shared run is not reported; an exact whole copy has no fragment rows; a docstring difference does not break a run; a Rust fixture reports a shared block.
+- [x] Tests: a container subject yields `not_comparable`; a function with no shared run or key yields typed-empty; `--at` inside a method takes the method; an ambiguous reference yields the candidate set.
+- [x] Test: no reported pair is contained in another pair for the same two symbols, over a fixture with an overlapping repeated block.
+- [x] Test: after a source file changes on disk without a rebuild, the fragment answer still reports runs from the indexed text and is marked stale.
+- [x] Test: on a store whose recorded k and w give a guaranteed length different from the binary's constants, the subject answer filters runs by the recorded length and reports it.
 
 ## Clone answer labeling
 

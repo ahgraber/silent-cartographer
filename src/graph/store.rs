@@ -1259,10 +1259,10 @@ impl GraphStore {
         rows.collect()
     }
 
-    /// The passages holding a fingerprint hash, as `(symbol, token_ordinal)` ordered by symbol
+    /// The symbols whose fingerprints hold a hash, as `(symbol, token_ordinal)` ordered by symbol
     /// identity then ordinal.
-    pub fn passages_with_fingerprint(&self, hash: i64) -> rusqlite::Result<Vec<(CanonicalId, usize)>> {
-        let mut stmt = self.conn.prepare(
+    pub fn symbols_with_fingerprint(&self, hash: i64) -> rusqlite::Result<Vec<(CanonicalId, usize)>> {
+        let mut stmt = self.conn.prepare_cached(
             "SELECT c.symbol_id, f.token_ordinal
              FROM clone_fingerprints f JOIN semantic_corpus c ON c.id = f.passage_id
              WHERE f.hash = ?1

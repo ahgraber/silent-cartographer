@@ -1899,7 +1899,8 @@ pub fn run_similar(
 }
 
 /// `clones`: the groups of deterministic token-equivalent symbols across the corpus, or, given a
-/// subject named by reference or by source position, the other symbols that are such copies of it.
+/// subject named by reference or by source position, the other symbols that are such copies of it
+/// and the token runs it shares with other symbols.
 ///
 /// The answer is computed whole and then paged, so the limit counts groups (no subject) or rows
 /// (subject) and the page block carries the total.
