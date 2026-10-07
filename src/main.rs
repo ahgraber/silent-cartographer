@@ -258,6 +258,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             args.detail.into(),
             args.max_lines,
             flag_explicit(matches, "max_lines"),
+            &args.exclude.iter().map(|label| (*label).into()).collect::<Vec<_>>(),
             args.paging.limit,
             args.paging.cursor.as_deref(),
             cli.json,

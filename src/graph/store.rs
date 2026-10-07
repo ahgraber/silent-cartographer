@@ -1846,6 +1846,50 @@ impl GraphStore {
         rows.collect()
     }
 
+    /// The symbols `id` has an edge of `kind` to — the forward counterpart of
+    /// [`edge_sources`](Self::edge_sources).
+    pub fn edge_targets(&self, kind: EdgeKind, id: &CanonicalId) -> rusqlite::Result<Vec<CanonicalId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT dst_id FROM edges WHERE kind = ?1 AND src_id = ?2 ORDER BY dst_id")?;
+        let rows = stmt.query_map(params![kind.tag(), id.as_str()], |r| {
+            Ok(CanonicalId::from_raw(r.get::<_, String>(0)?))
+        })?;
+        rows.collect()
+    }
+
+    /// The type that declares `id`: the symbol itself when it is a type or trait, else its directly
+    /// enclosing symbol when that is a type or trait. `None` for a symbol enclosed by anything else.
+    ///
+    /// The destination index is named because the planner otherwise walks every `contains` edge.
+    pub fn declaring_type_of(&self, id: &CanonicalId) -> rusqlite::Result<Option<CanonicalId>> {
+        self.conn
+            .prepare_cached(
+                "SELECT canonical_id FROM symbols WHERE canonical_id = ?1 AND kind IN ('type', 'trait')
+                 UNION ALL
+                 SELECT e.src_id FROM edges e INDEXED BY edges_by_dst JOIN symbols s ON s.canonical_id = e.src_id
+                 WHERE e.kind = 'contains' AND e.dst_id = ?1 AND s.kind IN ('type', 'trait')
+                 LIMIT 1",
+            )?
+            .query_row(params![id.as_str()], |r| {
+                Ok(CanonicalId::from_raw(r.get::<_, String>(0)?))
+            })
+            .optional()
+    }
+
+    /// The in-workspace symbols the type `id` has a `type_hierarchy` edge to.
+    pub fn workspace_supertypes_of(&self, id: &CanonicalId) -> rusqlite::Result<Vec<CanonicalId>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT e.dst_id FROM edges e JOIN symbols s ON s.canonical_id = e.dst_id
+             WHERE e.kind = 'type_hierarchy' AND e.src_id = ?1 AND s.class = 'in_workspace'
+             ORDER BY e.dst_id",
+        )?;
+        let rows = stmt.query_map(params![id.as_str()], |r| {
+            Ok(CanonicalId::from_raw(r.get::<_, String>(0)?))
+        })?;
+        rows.collect()
+    }
+
     /// Compute the seed's dependents: symbols whose dependency edges (`uses`, `imports`,
     /// `type_hierarchy`) reach the seed directly or transitively, walking each edge `dst → src`.
     ///

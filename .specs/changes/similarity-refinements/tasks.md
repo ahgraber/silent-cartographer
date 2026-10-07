@@ -29,15 +29,15 @@
 
 ## Relation labels
 
-- [ ] Add store lookups for a `uses` edge between two symbols in a given direction, a symbol's test rule, a symbol's declaring type, and whether two declaring types are linked by a `type_hierarchy` edge or share an `in_workspace` supertype.
-- [ ] Add `relations` to `SimilarItem` and compute it after ordering on the shared materialization path (design.md § RelationLabels, § AnswerShapes); render the labels in the human `similar` output.
-- [ ] Tests (single-subject path): a callee carries `used_by_subject`; a caller carries `uses_subject`; a test that calls the subject carries `uses_subject` and `tests_subject` with its rule; sibling Python methods carry `type_family`; a Rust trait default method and an implementing type's method carry `type_family`; an external common base gives no `type_family`; two methods of one class carry no `type_family`; an unrelated row carries an empty set.
-- [ ] Test: for a fixture subject, the rows and their order with labels equal the rows and order computed before labels were added.
+- [x] Add store lookups for a `uses` edge between two symbols in a given direction, a symbol's test rule, a symbol's declaring type, and whether two declaring types are linked by a `type_hierarchy` edge or share an `in_workspace` supertype.
+- [x] Add `relations` to `SimilarItem` and compute it after ordering on the shared materialization path (design.md § RelationLabels, § AnswerShapes); render the labels in the human `similar` output.
+- [x] Tests (single-subject path): a callee carries `used_by_subject`; a caller carries `uses_subject`; a test that calls the subject carries `uses_subject` and `tests_subject` with its rule; sibling Python methods carry `type_family`; a Rust trait default method and an implementing type's method carry `type_family`; an external common base gives no `type_family`; two methods of one class carry no `type_family`; an unrelated row carries an empty set.
+- [x] Test: for a fixture subject, the rows and their order with labels equal the rows and order computed before labels were added.
 
 ## Relation exclusion
 
-- [ ] Add the repeatable `--exclude <label>` flag to `SimilarArgs` in [src/cli.rs](../../../src/cli.rs), remove excluded rows before paging, bind the sorted set into the page identity, and emit `excluded_relations` (design.md § RelationExclusion).
-- [ ] Tests (single-subject path): an excluded test row is absent and the other rows keep their order; the limit counts remaining rows; `excluded_relations` names the label; a token issued under one exclusion is refused under none.
+- [x] Add the repeatable `--exclude <label>` flag to `SimilarArgs` in [src/cli.rs](../../../src/cli.rs), remove excluded rows before paging, bind the sorted set into the page identity, and emit `excluded_relations` (design.md § RelationExclusion).
+- [x] Tests (single-subject path): an excluded test row is absent and the other rows keep their order; the limit counts remaining rows; `excluded_relations` names the label; a token issued under one exclusion is refused under none.
 
 ## Batch similar
 

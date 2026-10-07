@@ -1762,6 +1762,7 @@ fn every_query_path_carries_a_refresh_command_on_a_stale_answer() {
         Detail::Signature,
         10,
         false,
+        &[],
         0,
         None,
         true,
@@ -4558,6 +4559,7 @@ fn a_get_at_cursor_is_refused_under_the_other_position_unit() {
             from: Some(1),
             position_unit: Some("line"),
             source_hash: None,
+            excluded_relations: Vec::new(),
             index_hash: format!(
                 "{}\u{1f}{}\u{1f}{}",
                 metadata.content_hash, metadata.provenance.analyzer_name, metadata.provenance.analyzer_version

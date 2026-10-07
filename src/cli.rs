@@ -13,6 +13,7 @@ use clap_complete::Shell;
 
 use crate::graph::syntax::Language;
 use crate::hooks::HookEvent;
+use crate::query::search::RelationLabel;
 use crate::query::{Detail, OrderMode, Relation};
 
 /// The `c10r` CLI: precise, type-aware navigation over a persisted code graph.
@@ -146,6 +147,34 @@ impl From<DetailArg> for Detail {
             DetailArg::Signature => Detail::Signature,
             DetailArg::Interface => Detail::Interface,
             DetailArg::Body => Detail::Body,
+        }
+    }
+}
+
+/// The relation labels `similar` rows can carry, and so the labels `--exclude` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RelationLabelArg {
+    /// Rows whose symbol uses the subject.
+    #[value(name = "uses_subject")]
+    UsesSubject,
+    /// Rows whose symbol the subject uses.
+    #[value(name = "used_by_subject")]
+    UsedBySubject,
+    /// Rows whose symbol is test code that uses the subject.
+    #[value(name = "tests_subject")]
+    TestsSubject,
+    /// Rows whose declaring type is a supertype, subtype, or sibling of the subject's declaring type.
+    #[value(name = "type_family")]
+    TypeFamily,
+}
+
+impl From<RelationLabelArg> for RelationLabel {
+    fn from(label: RelationLabelArg) -> Self {
+        match label {
+            RelationLabelArg::UsesSubject => RelationLabel::UsesSubject,
+            RelationLabelArg::UsedBySubject => RelationLabel::UsedBySubject,
+            RelationLabelArg::TestsSubject => RelationLabel::TestsSubject,
+            RelationLabelArg::TypeFamily => RelationLabel::TypeFamily,
         }
     }
 }
@@ -345,6 +374,11 @@ pub struct SimilarArgs {
     /// 10; `0` means unbounded.
     #[arg(long, default_value_t = 10)]
     pub max_lines: usize,
+
+    /// Omit rows carrying this relation label; repeat to omit several. The result limit counts only
+    /// the remaining rows.
+    #[arg(long, value_enum)]
+    pub exclude: Vec<RelationLabelArg>,
 
     #[command(flatten)]
     pub paging: PageArgs,

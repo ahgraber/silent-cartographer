@@ -11,11 +11,13 @@
 //! calibrated, and exposing them invites downstream thresholds that silently break on every model
 //! bump. The order is the claim; the answer-level estimation marker states its grade.
 
-use crate::graph::store::{GraphStore, SymbolRow};
+use std::collections::{HashMap, HashSet};
+
+use crate::graph::store::{EdgeKind, GraphStore, SymbolRow};
 use crate::graph::{corpus, embed};
 use crate::identity::CanonicalId;
 
-use super::output::{Answer, Location, SemanticIndexView, SymbolView};
+use super::output::{Answer, Location, Outcome, SemanticIndexView, SymbolView};
 use super::resolve::{Resolution, SourcePosition, resolve_position};
 use super::{Detail, QueryEngine, QueryError, location_of, projected_content, symbol_view};
 
@@ -35,6 +37,46 @@ pub enum CloneCertainty {
     /// key: identical token structure with only identifiers and literal values substituted — never
     /// a claim of behavioral equivalence.
     VariantClone,
+}
+
+/// A graph relation between a `similar` row's symbol and the subject. Each label states a persisted
+/// fact only, never that the row duplicates, overrides, or implements the subject. The declaration
+/// order is the order labels appear on a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationLabel {
+    /// The row's symbol has a `uses` edge to the subject.
+    UsesSubject,
+    /// The subject has a `uses` edge to the row's symbol.
+    UsedBySubject,
+    /// The row's symbol is classified test code and has a `uses` edge to the subject.
+    TestsSubject,
+    /// The row's declaring type and the subject's differ, and one declares the other as a supertype
+    /// or both declare a common supertype defined in the workspace.
+    TypeFamily,
+}
+
+impl RelationLabel {
+    /// The label as it appears in answers and on the command line.
+    pub fn tag(self) -> &'static str {
+        match self {
+            RelationLabel::UsesSubject => "uses_subject",
+            RelationLabel::UsedBySubject => "used_by_subject",
+            RelationLabel::TestsSubject => "tests_subject",
+            RelationLabel::TypeFamily => "type_family",
+        }
+    }
+}
+
+/// One relation label on a `similar` row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RelationView {
+    /// The label.
+    pub label: RelationLabel,
+    /// The convention rule that classified the row's symbol as test code; present only on
+    /// `tests_subject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
 }
 
 /// One `search` result row: a corpus symbol at its estimated-relevance position, carrying its
@@ -64,6 +106,9 @@ pub struct SimilarItem {
     /// subject; absent otherwise, and on every row when the subject carries no keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clone_certainty: Option<CloneCertainty>,
+    /// The relation labels that hold between this symbol and the subject, in label order; empty when
+    /// none holds. Never alters which rows are returned or their order.
+    pub relations: Vec<RelationView>,
     /// The symbol's definition location.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
@@ -188,7 +233,7 @@ impl QueryEngine<'_> {
         if candidates.is_empty() {
             return Ok(Answer::empty(provenance, freshness).estimated(semantic_index));
         }
-        let items = similar_items(self.store, &candidates, detail, max_lines)?;
+        let items = similar_items(self.store, subject, &candidates, detail, max_lines)?;
         Ok(Answer::found(items, provenance, freshness).estimated(semantic_index))
     }
 
@@ -295,13 +340,16 @@ pub fn similar_candidates(store: &GraphStore, subject: &SymbolRow) -> Result<Vec
 }
 
 /// The `similar` rows for `candidates`, in their order: each candidate's symbol row at the requested
-/// detail, capped at `max_lines`. A candidate absent from the store is a [`QueryError::MissingSymbol`].
+/// detail, capped at `max_lines`, with its relation labels against `subject`. A candidate absent from
+/// the store is a [`QueryError::MissingSymbol`].
 pub fn similar_items(
     store: &GraphStore,
+    subject: &SymbolRow,
     candidates: &[SimilarCandidate],
     detail: Detail,
     max_lines: Option<usize>,
 ) -> Result<Vec<SimilarItem>, QueryError> {
+    let mut relations = SubjectRelations::new(store, subject)?;
     candidates
         .iter()
         .map(|candidate| {
@@ -312,12 +360,133 @@ pub fn similar_items(
             Ok(SimilarItem {
                 symbol: symbol_view(&row),
                 clone_certainty: candidate.clone_certainty,
+                relations: relations.labels(store, &row)?,
                 location: location_of(&row),
                 content,
                 content_truncated,
             })
         })
         .collect()
+}
+
+/// The subject-side facts the relation labels read, gathered once per subject so labeling each
+/// candidate costs indexed lookups only.
+pub struct SubjectRelations {
+    /// The symbols with a `uses` edge to the subject.
+    users: HashSet<CanonicalId>,
+    /// The symbols the subject has a `uses` edge to.
+    used: HashSet<CanonicalId>,
+    /// The subject's declaring type and its type relations; `None` when no type declares the subject.
+    family: Option<SubjectFamily>,
+    /// Whether a candidate's declaring type is related to the subject's, by declaring type.
+    family_verdicts: HashMap<CanonicalId, bool>,
+}
+
+struct SubjectFamily {
+    declaring: CanonicalId,
+    /// The types with a direct `type_hierarchy` edge to or from the subject's declaring type.
+    direct: HashSet<CanonicalId>,
+    /// The in-workspace supertypes of the subject's declaring type.
+    supertypes: HashSet<CanonicalId>,
+}
+
+impl SubjectRelations {
+    /// Read the subject-side facts from `store`.
+    pub fn new(store: &GraphStore, subject: &SymbolRow) -> Result<Self, QueryError> {
+        let id = &subject.canonical_id;
+        let family = match store.declaring_type_of(id)? {
+            Some(declaring) => {
+                let mut direct: HashSet<CanonicalId> = store
+                    .edge_targets(EdgeKind::TypeHierarchy, &declaring)?
+                    .into_iter()
+                    .collect();
+                direct.extend(store.edge_sources(EdgeKind::TypeHierarchy, &declaring)?);
+                let supertypes = store.workspace_supertypes_of(&declaring)?.into_iter().collect();
+                Some(SubjectFamily {
+                    declaring,
+                    direct,
+                    supertypes,
+                })
+            }
+            None => None,
+        };
+        Ok(Self {
+            users: store.edge_sources(EdgeKind::Uses, id)?.into_iter().collect(),
+            used: store.edge_targets(EdgeKind::Uses, id)?.into_iter().collect(),
+            family,
+            family_verdicts: HashMap::new(),
+        })
+    }
+
+    /// The labels that hold between `row`'s symbol and the subject, in [`RelationLabel`] order.
+    pub fn labels(&mut self, store: &GraphStore, row: &SymbolRow) -> Result<Vec<RelationView>, QueryError> {
+        let mut labels = Vec::new();
+        let uses_subject = self.users.contains(&row.canonical_id);
+        if uses_subject {
+            labels.push(RelationView {
+                label: RelationLabel::UsesSubject,
+                rule: None,
+            });
+        }
+        if self.used.contains(&row.canonical_id) {
+            labels.push(RelationView {
+                label: RelationLabel::UsedBySubject,
+                rule: None,
+            });
+        }
+        if uses_subject && let Some(rule) = &row.test_rule {
+            labels.push(RelationView {
+                label: RelationLabel::TestsSubject,
+                rule: Some(rule.clone()),
+            });
+        }
+        if self.in_type_family(store, &row.canonical_id)? {
+            labels.push(RelationView {
+                label: RelationLabel::TypeFamily,
+                rule: None,
+            });
+        }
+        Ok(labels)
+    }
+
+    fn in_type_family(&mut self, store: &GraphStore, id: &CanonicalId) -> Result<bool, QueryError> {
+        let Some(family) = &self.family else {
+            return Ok(false);
+        };
+        let Some(declaring) = store.declaring_type_of(id)? else {
+            return Ok(false);
+        };
+        if declaring == family.declaring {
+            return Ok(false);
+        }
+        if let Some(verdict) = self.family_verdicts.get(&declaring) {
+            return Ok(*verdict);
+        }
+        let related = family.direct.contains(&declaring)
+            || store
+                .workspace_supertypes_of(&declaring)?
+                .iter()
+                .any(|supertype| family.supertypes.contains(supertype));
+        self.family_verdicts.insert(declaring, related);
+        Ok(related)
+    }
+}
+
+/// The `similar` answer without the rows that carry any of `excluded`, the remaining rows in their
+/// original order. An answer left with no rows is typed-empty. Applied before paging, so the result
+/// limit and continuation token count only the remaining rows.
+pub fn exclude_relations(mut answer: Answer<SimilarItem>, excluded: &[RelationLabel]) -> Answer<SimilarItem> {
+    if let Outcome::Found { results } = &mut answer.outcome {
+        results.retain(|item| {
+            item.relations
+                .iter()
+                .all(|relation| !excluded.contains(&relation.label))
+        });
+        if results.is_empty() {
+            answer.outcome = Outcome::Empty;
+        }
+    }
+    answer
 }
 
 /// Build one `search` row: identity, location, and content at the requested detail.

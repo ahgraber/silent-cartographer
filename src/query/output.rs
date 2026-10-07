@@ -10,6 +10,7 @@ use crate::graph::range::LineColumnSpan;
 use crate::graph::store::Freshness;
 use crate::identity::CanonicalId;
 use crate::query::OrderMode;
+use crate::query::search::RelationLabel;
 
 /// The analyzer provenance carried on every answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -256,6 +257,10 @@ pub struct Answer<T> {
     /// which speaks to answer content, not ordering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ordering: Option<OrderMode>,
+    /// The relation labels a `similar` query excluded, sorted: present exactly when an exclusion was
+    /// requested, so an unexcluded answer's shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_relations: Option<Vec<RelationLabel>>,
     /// The outcome.
     pub outcome: Outcome<T>,
     /// The result-set paging disclosure, present only when a result limit was applied.
@@ -301,6 +306,7 @@ impl<T> Answer<T> {
             classification: None,
             workspace_relation: None,
             ordering: None,
+            excluded_relations: None,
             outcome,
             page: None,
         }
@@ -335,6 +341,13 @@ impl<T> Answer<T> {
     /// answer carries, whatever its outcome, naming the ordering in effect.
     pub fn with_ordering(mut self, ordering: OrderMode) -> Self {
         self.ordering = Some(ordering);
+        self
+    }
+
+    /// Disclose the relation labels the query excluded, given sorted and deduplicated; no field at
+    /// all when none was requested.
+    pub fn with_excluded_relations(mut self, excluded: &[RelationLabel]) -> Self {
+        self.excluded_relations = (!excluded.is_empty()).then(|| excluded.to_vec());
         self
     }
 

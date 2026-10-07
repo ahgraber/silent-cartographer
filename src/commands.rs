@@ -28,6 +28,7 @@ use crate::query::page::{
     precheck_cursor,
 };
 use crate::query::resolve::SourcePosition;
+use crate::query::search::{RelationLabel, exclude_relations};
 use crate::query::{Detail, OrderMode, QueryEngine, Relation};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
 use crate::semantic::probe::PROBE_DEADLINE;
@@ -969,6 +970,7 @@ pub fn run_status(
             from: None,
             position_unit: None,
             source_hash: Some(hash),
+            excluded_relations: Vec::new(),
             index_hash,
         };
         let (files, page) = page_rows(differences, effective_limit, cursor, &identity)?;
@@ -1454,6 +1456,7 @@ pub fn run_get(
         from: Some(from),
         position_unit: at.map(|_| position.label()),
         source_hash: None,
+        excluded_relations: Vec::new(),
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1544,6 +1547,7 @@ pub fn run_trace(
         from: None,
         position_unit: None,
         source_hash: None,
+        excluded_relations: Vec::new(),
         index_hash,
     };
     // The relation decides which engine method answers it. `dependents` is the one whose answer does
@@ -1608,6 +1612,7 @@ pub fn run_find(
         from: None,
         position_unit: None,
         source_hash: None,
+        excluded_relations: Vec::new(),
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1664,6 +1669,7 @@ pub fn run_search(
         from: None,
         position_unit: None,
         source_hash: None,
+        excluded_relations: Vec::new(),
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
@@ -1684,6 +1690,7 @@ pub fn run_similar(
     detail: Detail,
     max_lines: usize,
     max_lines_explicit: bool,
+    exclude: &[RelationLabel],
     limit: usize,
     cursor: Option<&str>,
     json: bool,
@@ -1709,6 +1716,9 @@ pub fn run_similar(
         .map(str::to_string)
         .or_else(|| at.map(str::to_string))
         .unwrap_or_default();
+    let mut excluded = exclude.to_vec();
+    excluded.sort();
+    excluded.dedup();
     precheck_cursor(cursor, effective_limit)?;
     let store = open_query_store(db)?;
     let index_hash = recorded_index_hash(&store)?;
@@ -1726,6 +1736,7 @@ pub fn run_similar(
             effective_max_lines,
         )?,
     };
+    let answer = exclude_relations(answer, &excluded);
     let identity = PageIdentity {
         command: "similar",
         reference: subject,
@@ -1738,9 +1749,11 @@ pub fn run_similar(
         from: None,
         position_unit: at.map(|_| position.label()),
         source_hash: None,
+        excluded_relations: excluded.clone(),
         index_hash,
     };
     let answer = apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation);
+    let answer = answer.with_excluded_relations(&excluded);
     let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
     Ok(render(&answer, json, styled, position))
 }
@@ -1977,6 +1990,7 @@ pub fn run_impact(
         from: None,
         position_unit: None,
         source_hash: None,
+        excluded_relations: Vec::new(),
         index_hash: page_index_hash,
     };
     // Every impact answer carries the ordering disclosure, whatever its outcome.

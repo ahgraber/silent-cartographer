@@ -13,6 +13,7 @@ use crate::exit::Failure;
 
 use super::impact::ImpactReport;
 use super::output::{Answer, Outcome, PageInfo};
+use super::search::RelationLabel;
 use super::{DependentItem, DependentsReport};
 
 /// The query identity a continuation token is bound to: the command, subject, relation/detail, the
@@ -57,6 +58,11 @@ pub struct PageIdentity {
     /// The aggregate hash of the source files on disk, bound only by `status`: a token resumes only
     /// while the source files are as they were when its page was drawn. `None` for every query.
     pub source_hash: Option<String>,
+    /// The relation labels a `similar` query excludes, sorted and deduplicated; empty for every other
+    /// query and for an unexcluded `similar`, where it adds nothing to the hash.
+    /// Bound so a token issued under one exclusion is refused under another.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_relations: Vec<RelationLabel>,
     /// The recorded index identity the answer was drawn from: the index content-hash composed with
     /// the recorded analyzer provenance (name and version). A same-source rebuild under a different
     /// analyzer version changes this even when the content-hash is unchanged, so a stale token is
@@ -163,6 +169,7 @@ pub fn apply_pagination<T>(
         classification,
         workspace_relation,
         ordering,
+        excluded_relations,
         outcome,
         page: _,
     } = answer;
@@ -190,6 +197,7 @@ pub fn apply_pagination<T>(
             classification,
             workspace_relation,
             ordering,
+            excluded_relations,
             outcome: Outcome::Ambiguous {
                 candidates,
                 candidates_total,
@@ -212,6 +220,7 @@ pub fn apply_pagination<T>(
             classification,
             workspace_relation,
             ordering,
+            excluded_relations,
             outcome,
             page: None,
         });
@@ -227,6 +236,7 @@ pub fn apply_pagination<T>(
             classification,
             workspace_relation,
             ordering,
+            excluded_relations,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -242,6 +252,7 @@ pub fn apply_pagination<T>(
         classification,
         workspace_relation,
         ordering,
+        excluded_relations,
         outcome: Outcome::Found { results: page_results },
         page,
     })
@@ -279,6 +290,7 @@ pub fn apply_report_pagination<T>(
         classification,
         workspace_relation,
         ordering,
+        excluded_relations,
         outcome,
         page: _,
     } = answer;
@@ -296,6 +308,7 @@ pub fn apply_report_pagination<T>(
             classification,
             workspace_relation,
             ordering,
+            excluded_relations,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -318,6 +331,7 @@ pub fn apply_report_pagination<T>(
         classification,
         workspace_relation,
         ordering,
+        excluded_relations,
         outcome: Outcome::Found { results: vec![report] },
         page,
     })
@@ -499,6 +513,7 @@ mod tests {
             from: None,
             position_unit: None,
             source_hash: None,
+            excluded_relations: Vec::new(),
             index_hash: "hash".to_string(),
         }
     }
@@ -604,13 +619,14 @@ mod tests {
             from: Some(3),
             position_unit: Some("line"),
             source_hash: Some("disk-hash".to_string()),
+            excluded_relations: Vec::new(),
             index_hash: "index-hash".to_string(),
         };
 
         /// A named single-field change to a query identity.
         type Variation = (&'static str, fn(&mut PageIdentity));
 
-        let variations: [Variation; 12] = [
+        let variations: [Variation; 13] = [
             ("command", |id| id.command = "find"),
             ("reference", |id| id.reference = "other".to_string()),
             ("relation", |id| id.relation = Some("contains")),
@@ -624,6 +640,9 @@ mod tests {
             ("from", |id| id.from = Some(4)),
             ("position_unit", |id| id.position_unit = Some("byte")),
             ("source_hash", |id| id.source_hash = Some("edited".to_string())),
+            ("excluded_relations", |id| {
+                id.excluded_relations = vec![RelationLabel::TypeFamily]
+            }),
             ("index_hash", |id| id.index_hash = "rebuilt".to_string()),
         ];
 

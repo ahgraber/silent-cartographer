@@ -541,6 +541,7 @@ fn an_unresolved_position_subject_is_absent_with_no_marker() {
         Detail::Signature,
         10,
         false,
+        &[],
         0,
         None,
         true,
@@ -794,6 +795,7 @@ fn clone_markers_render_as_fact_distinct_from_the_estimate() {
         Detail::Signature,
         10,
         false,
+        &[],
         0,
         None,
         false,
@@ -868,6 +870,7 @@ fn a_mismatched_token_is_refused_on_similar() {
             Detail::Signature,
             10,
             false,
+            &[],
             2,
             cursor,
             true,
@@ -907,6 +910,7 @@ fn a_cursor_from_an_at_query_is_refused_under_the_other_position_unit() {
             Detail::Signature,
             10,
             false,
+            &[],
             1,
             cursor,
             true,
@@ -1121,4 +1125,595 @@ fn symbols_sharing_one_region_rank_as_similar() {
         gamma < helper,
         "the symbol sharing a region ranks above the disjoint one: {ids:?}"
     );
+}
+
+// ---- Relation labels and exclusion ----
+
+mod relations {
+    use super::*;
+    use silent_cartographer::cli::PositionUnit;
+    use silent_cartographer::graph::store::EdgeKind;
+    use silent_cartographer::graph::syntax::Language;
+    use silent_cartographer::query::search::{RelationLabel, similar_candidates};
+    use silent_cartographer::semantic::model::{ExtractedIndex, ExtractedOccurrence};
+    use support::{Decl, decl_id};
+
+    type Path = &'static [(&'static str, SegmentKind)];
+
+    const SHAPE: Path = &[("Shape", SegmentKind::Type)];
+    const SHAPE_DESCRIBE: Path = &[("Shape", SegmentKind::Type), ("describe", SegmentKind::Method)];
+    const SQUARE: Path = &[("Square", SegmentKind::Type)];
+    const SQUARE_DESCRIBE: Path = &[("Square", SegmentKind::Type), ("describe", SegmentKind::Method)];
+    const SQUARE_AREA: Path = &[("Square", SegmentKind::Type), ("area", SegmentKind::Method)];
+    const CIRCLE: Path = &[("Circle", SegmentKind::Type)];
+    const CIRCLE_DESCRIBE: Path = &[("Circle", SegmentKind::Type), ("describe", SegmentKind::Method)];
+    const LOOSE: Path = &[("Loose", SegmentKind::Type)];
+    const LOOSE_DESCRIBE: Path = &[("Loose", SegmentKind::Type), ("describe", SegmentKind::Method)];
+    const CORE: Path = &[("core", SegmentKind::Method)];
+    const CALLEE: Path = &[("callee", SegmentKind::Method)];
+    const FACADE: Path = &[("facade", SegmentKind::Method)];
+    const CHECKS: Path = &[("verifies_core", SegmentKind::Method)];
+    const PLAIN: Path = &[("plain", SegmentKind::Method)];
+    const LEFT: Path = &[("Left", SegmentKind::Type)];
+    const LEFT_RUN: Path = &[("Left", SegmentKind::Type), ("run", SegmentKind::Method)];
+    const RIGHT: Path = &[("Right", SegmentKind::Type)];
+    const RIGHT_RUN: Path = &[("Right", SegmentKind::Type), ("run", SegmentKind::Method)];
+    const EXTERNAL_BASE: Path = &[("Base", SegmentKind::Type)];
+    const EXTERNAL_MARKER: Path = &[("Marker", SegmentKind::Type)];
+
+    /// A reference to the declaration at `to`, spelled as `name` inside the unique `within` text.
+    struct Reference {
+        to: Path,
+        within: &'static str,
+        name: &'static str,
+    }
+
+    /// A source in one language with the declarations and references its relations are drawn from.
+    struct Fixture {
+        language: Language,
+        doc: &'static str,
+        source: &'static str,
+        decls: Vec<Decl<'static>>,
+        references: Vec<Reference>,
+        /// An external type referenced at its name inside each unique `within` text.
+        external: Option<(Path, Vec<&'static str>)>,
+    }
+
+    fn decl(segments: Path, kind: SymbolKind, within: &'static str) -> Decl<'static> {
+        Decl { segments, kind, within }
+    }
+
+    fn reference(to: Path, within: &'static str, name: &'static str) -> Reference {
+        Reference { to, within, name }
+    }
+
+    impl Fixture {
+        fn index(&self) -> ExtractedIndex {
+            let mut index = support::declared_index(self.language, self.doc, self.source, &self.decls);
+            let occurrence_at = |within: &str, name: &str| {
+                assert_eq!(self.source.matches(within).count(), 1, "{within:?} must occur once");
+                let at = self.source.find(within).unwrap() + within.find(name).unwrap();
+                let (line, col) = line_col(self.source, at);
+                ExtractedOccurrence {
+                    document_path: self.doc.to_string(),
+                    range: SourceRange::new(line, col, line, col + name.len() as u32),
+                    role: OccurrenceRole::Reference,
+                }
+            };
+            // `declared_index` lists the symbols in declaration order.
+            for reference in &self.references {
+                let target = self.decls.iter().position(|d| d.segments == reference.to).unwrap();
+                index.symbols[target]
+                    .occurrences
+                    .push(occurrence_at(reference.within, reference.name));
+            }
+            if let Some((path, withins)) = &self.external {
+                let name = path[0].0;
+                let mut symbol = support::one_occ_symbol(
+                    "poscrate",
+                    path,
+                    SymbolKind::Type,
+                    SymbolClass::External,
+                    self.doc,
+                    SourceRange::new(0, 0, 0, 0),
+                    OccurrenceRole::Reference,
+                );
+                symbol.occurrences = withins.iter().map(|within| occurrence_at(within, name)).collect();
+                index.symbols.push(symbol);
+            }
+            index
+        }
+
+        fn sources(&self) -> Vec<(String, String)> {
+            vec![(self.doc.to_string(), self.source.to_string())]
+        }
+
+        fn store(&self) -> GraphStore {
+            let mut store = GraphStore::open_in_memory().unwrap();
+            ingest(&mut store, &ws(), Some(WS_ROOT), &self.index(), &self.sources()).unwrap();
+            store
+        }
+    }
+
+    fn rust_relations() -> Fixture {
+        let source = "\
+pub trait Shape {
+    fn describe(&self) -> u32 { 1 }
+}
+pub struct Square;
+pub struct Circle;
+pub struct Loose;
+impl Shape for Square {
+    fn describe(&self) -> u32 { 2 }
+    fn area(&self) -> u32 { 4 }
+}
+impl Shape for Circle {
+    fn describe(&self) -> u32 { 3 }
+}
+impl Loose {
+    fn describe(&self) -> u32 { 5 }
+}
+pub fn core(x: u32) -> u32 { callee(x) + 1 }
+pub fn callee(x: u32) -> u32 { x * 2 }
+pub fn facade(x: u32) -> u32 { core(x) }
+#[test]
+fn verifies_core() { core(1); }
+pub fn plain(x: u32) -> u32 { x - 7 }
+";
+        Fixture {
+            language: Language::Rust,
+            doc: "src/rel.rs",
+            source,
+            decls: vec![
+                decl(SHAPE, SymbolKind::Trait, "trait Shape"),
+                decl(SHAPE_DESCRIBE, SymbolKind::Method, "fn describe(&self) -> u32 { 1 }"),
+                decl(SQUARE, SymbolKind::Type, "struct Square"),
+                decl(CIRCLE, SymbolKind::Type, "struct Circle"),
+                decl(LOOSE, SymbolKind::Type, "struct Loose"),
+                decl(SQUARE_DESCRIBE, SymbolKind::Method, "fn describe(&self) -> u32 { 2 }"),
+                decl(SQUARE_AREA, SymbolKind::Method, "fn area(&self)"),
+                decl(CIRCLE_DESCRIBE, SymbolKind::Method, "fn describe(&self) -> u32 { 3 }"),
+                decl(LOOSE_DESCRIBE, SymbolKind::Method, "fn describe(&self) -> u32 { 5 }"),
+                decl(CORE, SymbolKind::Function, "pub fn core(x: u32)"),
+                decl(CALLEE, SymbolKind::Function, "pub fn callee(x: u32)"),
+                decl(FACADE, SymbolKind::Function, "pub fn facade(x: u32)"),
+                decl(CHECKS, SymbolKind::Function, "fn verifies_core()"),
+                decl(PLAIN, SymbolKind::Function, "pub fn plain(x: u32)"),
+            ],
+            references: vec![
+                reference(SHAPE, "impl Shape for Square", "Shape"),
+                reference(SHAPE, "impl Shape for Circle", "Shape"),
+                reference(SQUARE, "impl Shape for Square", "Square"),
+                reference(CIRCLE, "impl Shape for Circle", "Circle"),
+                reference(LOOSE, "impl Loose {", "Loose"),
+                reference(CALLEE, "callee(x) + 1", "callee"),
+                reference(CORE, "{ core(x) }", "core"),
+                reference(CORE, "{ core(1); }", "core"),
+            ],
+            external: None,
+        }
+    }
+
+    fn python_relations() -> Fixture {
+        let source = "\
+class Shape:
+    def describe(self):
+        return 1
+
+
+class Square(Shape):
+    def describe(self):
+        return 2
+
+    def area(self):
+        return 4
+
+
+class Circle(Shape):
+    def describe(self):
+        return 3
+
+
+class Loose:
+    def describe(self):
+        return 5
+
+
+def core(x):
+    return callee(x) + 1
+
+
+def callee(x):
+    return x * 2
+
+
+def facade(x):
+    return core(x)
+
+
+def plain(x):
+    return x - 7
+";
+        Fixture {
+            language: Language::Python,
+            doc: "rel.py",
+            source,
+            decls: vec![
+                decl(SHAPE, SymbolKind::Type, "class Shape:"),
+                decl(
+                    SHAPE_DESCRIBE,
+                    SymbolKind::Method,
+                    "def describe(self):\n        return 1",
+                ),
+                decl(SQUARE, SymbolKind::Type, "class Square(Shape)"),
+                decl(CIRCLE, SymbolKind::Type, "class Circle(Shape)"),
+                decl(LOOSE, SymbolKind::Type, "class Loose:"),
+                decl(
+                    SQUARE_DESCRIBE,
+                    SymbolKind::Method,
+                    "def describe(self):\n        return 2",
+                ),
+                decl(SQUARE_AREA, SymbolKind::Method, "def area(self)"),
+                decl(
+                    CIRCLE_DESCRIBE,
+                    SymbolKind::Method,
+                    "def describe(self):\n        return 3",
+                ),
+                decl(
+                    LOOSE_DESCRIBE,
+                    SymbolKind::Method,
+                    "def describe(self):\n        return 5",
+                ),
+                decl(CORE, SymbolKind::Function, "def core(x)"),
+                decl(CALLEE, SymbolKind::Function, "def callee(x)"),
+                decl(FACADE, SymbolKind::Function, "def facade(x)"),
+                decl(PLAIN, SymbolKind::Function, "def plain(x)"),
+            ],
+            references: vec![
+                reference(SHAPE, "class Square(Shape)", "Shape"),
+                reference(SHAPE, "class Circle(Shape)", "Shape"),
+                reference(CALLEE, "return callee(x) + 1", "callee"),
+                reference(CORE, "return core(x)", "core"),
+            ],
+            external: None,
+        }
+    }
+
+    /// A Python source whose file name classifies its symbols as test code, with a test that calls
+    /// `core`. A Rust test is classified by attribute, inside [`rust_relations`].
+    fn python_test_relations() -> Fixture {
+        Fixture {
+            language: Language::Python,
+            doc: "test_core.py",
+            source: "\
+def core(x):
+    return x + 1
+
+
+def verifies_core():
+    return core(1)
+
+
+def plain(x):
+    return x - 7
+",
+            decls: vec![
+                decl(CORE, SymbolKind::Function, "def core(x)"),
+                decl(CHECKS, SymbolKind::Function, "def verifies_core()"),
+                decl(PLAIN, SymbolKind::Function, "def plain(x)"),
+            ],
+            references: vec![reference(CORE, "return core(1)", "core")],
+            external: None,
+        }
+    }
+
+    /// Two types whose only common supertype is defined outside the workspace.
+    fn external_base(language: Language) -> Fixture {
+        match language {
+            Language::Rust => Fixture {
+                language,
+                doc: "src/ext.rs",
+                source: "\
+pub struct Left;
+pub struct Right;
+impl Marker for Left {
+    fn run(&self) -> u32 { 1 }
+}
+impl Marker for Right {
+    fn run(&self) -> u32 { 2 }
+}
+",
+                decls: vec![
+                    decl(LEFT, SymbolKind::Type, "struct Left"),
+                    decl(RIGHT, SymbolKind::Type, "struct Right"),
+                    decl(LEFT_RUN, SymbolKind::Method, "fn run(&self) -> u32 { 1 }"),
+                    decl(RIGHT_RUN, SymbolKind::Method, "fn run(&self) -> u32 { 2 }"),
+                ],
+                references: vec![
+                    reference(LEFT, "impl Marker for Left", "Left"),
+                    reference(RIGHT, "impl Marker for Right", "Right"),
+                ],
+                external: Some((EXTERNAL_MARKER, vec!["impl Marker for Left", "impl Marker for Right"])),
+            },
+            Language::Python => Fixture {
+                language,
+                doc: "ext.py",
+                source: "\
+class Left(Base):
+    def run(self):
+        return 1
+
+
+class Right(Base):
+    def run(self):
+        return 2
+",
+                decls: vec![
+                    decl(LEFT, SymbolKind::Type, "class Left(Base)"),
+                    decl(RIGHT, SymbolKind::Type, "class Right(Base)"),
+                    decl(LEFT_RUN, SymbolKind::Method, "def run(self):\n        return 1"),
+                    decl(RIGHT_RUN, SymbolKind::Method, "def run(self):\n        return 2"),
+                ],
+                references: Vec::new(),
+                external: Some((EXTERNAL_BASE, vec!["class Left(Base)", "class Right(Base)"])),
+            },
+        }
+    }
+
+    /// The labels, as `label` or `label:rule`, on the row for `row` in `subject`'s answer.
+    fn labels_on(store: &GraphStore, fixture: &Fixture, subject: Path, row: Path) -> Vec<String> {
+        let engine = engine_over(store, &fixture.sources());
+        let answer = engine
+            .similar(decl_id(subject).as_str(), Detail::Location, None)
+            .unwrap();
+        let Outcome::Found { results } = answer.outcome else {
+            panic!("expected found results");
+        };
+        let item = results
+            .iter()
+            .find(|item| item.symbol.canonical_id == decl_id(row))
+            .unwrap_or_else(|| panic!("{row:?} is a row of the answer"));
+        item.relations
+            .iter()
+            .map(|relation| match &relation.rule {
+                Some(rule) => format!("{}:{rule}", relation.label.tag()),
+                None => relation.label.tag().to_string(),
+            })
+            .collect()
+    }
+
+    fn fixtures() -> [Fixture; 2] {
+        [rust_relations(), python_relations()]
+    }
+
+    // _(A callee is labeled used by the subject; a caller is labeled as using the subject; an
+    // unrelated row carries an empty set)_ — on every backend.
+    #[test]
+    fn calls_in_either_direction_are_labeled() {
+        for fixture in fixtures() {
+            let store = fixture.store();
+            let lang = fixture.language;
+            assert_eq!(
+                labels_on(&store, &fixture, CORE, CALLEE),
+                ["used_by_subject"],
+                "{lang:?}"
+            );
+            assert_eq!(labels_on(&store, &fixture, CORE, FACADE), ["uses_subject"], "{lang:?}");
+            assert!(labels_on(&store, &fixture, CORE, PLAIN).is_empty(), "{lang:?}");
+        }
+    }
+
+    // _(A test that calls the subject carries both labels)_ — the test label names the convention
+    // rule: an attribute in Rust, the file name in Python.
+    #[test]
+    fn a_test_that_calls_the_subject_carries_the_test_label_with_its_rule() {
+        let rust = rust_relations();
+        assert_eq!(
+            labels_on(&rust.store(), &rust, CORE, CHECKS),
+            ["uses_subject", "tests_subject:test_attribute"]
+        );
+        let python = python_test_relations();
+        let store = python.store();
+        assert_eq!(
+            labels_on(&store, &python, CORE, CHECKS),
+            ["uses_subject", "tests_subject:test_file"]
+        );
+        // Test code that does not use the subject carries neither label.
+        assert!(labels_on(&store, &python, CORE, PLAIN).is_empty());
+    }
+
+    // _(Sibling implementations, and a base method and its override, are labeled type family;
+    // methods of one type and unrelated types are not)_ — on every backend.
+    #[test]
+    fn related_types_are_labeled_type_family() {
+        for fixture in fixtures() {
+            let store = fixture.store();
+            let lang = fixture.language;
+            let family = ["type_family"];
+            let on = |row| labels_on(&store, &fixture, SQUARE_DESCRIBE, row);
+            assert_eq!(on(CIRCLE_DESCRIBE), family, "{lang:?} sibling");
+            assert_eq!(on(SHAPE_DESCRIBE), family, "{lang:?} base");
+            assert!(on(SQUARE_AREA).is_empty(), "{lang:?} same type");
+            assert!(on(LOOSE_DESCRIBE).is_empty(), "{lang:?} unrelated");
+        }
+    }
+
+    // _(An external common supertype is not a type family)_ — on every backend.
+    #[test]
+    fn an_external_common_supertype_is_not_a_type_family() {
+        for language in support::LANGUAGES {
+            let fixture = external_base(language);
+            let store = fixture.store();
+            let hierarchy = store.edges(EdgeKind::TypeHierarchy).unwrap();
+            let subtypes: Vec<_> = hierarchy.iter().map(|(sub, _)| sub.clone()).collect();
+            assert!(
+                subtypes.contains(&decl_id(LEFT)) && subtypes.contains(&decl_id(RIGHT)),
+                "{language:?}: both types declare the external base: {hierarchy:?}"
+            );
+            assert!(
+                labels_on(&store, &fixture, LEFT_RUN, RIGHT_RUN).is_empty(),
+                "{language:?}"
+            );
+        }
+    }
+
+    // _(Labels do not change the answer)_ — the rows and their order equal the ranked candidates.
+    #[test]
+    fn labels_leave_the_rows_and_their_order_unchanged() {
+        let fixture = rust_relations();
+        let store = fixture.store();
+        let subject = store.symbol(&decl_id(CORE)).unwrap().unwrap();
+        let candidates: Vec<CanonicalId> = similar_candidates(&store, &subject)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect();
+        let engine = engine_over(&store, &fixture.sources());
+        let answer = engine.similar(decl_id(CORE).as_str(), Detail::Location, None).unwrap();
+        let Outcome::Found { results } = answer.outcome else {
+            panic!("expected found results");
+        };
+        assert!(
+            results.iter().any(|item| !item.relations.is_empty()),
+            "some row carries labels"
+        );
+        let rows: Vec<CanonicalId> = results.into_iter().map(|item| item.symbol.canonical_id).collect();
+        assert_eq!(rows, candidates);
+    }
+
+    /// `similar` for `core` over the built Rust relations store.
+    fn run_core(
+        db: &std::path::Path,
+        root: &std::path::Path,
+        exclude: &[RelationLabel],
+        limit: usize,
+        cursor: Option<&str>,
+        json: bool,
+    ) -> anyhow::Result<String> {
+        silent_cartographer::commands::run_similar(
+            db,
+            root,
+            "rust-analyzer",
+            Some(decl_id(CORE).as_str()),
+            None,
+            Detail::Location,
+            10,
+            false,
+            exclude,
+            limit,
+            cursor,
+            json,
+            false,
+            PositionUnit::Line,
+        )
+    }
+
+    fn core_json(
+        db: &std::path::Path,
+        root: &std::path::Path,
+        exclude: &[RelationLabel],
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::from_str(&run_core(db, root, exclude, limit, cursor, true).unwrap()).unwrap()
+    }
+
+    fn built_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let fixture = rust_relations();
+        let db = dir.join("index.db");
+        silent_cartographer::commands::build_from_index(&db, "test-ws", dir, &fixture.index(), &fixture.sources())
+            .unwrap();
+        db
+    }
+
+    /// The row identities of `answer` whose labels include none of `without`, in answer order.
+    fn ids_without(answer: &serde_json::Value, without: &str) -> Vec<String> {
+        answer["outcome"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                !row["relations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["label"] == without)
+            })
+            .map(|row| row["symbol"]["canonical_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // _(The human rendering shows each row's labels)_ — including the rule of a test label.
+    #[test]
+    fn the_human_render_shows_the_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = built_db(dir.path());
+        let out = run_core(&db, dir.path(), &[], 0, None, false).unwrap();
+        for shown in [
+            "[uses_subject]",
+            "[used_by_subject]",
+            "[tests_subject (rule: test_attribute)]",
+        ] {
+            assert!(out.contains(shown), "{shown} is rendered: {out}");
+        }
+    }
+
+    // _(Excluded rows are omitted and the order is kept; the exclusion is disclosed)_ — a repeated
+    // label counts once, and the disclosed set is sorted.
+    #[test]
+    fn an_excluded_label_removes_its_rows_and_keeps_the_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = built_db(dir.path());
+        let all = core_json(&db, dir.path(), &[], 0, None);
+        assert!(all.get("excluded_relations").is_none(), "no exclusion, no disclosure");
+        let expected = ids_without(&all, "tests_subject");
+        assert!(
+            expected.len() < ids_without(&all, "").len(),
+            "the test row was among the rows"
+        );
+
+        let excluded = core_json(
+            &db,
+            dir.path(),
+            &[
+                RelationLabel::TypeFamily,
+                RelationLabel::TestsSubject,
+                RelationLabel::TestsSubject,
+            ],
+            0,
+            None,
+        );
+        assert_eq!(ids_without(&excluded, "type_family"), expected);
+        assert_eq!(
+            excluded["excluded_relations"],
+            serde_json::json!(["tests_subject", "type_family"])
+        );
+    }
+
+    // _(The limit counts remaining rows; a token under another exclusion is refused)_.
+    #[test]
+    fn the_limit_counts_remaining_rows_and_the_token_binds_the_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = built_db(dir.path());
+        let remaining = ids_without(&core_json(&db, dir.path(), &[], 0, None), "uses_subject");
+        let limit = remaining.len() - 1;
+        let exclude = [RelationLabel::UsesSubject];
+        let page = core_json(&db, dir.path(), &exclude, limit, None);
+        assert_eq!(
+            ids_without(&page, ""),
+            remaining[..limit],
+            "the page holds only remaining rows"
+        );
+        assert_eq!(page["page"]["total"], remaining.len());
+
+        let cursor = page["page"]["cursor"]
+            .as_str()
+            .expect("a truncated page carries a cursor");
+        let err = run_core(&db, dir.path(), &[], limit, Some(cursor), true)
+            .expect_err("the token is bound to its exclusion");
+        assert_eq!(classify(&err), ExitCode::Usage);
+        assert!(err.to_string().contains("different query parameters"), "{err}");
+        let resumed = core_json(&db, dir.path(), &exclude, limit, Some(cursor));
+        assert_eq!(ids_without(&resumed, ""), remaining[limit..]);
+    }
 }

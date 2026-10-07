@@ -1,5 +1,5 @@
 {
-  "surface_version": 12,
+  "surface_version": 13,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -366,6 +366,17 @@
           "name": "max-lines",
           "takes_value": true,
           "default": "10",
+          "global": false
+        },
+        {
+          "name": "exclude",
+          "takes_value": true,
+          "values": [
+            "uses_subject",
+            "used_by_subject",
+            "tests_subject",
+            "type_family"
+          ],
           "global": false
         },
         {

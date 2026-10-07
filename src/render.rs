@@ -121,6 +121,10 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool, unit: Position
             semantic.corpus_definition_version
         ));
     }
+    if let Some(excluded) = &answer.excluded_relations {
+        let tags: Vec<&str> = excluded.iter().map(|label| label.tag()).collect();
+        lines.push(format!("excluded relations: {}", tags.join(", ")));
+    }
     match &answer.outcome {
         Outcome::Found { results } => {
             // The heuristic-grade marker renders above the results, so a human consumer cannot
@@ -331,14 +335,25 @@ impl HumanRender for SimilarItem {
                 }
                 None => "",
             };
+            // Relation labels state graph facts about the row and the subject; a test label names
+            // the convention rule that classified the row.
+            let relations: String = item
+                .relations
+                .iter()
+                .map(|relation| match &relation.rule {
+                    Some(rule) => format!("  [{} (rule: {})]", relation.label.tag(), sanitize(rule)),
+                    None => format!("  [{}]", relation.label.tag()),
+                })
+                .collect();
             lines.push(format!(
-                "  {}  {}  [{}]{} at {}{}",
+                "  {}  {}  [{}]{} at {}{}{}",
                 sanitize(item.symbol.canonical_id.as_str()),
                 sanitize(&item.symbol.name),
                 sanitize(&item.symbol.kind),
                 external_tag(item.symbol.external),
                 location_at(item.location.as_ref(), unit),
-                certainty
+                certainty,
+                relations
             ));
             if let Some(text) = &item.content {
                 push_content(lines, Some(text));
