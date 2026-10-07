@@ -105,13 +105,12 @@ No vector work is involved.
 **Fragments by winnowing.**
 The build selects winnowing fingerprints over each leaf's token sequence with identifiers and literals replaced by their class.
 At query time, a shared fingerprint gives a candidate position, the query re-reads both token sequences from the indexed document text, and only verified token runs are reported.
+The guaranteed fragment length is 40 tokens.
+The build records the fragment parameters in the store, so tuning them later needs a rebuild and no schema version bump.
 `design.md` § FragmentDetection compares this with suffix-array, AST, embedding, late-interaction, and alignment approaches.
 
-## Open Questions
+## Resolved Questions
 
-- OPEN QUESTION: the guaranteed fragment length, in tokens.
-  `design.md` proposes 40 tokens, about five Python lines, and gates the value on the audit's five-line miss.
-- OPEN QUESTION: whether `--mutual` belongs in this change.
-  The audit's deliverable was the mutual pairs, but batch mode alone reproduces them at the cost of client-side matching.
-- OPEN QUESTION: the names `clones`, `--subjects-from`, `--mutual`, `--exclude`, and the four relation labels.
-  The spec fixes them because they are the CLI contract, and the user may rename them before apply.
+- 2026-10-06: the guaranteed fragment length is 40 tokens, and the fragment parameters stay cheap to tune (`design.md` § FragmentEvidenceStorage).
+- 2026-10-06: `--mutual` is in this change.
+- 2026-10-06: the names `clones`, `--subjects-from`, `--mutual`, `--exclude`, and the four relation labels stand as specified.

@@ -93,6 +93,7 @@ Serves: documentation-blind-clones
 For every corpus-contributing symbol that carries equivalence keys, the system SHALL persist with the build the evidence that the shared-fragment answer reads, derived from the same documentation-disregarding token sequence the equivalence keys read.
 The evidence SHALL be wholly superseded by each subsequent build, a build that fails SHALL leave the prior build's evidence intact and authoritative, and a rebuild over unchanged sources SHALL yield identical evidence.
 A symbol that carries no equivalence key SHALL contribute no evidence.
+The build SHALL record with the evidence the guaranteed fragment length it was derived under, and the shared-fragment answer SHALL apply and report that recorded length.
 
 Serves: shared-fragments
 
@@ -125,3 +126,9 @@ Serves: shared-fragments
 - **GIVEN** a store holding a completed build's shared-fragment evidence
 - **WHEN** a subsequent build fails before completing
 - **THEN** the prior build's evidence remains retrievable, unchanged
+
+#### Scenario: The answer applies the length the store records
+
+- **GIVEN** a store whose recorded guaranteed fragment length differs from the length the binary builds with
+- **WHEN** a shared-fragment answer is computed from that store
+- **THEN** the answer applies and reports the recorded length

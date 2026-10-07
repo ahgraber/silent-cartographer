@@ -95,9 +95,15 @@ The build writes them in the build transaction, after the keys, for every leaf w
 Parameters: k = 20 tokens, w = 21 k-grams, so the guaranteed length is w + k - 1 = 40 tokens, about five Python lines.
 The k-gram hash is the first 8 bytes of SHA-256 over the length-prefixed placeholder tokens, read as a signed 64-bit integer.
 Selection is robust winnowing: the rightmost minimum hash in each window, recorded once per selected position.
-The parameters are compiled constants; changing one is a schema version bump.
+The values of k and w are two named constants in one place.
+Each build records them in `index_metadata`, in new columns `fragment_kgram_length` and `fragment_window`, as it records the chunk size and overlap.
+A `clones` query reads k and w from the store, not from the binary, and reports the guaranteed length they give.
+Changing a constant therefore needs no schema version bump: the next build writes fingerprints under the new values, and a store built earlier answers under the values it records.
 
 **Rationale:** A fixed cryptographic hash needs no seed and gives the same fingerprints on every machine.
+The 40-token length is a first value that the audit's five-line case gates, so it must stay cheap to tune.
+A query never recomputes a fingerprint, so a store that records its own parameters answers correctly under them, and no compatibility check is needed.
+Exposing k and w later as build flags, as `--chunk-size` is, adds only the flags.
 `passage_id` is an integer, so a fingerprint row stays small.
 A leaf shorter than the guaranteed length cannot hold a reportable run, so it needs no fingerprints.
 The token count orders the corpus clone groups without reading any source text.
@@ -276,7 +282,8 @@ The MCP parameters mirror the command options, which the schema-against-surface 
 ### Decision: Versions
 
 **Chosen:** `SCHEMA_VERSION` rises by one above the value on `main` when the branch is cut: 18 when the kind fix and `stale-files-and-line-positions` have landed with 17.
-The bump covers the docstring change to the keys, `clone_fingerprints`, `clone_token_count`, and the key index.
+The bump covers the docstring change to the keys, `clone_fingerprints`, `clone_token_count`, the two fragment-parameter columns, and the key index.
+Later changes to k or w need no bump (§ FragmentEvidenceStorage).
 The migration is the existing replace-or-refuse rule: a build replaces an older store, and a query refuses it with the rebuild command.
 `SURFACE_VERSION` and the MCP pin rise by one above `main` when the branch is cut: 12, 13, or 14 depending on whether `stale-files-and-line-positions` and `ty-scip-backend` have merged.
 No release may ship two different schemas under one version number.
