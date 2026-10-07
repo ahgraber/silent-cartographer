@@ -1159,6 +1159,22 @@ impl GraphStore {
             })
     }
 
+    /// The symbols sharing `substitution_key`, each with its formatting-insensitive key — the symbols
+    /// that are clones of one another at the substitution-insensitive grade or tighter.
+    pub fn clone_key_matches(
+        &self,
+        substitution_key: &str,
+    ) -> rusqlite::Result<std::collections::HashMap<CanonicalId, String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT canonical_id, clone_formatting_key FROM symbols
+             WHERE clone_substitution_key = ?1 AND clone_formatting_key IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![substitution_key], |r| {
+            Ok((CanonicalId::from_raw(r.get::<_, String>(0)?), r.get::<_, String>(1)?))
+        })?;
+        rows.collect()
+    }
+
     /// Record the length of a leaf's spelled token sequence.
     pub fn set_clone_token_count(&self, id: &CanonicalId, token_count: usize) -> rusqlite::Result<()> {
         self.conn.execute(

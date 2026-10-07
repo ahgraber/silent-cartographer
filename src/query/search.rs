@@ -11,7 +11,7 @@
 //! calibrated, and exposing them invites downstream thresholds that silently break on every model
 //! bump. The order is the claim; the answer-level estimation marker states its grade.
 
-use crate::graph::store::SymbolRow;
+use crate::graph::store::{GraphStore, SymbolRow};
 use crate::graph::{corpus, embed};
 use crate::identity::CanonicalId;
 
@@ -174,10 +174,8 @@ impl QueryEngine<'_> {
         }
     }
 
-    /// The `similar` ranking for a resolved subject: the two-signal RRF hybrid — the subject's vector
-    /// neighbors fused with BM25 of the subject's own render words — with the subject excluded,
-    /// clone-marked rows lifted above unmarked ones (exact before variant), fused estimated order
-    /// within each certainty class.
+    /// The `similar` answer for a resolved subject: the ranked candidates of [`similar_candidates`],
+    /// materialized to rows by [`similar_items`].
     fn similar_of(
         &self,
         subject: &SymbolRow,
@@ -186,86 +184,11 @@ impl QueryEngine<'_> {
     ) -> Result<Answer<SimilarItem>, QueryError> {
         let (provenance, freshness) = self.provenance_and_freshness()?;
         let semantic_index = self.semantic_index_view()?;
-        // A subject outside the corpus (an external, or a symbol with no persisted content) has no
-        // representation to compare — a definite empty, not a failure.
-        let subject_vectors = self.store.chunk_vectors_of(&subject.canonical_id)?;
-        if subject_vectors.is_empty() {
+        let candidates = similar_candidates(self.store, subject)?;
+        if candidates.is_empty() {
             return Ok(Answer::empty(provenance, freshness).estimated(semantic_index));
         }
-        let corpus_size = self.store.corpus_size()? as usize;
-        // Similarity is the best pair over the subject's chunks and each candidate's: each subject
-        // chunk's neighbor list arrives deduplicated to candidates by best chunk, and merging by
-        // minimum distance across subject chunks completes the maximum over pairs. Neither side
-        // gains from the number of chunks representing it.
-        let chunk_count = self.store.chunk_count()? as usize;
-        let mut best: std::collections::HashMap<CanonicalId, f64> = std::collections::HashMap::new();
-        for subject_vector in &subject_vectors {
-            for (id, distance) in self.store.vector_neighbors(subject_vector, chunk_count)? {
-                let entry = best.entry(id).or_insert(distance);
-                if distance < *entry {
-                    *entry = distance;
-                }
-            }
-        }
-        let mut nearest: Vec<(CanonicalId, f64)> = best.into_iter().collect();
-        nearest.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
-        let vector_ranks: Vec<CanonicalId> = nearest.into_iter().map(|(id, _)| id).collect();
-        let lexical_ranks: Vec<CanonicalId> = match self
-            .store
-            .semantic_render_of(&subject.canonical_id)?
-            .as_deref()
-            .and_then(subject_word_expr)
-        {
-            Some(expr) => self
-                .store
-                .lexical_neighbors(&expr, corpus_size)?
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect(),
-            None => Vec::new(),
-        };
-        let fused = rrf_fuse(&[vector_ranks, lexical_ranks]);
-        let subject_keys = self.store.clone_keys_of(&subject.canonical_id)?;
-
-        let mut items = Vec::with_capacity(fused.len().saturating_sub(1));
-        for id in fused {
-            if id == subject.canonical_id {
-                continue;
-            }
-            let Some(row) = self.store.symbol(&id)? else {
-                return Err(QueryError::MissingSymbol(id));
-            };
-            let clone_certainty = match &subject_keys {
-                None => None,
-                Some((subject_formatting, subject_substitution)) => {
-                    match self.store.clone_keys_of(&row.canonical_id)? {
-                        Some((formatting, _)) if formatting == *subject_formatting => Some(CloneCertainty::ExactClone),
-                        Some((_, substitution)) if substitution == *subject_substitution => {
-                            Some(CloneCertainty::VariantClone)
-                        }
-                        _ => None,
-                    }
-                }
-            };
-            let (content, content_truncated) = projected_row_content(&row, detail, max_lines);
-            items.push(SimilarItem {
-                symbol: symbol_view(&row),
-                clone_certainty,
-                location: location_of(&row),
-                content,
-                content_truncated,
-            });
-        }
-        if items.is_empty() {
-            return Ok(Answer::empty(provenance, freshness).estimated(semantic_index));
-        }
-        // Certainty classes order ahead of the estimate: exact clones, then variant clones, then
-        // unmarked rows; the stable sort preserves the estimated-similarity order within each class.
-        items.sort_by_key(|item| match item.clone_certainty {
-            Some(CloneCertainty::ExactClone) => 0,
-            Some(CloneCertainty::VariantClone) => 1,
-            None => 2,
-        });
+        let items = similar_items(self.store, &candidates, detail, max_lines)?;
         Ok(Answer::found(items, provenance, freshness).estimated(semantic_index))
     }
 
@@ -287,6 +210,114 @@ impl QueryEngine<'_> {
             chunk_overlap: identity.chunk_params.overlap,
         })
     }
+}
+
+/// One ranked `similar` candidate: a corpus symbol and the clone class it shares with the subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimilarCandidate {
+    /// The candidate's canonical identity.
+    pub id: CanonicalId,
+    /// The deterministic clone-certainty marker; `None` when the candidate shares no key with the subject.
+    pub clone_certainty: Option<CloneCertainty>,
+}
+
+/// The `similar` ranking for a resolved subject, before paging: the two-signal RRF hybrid — the
+/// subject's vector neighbors fused with BM25 of the subject's own render words — with the subject
+/// excluded, clone-marked candidates lifted above unmarked ones (exact before variant), fused
+/// estimated order within each certainty class.
+///
+/// Empty when the subject has no persisted content to compare (an external, or a symbol outside the
+/// corpus) or the corpus offers no other symbol. Clone classes come from one lookup of the symbols
+/// sharing the subject's substitution key, never from a read of each candidate.
+pub fn similar_candidates(store: &GraphStore, subject: &SymbolRow) -> Result<Vec<SimilarCandidate>, QueryError> {
+    let subject_vectors = store.chunk_vectors_of(&subject.canonical_id)?;
+    if subject_vectors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let corpus_size = store.corpus_size()? as usize;
+    // Similarity is the best pair over the subject's chunks and each candidate's: each subject
+    // chunk's neighbor list arrives deduplicated to candidates by best chunk, and merging by
+    // minimum distance across subject chunks completes the maximum over pairs. Neither side
+    // gains from the number of chunks representing it.
+    let chunk_count = store.chunk_count()? as usize;
+    let mut best: std::collections::HashMap<CanonicalId, f64> = std::collections::HashMap::new();
+    for subject_vector in &subject_vectors {
+        for (id, distance) in store.vector_neighbors(subject_vector, chunk_count)? {
+            let entry = best.entry(id).or_insert(distance);
+            if distance < *entry {
+                *entry = distance;
+            }
+        }
+    }
+    let mut nearest: Vec<(CanonicalId, f64)> = best.into_iter().collect();
+    nearest.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+    let vector_ranks: Vec<CanonicalId> = nearest.into_iter().map(|(id, _)| id).collect();
+    let lexical_ranks: Vec<CanonicalId> = match store
+        .semantic_render_of(&subject.canonical_id)?
+        .as_deref()
+        .and_then(subject_word_expr)
+    {
+        Some(expr) => store
+            .lexical_neighbors(&expr, corpus_size)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect(),
+        None => Vec::new(),
+    };
+    let fused = rrf_fuse(&[vector_ranks, lexical_ranks]);
+
+    let (subject_formatting, clone_matches) = match store.clone_keys_of(&subject.canonical_id)? {
+        Some((formatting, substitution)) => (Some(formatting), store.clone_key_matches(&substitution)?),
+        None => (None, std::collections::HashMap::new()),
+    };
+    let mut candidates: Vec<SimilarCandidate> = fused
+        .into_iter()
+        .filter(|id| *id != subject.canonical_id)
+        .map(|id| {
+            let clone_certainty = clone_matches.get(&id).map(|formatting| {
+                if Some(formatting) == subject_formatting.as_ref() {
+                    CloneCertainty::ExactClone
+                } else {
+                    CloneCertainty::VariantClone
+                }
+            });
+            SimilarCandidate { id, clone_certainty }
+        })
+        .collect();
+    // Certainty classes order ahead of the estimate: exact clones, then variant clones, then
+    // unmarked candidates; the stable sort preserves the estimated-similarity order within each class.
+    candidates.sort_by_key(|candidate| match candidate.clone_certainty {
+        Some(CloneCertainty::ExactClone) => 0,
+        Some(CloneCertainty::VariantClone) => 1,
+        None => 2,
+    });
+    Ok(candidates)
+}
+
+/// The `similar` rows for `candidates`, in their order: each candidate's symbol row at the requested
+/// detail, capped at `max_lines`. A candidate absent from the store is a [`QueryError::MissingSymbol`].
+pub fn similar_items(
+    store: &GraphStore,
+    candidates: &[SimilarCandidate],
+    detail: Detail,
+    max_lines: Option<usize>,
+) -> Result<Vec<SimilarItem>, QueryError> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let Some(row) = store.symbol(&candidate.id)? else {
+                return Err(QueryError::MissingSymbol(candidate.id.clone()));
+            };
+            let (content, content_truncated) = projected_row_content(&row, detail, max_lines);
+            Ok(SimilarItem {
+                symbol: symbol_view(&row),
+                clone_certainty: candidate.clone_certainty,
+                location: location_of(&row),
+                content,
+                content_truncated,
+            })
+        })
+        .collect()
 }
 
 /// Build one `search` row: identity, location, and content at the requested detail.

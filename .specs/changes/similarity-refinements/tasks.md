@@ -24,8 +24,8 @@
 
 ## Similar internals
 
-- [ ] Split `similar_of` ([src/query/search.rs](../../../src/query/search.rs)) into a function that returns the ordered candidate identities with their clone classes and a function that materializes the rows of one page (design.md § BatchSimilar); fetch clone-key matches with the new key index instead of per row.
-- [ ] Run the existing `similar` tests unchanged and compare `similar --json` output for ten subjects on the httpx2 and ripgrep dogfood stores before and after the split; record that the outputs are byte-identical.
+- [x] Split `similar_of` ([src/query/search.rs](../../../src/query/search.rs)) into a function that returns the ordered candidate identities with their clone classes and a function that materializes the rows of one page (design.md § BatchSimilar); fetch clone-key matches with the new key index instead of per row.
+- [x] Run the existing `similar` tests unchanged and compare `similar --json` output for ten subjects on the httpx2 and ripgrep dogfood stores before and after the split; record that the outputs are byte-identical.
 
 ## Relation labels
 

@@ -188,12 +188,15 @@ A line that is not valid UTF-8 or a path that cannot be read is a usage error na
 The machine answer is `{"answers": [{"reference": <line>, "answer": <single answer>}]}` in list order, where `<single answer>` is the object a single-subject `similar --json` returns.
 The human rendering prints each reference as a heading, then its single-subject rendering.
 
-`similar_of` is split into a function that returns the ordered candidate identities with their clone classes and a function that materializes only the rows the page needs.
+`similar_of` is split into a function that returns the ordered candidate identities with their clone classes and a function that materializes rows for the candidates it is given.
 The single, batch, and mutual paths all call the same two functions on one store connection.
+The single and batch paths materialize every candidate, because the page is cut after the answer is built, in the paging code that every result-bearing command shares.
+The mutual path materializes only the first rows of the pairs it reports.
 
 **Rationale:** One process opens the store and loads the model once, which removes the per-launch cost the audit paid.
 Calling the same code keeps each per-subject answer identical to the single answer, which a test checks byte for byte.
-Materializing only the page avoids fetching every corpus row per subject, which today is the largest per-subject cost after the scans.
+Clone classes come from one indexed lookup of the subject's substitution key, not from a key read for each candidate.
+Cutting the page before materialization would change the shared paging code for every command, so it waits for a measured need; one ripgrep subject takes about 0.12 s in-process with every candidate materialized.
 The flag form keeps the single-subject answer shape unchanged; the shape never depends on how many references the caller passes.
 
 **Alternatives considered:**
