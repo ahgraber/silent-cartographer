@@ -35,7 +35,8 @@ The grade says the rows have identical token structure, not that the symbols beh
 Two symbols are token equivalent when they differ only in whitespace, comments, and documentation (`exact_clone`), or also in identifiers and literal values substituted consistently one for one (`variant_clone`).
 
 `guaranteed_fragment_length` is the number of tokens, taken from the parameters the index was built under, at which a shared run of tokens is guaranteed to be found.
-Every shared run at least this long lies within a reported fragment, and no reported run is shorter.
+An index built with the current defaults guarantees 32 tokens, about four lines of Python.
+Every shared run at least this long lies within a reported fragment, except in a pair named in `not_compared_completely`, and no reported run is shorter.
 An answer carries no estimation label, no semantic-index identity, and no score.
 An ambiguous or unresolved reference ends before the clone evidence is read, so its answer carries neither field.
 
@@ -98,6 +99,30 @@ After a file changes without a rebuild, the answer still reports the runs of the
 
 `not_comparable` is not `empty`: an empty answer says the comparison ran and found no clone, while `not_comparable` says there was nothing to compare.
 Only `clones` produces it.
+
+### Comparable content
+
+A function or method that contains nested symbols, such as a nested function, is compared over its own code.
+The code of each nested symbol is cut out, so no run includes a nested symbol and a run never joins the code before and after one.
+A block copied into the own code of such a function is found from either side, and a block inside the nested function is reported against the nested function, not against its container.
+A function or method with no nested symbols is compared over its whole body.
+Only a symbol with no comparable content, such as a type or module that contains methods, is `not_comparable`.
+
+### Data stretches
+
+A stretch of 16 or more consecutive data tokens, the fingerprint length the index records, must be identical in both symbols for a run to include it.
+Data tokens are literal values, a sign directly before a number, punctuation, and, in Rust, the field names and the type name of a struct literal.
+Two different tables of values therefore never match, while a copied table matches exactly.
+Literal values elsewhere, such as a changed constant inside code, can still differ in a `variant_clone` fragment.
+
+### Pairs too large to compare
+
+The comparison of the subject with one other symbol is limited by the number of candidate positions the two share.
+A pair over the limit is not compared: it yields no fragment rows, and the other symbol appears in the answer's `not_compared_completely` field on every page, in canonical-identity order.
+The field is absent when every pair was compared.
+The human rendering prints `not compared completely (too many candidate positions)` followed by the symbols.
+When the field is present and the answer is empty, the empty line is scoped to the symbols that were compared: `empty: no clones found among the symbols compared (clones are token-identical copies only)`.
+Otherwise an empty answer reads `empty: no clones found (a definite empty set; clones are token-identical copies only)`.
 
 ## Paging
 
