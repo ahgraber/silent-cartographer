@@ -6,6 +6,7 @@
 //! fingerprints and the indexed text, so the answers carry no estimation marker and no score.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use serde::Serialize;
 
@@ -368,17 +369,18 @@ impl QueryEngine<'_> {
 
         let mut texts = IndexedTexts::new(self.store, analyzer)?;
         let subject_tokens = texts.tokens(subject)?;
-        let mut found: Vec<(SymbolRow, SharedRun, ByteSpan, ByteSpan)> = Vec::new();
+        let mut found: Vec<(Rc<SymbolRow>, SharedRun, ByteSpan, ByteSpan)> = Vec::new();
         for (other, pairs) in seeds {
-            let row = self
-                .store
-                .symbol(&other)?
-                .ok_or_else(|| QueryError::MissingSymbol(other.clone()))?;
+            let row = Rc::new(
+                self.store
+                    .symbol(&other)?
+                    .ok_or_else(|| QueryError::MissingSymbol(other.clone()))?,
+            );
             let other_tokens = texts.tokens(&row)?;
             for run in shared_runs(&subject_tokens, &other_tokens, &pairs, min_length, data_stretch_length) {
                 let subject_span = run_span(&subject_tokens[run.a_start..run.a_start + run.length]);
                 let other_span = run_span(&other_tokens[run.b_start..run.b_start + run.length]);
-                found.push((row.clone(), run, subject_span, other_span));
+                found.push((Rc::clone(&row), run, subject_span, other_span));
             }
         }
         found.sort_by(|a, b| {
