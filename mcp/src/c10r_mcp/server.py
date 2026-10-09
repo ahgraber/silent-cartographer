@@ -491,8 +491,10 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
         clone marker; the rest are model-derived estimates, not a complete set.
         Use `clones` for the deterministic list of copies.
         """
-        if subjects is not None and any("\n" in subject or "\r" in subject for subject in subjects):
-            return errors.usage("each entry of `subjects` must be a single-line reference")
+        if subjects is not None and any(
+            "\n" in subject or "\r" in subject or not subject.strip() for subject in subjects
+        ):
+            return errors.usage("each entry of `subjects` must be a non-blank, single-line reference")
         args = [
             "similar",
             *([reference] if reference is not None else []),

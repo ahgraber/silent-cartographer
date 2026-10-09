@@ -15,6 +15,7 @@ It takes `reference` or `at` for the copies of one symbol, or neither for the cl
 
 - `subjects` is a list of references answered in one call.
   The server runs `similar --subjects-from -` and writes the references, one per line, to the command's standard input.
+  An entry that is blank or spans lines is a usage error, so the answers match the list entry for entry.
 - `mutual` lists the pairs of symbols that are each the first row of the other's answer.
 - `exclude` is a list of relation labels (`uses_subject`, `used_by_subject`, `tests_subject`, `type_family`) whose rows are omitted.
 

@@ -87,9 +87,10 @@ async def test_conflicting_similar_parameters_are_rejected_by_the_command(server
         assert result.structured_content["exit_code"] == 2, arguments
 
 
-async def test_a_subject_spanning_lines_is_rejected_before_any_command_runs(server: FastMCP) -> None:
-    result = await call(server, "similar", {"subjects": ["double_value\nadd_numbers"]})
+async def test_a_subject_that_is_not_one_reference_is_rejected_before_any_command_runs(server: FastMCP) -> None:
+    for subjects in (["double_value\nadd_numbers"], ["", "double_value"], [" ", "double_value"]):
+        result = await call(server, "similar", {"subjects": subjects})
 
-    assert result.is_error
-    assert result.structured_content["category"] == Category.USAGE
-    assert result.structured_content["exit_code"] is None
+        assert result.is_error, subjects
+        assert result.structured_content["category"] == Category.USAGE, subjects
+        assert result.structured_content["exit_code"] is None, subjects
