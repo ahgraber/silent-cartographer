@@ -946,7 +946,7 @@ impl SyntaxTree {
             }
             if self.language == Language::Python
                 && matches!(kind, "string" | "concatenated_string")
-                && is_python_docstring(node)
+                && is_python_docstring(node, &self.source)
             {
                 continue;
             }
@@ -1084,7 +1084,9 @@ impl SyntaxTree {
             .get(decl.full_span.start..signature_end)
             .map(|s| s.trim_end().to_string())
             .unwrap_or_else(&full_text);
-        let docstring_end = body.and_then(python_leading_docstring).map(|d| d.end_byte());
+        let docstring_end = body
+            .and_then(|b| python_leading_docstring(b, source))
+            .map(|d| d.end_byte());
         let interface = match docstring_end {
             Some(end) => source
                 .get(decl.full_span.start..end)
@@ -1126,7 +1128,7 @@ impl SyntaxTree {
     /// when it is an expression statement holding a string.
     fn python_module_documentation(&self) -> Option<String> {
         let root = self.tree.root_node();
-        let docstring = python_leading_docstring(root)?;
+        let docstring = python_leading_docstring(root, &self.source)?;
         self.text_at(span_of(docstring)).map(str::to_string)
     }
 }
@@ -1424,8 +1426,9 @@ fn python_header_end(node: Node) -> Option<usize> {
 /// statement is an expression statement holding a string — plain or implicitly concatenated
 /// (adjacent literals concatenate at compile time and still form the docstring). Comments are not
 /// statements (a shebang line is a comment), so they are skipped rather than ending the search.
-/// `None` for an empty body or one whose first statement is not a bare string expression.
-fn python_leading_docstring(container: Node) -> Option<Node> {
+/// A formatted, bytes, or template string is code, not a docstring. `None` for an empty body or
+/// one whose first statement is not a bare string expression.
+fn python_leading_docstring<'tree>(container: Node<'tree>, source: &str) -> Option<Node<'tree>> {
     let mut cursor = container.walk();
     let first = container
         .named_children(&mut cursor)
@@ -1435,12 +1438,34 @@ fn python_leading_docstring(container: Node) -> Option<Node> {
     }
     let mut inner_cursor = first.walk();
     let inner = first.named_children(&mut inner_cursor).next()?;
-    matches!(inner.kind(), "string" | "concatenated_string").then_some(inner)
+    is_python_text_string(inner, source).then_some(inner)
+}
+
+/// Whether `node` is a string literal that evaluates to text: every part's prefix is made of the
+/// raw and unicode prefix letters only.
+fn is_python_text_string(node: Node, source: &str) -> bool {
+    let mut cursor = node.walk();
+    match node.kind() {
+        "string" => node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "string_start")
+            .and_then(|start| source.get(start.start_byte()..start.end_byte()))
+            .is_some_and(|start| {
+                start
+                    .trim_end_matches(['"', '\''])
+                    .chars()
+                    .all(|c| matches!(c, 'r' | 'R' | 'u' | 'U'))
+            }),
+        "concatenated_string" => node
+            .named_children(&mut cursor)
+            .all(|part| is_python_text_string(part, source)),
+        _ => false,
+    }
 }
 
 /// Whether `node` is the docstring of a Python module, function, or class body. A string opening
 /// any other block, such as an `if` or `for` body, is not documentation and stays a literal.
-fn is_python_docstring(node: Node) -> bool {
+fn is_python_docstring(node: Node, source: &str) -> bool {
     let Some(container) = node.parent().and_then(|statement| statement.parent()) else {
         return false;
     };
@@ -1451,7 +1476,7 @@ fn is_python_docstring(node: Node) -> bool {
             .is_some_and(|owner| matches!(owner.kind(), "function_definition" | "class_definition")),
         _ => false,
     };
-    documented && python_leading_docstring(container) == Some(node)
+    documented && python_leading_docstring(container, source) == Some(node)
 }
 
 #[cfg(test)]

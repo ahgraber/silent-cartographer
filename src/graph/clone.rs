@@ -614,6 +614,27 @@ mod tests {
         assert_eq!(a.substitution_key, b.substitution_key);
     }
 
+    /// A leading formatted, bytes, or template string, alone or in a concatenation, is not a
+    /// docstring: it stays in the sequence.
+    #[test]
+    fn python_leading_non_docstring_string_stays_in_the_sequence() {
+        let plain = python_keys_of("def f():\n    return 1\n");
+        for leading in ["f\"{effect()}\"", "b\"raw\"", "t\"{x}\"", "\"doc \" f\"{effect()}\""] {
+            let keys = python_keys_of(&format!("def f():\n    {leading}\n    return 1\n"));
+            assert_ne!(keys.formatting_key, plain.formatting_key, "{leading}");
+        }
+    }
+
+    /// A raw or unicode-prefixed leading string is a docstring.
+    #[test]
+    fn python_prefixed_docstring_is_disregarded() {
+        let plain = python_keys_of("def f():\n    return 1\n");
+        for leading in ["r\"\"\"Doc.\"\"\"", "u\"Doc.\"", "R\"a\" \"b\""] {
+            let keys = python_keys_of(&format!("def f():\n    {leading}\n    return 1\n"));
+            assert_eq!(keys.formatting_key, plain.formatting_key, "{leading}");
+        }
+    }
+
     /// A bare string statement after the first statement is not a docstring: it stays a literal.
     #[test]
     fn python_string_after_the_first_statement_stays_a_literal() {
