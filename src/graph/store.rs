@@ -1212,7 +1212,7 @@ impl GraphStore {
         rows.collect()
     }
 
-    /// Record the length of a leaf's spelled token sequence.
+    /// Record the length of a symbol's comparable token sequence.
     pub fn set_clone_token_count(&self, id: &CanonicalId, token_count: usize) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE symbols SET clone_token_count = ?2 WHERE canonical_id = ?1",
@@ -1221,7 +1221,8 @@ impl GraphStore {
         Ok(())
     }
 
-    /// The length of the token sequence behind a symbol's clone keys, or `None` when it carries none.
+    /// The length of a symbol's comparable token sequence, or `None` when it has no comparable
+    /// content.
     pub fn clone_token_count_of(&self, id: &CanonicalId) -> rusqlite::Result<Option<usize>> {
         self.conn
             .query_row(
@@ -1233,9 +1234,9 @@ impl GraphStore {
             .map(|count| count.flatten().map(|count| count as usize))
     }
 
-    /// Record a leaf's `(hash, token_ordinal)` fingerprints against its passage.
+    /// Record a symbol's `(hash, token_ordinal)` fingerprints against its passage.
     ///
-    /// The leaf's passage must already be inserted; a leaf without one records nothing.
+    /// The symbol's passage must already be inserted; a symbol without one records nothing.
     pub fn write_clone_fingerprints(&self, id: &CanonicalId, fingerprints: &[(i64, usize)]) -> rusqlite::Result<()> {
         let mut stmt = self.conn.prepare(
             "INSERT INTO clone_fingerprints (hash, passage_id, token_ordinal)

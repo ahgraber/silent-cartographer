@@ -172,6 +172,7 @@ pub fn apply_pagination<T>(
         workspace_relation,
         ordering,
         excluded_relations,
+        not_compared_completely,
         outcome,
         page: _,
     } = answer;
@@ -201,6 +202,7 @@ pub fn apply_pagination<T>(
             workspace_relation,
             ordering,
             excluded_relations,
+            not_compared_completely,
             outcome: Outcome::Ambiguous {
                 candidates,
                 candidates_total,
@@ -225,6 +227,7 @@ pub fn apply_pagination<T>(
             workspace_relation,
             ordering,
             excluded_relations,
+            not_compared_completely,
             outcome,
             page: None,
         });
@@ -242,6 +245,7 @@ pub fn apply_pagination<T>(
             workspace_relation,
             ordering,
             excluded_relations,
+            not_compared_completely,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -259,6 +263,7 @@ pub fn apply_pagination<T>(
         workspace_relation,
         ordering,
         excluded_relations,
+        not_compared_completely,
         outcome: Outcome::Found { results: page_results },
         page,
     })
@@ -298,6 +303,7 @@ pub fn apply_report_pagination<T>(
         workspace_relation,
         ordering,
         excluded_relations,
+        not_compared_completely,
         outcome,
         page: _,
     } = answer;
@@ -317,6 +323,7 @@ pub fn apply_report_pagination<T>(
             workspace_relation,
             ordering,
             excluded_relations,
+            not_compared_completely,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -341,6 +348,7 @@ pub fn apply_report_pagination<T>(
         workspace_relation,
         ordering,
         excluded_relations,
+        not_compared_completely,
         outcome: Outcome::Found { results: vec![report] },
         page,
     })

@@ -15,6 +15,7 @@
 use crate::identity::CanonicalId;
 
 use super::range::ByteSpan;
+use super::store::{PersistedClass, SymbolRow};
 
 /// The corpus definition version: part of the semantic-index identity, alongside the embedding
 /// model identity and the chunk parameters. Bumped whenever corpus membership or the render
@@ -81,6 +82,26 @@ pub fn content_contributes(
     let name_only =
         span_text == display_name && signature_text == Some(span_text) && interface_text == Some(span_text);
     !name_only
+}
+
+/// Whether a persisted symbol contributes a passage: in the workspace, and [`content_contributes`]
+/// over its persisted tiers.
+pub fn row_contributes(row: &SymbolRow) -> bool {
+    row.class == PersistedClass::InWorkspace
+        && content_contributes(
+            &row.display_name,
+            row.signature_text.as_deref(),
+            row.interface_text.as_deref(),
+            row.span_text.as_deref(),
+        )
+}
+
+/// Whether the span `outer` encloses the span `inner` of another symbol in the same document, for
+/// corpus containment. Equal spans enclose only when the outer symbol is a module: a document
+/// encloses its declarations, so a file module whose span equals its sole declaration's span still
+/// contains it, and the declaration stays a leaf.
+pub fn span_encloses(outer: (usize, usize), inner: (usize, usize), outer_is_module: bool) -> bool {
+    outer.0 <= inner.0 && inner.1 <= outer.1 && (inner != outer || outer_is_module)
 }
 
 /// One passage — the corpus's per-symbol unit: a symbol identity, the render text its

@@ -90,10 +90,12 @@ Serves: documentation-blind-clones
 
 ### Requirement: Shared-fragment evidence persisted per build
 
-For every corpus-contributing symbol that carries equivalence keys, the system SHALL persist with the build the evidence that the shared-fragment answer reads, derived from the same documentation-disregarding token sequence the equivalence keys read.
+For every corpus-contributing symbol with comparable content, the system SHALL persist with the build the evidence that the shared-fragment answer reads, derived from that comparable content.
+A symbol that carries equivalence keys has as comparable content the documentation-disregarding token sequence the keys read.
+A function or method that contains other corpus-contributing symbols has as comparable content the same documentation-disregarding token sequence over its own span, with the tokens of each contained corpus-contributing symbol replaced by one boundary that no run of shared tokens can include.
+Any other symbol, such as a type or module that contains other corpus-contributing symbols, has no comparable content and SHALL contribute no evidence.
 The evidence SHALL be wholly superseded by each subsequent build, a build that fails SHALL leave the prior build's evidence intact and authoritative, and a rebuild over unchanged sources SHALL yield identical evidence.
-A symbol that carries no equivalence key SHALL contribute no evidence.
-The build SHALL record with the evidence the guaranteed fragment length it was derived under, and the shared-fragment answer SHALL apply and report that recorded length.
+The build SHALL record with the evidence the guaranteed fragment length and the data-stretch length it was derived under, and the shared-fragment answer SHALL apply that recorded data-stretch length and apply and report that recorded guaranteed length.
 
 Serves: shared-fragments
 
@@ -108,6 +110,12 @@ Serves: shared-fragments
 - **GIVEN** an indexed type containing several methods
 - **WHEN** the index is built
 - **THEN** the store holds no shared-fragment evidence for the type itself
+
+#### Scenario: A function that contains a nested function contributes evidence for its own code
+
+- **GIVEN** an indexed function that defines a nested function, and whose own code outside the nested function is longer than the guaranteed fragment length
+- **WHEN** the index is built
+- **THEN** the store holds shared-fragment evidence for the function derived from its own code, and separate evidence for the nested function
 
 #### Scenario: Rebuild over unchanged sources is idempotent
 

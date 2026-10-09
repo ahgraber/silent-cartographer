@@ -136,6 +136,16 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool, unit: Position
         let tags: Vec<&str> = excluded.iter().map(|label| label.tag()).collect();
         lines.push(format!("excluded relations: {}", tags.join(", ")));
     }
+    if let Some(symbols) = &answer.not_compared_completely {
+        let names: Vec<String> = symbols
+            .iter()
+            .map(|symbol| sanitize(symbol.canonical_id.as_str()))
+            .collect();
+        lines.push(format!(
+            "not compared completely (too many candidate positions): {}",
+            names.join(", ")
+        ));
+    }
     match &answer.outcome {
         Outcome::Found { results } => {
             // The heuristic-grade marker renders above the results, so a human consumer cannot
@@ -184,6 +194,11 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool, unit: Position
             "not comparable: the subject has no comparable content (not the same as finding no clone)".to_string(),
         ),
         Outcome::Empty => lines.push(match (&answer.classification, &answer.token_equivalence) {
+            // The symbols named above were not compared, so the empty set covers only the rest.
+            (_, Some(_)) if answer.not_compared_completely.is_some() => {
+                "empty: no clones found among the symbols compared (clones are token-identical copies only)"
+                    .to_string()
+            }
             (_, Some(_)) => {
                 "empty: no clones found (a definite empty set; clones are token-identical copies only)".to_string()
             }

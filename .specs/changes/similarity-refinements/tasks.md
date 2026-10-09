@@ -86,17 +86,41 @@
 
 ## Documentation
 
-- [ ] Add [docs/commands/clones.md](../../../docs/commands/clones.md) covering both forms, the token-equivalence grade, the guaranteed length, and `not_comparable`.
-- [ ] Update [docs/commands/similar.md](../../../docs/commands/similar.md) for relation labels, `--exclude`, `--subjects-from`, `--mutual`, the mutual-pair cost, and the docstring rule for clone markers.
-- [ ] Add a changelog entry for the schema bump, the changed clone markers, and the new surface.
+- [x] Add [docs/commands/clones.md](../../../docs/commands/clones.md) covering both forms, the token-equivalence grade, the guaranteed length, and `not_comparable`.
+- [x] Update [docs/commands/similar.md](../../../docs/commands/similar.md) for relation labels, `--exclude`, `--subjects-from`, `--mutual`, the mutual-pair cost, and the docstring rule for clone markers.
+- [x] Changelog: no hand-written entry.
+  `just changelog` drafts the release section from this change's commits, which state the schema bump, the changed clone markers, and the new surface.
 
 ## Measurements
 
-- [ ] On every dogfood store, measure build time and store size before and after, and the fingerprint row count; record them in design.md § Risks.
-- [ ] Measure in-process `similar` time per subject and the full `--mutual` time on the httpx2, Faker, and ripgrep stores, and on a sympy store; replace the cost estimate in design.md § AllPairsDiscovery.
-- [ ] Measure the slowest `clones <subject>` queries and the fragment row counts per subject on the Python and Rust stores; record them in design.md § Risks.
-- [ ] Re-run the audit repository's five-line case and the renamed-test-with-docstring case; record whether `clones` reports the block and marks the tests as variant clones, as the gate for the guaranteed length.
+- [x] On every dogfood store, measure build time and store size before and after, and the fingerprint row count; record them in design.md § Risks.
+- [x] Measure in-process `similar` time per subject and the full `--mutual` time on the httpx2, Faker, and ripgrep stores; replace the cost estimate in design.md § AllPairsDiscovery.
+- [x] Measure the slowest `clones <subject>` queries and the fragment row counts per subject on the Python and Rust stores; record them in design.md § Risks.
+- [x] Re-run the audit repository's five-line case and the renamed-test-with-docstring case; record whether `clones` reports the block and marks the tests as variant clones, as the gate for the guaranteed length.
+
+## Amendments after the audit gate
+
+- [x] Set k = 16 and w = 17 in [src/graph/clone.rs](../../../src/graph/clone.rs) (design.md § FragmentEvidenceStorage); update tests that depend on the literal length.
+- [x] Add a boundary token class to `SpelledToken` that `placeholder_equal` never matches and `kgram_hash` tags with the contained symbol's canonical identity; add one function that computes a symbol's comparable tokens from a syntax tree, a span, and the merged spans of the corpus symbols it contains (design.md § ComparableContent).
+- [x] Build: write `clone_token_count` and fingerprints for every function or method that contains corpus symbols, over its comparable tokens; keys stay leaf-only.
+- [x] Query: re-spell both symbols through the same comparable-token function; gate `not_comparable` on `clone_token_count` instead of the keys.
+- [x] Invariant test: over a built fixture store, the re-spelled comparable sequence of every symbol with a token count has exactly that length.
+- [x] Tests on a Rust and a Python fixture: a function with a nested function contributes evidence for its own code; a block copied into the own code of a function with a nested function is found from the other function; no reported run covers a nested function's tokens; a type that contains methods is still `not_comparable`; `similar` output and corpus clone groups are unchanged.
+- [x] Work limit: compute the candidate seed count per pair from the stored fingerprints before verification; a pair over the limit gets no fragment rows and is listed in `not_compared_completely` on the machine answer and in the human rendering (design.md § FragmentWorkLimit).
+- [x] Measure the largest candidate seed count of any pair on the fd, Flask, httpx2, ripgrep, and audit-repository stores built at k = 16 and w = 17; set the limit by the rule in design.md § FragmentWorkLimit; record the value and the Faker pairs it excludes in design.md § Risks.
+- [x] Tests: a pair of long literal tables is named as not compared completely with no fragment rows, while other symbols' rows are reported; the field is absent or empty when no pair reaches the limit.
+- [x] Data stretches (design.md § DataStretches): classify data tokens (literal, punctuation, and record-literal structure from a per-backend node-kind table; Rust: struct-expression field names and its opening type name; Python: none); hash an all-data k-gram over its literal text; in verification, require every data stretch of at least k tokens within an interval to be identical.
+- [x] Tests on Rust and Python: different literal tables share no fragment; a copied table is an exact fragment; a changed numeric constant in code remains a variant fragment; the completeness test of the shared-run scan still passes.
+  Rust only (the backend that classifies record structure): different tables of struct literals share no fragment.
+- [x] Rework the work-limit tests so they still reach the limit after the data-stretch rule (literal tables no longer share fingerprints): use a repetitive code fixture, and keep the assertions on naming, absence, paging, and rendering.
+- [x] Make the removal of contained runs sub-quadratic (sort, then a sweep), with answers unchanged; the shared-run unit tests and the fragment tests pass unchanged.
+- [x] Human rendering: name each symbol not compared completely by canonical identity, and word an empty answer with such symbols as "no clones found among the symbols compared".
+- [x] Tighten data stretches (design.md § DataStretches): measure each stretch over its whole length in the aligned run; mark every differing token of a stretch as a break no interval includes; classify a sign directly before a numeric literal as a data token in Rust and Python.
+- [x] Tests on Rust and Python: different table values do not extend a fragment (one shared statement between two pairs of differing tables yields no row); different tables of negative numbers share no fragment; a copied table with one edited value still reports the identical parts of at least the guaranteed length; the brute-force scan test and the completeness reasoning are updated to the per-token rule.
+- [x] Rebuild the measured stores at k = 16 and w = 17; re-measure fingerprint rows, store growth, and the slowest `clones <subject>` queries, including Faker's ten heaviest subjects; update design.md § Risks.
+- [x] Re-run the audit gate on the audit repository: record whether `clones` reports the five-line block, and record the result in design.md § FragmentEvidenceStorage.
+- [x] Update [docs/commands/clones.md](../../../docs/commands/clones.md) for the 32-token length, comparable content, the boundary rule, the work limit, and `not_compared_completely`; update the MCP `clones` tool description if it mentions the length.
 
 ## Close-out
 
-- [ ] Run the full Rust and MCP test suites and every pre-commit hook on the changed files, and report the results with counts.
+- [x] Run the full Rust and MCP test suites and every pre-commit hook on the changed files, and report the results with counts.

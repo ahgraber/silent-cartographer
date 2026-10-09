@@ -155,11 +155,13 @@ CREATE TABLE IF NOT EXISTS symbols (
 );
 CREATE INDEX IF NOT EXISTS symbols_by_clone_substitution_key ON symbols(clone_substitution_key);
 
--- Shared-fragment evidence: the winnowed fingerprints of a leaf's placeholder token sequence, one row
--- per selected k-gram. `passage_id` is the leaf's `semantic_corpus` rowid and `token_ordinal` is the
--- k-gram's start index in the leaf's spelled token sequence. A leaf shorter than the guaranteed
--- fragment length holds none. `symbols.clone_token_count` is the length of that sequence, set for
--- every leaf carrying clone keys.
+-- Shared-fragment evidence: the winnowed fingerprints of a symbol's comparable token sequence, one
+-- row per selected k-gram. A leaf's comparable sequence is the spelled sequence its clone keys read;
+-- a function or method containing other corpus symbols has one over its own code, each contained
+-- symbol replaced by one boundary token. `passage_id` is the symbol's `semantic_corpus` rowid and
+-- `token_ordinal` is the k-gram's start index in the comparable sequence. A sequence shorter than the
+-- guaranteed fragment length holds none. `symbols.clone_token_count` is the sequence's length, set
+-- for every symbol with comparable content.
 CREATE TABLE IF NOT EXISTS clone_fingerprints (
     hash           INTEGER NOT NULL,
     passage_id     INTEGER NOT NULL,

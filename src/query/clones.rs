@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use crate::graph::backend_language;
-use crate::graph::clone::{SharedRun, guaranteed_fragment_length, shared_runs};
+use crate::graph::clone::{SharedRun, comparable_tokens, contained_symbols, guaranteed_fragment_length, shared_runs};
+use crate::graph::corpus::row_contributes;
 use crate::graph::range::{ByteSpan, PositionIndex};
 use crate::graph::store::{GraphStore, SymbolRow};
 use crate::graph::syntax::{Language, SpelledToken, SyntaxTree};
@@ -20,6 +21,11 @@ use super::output::{Answer, Location, SymbolView};
 use super::resolve::{Resolution, SourcePosition, resolve_position};
 use super::search::CloneCertainty;
 use super::{QueryEngine, QueryError, location_of, symbol_view};
+
+/// The most candidate seeds the comparison of the subject with one other symbol may have: the sum,
+/// over the fingerprint hashes the two share, of the product of the two occurrence counts. A pair
+/// over the limit is not compared and is named in the answer instead.
+pub const FRAGMENT_SEED_LIMIT: usize = 1_000_000;
 
 /// One member of a clone group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -103,9 +109,20 @@ struct IndexedTexts<'s> {
     trees: HashMap<String, SyntaxTree>,
 }
 
-impl IndexedTexts<'_> {
-    /// A symbol's spelled tokens, exactly as the build spelled them for its keys and fingerprints:
-    /// the same call over the same span of the same text.
+impl<'s> IndexedTexts<'s> {
+    /// Indexed texts parsed under the language of the store's recorded `analyzer`.
+    fn new(store: &'s GraphStore, analyzer: &str) -> Result<Self, QueryError> {
+        let language = backend_language(analyzer).map_err(|_| QueryError::UnknownAnalyzer(analyzer.to_string()))?;
+        Ok(Self {
+            store,
+            language,
+            trees: HashMap::new(),
+        })
+    }
+
+    /// A symbol's comparable tokens, exactly as the build computed them for its fingerprints: the
+    /// same call over the same span of the same text, cutting the corpus-contributing symbols the
+    /// store holds within the span under the build's containment rule.
     fn tokens(&mut self, row: &SymbolRow) -> Result<Vec<SpelledToken>, QueryError> {
         let (Some(document), Some((start, end))) = (row.document_path.as_deref(), row.span) else {
             return Err(QueryError::MissingIndexedText(row.canonical_id.to_string()));
@@ -119,8 +136,28 @@ impl IndexedTexts<'_> {
                 .ok_or_else(|| QueryError::MissingIndexedText(document.to_string()))?;
             self.trees.insert(document.to_string(), tree);
         }
-        Ok(self.trees[document].spelled_tokens(ByteSpan { start, end }))
+        let within: Vec<SymbolRow> = self
+            .store
+            .symbols_overlapping_span(document, start, end)?
+            .into_iter()
+            .filter(row_contributes)
+            .collect();
+        let candidates = within
+            .iter()
+            .filter_map(|other| Some((&other.canonical_id, other.span?)));
+        let contained = contained_symbols(&row.canonical_id, (start, end), candidates);
+        Ok(comparable_tokens(
+            &self.trees[document],
+            ByteSpan { start, end },
+            &contained,
+        ))
     }
+}
+
+/// The fragment lengths a store's recorded winnowing parameters imply.
+struct FragmentLengths {
+    data_stretch_length: usize,
+    guaranteed_length: usize,
 }
 
 /// A group of symbols sharing one substitution-insensitive key, before its members are read.
@@ -161,7 +198,7 @@ impl QueryEngine<'_> {
     /// key, longest token sequences first. A corpus with no shared key is a typed-empty answer.
     pub fn clone_groups(&self) -> Result<Answer<CloneGroup>, QueryError> {
         let (provenance, freshness) = self.provenance_and_freshness()?;
-        let length = self.guaranteed_fragment_length()?;
+        let length = self.fragment_lengths()?.guaranteed_length;
         let groups = order_groups(self.store.clone_key_sharers()?);
         if groups.is_empty() {
             return Ok(Answer::empty(provenance, freshness).with_token_equivalence(length));
@@ -199,17 +236,37 @@ impl QueryEngine<'_> {
             }
             Resolution::None => return Ok(Answer::absent(provenance, freshness)),
         };
-        let length = self.guaranteed_fragment_length()?;
-        let Some((subject_formatting, substitution)) = self.store.clone_keys_of(&subject.canonical_id)? else {
+        let FragmentLengths {
+            data_stretch_length,
+            guaranteed_length: length,
+        } = self.fragment_lengths()?;
+        if self.store.clone_token_count_of(&subject.canonical_id)?.is_none() {
             return Ok(Answer::not_comparable(provenance, freshness).with_token_equivalence(length));
-        };
-        let mut items = self.whole_symbol_items(&subject, &subject_formatting, &substitution)?;
-        let whole_symbol: HashSet<CanonicalId> = items.iter().map(|item| item.symbol.canonical_id.clone()).collect();
-        items.extend(self.fragment_items(&subject, &whole_symbol, length, &provenance.analyzer_name)?);
-        if items.is_empty() {
-            return Ok(Answer::empty(provenance, freshness).with_token_equivalence(length));
         }
-        Ok(Answer::found(items, provenance, freshness).with_token_equivalence(length))
+        // Only a leaf carries keys; a function containing corpus symbols has fragments alone.
+        let mut items = match self.store.clone_keys_of(&subject.canonical_id)? {
+            Some((subject_formatting, substitution)) => {
+                self.whole_symbol_items(&subject, &subject_formatting, &substitution)?
+            }
+            None => Vec::new(),
+        };
+        let whole_symbol: HashSet<CanonicalId> = items.iter().map(|item| item.symbol.canonical_id.clone()).collect();
+        let (fragments, not_compared) = self.fragment_items(
+            &subject,
+            &whole_symbol,
+            length,
+            data_stretch_length,
+            &provenance.analyzer_name,
+        )?;
+        items.extend(fragments);
+        let answer = if items.is_empty() {
+            Answer::empty(provenance, freshness)
+        } else {
+            Answer::found(items, provenance, freshness)
+        };
+        Ok(answer
+            .with_token_equivalence(length)
+            .with_not_compared_completely(not_compared))
     }
 
     /// The other symbols sharing `substitution`, exact before variant, then by identity.
@@ -253,40 +310,63 @@ impl QueryEngine<'_> {
     }
 
     /// The token runs of at least `min_length` tokens the subject shares with each other symbol
-    /// outside `whole_symbol`, verified against tokens re-spelled from the indexed text under the
-    /// store's recorded `analyzer`. Ordered by run length descending, then the other symbol's
-    /// identity, then the subject run's start, then the other run's start.
+    /// outside `whole_symbol`. Runs are verified against tokens re-spelled from the indexed text
+    /// under the store's recorded `analyzer`. `data_stretch_length` is the length of a data stretch.
+    /// Runs are ordered by length descending, then the other symbol's identity, then the subject
+    /// run's start, then the other run's start.
+    ///
+    /// A symbol whose candidate seed count with the subject exceeds [`FRAGMENT_SEED_LIMIT`] is not
+    /// compared. Its view is returned apart, in canonical-identity order.
     fn fragment_items(
         &self,
         subject: &SymbolRow,
         whole_symbol: &HashSet<CanonicalId>,
         min_length: usize,
+        data_stretch_length: usize,
         analyzer: &str,
-    ) -> Result<Vec<CloneItem>, QueryError> {
+    ) -> Result<(Vec<CloneItem>, Vec<SymbolView>), QueryError> {
         let mut subject_ordinals: HashMap<i64, Vec<usize>> = HashMap::new();
         for (hash, ordinal) in self.store.clone_fingerprints_of(&subject.canonical_id)? {
             subject_ordinals.entry(hash).or_default().push(ordinal);
         }
-        let mut seeds: HashMap<CanonicalId, Vec<(usize, usize)>> = HashMap::new();
-        for (hash, ordinals) in &subject_ordinals {
+        // A pair's candidate seed count sums, over the hashes they share, the product of the two
+        // occurrence counts. It accumulates from the other symbol's positions, so a pair over the
+        // limit never has its position cross product built.
+        let mut occurrences: HashMap<CanonicalId, Vec<(i64, usize)>> = HashMap::new();
+        for hash in subject_ordinals.keys() {
             for (other, other_ordinal) in self.store.symbols_with_fingerprint(*hash)? {
                 if other == subject.canonical_id || whole_symbol.contains(&other) {
                     continue;
                 }
-                let pairs = seeds.entry(other).or_default();
-                pairs.extend(ordinals.iter().map(|&ordinal| (ordinal, other_ordinal)));
+                occurrences.entry(other).or_default().push((*hash, other_ordinal));
             }
         }
+        let mut limited: Vec<CanonicalId> = Vec::new();
+        let mut seeds: HashMap<CanonicalId, Vec<(usize, usize)>> = HashMap::new();
+        for (other, positions) in occurrences {
+            let seed_count: usize = positions.iter().map(|(hash, _)| subject_ordinals[hash].len()).sum();
+            if seed_count > FRAGMENT_SEED_LIMIT {
+                limited.push(other);
+                continue;
+            }
+            let pairs = seeds.entry(other).or_default();
+            for (hash, other_ordinal) in positions {
+                pairs.extend(subject_ordinals[&hash].iter().map(|&ordinal| (ordinal, other_ordinal)));
+            }
+        }
+        limited.sort();
+        let not_compared = limited
+            .into_iter()
+            .map(|id| {
+                let row = self.store.symbol(&id)?.ok_or(QueryError::MissingSymbol(id))?;
+                Ok(symbol_view(&row))
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?;
         if seeds.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), not_compared));
         }
 
-        let language = backend_language(analyzer).map_err(|_| QueryError::UnknownAnalyzer(analyzer.to_string()))?;
-        let mut texts = IndexedTexts {
-            store: self.store,
-            language,
-            trees: HashMap::new(),
-        };
+        let mut texts = IndexedTexts::new(self.store, analyzer)?;
         let subject_tokens = texts.tokens(subject)?;
         let mut found: Vec<(SymbolRow, SharedRun, ByteSpan, ByteSpan)> = Vec::new();
         for (other, pairs) in seeds {
@@ -295,7 +375,7 @@ impl QueryEngine<'_> {
                 .symbol(&other)?
                 .ok_or_else(|| QueryError::MissingSymbol(other.clone()))?;
             let other_tokens = texts.tokens(&row)?;
-            for run in shared_runs(&subject_tokens, &other_tokens, &pairs, min_length) {
+            for run in shared_runs(&subject_tokens, &other_tokens, &pairs, min_length, data_stretch_length) {
                 let subject_span = run_span(&subject_tokens[run.a_start..run.a_start + run.length]);
                 let other_span = run_span(&other_tokens[run.b_start..run.b_start + run.length]);
                 found.push((row.clone(), run, subject_span, other_span));
@@ -325,7 +405,7 @@ impl QueryEngine<'_> {
             .document_path
             .as_deref()
             .expect("a re-spelled subject has a document");
-        Ok(found
+        let items = found
             .into_iter()
             .map(|(row, run, subject_span, other_span)| {
                 let other_document = row
@@ -348,7 +428,15 @@ impl QueryEngine<'_> {
                     location: location_of(&row),
                 }
             })
-            .collect())
+            .collect();
+        Ok((items, not_compared))
+    }
+
+    /// A symbol's comparable tokens as a `clones` query re-spells them from the indexed text, under
+    /// the store's recorded analyzer. Their positions are the ordinals the stored fingerprints index.
+    pub fn comparable_tokens_of(&self, row: &SymbolRow) -> Result<Vec<SpelledToken>, QueryError> {
+        let (provenance, _) = self.provenance_and_freshness()?;
+        IndexedTexts::new(self.store, &provenance.analyzer_name)?.tokens(row)
     }
 
     fn materialize_group(&self, group: RawGroup) -> Result<CloneGroup, QueryError> {
@@ -384,13 +472,17 @@ impl QueryEngine<'_> {
         })
     }
 
-    /// The guaranteed fragment length under the winnowing parameters the store records, never the
-    /// binary's constants: a store built under other parameters answers under its own.
-    fn guaranteed_fragment_length(&self) -> Result<usize, QueryError> {
+    /// The data-stretch length and the guaranteed fragment length under the winnowing parameters
+    /// the store records, never the binary's constants: a store built under other parameters
+    /// answers under its own. The data-stretch length is the recorded k-gram length.
+    fn fragment_lengths(&self) -> Result<FragmentLengths, QueryError> {
         let (k, w) = self
             .store
             .fragment_parameters()?
             .ok_or(QueryError::MissingFragmentParameters)?;
-        Ok(guaranteed_fragment_length(k, w))
+        Ok(FragmentLengths {
+            data_stretch_length: k,
+            guaranteed_length: guaranteed_fragment_length(k, w),
+        })
     }
 }

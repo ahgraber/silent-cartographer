@@ -465,15 +465,7 @@ pub fn ingest_with_params(
     // signals below filter through this set.
     let contributing: std::collections::HashSet<&CanonicalId> = symbol_rows
         .iter()
-        .filter(|row| row.class == PersistedClass::InWorkspace)
-        .filter(|row| {
-            corpus::content_contributes(
-                &row.display_name,
-                row.signature_text.as_deref(),
-                row.interface_text.as_deref(),
-                row.span_text.as_deref(),
-            )
-        })
+        .filter(|row| corpus::row_contributes(row))
         .map(|row| &row.canonical_id)
         .collect();
 
@@ -644,36 +636,32 @@ pub fn ingest_with_params(
     // blocks outside its own span) and span containment within a document (which catches a file
     // module, whose members' enclosing-declaration chains are empty so no edge ever names it).
     let mut span_containers: std::collections::HashSet<&CanonicalId> = std::collections::HashSet::new();
-    {
-        /// One contributing symbol's identity, definition span, and whether it is a module,
-        /// grouped per document below. Only contributing symbols enter: containment over
-        /// non-contributing symbols (name-only parameter tokens) must not turn their encloser into
-        /// a container.
-        type SpannedSymbol<'a> = (&'a CanonicalId, (usize, usize), bool);
-        let mut spans_by_doc: HashMap<&str, Vec<SpannedSymbol<'_>>> = HashMap::new();
-        for row in &symbol_rows {
-            if !contributing.contains(&row.canonical_id) {
-                continue;
-            }
-            if let (Some(doc), Some(span)) = (row.document_path.as_deref(), row.span) {
-                spans_by_doc
-                    .entry(doc)
-                    .or_default()
-                    .push((&row.canonical_id, span, row.kind == "module"));
-            }
+    /// One contributing symbol's identity, definition span, and whether it is a module, grouped per
+    /// document below. Only contributing symbols enter: containment over non-contributing symbols
+    /// (name-only parameter tokens) must not turn their encloser into a container. The clone pass
+    /// reads the same grouping for the symbols a function contains.
+    type SpannedSymbol<'a> = (&'a CanonicalId, (usize, usize), bool);
+    let mut spans_by_doc: HashMap<&str, Vec<SpannedSymbol<'_>>> = HashMap::new();
+    for row in &symbol_rows {
+        if !contributing.contains(&row.canonical_id) {
+            continue;
         }
-        for spans in spans_by_doc.values() {
-            for (id, outer, is_module) in spans {
-                // Containment compares identities, not spans: a file module whose span exactly
-                // equals its sole declaration's span still encloses it. Equal spans confer
-                // containment only on the module side of the pair (a document encloses its
-                // declarations), so the declaration stays a leaf.
-                let contains_other = spans.iter().any(|(other, inner, _)| {
-                    *other != *id && outer.0 <= inner.0 && inner.1 <= outer.1 && (*inner != *outer || *is_module)
-                });
-                if contains_other {
-                    span_containers.insert(id);
-                }
+        if let (Some(doc), Some(span)) = (row.document_path.as_deref(), row.span) {
+            spans_by_doc
+                .entry(doc)
+                .or_default()
+                .push((&row.canonical_id, span, row.kind == "module"));
+        }
+    }
+    for spans in spans_by_doc.values() {
+        for (id, outer, is_module) in spans {
+            // Containment compares identities, not spans: a file module whose span exactly equals
+            // its sole declaration's span still encloses it.
+            let contains_other = spans
+                .iter()
+                .any(|(other, inner, _)| *other != *id && corpus::span_encloses(*outer, *inner, *is_module));
+            if contains_other {
+                span_containers.insert(id);
             }
         }
     }
@@ -746,30 +734,41 @@ pub fn ingest_with_params(
         store.insert_passage(&passage.symbol_id, &passage.render, &words, chunk_vectors)?;
     }
 
-    // Clone-equivalence keys for the corpus's leaves, from each leaf's spelled token sequence.
-    // Containers carry none: a container "clone" over interface text would assert a body
-    // equivalence the key never examined.
+    // Clone-equivalence keys for the corpus's leaves, from each leaf's spelled token sequence, and
+    // shared-fragment evidence over every symbol's comparable tokens. Containers carry no keys: a
+    // container "clone" over interface text would assert a body equivalence the key never examined.
+    // A function or method containing corpus symbols has comparable tokens over its own code, so it
+    // carries a token count and fingerprints; a type or module containing them carries nothing.
+    let (k, w) = (clone::FRAGMENT_KGRAM_LENGTH, clone::FRAGMENT_WINDOW);
     for source in &corpus_sources {
-        if source.contains_persisted || !source.contributes() {
+        let callable = matches!(source.kind, "function" | "method");
+        if !source.contributes() || (source.contains_persisted && !callable) {
             continue;
         }
-        let row = symbol_rows
-            .iter()
-            .find(|row| &row.canonical_id == source.canonical_id)
-            .expect("corpus sources are drawn from the retained rows");
-        let (Some(doc), Some((start, end))) = (row.document_path.as_deref(), row.span) else {
+        let (Some(path), Some(span)) = (source.document_path, source.span) else {
             continue;
         };
-        let Some(doc) = prepared.get(doc) else {
+        let Some(doc) = prepared.get(path) else {
             continue;
         };
-        let tokens = doc.tree.spelled_tokens(ByteSpan { start, end });
-        if let Some(keys) = clone::clone_keys(&tokens) {
+        let tokens = if source.contains_persisted {
+            let candidates = spans_by_doc
+                .get(path)
+                .into_iter()
+                .flatten()
+                .map(|&(id, span, _)| (id, span));
+            let contained = clone::contained_symbols(source.canonical_id, (span.start, span.end), candidates);
+            clone::comparable_tokens(&doc.tree, span, &contained)
+        } else {
+            let tokens = doc.tree.spelled_tokens(span);
+            let Some(keys) = clone::clone_keys(&tokens) else {
+                continue;
+            };
             store.set_clone_keys(source.canonical_id, &keys.formatting_key, &keys.substitution_key)?;
-            store.set_clone_token_count(source.canonical_id, tokens.len())?;
-            let (k, w) = (clone::FRAGMENT_KGRAM_LENGTH, clone::FRAGMENT_WINDOW);
-            store.write_clone_fingerprints(source.canonical_id, &clone::winnow(&tokens, k, w))?;
-        }
+            tokens
+        };
+        store.set_clone_token_count(source.canonical_id, tokens.len())?;
+        store.write_clone_fingerprints(source.canonical_id, &clone::winnow(&tokens, k, w))?;
     }
 
     let fingerprints: Vec<(String, String)> = sources

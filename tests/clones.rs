@@ -638,7 +638,14 @@ fn the_human_render_states_token_equivalence_and_the_length() {
             out.contains("identical token structure, not proof of identical behavior"),
             "{out}"
         );
-        assert!(out.contains("guaranteed fragment length: 40 tokens"), "{out}");
+        let length = silent_cartographer::graph::clone::guaranteed_fragment_length(
+            silent_cartographer::graph::clone::FRAGMENT_KGRAM_LENGTH,
+            silent_cartographer::graph::clone::FRAGMENT_WINDOW,
+        );
+        assert!(
+            out.contains(&format!("guaranteed fragment length: {length} tokens")),
+            "{out}"
+        );
         assert!(out.contains(expected), "{out}");
     }
 }
@@ -1249,4 +1256,1170 @@ fn the_human_render_locates_both_runs_of_a_fragment() {
         by_byte.contains(&format!("subject src/fragments.rs:{start}-")),
         "{by_byte}"
     );
+}
+
+const PLAIN: Segments = &[("plain", SegmentKind::Method)];
+const TWIN: Segments = &[("twin", SegmentKind::Method)];
+const HOST: Segments = &[("host", SegmentKind::Method)];
+const HELPER: Segments = &[("host", SegmentKind::Method), ("helper", SegmentKind::Method)];
+
+/// A source in one language for comparable content. `plain` holds two blocks back to back, each
+/// longer than the guaranteed length; `twin` is a renamed whole copy of `plain`. `host` holds both
+/// blocks in its own code with a nested function `helper` between them, and a header and a tail of
+/// its own.
+struct NestedFixture {
+    language: Language,
+    doc: &'static str,
+    source: &'static str,
+    decls: Vec<Decl<'static>>,
+    /// The first and last line of each block in `host`.
+    host_blocks: [(u64, u64); 2],
+}
+
+fn nested_fixtures() -> Vec<NestedFixture> {
+    LANGUAGES
+        .into_iter()
+        .map(|language| match language {
+            Language::Rust => rust_nested_fixture(),
+            Language::Python => python_nested_fixture(),
+        })
+        .collect()
+}
+
+fn rust_nested_fixture() -> NestedFixture {
+    let source = "\
+pub fn plain(items: &[u32], scale: u32) -> u32 {
+    let mut total = 0;
+    let count = items.len() as u32 + scale;
+    for item in items {
+        if *item > scale { total += item * scale; } else { total += item + scale; }
+    }
+    let result = total * 2 + scale;
+    let bonus = result / 3 + scale * 5;
+    let spare = bonus - result * 2;
+    let extra = spare % 7 + bonus + count;
+    extra
+}
+
+pub fn twin(values: &[u32], factor: u32) -> u32 {
+    let mut acc = 0;
+    let size = values.len() as u32 + factor;
+    for elem in values {
+        if *elem > factor { acc += elem * factor; } else { acc += elem + factor; }
+    }
+    let outcome = acc * 2 + factor;
+    let gain = outcome / 3 + factor * 5;
+    let rest = gain - outcome * 2;
+    let more = rest % 7 + gain + size;
+    more
+}
+
+pub fn host(items: &[u32], scale: u32, label: &str) -> usize {
+    let width = label.chars().count();
+    let mut total = 0;
+    let count = items.len() as u32 + scale;
+    for item in items {
+        if *item > scale { total += item * scale; } else { total += item + scale; }
+    }
+    #[inline]
+    fn helper(values: &[u32]) -> u32 {
+        let doubled: u32 = values.iter().map(|v| v * 7 + 3).sum();
+        doubled / 2 + values.len() as u32
+    }
+    let result = total * 2 + scale;
+    let bonus = result / 3 + scale * 5;
+    let spare = bonus - result * 2;
+    let extra = spare % 7 + bonus + count;
+    width + extra as usize + helper(items) as usize
+}
+";
+    NestedFixture {
+        language: Language::Rust,
+        doc: "src/nested.rs",
+        source,
+        decls: vec![
+            decl(PLAIN, SymbolKind::Function, "pub fn plain("),
+            decl(TWIN, SymbolKind::Function, "pub fn twin("),
+            decl(HOST, SymbolKind::Function, "pub fn host("),
+            decl(HELPER, SymbolKind::Function, "fn helper("),
+        ],
+        host_blocks: [(29, 33), (39, 42)],
+    }
+}
+
+fn python_nested_fixture() -> NestedFixture {
+    let source = "\
+def plain(items, scale):
+    total = 0
+    count = len(items) + scale
+    limit = count * 2 - 1
+    for item in items:
+        if item > scale:
+            total += item * scale
+        else:
+            total += item + scale
+    result = total * 2 + scale
+    bonus = result // 3 + scale * 5
+    spare = bonus - result * 2
+    extra = spare % 7 + bonus + limit
+    final = extra * count
+    return final
+
+
+def twin(values, factor):
+    acc = 0
+    size = len(values) + factor
+    bound = size * 2 - 1
+    for elem in values:
+        if elem > factor:
+            acc += elem * factor
+        else:
+            acc += elem + factor
+    outcome = acc * 2 + factor
+    gain = outcome // 3 + factor * 5
+    rest = gain - outcome * 2
+    more = rest % 7 + gain + bound
+    last = more * size
+    return last
+
+
+def host(items, scale, label):
+    width = len(label.strip())
+    total = 0
+    count = len(items) + scale
+    limit = count * 2 - 1
+    for item in items:
+        if item > scale:
+            total += item * scale
+        else:
+            total += item + scale
+
+    def helper(values):
+        doubled = sum(v * 7 + 3 for v in values)
+        doubled -= len(values) * 3
+        return doubled // 2 + len(values) - 1
+
+    result = total * 2 + scale
+    bonus = result // 3 + scale * 5
+    spare = bonus - result * 2
+    extra = spare % 7 + bonus + limit
+    final = extra * count
+    print(width, helper(items))
+    return width
+";
+    NestedFixture {
+        language: Language::Python,
+        doc: "nested.py",
+        source,
+        decls: vec![
+            decl(PLAIN, SymbolKind::Function, "def plain("),
+            decl(TWIN, SymbolKind::Function, "def twin("),
+            decl(HOST, SymbolKind::Function, "def host("),
+            decl(HELPER, SymbolKind::Function, "def helper("),
+        ],
+        host_blocks: [(37, 44), (51, 55)],
+    }
+}
+
+impl NestedFixture {
+    fn sources(&self) -> Vec<(String, String)> {
+        vec![(self.doc.to_string(), self.source.to_string())]
+    }
+
+    /// The fixture built to an index on disk under `dir`.
+    fn db(&self, dir: &Path) -> std::path::PathBuf {
+        let db = dir.join("index.db");
+        let index = support::declared_index(self.language, self.doc, self.source, &self.decls);
+        silent_cartographer::commands::build_from_index(&db, "test-ws", dir, &index, &self.sources()).unwrap();
+        db
+    }
+
+    fn store(&self) -> silent_cartographer::graph::store::GraphStore {
+        support::declared_store(self.language, self.doc, self.source, &self.decls)
+    }
+}
+
+/// A run's byte span.
+fn byte_span(run: &Value) -> (usize, usize) {
+    (
+        run["span_start"].as_u64().unwrap() as usize,
+        run["span_end"].as_u64().unwrap() as usize,
+    )
+}
+
+// _(A function that contains a nested function contributes evidence for its own code)_ — its token
+// count is its own tokens plus one boundary for the nested function, which keeps evidence of its own;
+// the function carries no clone keys.
+#[test]
+fn a_function_with_a_nested_function_contributes_evidence_for_its_own_code() {
+    for fixture in nested_fixtures() {
+        let store = fixture.store();
+        let (host, helper) = (decl_id(HOST), decl_id(HELPER));
+        let span_of = |id| {
+            let (start, end) = store.symbol(id).unwrap().unwrap().span.unwrap();
+            silent_cartographer::graph::range::ByteSpan { start, end }
+        };
+        let tree = silent_cartographer::graph::syntax::SyntaxTree::parse(fixture.source, fixture.language).unwrap();
+        let own = tree.spelled_tokens(span_of(&host)).len() - tree.spelled_tokens(span_of(&helper)).len();
+        assert_eq!(
+            store.clone_token_count_of(&host).unwrap(),
+            Some(own + 1),
+            "{:?}",
+            fixture.language
+        );
+        assert!(!store.clone_fingerprints_of(&host).unwrap().is_empty());
+        assert_eq!(store.clone_keys_of(&host).unwrap(), None);
+        assert!(store.clone_keys_of(&helper).unwrap().is_some());
+        assert!(!store.clone_fingerprints_of(&helper).unwrap().is_empty());
+    }
+}
+
+// _(Shared lines in the own code of a function with a nested function are found)_ and _(A run does
+// not include a nested symbol)_ — from either side, the two blocks `host` shares with `plain` are two
+// fragments, one on each side of `helper`, and neither run in `host` covers `helper`'s tokens.
+#[test]
+fn blocks_around_a_nested_function_are_found_and_no_run_covers_it() {
+    for fixture in nested_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        let store = silent_cartographer::graph::store::GraphStore::open(&db).unwrap();
+        let helper = store.symbol(&decl_id(HELPER)).unwrap().unwrap().span.unwrap();
+        for (subject, other, host_side) in [("plain", HOST, "other_run"), ("host", PLAIN, "subject_run")] {
+            let answer = clones(&db, dir.path(), Some(subject), None, 0, None);
+            let rows = fragments_naming(&answer, other);
+            let mut host_runs: Vec<(u64, u64)> =
+                rows.iter().map(|row| lines_of(&row["fragment"][host_side])).collect();
+            host_runs.sort();
+            assert_eq!(
+                host_runs,
+                fixture.host_blocks.to_vec(),
+                "{:?} from {subject}: {answer}",
+                fixture.language
+            );
+            for row in rows {
+                let (start, end) = byte_span(&row["fragment"][host_side]);
+                assert!(
+                    end <= helper.0 || helper.1 <= start,
+                    "{:?} from {subject}: a run covers the nested function: {row}",
+                    fixture.language
+                );
+            }
+        }
+    }
+}
+
+// _(The comparable sequence the query re-spells is the one the build fingerprinted)_ — for every
+// symbol with a token count, the re-spelled sequence has exactly that length.
+#[test]
+fn the_respelled_comparable_sequence_has_the_stored_token_count() {
+    let mut built = Vec::new();
+    for fixture in nested_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        built.push((fixture.language, fixture.sources(), fixture.db(dir.path()), dir));
+    }
+    for fixture in fragment_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        built.push((fixture.language, fixture.sources(), fixture.db(dir.path()), dir));
+    }
+    for (language, sources, db, _dir) in built {
+        let counts: Vec<(String, usize)> = {
+            let connection = rusqlite::Connection::open(&db).unwrap();
+            let mut stmt = connection
+                .prepare("SELECT canonical_id, clone_token_count FROM symbols WHERE clone_token_count IS NOT NULL")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(!counts.is_empty());
+        let store = silent_cartographer::graph::store::GraphStore::open(&db).unwrap();
+        let engine = QueryEngine::new(&store, backend_provenance(language), content_hash(&sources), None);
+        for (id, count) in counts {
+            let row = store
+                .symbol(&silent_cartographer::identity::CanonicalId::from_raw(id.clone()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                engine.comparable_tokens_of(&row).unwrap().len(),
+                count,
+                "{language:?}: {id}"
+            );
+        }
+    }
+}
+
+// _(Clone keys stay leaf-only)_ — `similar` for every symbol and the corpus clone groups answer the
+// same with and without the comparable-content evidence of the function holding a nested function.
+#[test]
+fn comparable_content_leaves_similar_and_clone_groups_unchanged() {
+    for fixture in nested_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        let answers = || {
+            let groups = clones(&db, dir.path(), None, None, 0, None)["outcome"].clone();
+            let similar: Vec<Value> = ["plain", "twin", "host", "helper"]
+                .into_iter()
+                .map(|reference| {
+                    let out = silent_cartographer::commands::run_similar(
+                        &db,
+                        dir.path(),
+                        "rust-analyzer",
+                        Some(reference),
+                        None,
+                        Detail::Location,
+                        10,
+                        false,
+                        &[],
+                        0,
+                        None,
+                        true,
+                        false,
+                        PositionUnit::Line,
+                    )
+                    .unwrap();
+                    serde_json::from_str::<Value>(&out).unwrap()["outcome"].clone()
+                })
+                .collect();
+            (groups, similar)
+        };
+        let with_evidence = answers();
+        assert!(!with_evidence.0["results"].as_array().unwrap().is_empty());
+
+        // Remove the evidence of every symbol carrying no keys: the store as the leaf-only rule
+        // builds it.
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let removed = connection
+            .execute(
+                "DELETE FROM clone_fingerprints WHERE passage_id IN (
+                     SELECT c.id FROM semantic_corpus c JOIN symbols s ON s.canonical_id = c.symbol_id
+                     WHERE s.clone_formatting_key IS NULL)",
+                [],
+            )
+            .unwrap();
+        assert!(removed > 0, "{:?}", fixture.language);
+        connection
+            .execute(
+                "UPDATE symbols SET clone_token_count = NULL WHERE clone_formatting_key IS NULL",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(answers(), with_evidence, "{:?}", fixture.language);
+    }
+}
+
+const REPEAT_ALPHA: Segments = &[("repeat_alpha", SegmentKind::Method)];
+const REPEAT_BETA: Segments = &[("repeat_beta", SegmentKind::Method)];
+const REPEAT_GAMMA: Segments = &[("repeat_gamma", SegmentKind::Method)];
+const BLOCK_USER: Segments = &[("block_user", SegmentKind::Method)];
+
+/// Each repetitive function holds this many statements of one shape; `repeat_beta` holds
+/// `REPEAT_EXTRA` more, so it is no whole-symbol clone of the others. A function's fingerprints
+/// then share one hash about once per statement, and a pair of them has more candidate seeds than
+/// the work limit allows.
+const REPEAT_LENGTH: usize = 1500;
+const REPEAT_EXTRA: usize = 100;
+
+/// A source in one language for the work limit. `repeat_alpha` and `repeat_gamma` hold the same
+/// run of repeated statements, with consistently renamed variables, followed by the same block of
+/// statements, so each is a variant whole-symbol clone of the other; `repeat_beta` holds a longer
+/// run of other variables and no block; `block_user` holds the block alone.
+struct RepeatFixture {
+    language: Language,
+    doc: &'static str,
+    source: String,
+    decls: Vec<Decl<'static>>,
+}
+
+/// `count` statements of one shape, each assigning a new variable named with `prefix` from the
+/// previous one, in `language`.
+fn repeated_statements(language: Language, prefix: &str, count: usize) -> String {
+    (0..count)
+        .map(|i| {
+            let previous = if i == 0 {
+                "scale".to_string()
+            } else {
+                format!("{prefix}{}", i - 1)
+            };
+            match language {
+                Language::Rust => format!("    let {prefix}{i} = {previous} + scale;\n"),
+                Language::Python => format!("    {prefix}{i} = {previous} + scale\n"),
+            }
+        })
+        .collect()
+}
+
+fn rust_repeat_fixture() -> RepeatFixture {
+    let function = |name: &str, prefix: &str, count: usize, block: bool| {
+        let tail = if block {
+            "    let mut total = scale * 2;
+    for name in names.iter() { if name.len() > 3 { total += scale; } else { total += 2; } }
+    let result = total * 2 + scale;
+    let bonus = result / 3 + scale * 5;
+    bonus + result
+"
+        } else {
+            "    scale\n"
+        };
+        format!(
+            "pub fn {name}(names: &[&str], scale: u32) -> u32 {{\n{}{tail}}}\n\n",
+            repeated_statements(Language::Rust, prefix, count)
+        )
+    };
+    let source = format!(
+        "{}{}{}pub fn block_user(names: &[&str], scale: u32) -> u32 {{
+    let mut total = scale * 2;
+    for name in names.iter() {{ if name.len() > 3 {{ total += scale; }} else {{ total += 2; }} }}
+    let result = total * 2 + scale;
+    let bonus = result / 3 + scale * 5;
+    bonus + result
+}}
+",
+        function("repeat_alpha", "a", REPEAT_LENGTH, true),
+        function("repeat_beta", "b", REPEAT_LENGTH + REPEAT_EXTRA, false),
+        function("repeat_gamma", "c", REPEAT_LENGTH, true),
+    );
+    RepeatFixture {
+        language: Language::Rust,
+        doc: "src/repeats.rs",
+        source,
+        decls: vec![
+            decl(REPEAT_ALPHA, SymbolKind::Function, "pub fn repeat_alpha("),
+            decl(REPEAT_BETA, SymbolKind::Function, "pub fn repeat_beta("),
+            decl(REPEAT_GAMMA, SymbolKind::Function, "pub fn repeat_gamma("),
+            decl(BLOCK_USER, SymbolKind::Function, "pub fn block_user("),
+        ],
+    }
+}
+
+fn python_repeat_fixture() -> RepeatFixture {
+    let function = |name: &str, prefix: &str, count: usize, block: bool| {
+        let tail = if block {
+            "    total = scale * 2
+    for name in names:
+        if len(name) > 3:
+            total += scale
+        else:
+            total += 2
+    result = total * 2 + scale
+    bonus = result // 3 + scale * 5
+    return bonus + result
+"
+        } else {
+            "    return scale\n"
+        };
+        format!(
+            "def {name}(names, scale):\n{}{tail}\n\n",
+            repeated_statements(Language::Python, prefix, count)
+        )
+    };
+    let source = format!(
+        "{}{}{}def block_user(names, scale):
+    total = scale * 2
+    for name in names:
+        if len(name) > 3:
+            total += scale
+        else:
+            total += 2
+    result = total * 2 + scale
+    bonus = result // 3 + scale * 5
+    return bonus + result
+",
+        function("repeat_alpha", "a", REPEAT_LENGTH, true),
+        function("repeat_beta", "b", REPEAT_LENGTH + REPEAT_EXTRA, false),
+        function("repeat_gamma", "c", REPEAT_LENGTH, true),
+    );
+    RepeatFixture {
+        language: Language::Python,
+        doc: "repeats.py",
+        source,
+        decls: vec![
+            decl(REPEAT_ALPHA, SymbolKind::Function, "def repeat_alpha("),
+            decl(REPEAT_BETA, SymbolKind::Function, "def repeat_beta("),
+            decl(REPEAT_GAMMA, SymbolKind::Function, "def repeat_gamma("),
+            decl(BLOCK_USER, SymbolKind::Function, "def block_user("),
+        ],
+    }
+}
+
+fn repeat_fixtures() -> Vec<RepeatFixture> {
+    LANGUAGES
+        .into_iter()
+        .map(|language| match language {
+            Language::Rust => rust_repeat_fixture(),
+            Language::Python => python_repeat_fixture(),
+        })
+        .collect()
+}
+
+impl RepeatFixture {
+    fn db(&self, dir: &Path) -> std::path::PathBuf {
+        let db = dir.join("index.db");
+        let index = support::declared_index(self.language, self.doc, &self.source, &self.decls);
+        let sources = vec![(self.doc.to_string(), self.source.clone())];
+        silent_cartographer::commands::build_from_index(&db, "test-ws", dir, &index, &sources).unwrap();
+        db
+    }
+}
+
+/// The identities the answer lists as not compared completely, in the order listed.
+fn not_compared(answer: &Value) -> Vec<String> {
+    answer["not_compared_completely"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no not_compared_completely field: {answer}"))
+        .iter()
+        .map(|view| view["canonical_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+// _(A repetitive pair is named, not reported in part)_ — the repetitive pair is named, has no
+// fragment rows, and the other symbols' rows are still reported.
+#[test]
+fn a_repetitive_pair_is_named_and_reports_no_fragment_rows() {
+    for fixture in repeat_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        let language = fixture.language;
+        let answer = clones(&db, dir.path(), Some("repeat_alpha"), None, 0, None);
+        assert_eq!(
+            not_compared(&answer),
+            vec![decl_id(REPEAT_BETA).as_str().to_string()],
+            "{language:?}: {answer}"
+        );
+        assert!(rows_naming(&answer, REPEAT_BETA).is_empty(), "{language:?}: {answer}");
+        let gamma = rows_naming(&answer, REPEAT_GAMMA);
+        assert_eq!(gamma.len(), 1, "{language:?}: {answer}");
+        assert_eq!(gamma[0]["kind"], "whole_symbol");
+        assert_eq!(fragments_naming(&answer, BLOCK_USER).len(), 1, "{language:?}: {answer}");
+
+        // From the longer function, both other repetitive functions are over the limit, in
+        // identity order.
+        let from_beta = clones(&db, dir.path(), Some("repeat_beta"), None, 0, None);
+        let mut expected = vec![
+            decl_id(REPEAT_ALPHA).as_str().to_string(),
+            decl_id(REPEAT_GAMMA).as_str().to_string(),
+        ];
+        expected.sort();
+        assert_eq!(not_compared(&from_beta), expected, "{language:?}: {from_beta}");
+    }
+}
+
+// An answer in which no pair reaches the limit carries no such field.
+#[test]
+fn the_field_is_absent_when_no_pair_reaches_the_limit() {
+    for fixture in fragment_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer = clones(&fixture.db(dir.path()), dir.path(), Some("f1::shorter"), None, 0, None);
+        assert!(
+            answer.get("not_compared_completely").is_none(),
+            "{:?}: {answer}",
+            fixture.language
+        );
+    }
+}
+
+// The limited symbols ride on every page of the answer.
+#[test]
+fn a_limited_answer_carries_the_field_on_every_page() {
+    for fixture in repeat_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        let whole = clones(&db, dir.path(), Some("repeat_alpha"), None, 0, None);
+        assert_eq!(groups_of(&whole).len(), 2, "{:?}", fixture.language);
+        assert!(!not_compared(&whole).is_empty(), "{:?}: {whole}", fixture.language);
+        let mut pages = 0;
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = clones(&db, dir.path(), Some("repeat_alpha"), None, 1, cursor.as_deref());
+            assert_eq!(
+                page["not_compared_completely"], whole["not_compared_completely"],
+                "{:?}: {page}",
+                fixture.language
+            );
+            pages += 1;
+            match page["page"]["cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 2, "{:?}", fixture.language);
+    }
+}
+
+/// The human rendering of a `clones` answer for `reference`.
+fn human_clones(db: &Path, root: &Path, reference: &str) -> String {
+    silent_cartographer::commands::run_clones(
+        db,
+        root,
+        "rust-analyzer",
+        Some(reference),
+        None,
+        0,
+        None,
+        false,
+        false,
+        PositionUnit::Line,
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_human_render_names_the_symbols_not_compared_completely() {
+    for fixture in repeat_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        let out = human_clones(&db, dir.path(), "repeat_alpha");
+        let expected = format!(
+            "not compared completely (too many candidate positions): {}",
+            decl_id(REPEAT_BETA).as_str()
+        );
+        assert!(out.contains(&expected), "{:?}: {out}", fixture.language);
+    }
+}
+
+// An empty answer whose other symbols were not all compared says so, rather than the plain empty
+// line: `repeat_beta` has no clone but the two functions it was not compared with.
+#[test]
+fn an_empty_answer_with_symbols_not_compared_is_scoped_to_the_symbols_compared() {
+    for fixture in repeat_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        let answer = clones(&db, dir.path(), Some("repeat_beta"), None, 0, None);
+        assert_eq!(
+            answer["outcome"]["outcome"], "empty",
+            "{:?}: {answer}",
+            fixture.language
+        );
+        let out = human_clones(&db, dir.path(), "repeat_beta");
+        assert!(
+            out.contains("empty: no clones found among the symbols compared"),
+            "{:?}: {out}",
+            fixture.language
+        );
+    }
+}
+
+const TABLE_ONE: Segments = &[("table_one", SegmentKind::Method)];
+const TABLE_TWO: Segments = &[("table_two", SegmentKind::Method)];
+const TABLE_HOST: Segments = &[("table_host", SegmentKind::Method)];
+const RECORDS_ONE: Segments = &[("records_one", SegmentKind::Method)];
+const RECORDS_TWO: Segments = &[("records_two", SegmentKind::Method)];
+const CONSTANT_ONE: Segments = &[("constant_one", SegmentKind::Method)];
+const CONSTANT_TWO: Segments = &[("constant_two", SegmentKind::Method)];
+const PADDED_ONE: Segments = &[("padded_one", SegmentKind::Method)];
+const PADDED_TWO: Segments = &[("padded_two", SegmentKind::Method)];
+const NEGATIVES_ONE: Segments = &[("negatives_one", SegmentKind::Method)];
+const NEGATIVES_TWO: Segments = &[("negatives_two", SegmentKind::Method)];
+const EDITED_HOST: Segments = &[("edited_host", SegmentKind::Method)];
+
+/// The row of `table_one`'s table that `edited_host` holds with another value.
+const EDITED_ROW: usize = 30;
+
+/// Rows in each table; the second table of each pair holds `DATA_EXTRA` more, so neither is a
+/// whole-symbol clone of the other.
+const DATA_ROWS: usize = 60;
+const DATA_EXTRA: usize = 5;
+
+/// A source in one language for data stretches. `table_one` and `table_two` each hold a table of
+/// distinct literal values, the values different; `table_host` holds `table_one`'s table between
+/// code of its own. `records_one` and `records_two` each hold a table of record literals with the
+/// same field or key names and different values. `constant_one` holds a block of statements that
+/// `constant_two` holds with one numeric constant changed, followed by a statement of its own.
+/// `padded_one` and `padded_two` each hold two tables, the values different, around one shared
+/// statement shorter than the guaranteed length. `negatives_one` and `negatives_two` each hold a
+/// table of distinct negative numbers, the values different. `edited_host` holds `table_one`'s
+/// table with the value of row `EDITED_ROW` changed.
+struct DataFixture {
+    language: Language,
+    doc: &'static str,
+    source: String,
+    decls: Vec<Decl<'static>>,
+    /// The first and last line of `table_one`'s table inside `table_host`.
+    host_table: (u64, u64),
+    /// The byte spans of the first, edited, and last value of the table inside `edited_host`.
+    edited_table: [(usize, usize); 3],
+}
+
+/// The source of the padded, negative, and edited tables in `language`, appended to the data
+/// fixture.
+fn more_data_source(language: Language) -> String {
+    let strings = |prefix: &'static str| move |i: usize| format!("\"{prefix}{i:03}\"");
+    let negatives = |step: usize| move |i: usize| format!("-{}", i * step + 1);
+    let edited = |i: usize| {
+        if i == EDITED_ROW {
+            "\"edited\"".to_string()
+        } else {
+            format!("\"one{i:03}\"")
+        }
+    };
+    let indent = "        ";
+    match language {
+        Language::Rust => format!(
+            "
+pub fn padded_one(scale: usize) -> usize {{
+    let first = [
+{}    ];
+    let total = first.len() + scale;
+    let second = [
+{}    ];
+    total + second.len()
+}}
+
+pub fn padded_two(scale: usize) -> usize {{
+    let first = [
+{}    ];
+    let total = first.len() + scale;
+    let second = [
+{}    ];
+    total + second.len()
+}}
+
+pub fn negatives_one() -> usize {{
+    let values = [
+{}    ];
+    values.len()
+}}
+
+pub fn negatives_two() -> usize {{
+    let values = [
+{}    ];
+    values.len()
+}}
+
+pub fn edited_host(scale: usize) -> usize {{
+    let width = scale * 2 + 1;
+    let values = [
+{}    ];
+    values.len() + width
+}}
+",
+            rows(DATA_ROWS, indent, strings("pa")),
+            rows(DATA_ROWS, indent, strings("pb")),
+            rows(DATA_ROWS + DATA_EXTRA, indent, strings("qa")),
+            rows(DATA_ROWS, indent, strings("qb")),
+            rows(DATA_ROWS, indent, negatives(3)),
+            rows(DATA_ROWS + DATA_EXTRA, indent, negatives(5)),
+            rows(DATA_ROWS, indent, edited),
+        ),
+        Language::Python => format!(
+            "
+
+def padded_one(scale):
+    first = [
+{}    ]
+    total = len(first) + scale
+    second = [
+{}    ]
+    return total + len(second)
+
+
+def padded_two(scale):
+    first = [
+{}    ]
+    total = len(first) + scale
+    second = [
+{}    ]
+    return total + len(second)
+
+
+def negatives_one():
+    values = [
+{}    ]
+    return len(values)
+
+
+def negatives_two():
+    values = [
+{}    ]
+    return len(values)
+
+
+def edited_host(scale):
+    width = scale * 2 + 1
+    values = [
+{}    ]
+    return len(values) + width
+",
+            rows(DATA_ROWS, indent, strings("pa")),
+            rows(DATA_ROWS, indent, strings("pb")),
+            rows(DATA_ROWS + DATA_EXTRA, indent, strings("qa")),
+            rows(DATA_ROWS, indent, strings("qb")),
+            rows(DATA_ROWS, indent, negatives(3)),
+            rows(DATA_ROWS + DATA_EXTRA, indent, negatives(5)),
+            rows(DATA_ROWS, indent, edited),
+        ),
+    }
+}
+
+/// The byte spans of the first, edited, and last value of the table inside `edited_host` in
+/// `source`, which declares it after `opener`.
+fn edited_values(source: &str, opener: &str) -> [(usize, usize); 3] {
+    let host = source.find(&format!("{opener}edited_host")).unwrap();
+    let last = format!("\"one{:03}\"", DATA_ROWS - 1);
+    ["\"one000\"", "\"edited\"", last.as_str()].map(|value| {
+        let start = host + source[host..].find(value).unwrap();
+        (start, start + value.len())
+    })
+}
+
+/// `count` lines, each `row` applied to its index and indented by `indent`.
+fn rows(count: usize, indent: &str, row: impl Fn(usize) -> String) -> String {
+    (0..count).map(|i| format!("{indent}{},\n", row(i))).collect()
+}
+
+/// The 1-based line on which `needle` first occurs in `source`.
+fn line_of(source: &str, needle: &str) -> u64 {
+    let at = source.find(needle).unwrap_or_else(|| panic!("{needle} occurs"));
+    source[..at].matches('\n').count() as u64 + 1
+}
+
+fn rust_data_fixture() -> DataFixture {
+    let strings = |prefix: &'static str| move |i: usize| format!("\"{prefix}{i:03}\"");
+    let records =
+        |prefix: &'static str| move |i: usize| format!("Row {{ name: \"{prefix}{i:03}\", size: {} }}", i * 7);
+    let table_one = rows(DATA_ROWS, "        ", strings("one"));
+    let source = format!(
+        "pub fn table_one() -> usize {{
+    let values = [
+{table_one}    ];
+    values.len()
+}}
+
+pub fn table_two() -> usize {{
+    let values = [
+{}    ];
+    values.len()
+}}
+
+pub fn table_host(scale: usize) -> usize {{
+    let width = scale * 2 + 1;
+    let values = [
+{table_one}    ];
+    values.len() + width
+}}
+
+pub fn records_one() -> usize {{
+    let values = [
+{}    ];
+    values.len()
+}}
+
+pub fn records_two() -> usize {{
+    let values = [
+{}    ];
+    values.len()
+}}
+
+pub fn constant_one(items: &[u32], scale: u32) -> u32 {{
+    let mut total = 0;
+    for item in items {{
+        if *item > scale {{ total += item * 7; }} else {{ total += item + scale; }}
+    }}
+    let result = total * 2 + scale;
+    let bonus = result / 3 + scale * 5;
+    bonus + result
+}}
+
+pub fn constant_two(items: &[u32], scale: u32) -> u32 {{
+    let mut total = 0;
+    for item in items {{
+        if *item > scale {{ total += item * 9; }} else {{ total += item + scale; }}
+    }}
+    let result = total * 2 + scale;
+    let bonus = result / 3 + scale * 5;
+    println!(\"{{}}\", bonus);
+    bonus + result
+}}
+",
+        rows(DATA_ROWS + DATA_EXTRA, "        ", strings("two")),
+        rows(DATA_ROWS, "        ", records("one")),
+        rows(DATA_ROWS + DATA_EXTRA, "        ", records("two")),
+    );
+    let source = source + &more_data_source(Language::Rust);
+    let edited_table = edited_values(&source, "pub fn ");
+    let host = &source[source.find("pub fn table_host").unwrap()..];
+    let offset = line_of(&source, "pub fn table_host") - 1;
+    let host_table = (
+        offset + line_of(host, "\"one000\""),
+        offset + line_of(host, &format!("\"one{:03}\"", DATA_ROWS - 1)),
+    );
+    DataFixture {
+        language: Language::Rust,
+        doc: "src/data.rs",
+        decls: data_decls("pub fn "),
+        source,
+        host_table,
+        edited_table,
+    }
+}
+
+fn python_data_fixture() -> DataFixture {
+    let strings = |prefix: &'static str| move |i: usize| format!("\"{prefix}{i:03}\"");
+    let records =
+        |prefix: &'static str| move |i: usize| format!("{{\"name\": \"{prefix}{i:03}\", \"size\": {}}}", i * 7);
+    let table_one = rows(DATA_ROWS, "        ", strings("one"));
+    let source = format!(
+        "def table_one():
+    values = [
+{table_one}    ]
+    return len(values)
+
+
+def table_two():
+    values = [
+{}    ]
+    return len(values)
+
+
+def table_host(scale):
+    width = scale * 2 + 1
+    values = [
+{table_one}    ]
+    return len(values) + width
+
+
+def records_one():
+    values = [
+{}    ]
+    return len(values)
+
+
+def records_two():
+    values = [
+{}    ]
+    return len(values)
+
+
+def constant_one(items, scale):
+    total = 0
+    for item in items:
+        if item > scale:
+            total += item * 7
+        else:
+            total += item + scale
+    result = total * 2 + scale
+    bonus = result // 3 + scale * 5
+    return bonus + result
+
+
+def constant_two(items, scale):
+    total = 0
+    for item in items:
+        if item > scale:
+            total += item * 9
+        else:
+            total += item + scale
+    result = total * 2 + scale
+    bonus = result // 3 + scale * 5
+    print(bonus)
+    return bonus + result
+",
+        rows(DATA_ROWS + DATA_EXTRA, "        ", strings("two")),
+        rows(DATA_ROWS, "        ", records("one")),
+        rows(DATA_ROWS + DATA_EXTRA, "        ", records("two")),
+    );
+    let source = source + &more_data_source(Language::Python);
+    let edited_table = edited_values(&source, "def ");
+    let host = &source[source.find("def table_host").unwrap()..];
+    let offset = line_of(&source, "def table_host") - 1;
+    let host_table = (
+        offset + line_of(host, "\"one000\""),
+        offset + line_of(host, &format!("\"one{:03}\"", DATA_ROWS - 1)),
+    );
+    DataFixture {
+        language: Language::Python,
+        doc: "data.py",
+        decls: data_decls("def "),
+        source,
+        host_table,
+        edited_table,
+    }
+}
+
+/// The data fixture's declarations, each found by `opener` followed by its name.
+fn data_decls(opener: &str) -> Vec<Decl<'static>> {
+    [
+        TABLE_ONE,
+        TABLE_TWO,
+        TABLE_HOST,
+        RECORDS_ONE,
+        RECORDS_TWO,
+        CONSTANT_ONE,
+        CONSTANT_TWO,
+        PADDED_ONE,
+        PADDED_TWO,
+        NEGATIVES_ONE,
+        NEGATIVES_TWO,
+        EDITED_HOST,
+    ]
+    .into_iter()
+    .map(|segments| {
+        let within: &'static str = Box::leak(format!("{opener}{}(", segments[0].0).into_boxed_str());
+        decl(segments, SymbolKind::Function, within)
+    })
+    .collect()
+}
+
+fn data_fixtures() -> Vec<DataFixture> {
+    LANGUAGES
+        .into_iter()
+        .map(|language| match language {
+            Language::Rust => rust_data_fixture(),
+            Language::Python => python_data_fixture(),
+        })
+        .collect()
+}
+
+impl DataFixture {
+    fn db(&self, dir: &Path) -> std::path::PathBuf {
+        let db = dir.join("index.db");
+        let index = support::declared_index(self.language, self.doc, &self.source, &self.decls);
+        let sources = vec![(self.doc.to_string(), self.source.clone())];
+        silent_cartographer::commands::build_from_index(&db, "test-ws", dir, &index, &sources).unwrap();
+        db
+    }
+}
+
+/// Whether any row of a subject answer, which may be empty, names `other`.
+fn names(answer: &Value, other: Segments) -> bool {
+    let id = decl_id(other);
+    answer["outcome"]["results"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|row| row["symbol"]["canonical_id"] == id.as_str()))
+}
+
+// _(Different tables of literal values share no fragment)_
+#[test]
+fn different_literal_tables_share_no_fragment() {
+    for fixture in data_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        for (subject, other) in [("table_one", TABLE_TWO), ("table_two", TABLE_ONE)] {
+            let answer = clones(&db, dir.path(), Some(subject), None, 0, None);
+            assert!(!names(&answer, other), "{:?}: {answer}", fixture.language);
+        }
+    }
+}
+
+// _(A copied table is an exact fragment)_
+#[test]
+fn a_copied_table_is_an_exact_fragment() {
+    for fixture in data_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer = clones(&fixture.db(dir.path()), dir.path(), Some("table_one"), None, 0, None);
+        let rows = fragments_naming(&answer, TABLE_HOST);
+        assert_eq!(rows.len(), 1, "{:?}: {answer}", fixture.language);
+        assert_eq!(rows[0]["certainty"], "exact_clone", "{:?}: {answer}", fixture.language);
+        let (first, last) = lines_of(&rows[0]["fragment"]["other_run"]);
+        assert!(
+            first <= fixture.host_table.0 && fixture.host_table.1 <= last,
+            "{:?}: {answer}",
+            fixture.language
+        );
+    }
+}
+
+// _(Different tables of records share no fragment)_ — Rust classifies record-literal structure;
+// in Python a table of dictionaries with string keys is literals and punctuation throughout.
+#[test]
+fn different_record_tables_share_no_fragment() {
+    for fixture in data_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        for (subject, other) in [("records_one", RECORDS_TWO), ("records_two", RECORDS_ONE)] {
+            let answer = clones(&db, dir.path(), Some(subject), None, 0, None);
+            assert!(!names(&answer, other), "{:?}: {answer}", fixture.language);
+        }
+    }
+}
+
+// _(A changed constant in code remains a variant)_
+#[test]
+fn a_changed_constant_in_code_remains_a_variant_fragment() {
+    for fixture in data_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer = clones(&fixture.db(dir.path()), dir.path(), Some("constant_one"), None, 0, None);
+        let rows = fragments_naming(&answer, CONSTANT_TWO);
+        assert_eq!(rows.len(), 1, "{:?}: {answer}", fixture.language);
+        assert_eq!(
+            rows[0]["certainty"], "variant_clone",
+            "{:?}: {answer}",
+            fixture.language
+        );
+        assert!(
+            rows[0]["fragment"]["token_length"].as_u64() >= answer["guaranteed_fragment_length"].as_u64(),
+            "{:?}: {answer}",
+            fixture.language
+        );
+    }
+}
+
+// _(Different table values do not extend a fragment)_ — the one shared statement between the
+// tables is shorter than the guaranteed length, and the differing values around it do not pad it.
+#[test]
+fn different_table_values_do_not_extend_a_fragment() {
+    for fixture in data_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        for (subject, other) in [("padded_one", PADDED_TWO), ("padded_two", PADDED_ONE)] {
+            let answer = clones(&db, dir.path(), Some(subject), None, 0, None);
+            assert!(!names(&answer, other), "{:?}: {answer}", fixture.language);
+        }
+    }
+}
+
+// _(Different tables of negative numbers share no fragment)_
+#[test]
+fn different_tables_of_negative_numbers_share_no_fragment() {
+    for fixture in data_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        for (subject, other) in [("negatives_one", NEGATIVES_TWO), ("negatives_two", NEGATIVES_ONE)] {
+            let answer = clones(&db, dir.path(), Some(subject), None, 0, None);
+            assert!(!names(&answer, other), "{:?}: {answer}", fixture.language);
+        }
+    }
+}
+
+// A copied table with one edited value still reports its identical parts: one exact fragment runs
+// from the table's first value up to the edited value, another from after it through the last
+// value, and none includes it.
+#[test]
+fn a_copied_table_with_one_edited_value_reports_its_identical_parts() {
+    for fixture in data_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer = clones(&fixture.db(dir.path()), dir.path(), Some("table_one"), None, 0, None);
+        let rows = fragments_naming(&answer, EDITED_HOST);
+        let [first, edited, last] = fixture.edited_table;
+        let runs: Vec<(usize, usize)> = rows
+            .iter()
+            .map(|row| byte_span(&row["fragment"]["other_run"]))
+            .collect();
+        assert!(
+            rows.iter().all(|row| row["certainty"] == "exact_clone"),
+            "{:?}: {answer}",
+            fixture.language
+        );
+        assert!(
+            runs.iter().all(|&(start, end)| end <= edited.0 || edited.1 <= start),
+            "{:?}: {runs:?}",
+            fixture.language
+        );
+        // Only layout lies between the two offsets.
+        let adjacent = |from: usize, to: usize| from <= to && fixture.source[from..to].trim().is_empty();
+        assert!(
+            runs.iter()
+                .any(|&(start, end)| start <= first.0 && adjacent(end, edited.0)),
+            "{:?}: {runs:?}",
+            fixture.language
+        );
+        assert!(
+            runs.iter()
+                .any(|&(start, end)| adjacent(edited.1, start) && last.1 <= end),
+            "{:?}: {runs:?}",
+            fixture.language
+        );
+    }
 }

@@ -285,6 +285,11 @@ pub struct Answer<T> {
     /// requested, so an unexcluded answer's shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excluded_relations: Option<Vec<RelationLabel>>,
+    /// The symbols a `clones` answer did not compare with the subject because the comparison
+    /// exceeded the work limit, in canonical-identity order: present exactly when there are any,
+    /// so every other answer's shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_compared_completely: Option<Vec<SymbolView>>,
     /// The outcome.
     pub outcome: Outcome<T>,
     /// The result-set paging disclosure, present only when a result limit was applied.
@@ -337,6 +342,7 @@ impl<T> Answer<T> {
             workspace_relation: None,
             ordering: None,
             excluded_relations: None,
+            not_compared_completely: None,
             outcome,
             page: None,
         }
@@ -388,6 +394,12 @@ impl<T> Answer<T> {
     /// all when none was requested.
     pub fn with_excluded_relations(mut self, excluded: &[RelationLabel]) -> Self {
         self.excluded_relations = (!excluded.is_empty()).then(|| excluded.to_vec());
+        self
+    }
+
+    /// Name the symbols a `clones` query did not compare completely; no field at all when none.
+    pub fn with_not_compared_completely(mut self, symbols: Vec<SymbolView>) -> Self {
+        self.not_compared_completely = (!symbols.is_empty()).then_some(symbols);
         self
     }
 

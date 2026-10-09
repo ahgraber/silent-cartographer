@@ -320,13 +320,19 @@ Serves: duplication-audit-in-one-run
 
 Given a subject symbol supplied as a symbol reference or a source position, resolved under the symbol-reference resolution contract, `clones` SHALL return the subject's whole-symbol clones and its shared fragments.
 A whole-symbol clone is another symbol sharing the subject's substitution-insensitive key, marked exact or variant as in `similar`.
-A shared fragment is a pair of token runs, one in the subject and one in another symbol carrying equivalence keys, reported as a location in each symbol.
-Every reported pair of runs SHALL be identical, marked exact, or identical under a consistent one-to-one substitution of identifiers and literal values within the runs, marked variant, after documentation is disregarded.
+A shared fragment is a pair of token runs, one in the comparable content of the subject and one in the comparable content of another symbol, as the shared-fragment evidence requirement defines comparable content, reported as a location in each symbol.
+A data token is a literal value, a sign directly before a numeric literal, a punctuation token, or a token that the language backend classifies as part of a record literal's structure: a field or key name, or the name or keyword that opens a record literal.
+A data stretch is a maximal stretch of consecutive data tokens that the two symbols hold at corresponding positions and that is at least the documented data-stretch length, measured over the whole stretch, not only the part a run includes.
+Every reported pair of runs SHALL be identical, marked exact, or identical under a consistent one-to-one substitution of identifiers and literal values within the runs, marked variant, after documentation is disregarded, except that every token of a data stretch that a run includes SHALL be identical in both runs.
+A backend that classifies no record-literal structure satisfies this requirement with literal values and punctuation as its only data tokens.
+No reported run SHALL include the boundary of a contained corpus-contributing symbol.
 No reported run SHALL be shorter than the documented guaranteed fragment length.
-Every pair of runs that meets that definition and is at least the guaranteed length SHALL be contained in a reported pair.
+The comparison of the subject with any one other symbol SHALL be bounded by a documented limit on comparison work.
+Every pair of runs that meets that definition and is at least the guaranteed length SHALL be contained in a reported pair, except where the comparison of the two symbols reached the limit.
+A symbol whose comparison with the subject reached the limit SHALL have no fragment rows, and the answer SHALL name it as not compared completely.
 No reported pair SHALL be contained in another reported pair for the same two symbols, and a symbol reported as a whole-symbol clone SHALL have no fragment rows.
 The subject SHALL NOT appear in its own answer.
-A subject that carries no equivalence key SHALL yield a typed answer stating that the subject has no comparable content, distinct from an answer that found no clone.
+A subject with no comparable content SHALL yield a typed answer stating that the subject has no comparable content, distinct from an answer that found no clone.
 An ambiguous subject reference SHALL yield the typed candidate set.
 The answer SHALL be bounded and resumable, ordered deterministically with longer runs first.
 
@@ -374,6 +380,60 @@ Serves: shared-fragments
 - **WHEN** `clones` is invoked for the type
 - **THEN** the answer states that the subject has no comparable content, distinct from a typed-empty answer
 
+#### Scenario: Shared lines in the own code of a function with a nested function are found
+
+- **GIVEN** an indexed function that defines a nested function, and whose own code outside the nested function contains a block copied from a second function, the block longer than the guaranteed length
+- **WHEN** `clones` is invoked for the second function
+- **THEN** the answer reports a fragment whose run in the first function covers the copied block
+
+#### Scenario: A run does not include a nested symbol
+
+- **GIVEN** two indexed functions that share the same statements, where one of them defines a nested function between two of those statements
+- **WHEN** `clones` is invoked for either function
+- **THEN** no reported run in the function with the nested function covers the nested function's tokens
+
+#### Scenario: Different tables of literal values share no fragment
+
+- **GIVEN** two indexed symbols that each hold a long table of distinct literal values, the tables holding different values
+- **WHEN** `clones` is invoked for one of them
+- **THEN** no fragment row joins the two tables
+
+#### Scenario: Different table values do not extend a fragment
+
+- **GIVEN** two indexed symbols that share one statement shorter than the guaranteed length, each statement placed between two long tables whose values differ between the symbols
+- **WHEN** `clones` is invoked for one of them
+- **THEN** no fragment row joins the two symbols
+
+#### Scenario: Different tables of negative numbers share no fragment
+
+- **GIVEN** two indexed symbols that each hold a long table of distinct negative numbers, the tables holding different values
+- **WHEN** `clones` is invoked for one of them
+- **THEN** no fragment row joins the two tables
+
+#### Scenario: A copied table is an exact fragment
+
+- **GIVEN** an indexed function that contains a long table of literal values copied from a second function
+- **WHEN** `clones` is invoked for the second function
+- **THEN** the answer reports an exact fragment whose run in the first function covers the table
+
+#### Scenario: Different tables of records share no fragment
+
+- **GIVEN** two indexed symbols that each hold a long table of record literals with the same field names and different values, in a language whose backend classifies record-literal structure
+- **WHEN** `clones` is invoked for one of them
+- **THEN** no fragment row joins the two tables
+
+#### Scenario: A changed constant in code remains a variant
+
+- **GIVEN** an indexed function containing a block of statements that another function holds with one numeric constant changed
+- **WHEN** `clones` is invoked for the first function
+- **THEN** the block is reported as a variant fragment
+
+#### Scenario: A repetitive pair is named, not reported in part
+
+- **GIVEN** an indexed subject and another symbol whose comparison exceeds the documented work limit, such as two long tables of distinct literal values
+- **WHEN** `clones` is invoked for the subject
+- **THEN** the answer names the other symbol as not compared completely, reports no fragment row for it, and reports the rows of every other symbol
+
 #### Scenario: No shared run is typed absence
 
 - **GIVEN** an indexed function that shares no run of the guaranteed length and no key with any symbol
@@ -398,6 +458,7 @@ Every `clones` answer that reaches the clone evidence, a typed-empty answer incl
 A `clones` answer SHALL NOT carry the estimation marker or the semantic-index identity, and SHALL carry no similarity score.
 An ambiguous-reference or unresolved-subject answer terminates before the clone evidence is read, so it SHALL NOT carry the token-equivalence marker.
 The marker SHALL accompany, never replace, the provenance and freshness labeling every answer carries.
+The machine answer and the human rendering SHALL both name every symbol not compared completely.
 
 Serves: duplication-audit-in-one-run, shared-fragments
 

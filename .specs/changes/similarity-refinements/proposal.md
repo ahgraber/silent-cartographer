@@ -48,7 +48,7 @@ As a developer or agent, I want to see the exact code that a symbol shares with 
 
 - Clone keys disregard documentation (`code-graph`).
   A Python docstring leaves the token sequence that the clone keys and the fragment evidence read, as Rust doc comments already do.
-- The build persists shared-fragment evidence for every leaf symbol (`code-graph`).
+- The build persists shared-fragment evidence for every leaf symbol, and for the own code of every function or method that contains a nested symbol (`code-graph`).
 - One schema version bump for both items above.
   The existing replace-or-refuse rule is the migration.
 - Every `similar` row carries the relation labels that hold between it and the subject (`code-navigation`).
@@ -59,7 +59,7 @@ As a developer or agent, I want to see the exact code that a symbol shares with 
 - `similar --mutual` lists the pairs of corpus symbols each of which is the first row of the other's `similar` answer (`code-navigation`).
 - A new command `clones` (`code-navigation`).
   With no subject, it lists the corpus clone groups.
-  With a subject, it lists the subject's whole-symbol clones and the token runs the subject shares with other leaf symbols.
+  With a subject, it lists the subject's whole-symbol clones and the token runs the subject shares with other symbols.
 - No similarity score appears in any answer.
   Answers carry ranks, the clone-certainty marker, and relation labels only.
 - One surface version bump, the matching MCP pin, a new MCP `clones` tool, and the new `similar` controls on the MCP `similar` tool.
@@ -81,6 +81,13 @@ As a developer or agent, I want to see the exact code that a symbol shares with 
   Fragment certainty is exact or variant only.
 - Fragment rows in `similar` answers.
 - Approximate nearest-neighbor indexes.
+- A run that continues across a nested function present in both copies.
+  The boundary that replaces a nested function stops every run, so such a block is reported as separate runs on each side.
+  A follow-up can give the boundary the nested function's clone key, so that the runs join when the two nested functions are clones.
+- Whole-symbol clone keys for functions that contain nested functions.
+  Two identical functions that each define the same nested function carry no clone marker and form no clone group.
+  This belongs with the follow-up above, because both need keys computed from nested symbols outward.
+- Comparable content for types and modules.
 
 ## Approach
 
@@ -103,15 +110,24 @@ The corpus clone groups are a grouping on the persisted substitution-insensitive
 No vector work is involved.
 
 **Fragments by winnowing.**
-The build selects winnowing fingerprints over each leaf's token sequence with identifiers and literals replaced by their class.
+The build selects winnowing fingerprints over each symbol's comparable content with identifiers and literals replaced by their class.
+A function or method that contains a nested symbol is compared over its own code, with each nested symbol replaced by a boundary that no run crosses.
 At query time, a shared fingerprint gives a candidate position, the query re-reads both token sequences from the indexed document text, and only verified token runs are reported.
-The guaranteed fragment length is 40 tokens.
+Inside a fragment, a stretch of data tokens, such as a table of literal values, must be identical, so different tables do not match each other.
+The comparison of the subject with one other symbol stops at a work limit, and the answer names every symbol it did not compare completely.
+The guaranteed fragment length is 32 tokens.
 The build records the fragment parameters in the store, so tuning them later needs a rebuild and no schema version bump.
 `design.md` § FragmentDetection compares this with suffix-array, AST, embedding, late-interaction, and alignment approaches.
 
 ## Resolved Questions
 
-- 2026-10-06: the guaranteed fragment length is 40 tokens, and the fragment parameters stay cheap to tune (`design.md` § FragmentEvidenceStorage).
+- 2026-10-06: the fragment parameters stay cheap to tune (`design.md` § FragmentEvidenceStorage).
+- 2026-10-08: the guaranteed fragment length is 32 tokens, after the audit's five-line block (37 tokens) was missed at 40.
+- 2026-10-08: a function or method that contains a nested symbol is compared over its own code, with a boundary in place of each nested symbol; types and modules are not (`design.md` § ComparableContent).
+- 2026-10-08: the comparison of one pair of symbols stops at a work limit, and the answer names the pairs it did not compare completely (`design.md` § FragmentWorkLimit).
+- 2026-10-08: runs across a shared nested function, and whole-symbol keys for functions that contain nested functions, are a named follow-up.
+- 2026-10-09: inside a fragment, a stretch of data tokens (literal values, punctuation, and record-literal structure each backend classifies) must be identical, so different tables of values never match each other (`design.md` § DataStretches); the work limit stays as a safety net.
+- 2026-10-09: a data stretch is measured as a whole, so differing table entries never pad a fragment, and a sign before a number is a data token.
 - 2026-10-06: `--mutual` is in this change.
 - 2026-10-07: a mutual answer pages by walk position and reports no total, so a page costs only the walk it needs (`design.md` § AllPairsDiscovery).
 - 2026-10-06: the names `clones`, `--subjects-from`, `--mutual`, `--exclude`, and the four relation labels stand as specified.

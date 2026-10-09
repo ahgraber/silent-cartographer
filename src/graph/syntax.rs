@@ -91,6 +91,10 @@ pub enum TokenClass {
     Literal,
     /// Structure: keywords, punctuation, operators — never substituted.
     Other,
+    /// One contained corpus symbol in a comparable token sequence, never spelled by
+    /// [`SyntaxTree::spelled_tokens`]. Its text is the contained symbol's canonical identity and its
+    /// start is the contained span's start; it never matches any token.
+    Boundary,
 }
 
 /// One token of a declaration's spelled sequence, comments and whitespace excluded.
@@ -102,6 +106,10 @@ pub struct SpelledToken {
     pub text: String,
     /// The token's starting byte offset, fixing source order.
     pub start: usize,
+    /// Whether the token is a data token: a literal, a sign directly before a numeric literal, a
+    /// punctuation token, or part of a record literal's structure as the language's backend
+    /// classifies it. A boundary is never data.
+    pub data: bool,
 }
 
 /// The name-token spans of the trait and the implementing type in one `impl Trait for Type` block.
@@ -917,12 +925,18 @@ impl SyntaxTree {
     /// operators). Whitespace never appears (the tree carries none), and comment nodes and Python
     /// docstrings are skipped, so two sources differing only in layout, comments, or documentation
     /// spell the same sequence.
+    ///
+    /// Every token also carries whether it is data: a literal, a sign directly before a numeric
+    /// literal ([`is_numeric_sign`]), a punctuation token ([`is_punctuation`]), or a token within a
+    /// record literal's structure ([`record_structure_kinds`]).
     pub fn spelled_tokens(&self, span: ByteSpan) -> Vec<SpelledToken> {
         let root = self.tree.root_node();
+        let record_structure = record_structure_kinds(self.language);
         let mut out = Vec::new();
         let mut cursor = root.walk();
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
+        // Each node carries whether it lies within a record literal's structure.
+        let mut stack = vec![(root, false)];
+        while let Some((node, in_record)) = stack.pop() {
             if node.end_byte() <= span.start || node.start_byte() >= span.end {
                 continue;
             }
@@ -942,6 +956,7 @@ impl SyntaxTree {
                         class: TokenClass::Literal,
                         text: text.to_string(),
                         start: node.start_byte(),
+                        data: true,
                     });
                 }
                 continue;
@@ -958,15 +973,31 @@ impl SyntaxTree {
                 } else {
                     TokenClass::Other
                 };
+                let data = in_record
+                    || (class == TokenClass::Other
+                        && (is_punctuation(self.language, text) || is_numeric_sign(node, self.language)));
                 out.push(SpelledToken {
                     class,
                     text: text.to_string(),
                     start: node.start_byte(),
+                    data,
                 });
                 continue;
             }
             // Children are pushed in reverse so the stack pops them in source order.
-            let children: Vec<Node> = node.children(&mut cursor).collect();
+            let children: Vec<(Node, bool)> = node
+                .children(&mut cursor)
+                .enumerate()
+                .map(|(index, child)| {
+                    let field = u32::try_from(index)
+                        .ok()
+                        .and_then(|index| node.field_name_for_child(index));
+                    let opens = record_structure
+                        .iter()
+                        .any(|&(parent, at)| parent == kind && (at.is_none() || at == field));
+                    (child, in_record || opens)
+                })
+                .collect();
             for child in children.into_iter().rev() {
                 stack.push(child);
             }
@@ -1139,6 +1170,53 @@ fn literal_kinds(language: Language) -> &'static [&'static str] {
         ],
         Language::Python => &["integer", "float", "string", "true", "false", "none"],
     }
+}
+
+/// The record-literal structure of `language`, as `(node kind, field)` pairs: every token within
+/// the child at `field` of a node of that kind, or within any of its children when `field` is
+/// `None`, is a data token. Rust classifies the type name that opens a struct expression, the field
+/// name of each field initializer, and each shorthand field initializer. Python classifies none: a
+/// dictionary's keys are already literals, and a call that builds a record is code.
+fn record_structure_kinds(language: Language) -> &'static [(&'static str, Option<&'static str>)] {
+    match language {
+        Language::Rust => &[
+            ("struct_expression", Some("name")),
+            ("field_initializer", Some("field")),
+            ("shorthand_field_initializer", None),
+        ],
+        Language::Python => &[],
+    }
+}
+
+/// Whether a structural token of `language` is punctuation: its text consists only of the
+/// bracketing and separating characters `, ; : ( ) [ ] { }`, or, in Rust, is the `&` that borrows a
+/// slice or array literal, so a table of borrowed rows (`&[&["a", "b"], &["c"]]`) stays one stretch
+/// of data.
+fn is_punctuation(language: Language, text: &str) -> bool {
+    let separators = !text.is_empty() && text.chars().all(|c| ",;:()[]{}".contains(c));
+    separators || (language == Language::Rust && text == "&")
+}
+
+/// The node kinds of `language` that apply a sign to an operand, and its numeric literal kinds.
+fn signed_number_kinds(language: Language) -> (&'static [&'static str], &'static [&'static str]) {
+    match language {
+        Language::Rust => (
+            &["unary_expression", "negative_literal"],
+            &["integer_literal", "float_literal"],
+        ),
+        Language::Python => (&["unary_operator"], &["integer", "float"]),
+    }
+}
+
+/// Whether the leaf `node` is a sign (`-` or `+`) that directly precedes a numeric literal as its
+/// operand, so a table of negative numbers stays one stretch of data. A binary minus is never one.
+fn is_numeric_sign(node: Node, language: Language) -> bool {
+    let (signed, numbers) = signed_number_kinds(language);
+    matches!(node.kind(), "-" | "+")
+        && node.parent().is_some_and(|parent| signed.contains(&parent.kind()))
+        && node
+            .next_sibling()
+            .is_some_and(|operand| numbers.contains(&operand.kind()))
 }
 
 /// The identifier node kinds for `language` — leaf tokens of class [`TokenClass::Identifier`].
