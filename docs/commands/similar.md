@@ -38,9 +38,11 @@ Two clone markers can appear on rows, and marked rows rank ahead of the estimate
 
 | Marker          | Means                                                                                                                                  |
 | --------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `exact_clone`   | The same token sequence as the subject; the sources differ only in whitespace and comments                                             |
+| `exact_clone`   | The same token sequence as the subject; the sources differ only in whitespace, comments, and documentation                             |
 | `variant_clone` | The same token structure, with identifiers and literal values consistently substituted — a renamed copy, or one with changed constants |
 
+Documentation is a Rust doc comment or a Python docstring: the leading string statement of a module, function, or class body.
+Any other string statement is a literal value.
 The markers come from stored equivalence keys and are stated as fact.
 Neither claims the two symbols behave identically.
 
