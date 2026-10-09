@@ -203,6 +203,7 @@ Python classifies none: a dictionary's string keys are already literals, and a c
 The data-stretch length equals the k-gram length k, which the store already records, so no new column is needed.
 A k-gram whose tokens are all data tokens is hashed over its literal text verbatim; every other k-gram is hashed over placeholders, as before.
 Verification marks, within each placeholder-equal run, every token of a data stretch whose text differs between the symbols, and treats it as a break that no reported interval includes, as it treats a boundary token.
+A token matches only a token with the same data role.
 
 **Rationale:** A run made only of data tokens has no structure, so a consistent substitution of it always exists: any table of distinct values matches any other table at every shift.
 On Faker, one pair of tables produced about 4,290 such runs, and no work limit or coverage rule reduced them, because each run covers different subject code.
@@ -213,12 +214,15 @@ Tying the length to k keeps short literals in code, such as the constants in `x 
 Measuring the stretch as a whole, rather than only the part a run includes, stops differing table entries from padding a short shared statement up to the guaranteed length; on Faker, a first version that measured only the included part still reported 133 rows for `person.en::Provider`, almost all of them one shared line between the ends of two different tables.
 The condition applies per token, so every sub-interval of a valid interval is valid, and the scan stays a linear two-pointer pass.
 A sign before a number is a data token so that a table of negative numbers forms one stretch rather than many short ones.
+A backend assigns data roles from syntactic context, so the same spelling can carry different roles in two places; in Rust, a struct expression's field names are data, but the same text inside a macro's token tree is not.
+The fingerprint of a k-gram depends on its tokens' roles, so a match between tokens of different roles would have no shared fingerprint to find it; requiring the same role keeps every reported run inside what the fingerprints guarantee.
 
 **Alternatives considered:**
 
 - Require identical literals everywhere in fragments: simpler, but no copied block with a changed constant would be found.
 - Skip stretches whose token pattern repeats with a short period: a heuristic, and it hides copied tables.
 - Classify record field names as data in every backend by a fixed list: field names are grammar-specific node kinds, so the table belongs to each backend.
+- Assign data roles from the token sequence alone, so a role never depends on context: a macro body has no syntax tree, so the classifier would be a heuristic over token patterns, which would mark code such as a typed `let` binding as record structure.
 
 ### Decision: RelationLabels
 

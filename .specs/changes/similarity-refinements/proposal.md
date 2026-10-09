@@ -128,6 +128,7 @@ The build records the fragment parameters in the store, so tuning them later nee
 - 2026-10-08: runs across a shared nested function, and whole-symbol keys for functions that contain nested functions, are a named follow-up.
 - 2026-10-09: inside a fragment, a stretch of data tokens (literal values, punctuation, and record-literal structure each backend classifies) must be identical, so different tables of values never match each other (`design.md` § DataStretches); the work limit stays as a safety net.
 - 2026-10-09: a data stretch is measured as a whole, so differing table entries never pad a fragment, and a sign before a number is a data token.
+- 2026-10-09: a token in a shared fragment matches only a token with the same data role, so code whose roles a backend derives from different syntactic contexts does not match (`design.md` § DataStretches).
 - 2026-10-06: `--mutual` is in this change.
 - 2026-10-07: a mutual answer pages by walk position and reports no total, so a page costs only the walk it needs (`design.md` § AllPairsDiscovery).
 - 2026-10-06: the names `clones`, `--subjects-from`, `--mutual`, `--exclude`, and the four relation labels stand as specified.
