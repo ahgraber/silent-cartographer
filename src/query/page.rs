@@ -481,11 +481,12 @@ pub fn resolve_walk_resume(
             page_index: 0,
             after: None,
         }),
-        Some((page_index, Some(position))) => Ok(WalkResume {
+        // A page with no successor index cannot issue its next cursor; only a hand-edited token names one.
+        Some((page_index, Some(position))) if page_index < usize::MAX => Ok(WalkResume {
             page_index,
             after: Some(CanonicalId::from_raw(position)),
         }),
-        Some((_, None)) => Err(Failure::Usage(
+        Some(_) => Err(Failure::Usage(
             "the continuation token is malformed; re-issue the query without --cursor".to_string(),
         )
         .into()),
@@ -872,5 +873,16 @@ mod tests {
             message.contains("0..=2"),
             "the rejection names the valid page range: {message}"
         );
+    }
+
+    // A hand-edited walk token whose page index has no successor is malformed, not resumed.
+    #[test]
+    fn a_walk_token_whose_page_cannot_advance_is_refused() {
+        let identity = identity(1);
+        let token = encode_walk_token(&identity.hash(), usize::MAX, &CanonicalId::from_raw("test-ws::a"));
+        let err = resolve_walk_resume(Some(&token), Some(1), &identity)
+            .err()
+            .expect("an unadvanceable page index is refused");
+        assert!(err.to_string().contains("malformed"), "{err}");
     }
 }
