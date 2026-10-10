@@ -122,13 +122,26 @@ The build records the fragment parameters in the store, so tuning them later nee
 ## Resolved Questions
 
 - 2026-10-06: the fragment parameters stay cheap to tune (`design.md` § FragmentEvidenceStorage).
+  Decided with the user.
 - 2026-10-08: the guaranteed fragment length is 32 tokens, after the audit's five-line block (37 tokens) was missed at 40.
+  Decided with the user.
 - 2026-10-08: a function or method that contains a nested symbol is compared over its own code, with a boundary in place of each nested symbol; types and modules are not (`design.md` § ComparableContent).
+  Decided with the user.
 - 2026-10-08: the comparison of one pair of symbols stops at a work limit, and the answer names the pairs it did not compare completely (`design.md` § FragmentWorkLimit).
+  Decided with the user.
 - 2026-10-08: runs across a shared nested function, and whole-symbol keys for functions that contain nested functions, are a named follow-up.
+  Decided with the user.
 - 2026-10-09: inside a fragment, a stretch of data tokens (literal values, punctuation, and record-literal structure each backend classifies) must be identical, so different tables of values never match each other (`design.md` § DataStretches); the work limit stays as a safety net.
+  Decided with the user.
 - 2026-10-09: a data stretch is measured as a whole, so differing table entries never pad a fragment, and a sign before a number is a data token.
+  Decided with the user.
 - 2026-10-09: a token in a shared fragment matches only a token with the same data role, so code whose roles a backend derives from different syntactic contexts does not match (`design.md` § DataStretches).
+  Decided with the user.
+- 2026-10-09: a Python docstring is a leading string statement that Python reads as the docstring, so a leading formatted, bytes, or template string stays in the token sequence (`design.md` § DocumentationLeavesTheTokenSequence).
+  Decided with the user.
 - 2026-10-06: `--mutual` is in this change.
+  Decided with the user.
 - 2026-10-07: a mutual answer pages by walk position and reports no total, so a page costs only the walk it needs (`design.md` § AllPairsDiscovery).
+  Decided with the user.
 - 2026-10-06: the names `clones`, `--subjects-from`, `--mutual`, `--exclude`, and the four relation labels stand as specified.
+  Decided with the user.

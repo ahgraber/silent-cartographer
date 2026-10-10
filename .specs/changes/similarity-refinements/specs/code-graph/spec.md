@@ -7,7 +7,7 @@
 > Previously: the token sequences disregarded comments and whitespace only, so a Python docstring counted as a literal value while a Rust doc comment did not.
 
 For every corpus-contributing symbol that contains no other corpus-contributing symbol, the system SHALL persist two equivalence keys over the symbol's source: a formatting-insensitive key that two symbols share exactly when their token sequences are identical after comments, whitespace, and documentation are disregarded, and a substitution-insensitive key that two symbols share exactly when their token sequences are additionally identical under a consistent one-to-one substitution of identifiers and literal values.
-Documentation here is the text the system reads as a symbol's own documentation for its interface tier: a Rust doc comment, and a Python docstring, which is the leading string statement of a function, class, or module body.
+Documentation here is the text the system reads as a symbol's own documentation for its interface tier: a Rust doc comment, and a Python docstring, which is the leading string statement of a function, class, or module body that Python reads as its docstring.
 A string statement that is not in a docstring position SHALL remain in the token sequence as a literal value.
 A symbol that contains other corpus-contributing symbols SHALL carry no equivalence key.
 Keys SHALL be persisted with the build and wholly superseded by each subsequent build.

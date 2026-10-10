@@ -46,6 +46,7 @@ A `#[doc = "..."]` attribute stays in the Rust sequence, because the interface t
 
 **Rationale:** The interface tier already defines what counts as a symbol's documentation, so one definition serves both features, and Rust and Python get the same treatment.
 A string statement after the first statement is code that a reader may depend on, so it stays.
+A leading formatted, bytes, or template string is code too, because Python does not read it as the docstring; the shared detector excludes it, so the interface tier stops showing it as documentation as well.
 
 **Alternatives considered:**
 
@@ -500,3 +501,25 @@ clones
 
 - **A per-subject answer drifts from the single answer.**
   Mitigation: the single, batch, and mutual paths share the candidate and materialization functions, and a test compares the outputs byte for byte.
+
+## Spec Changes
+
+- **Change:** code-graph: add scenario "The answer applies the length the store records".
+  **Source:** decision FragmentEvidenceStorage.
+  **Rationale:** the fragment parameters are tuned by rebuilding, so an answer must apply the parameters its store was built under.
+  **Approved by user:** 2026-10-06
+
+- **Change:** code-graph: add scenario "A function that contains a nested function contributes evidence for its own code"; code-navigation: add scenarios "Shared lines in the own code of a function with a nested function are found" and "A run does not include a nested symbol".
+  **Source:** decision ComparableContent.
+  **Rationale:** a function that defines a nested function still holds code of its own that can be copied, and a nested symbol is compared separately.
+  **Approved by user:** 2026-10-08
+
+- **Change:** code-navigation: add scenario "A repetitive pair is named, not reported in part".
+  **Source:** decision FragmentWorkLimit.
+  **Rationale:** a pair that reaches the work limit has no complete answer, so the answer names it instead of reporting part of it.
+  **Approved by user:** 2026-10-08
+
+- **Change:** code-navigation: add scenarios "Different tables of literal values share no fragment", "Different table values do not extend a fragment", "Different tables of negative numbers share no fragment", "A copied table is an exact fragment", "Different tables of records share no fragment", and "A changed constant in code remains a variant".
+  **Source:** decision DataStretches.
+  **Rationale:** a table of values has no structure, so only an identical table is a copy, while a changed constant inside code is still a variant.
+  **Approved by user:** 2026-10-09
