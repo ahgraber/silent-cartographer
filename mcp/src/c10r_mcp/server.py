@@ -433,7 +433,8 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
                 description=(
                     "Answer for every reference in this list in one call; the answer "
                     "holds one per-subject answer for each, in list order, each the "
-                    "one a single-subject call returns. Not combinable with "
+                    "one a single-subject call returns. Each entry is one non-blank "
+                    "line. Not combinable with "
                     "`reference`, `at`, `cursor`, or `mutual`."
                 )
             ),
