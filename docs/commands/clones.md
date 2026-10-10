@@ -110,7 +110,8 @@ Only a symbol with no comparable content, such as a type or module that contains
 
 ### Data stretches
 
-A stretch of 16 or more consecutive data tokens, the fingerprint length the index records, must be identical in both symbols for a run to include it.
+A data stretch is 16 or more consecutive data tokens, the fingerprint length the index records, in both symbols at the same positions.
+A run includes a token of a data stretch only where that token is identical in both symbols.
 Data tokens are literal values, a sign directly before a number, punctuation, and, in Rust, the field names and the type name of a struct literal.
 A data token matches only another data token, so a Rust struct literal inside a macro call, where its field names are not data tokens, does not match a copy outside one.
 Two different tables of values therefore never match, while a copied table matches exactly.

@@ -87,7 +87,7 @@ Surrounding whitespace is trimmed and blank lines are skipped.
 A list that cannot be read, is not valid UTF-8, or is `-` while standard input is a terminal fails with exit code 2 and a message naming the source.
 
 Each subject gets the answer a single `c10r similar <reference>` returns under the same `--detail`, `--max-lines`, `--exclude`, and `--limit`, including its typed outcome, rows, markers, labels, truncation disclosure, and continuation token.
-The JSON answer is an `answers` array in list order, each entry holding the `reference` as written and its `answer`, the object a single `--json` invocation emits.
+The JSON answer is an `answers` array in list order, each entry holding the trimmed `reference` and its `answer`, the object a single `--json` invocation emits.
 The human rendering prints each reference as a `#` heading followed by its single-subject rendering.
 
 An ambiguous reference yields its candidate set, and an unresolved reference yields the typed absence.
