@@ -678,6 +678,99 @@ fn fragment_fingerprints_follow_the_build() {
     );
 }
 
+// _(Rebuild is idempotent; a changed leaf's evidence is replaced)_ — on Python, and on a function
+// that contains a nested function, whose evidence is that of its own code.
+#[test]
+fn fragment_fingerprints_follow_the_build_for_python_and_nested_functions() {
+    use silent_cartographer::graph::syntax::Language;
+    use silent_cartographer::semantic::model::SymbolKind;
+
+    use crate::support::{Decl, decl_id, declared_index};
+
+    const OUTER: &[(&str, SegmentKind)] = &[("outer", SegmentKind::Method)];
+    const INNER: &[(&str, SegmentKind)] = &[("outer", SegmentKind::Method), ("inner", SegmentKind::Method)];
+
+    // `operator` is spelled in every statement of the outer function's own code.
+    let source = |language: Language, nested: bool, operator: &str| -> String {
+        let statements = |indent: &str, line: &dyn Fn(usize) -> String| -> String {
+            (0..8).map(|i| format!("{indent}{}\n", line(i))).collect()
+        };
+        match (language, nested) {
+            (Language::Rust, true) => format!(
+                "pub fn outer(x: u32) -> u32 {{\n{}    fn inner(y: u32) -> u32 {{ y - 1 }}\n    inner(x)\n}}\n",
+                statements("    ", &|i| format!("let v{i} = 1 {operator} 2;"))
+            ),
+            (Language::Rust, false) => format!(
+                "pub fn outer(x: u32) -> u32 {{\n{}    x\n}}\n",
+                statements("    ", &|i| format!("let v{i} = 1 {operator} 2;"))
+            ),
+            (Language::Python, true) => format!(
+                "def outer(x):\n    def inner(y):\n        return y - 1\n{}    return inner(x)\n",
+                statements("    ", &|i| format!("v{i} = 1 {operator} 2"))
+            ),
+            (Language::Python, false) => format!(
+                "def outer(x):\n{}    return x\n",
+                statements("    ", &|i| format!("v{i} = 1 {operator} 2"))
+            ),
+        }
+    };
+    let ingest_source = |store: &mut GraphStore, language: Language, nested: bool, operator: &str| {
+        let (doc, within_inner) = match language {
+            Language::Rust => ("outer.rs", "fn inner("),
+            Language::Python => ("outer.py", "def inner("),
+        };
+        let text = source(language, nested, operator);
+        let within_outer = if language == Language::Rust {
+            "pub fn outer("
+        } else {
+            "def outer("
+        };
+        let mut decls = vec![Decl {
+            segments: OUTER,
+            kind: SymbolKind::Function,
+            within: within_outer,
+        }];
+        if nested {
+            decls.push(Decl {
+                segments: INNER,
+                kind: SymbolKind::Function,
+                within: within_inner,
+            });
+        }
+        let index = declared_index(language, doc, &text, &decls);
+        ingest(store, &ws(), Some(WS_ROOT), &index, &[(doc.to_string(), text)]).unwrap();
+    };
+    for (language, nested) in [
+        (Language::Rust, true),
+        (Language::Python, false),
+        (Language::Python, true),
+    ] {
+        let case = format!("{language:?} nested={nested}");
+        let outer = decl_id(OUTER);
+        let mut store = GraphStore::open_in_memory().unwrap();
+        ingest_source(&mut store, language, nested, "+");
+        let first = store.clone_fingerprints_of(&outer).unwrap();
+        assert!(!first.is_empty(), "{case}");
+        ingest_source(&mut store, language, nested, "+");
+        assert_eq!(store.clone_fingerprints_of(&outer).unwrap(), first, "{case}");
+
+        ingest_source(&mut store, language, nested, "*");
+        let second = store.clone_fingerprints_of(&outer).unwrap();
+        assert_ne!(second, first, "{case}");
+        let mut fresh = GraphStore::open_in_memory().unwrap();
+        ingest_source(&mut fresh, language, nested, "*");
+        assert_eq!(second, fresh.clone_fingerprints_of(&outer).unwrap(), "{case}");
+        let (hash, ordinal) = first[0];
+        assert!(
+            !store
+                .symbols_with_fingerprint(hash)
+                .unwrap()
+                .contains(&(outer.clone(), ordinal)),
+            "{case}: no row from the prior source remains"
+        );
+    }
+}
+
 // _(A failed build leaves prior evidence authoritative)_ — a build abandoned after clearing rolls
 // back, as for the representations.
 #[test]

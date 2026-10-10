@@ -2423,3 +2423,201 @@ fn a_copied_table_with_one_edited_value_reports_its_identical_parts() {
         );
     }
 }
+
+// _(The data-stretch length comes from the store)_ — a lone differing constant is a variant at the
+// built length, and a break at a recorded length of 1, so no run includes it.
+#[test]
+fn the_fragment_answer_applies_the_recorded_data_stretch_length() {
+    for fixture in data_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture.db(dir.path());
+        let constant = fixture.source.find("item * 9").unwrap() + "item * ".len();
+        let covers = |row: &&Value| {
+            let (start, end) = byte_span(&row["fragment"]["other_run"]);
+            start <= constant && constant < end
+        };
+        let built = clones(&db, dir.path(), Some("constant_one"), None, 0, None);
+        assert!(fragments_naming(&built, CONSTANT_TWO).iter().any(covers));
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute("UPDATE index_metadata SET fragment_kgram_length = 1 WHERE id = 1", [])
+            .unwrap();
+        drop(connection);
+        let answer = clones(&db, dir.path(), Some("constant_one"), None, 0, None);
+        let rows = fragments_naming(&answer, CONSTANT_TWO);
+        assert!(!rows.is_empty(), "{:?}: {answer}", fixture.language);
+        assert!(!rows.iter().any(covers), "{:?}: {answer}", fixture.language);
+    }
+}
+
+/// A build of `source` in `language`, declaring `decls`, under `dir`.
+fn build_source(language: Language, doc: &str, source: &str, decls: &[Decl], dir: &Path) -> std::path::PathBuf {
+    let db = dir.join("index.db");
+    let index = support::declared_index(language, doc, source, decls);
+    silent_cartographer::commands::build_from_index(&db, "test-ws", dir, &index, &[(doc.into(), source.into())])
+        .unwrap();
+    db
+}
+
+// _(Documentation is disregarded by the clone key)_ — two functions differing only in a docstring
+// (Python) or doc comments (Rust) are exact clones, in the corpus groups and from either subject.
+#[test]
+fn functions_differing_only_in_documentation_are_exact_clones() {
+    for language in LANGUAGES {
+        let (doc, source, withins) = match language {
+            Language::Rust => (
+                "src/docs.rs",
+                "\
+/// Adds the pair.
+pub fn alpha(x: u32, y: u32) -> u32 {
+    /// Inner note.
+    let total = x + y;
+    total * 3
+}
+
+/// Sums two numbers and scales the result, described differently.
+pub fn alpha(x: u32, y: u32) -> u32 {
+    /// Another inner note.
+    let total = x + y;
+    total * 3
+}
+",
+                [
+                    "/// Adds the pair.\npub fn alpha(",
+                    "described differently.\npub fn alpha(",
+                ],
+            ),
+            Language::Python => (
+                "docs.py",
+                "\
+def alpha(x, y):
+    \"\"\"Adds the pair.\"\"\"
+    total = x + y
+    return total * 3
+
+
+def alpha(x, y):
+    \"\"\"Sums two numbers and scales the result, described differently.\"\"\"
+    total = x + y
+    return total * 3
+",
+                ["def alpha(x, y):\n    \"\"\"Adds", "def alpha(x, y):\n    \"\"\"Sums"],
+            ),
+        };
+        let decls = vec![
+            decl(ALPHA_1, SymbolKind::Function, withins[0]),
+            decl(ALPHA_2, SymbolKind::Function, withins[1]),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let db = build_source(language, doc, source, &decls, dir.path());
+        let corpus = clones(&db, dir.path(), None, None, 0, None);
+        let group = group_with(&corpus, ALPHA_1);
+        assert_eq!(group["certainty"], "exact_clone", "{language:?}: {corpus}");
+        assert_eq!(
+            sorted(ids(&group["members"], "symbol")),
+            id_strings(&[ALPHA_1, ALPHA_2]),
+            "{language:?}"
+        );
+        for (subject, other) in [("m1::alpha", ALPHA_2), ("m2::alpha", ALPHA_1)] {
+            let answer = clones(&db, dir.path(), Some(subject), None, 0, None);
+            let rows = rows_naming(&answer, other);
+            assert_eq!(rows.len(), 1, "{language:?}: {answer}");
+            assert_eq!(rows[0]["certainty"], "exact_clone", "{language:?}");
+        }
+    }
+}
+
+// _(The marker composes with staleness)_ — through the command, a changed source leaves the answer
+// stale and still graded.
+#[test]
+fn a_stale_clones_command_answer_carries_the_flag_and_the_marker() {
+    for fixture in fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(fixture.doc);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, fixture.source).unwrap();
+        let db = fixture.db(dir.path());
+        std::fs::write(&path, format!("{}\n// edited\n", fixture.source)).unwrap();
+        for answer in [
+            clones(&db, dir.path(), None, None, 0, None),
+            clones(&db, dir.path(), Some("n1::bravo"), None, 0, None),
+        ] {
+            assert_eq!(answer["stale"], true, "{:?}: {answer}", fixture.language);
+            assert_eq!(answer["grade"], "token_equivalence", "{:?}", fixture.language);
+            assert!(answer["guaranteed_fragment_length"].is_u64());
+        }
+    }
+}
+
+const PLUS_Z1: Segments = &[("z1", SegmentKind::Module), ("plus", SegmentKind::Method)];
+const PLUS_Z2: Segments = &[("z2", SegmentKind::Module), ("plus", SegmentKind::Method)];
+const PLUS_Z3: Segments = &[("z3", SegmentKind::Module), ("plus", SegmentKind::Method)];
+const MINUS_A1: Segments = &[("a1", SegmentKind::Module), ("minus", SegmentKind::Method)];
+const MINUS_A2: Segments = &[("a2", SegmentKind::Module), ("minus", SegmentKind::Method)];
+const DIVIDE_B1: Segments = &[("b1", SegmentKind::Module), ("divide", SegmentKind::Method)];
+const DIVIDE_B2: Segments = &[("b2", SegmentKind::Module), ("divide", SegmentKind::Method)];
+const TIMES_C1: Segments = &[("c1", SegmentKind::Module), ("times", SegmentKind::Method)];
+const TIMES_C2: Segments = &[("c2", SegmentKind::Module), ("times", SegmentKind::Method)];
+
+// _(Groups of equal length order by member count, then lowest identity)_ — four groups of one token
+// count: the three-member group first although its lowest identity sorts last, then the two-member
+// groups by lowest identity.
+#[test]
+fn groups_of_equal_token_count_order_by_member_count_then_lowest_identity() {
+    for language in LANGUAGES {
+        let (doc, opener, operations) = match language {
+            Language::Rust => ("src/order.rs", "pub fn ", "{ x OP y }"),
+            Language::Python => ("order.py", "def ", ":\n    return x OP y"),
+        };
+        let signature = match language {
+            Language::Rust => "(x: u32, y: u32) -> u32 ",
+            Language::Python => "(x, y)",
+        };
+        let members: [(Segments, &str, &str); 9] = [
+            (PLUS_Z1, "plus", "+"),
+            (PLUS_Z2, "plus", "+"),
+            (PLUS_Z3, "plus", "+"),
+            (MINUS_A1, "minus", "-"),
+            (MINUS_A2, "minus", "-"),
+            (DIVIDE_B1, "divide", "/"),
+            (DIVIDE_B2, "divide", "/"),
+            (TIMES_C1, "times", "*"),
+            (TIMES_C2, "times", "*"),
+        ];
+        let mut source = String::new();
+        let mut decls = Vec::new();
+        for (index, (segments, name, operator)) in members.into_iter().enumerate() {
+            let within: &'static str = Box::leak(format!("// m{index}\n{opener}{name}(").into_boxed_str());
+            let comment = if language == Language::Rust { "//" } else { "#" };
+            source.push_str(&format!(
+                "{comment} m{index}\n{opener}{name}{signature}{}\n\n",
+                operations.replace("OP", operator)
+            ));
+            let within = if language == Language::Rust {
+                within
+            } else {
+                Box::leak(format!("# m{index}\n{opener}{name}(").into_boxed_str())
+            };
+            decls.push(decl(segments, SymbolKind::Function, within));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = build_source(language, doc, &source, &decls, dir.path());
+        let answer = clones(&db, dir.path(), None, None, 0, None);
+        let groups = groups_of(&answer);
+        let counts: Vec<u64> = groups.iter().map(|g| g["token_count"].as_u64().unwrap()).collect();
+        assert_eq!(counts.len(), 4, "{language:?}: {answer}");
+        assert!(
+            counts.windows(2).all(|pair| pair[0] == pair[1]),
+            "{language:?}: {counts:?}"
+        );
+        let lowest: Vec<String> = groups
+            .iter()
+            .map(|group| sorted(ids(&group["members"], "symbol")).remove(0))
+            .collect();
+        let expected: Vec<String> = [PLUS_Z1, MINUS_A1, DIVIDE_B1, TIMES_C1]
+            .iter()
+            .map(|segments| decl_id(segments).as_str().to_string())
+            .collect();
+        assert_eq!(lowest, expected, "{language:?}: {answer}");
+    }
+}

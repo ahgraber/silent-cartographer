@@ -1658,6 +1658,25 @@ class Right(Base):
         }
     }
 
+    // _(The human rendering names the excluded labels)_ — sorted, once each.
+    #[test]
+    fn the_human_render_names_the_excluded_relations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = built_db(dir.path());
+        let out = run_core(
+            &db,
+            dir.path(),
+            &[RelationLabel::TypeFamily, RelationLabel::TestsSubject],
+            0,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("excluded relations: tests_subject, type_family"), "{out}");
+        let none = run_core(&db, dir.path(), &[], 0, None, false).unwrap();
+        assert!(!none.contains("excluded relations"), "{none}");
+    }
+
     // _(Excluded rows are omitted and the order is kept; the exclusion is disclosed)_ — a repeated
     // label counts once, and the disclosed set is sorted.
     #[test]
@@ -1865,6 +1884,135 @@ class Right(Base):
         );
     }
 
+    /// Non-default controls shared by a single and a batch invocation.
+    const BODY_CONTROLS: (Detail, usize, usize) = (Detail::Body, 1, 1);
+
+    /// `similar` for `reference` under [`BODY_CONTROLS`] and `exclude`, as a single invocation.
+    fn single_under_controls(
+        db: &std::path::Path,
+        root: &std::path::Path,
+        reference: &str,
+        exclude: &[RelationLabel],
+    ) -> serde_json::Value {
+        let (detail, max_lines, limit) = BODY_CONTROLS;
+        let out = silent_cartographer::commands::run_similar(
+            db,
+            root,
+            "rust-analyzer",
+            Some(reference),
+            None,
+            detail,
+            max_lines,
+            true,
+            exclude,
+            limit,
+            None,
+            true,
+            false,
+            PositionUnit::Line,
+        )
+        .unwrap();
+        serde_json::from_str(&out).unwrap()
+    }
+
+    /// `similar` for `references` under [`BODY_CONTROLS`] and `exclude`, as a batch.
+    fn batch_under_controls(
+        db: &std::path::Path,
+        root: &std::path::Path,
+        references: &[&str],
+        exclude: &[RelationLabel],
+    ) -> Vec<serde_json::Value> {
+        let (detail, max_lines, limit) = BODY_CONTROLS;
+        let references: Vec<String> = references.iter().map(|r| r.to_string()).collect();
+        let out = silent_cartographer::commands::run_similar_batch(
+            db,
+            root,
+            "rust-analyzer",
+            &references,
+            detail,
+            max_lines,
+            true,
+            exclude,
+            limit,
+            true,
+            false,
+            PositionUnit::Line,
+        )
+        .unwrap();
+        let answer: serde_json::Value = serde_json::from_str(&out).unwrap();
+        answer["answers"].as_array().unwrap().clone()
+    }
+
+    /// The `clone_certainty` of the row for `row` in `answer`, if it has one.
+    fn certainty_of(answer: &serde_json::Value, row: Path) -> Option<&str> {
+        answer["outcome"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["symbol"]["canonical_id"] == decl_id(row).as_str())
+            .unwrap_or_else(|| panic!("{row:?} is a row of the answer"))["clone_certainty"]
+            .as_str()
+    }
+
+    // _(A clone row carries its marker, singly and in a batch)_ — an exact sibling and a variant
+    // base method, and the batch answer equals the single answer, on every backend.
+    #[test]
+    fn a_clone_row_carries_its_marker_in_a_single_and_a_batch_answer() {
+        for language in support::LANGUAGES {
+            let dir = tempfile::tempdir().unwrap();
+            let db = db_for(&mutual::clone_family(language), dir.path());
+            let subject = decl_id(SQUARE_DESCRIBE);
+            let single = single_json(&db, dir.path(), subject.as_str(), &[], 0, None);
+            assert_eq!(
+                certainty_of(&single, CIRCLE_DESCRIBE),
+                Some("exact_clone"),
+                "{language:?}"
+            );
+            assert_eq!(
+                certainty_of(&single, SHAPE_DESCRIBE),
+                Some("variant_clone"),
+                "{language:?}"
+            );
+            let answers = batch_json(&db, dir.path(), &[subject.as_str()], &[], 0);
+            assert_eq!(answers[0]["answer"], single, "{language:?}");
+        }
+    }
+
+    // _(A batch answers as a single invocation does under every control)_ — body detail, a line
+    // bound, an exclusion, and a limit, for a clone subject, a subject with no clone key, and an
+    // unresolved reference, on every backend.
+    #[test]
+    fn a_batch_equals_single_answers_under_non_default_controls() {
+        for language in support::LANGUAGES {
+            let dir = tempfile::tempdir().unwrap();
+            let db = db_for(&mutual::clone_family(language), dir.path());
+            let (clone, keyless) = (decl_id(SQUARE_DESCRIBE), decl_id(SQUARE));
+            let references = [clone.as_str(), keyless.as_str(), "no_such_symbol_anywhere"];
+            for exclude in [&[][..], &[RelationLabel::TypeFamily][..]] {
+                let answers = batch_under_controls(&db, dir.path(), &references, exclude);
+                for (entry, reference) in answers.iter().zip(references) {
+                    assert_eq!(
+                        entry["answer"],
+                        single_under_controls(&db, dir.path(), reference, exclude),
+                        "{language:?}: {reference} excluding {exclude:?}"
+                    );
+                }
+                let rows = answers[0]["answer"]["outcome"]["results"].as_array().unwrap();
+                assert_eq!(rows.len(), 1, "{language:?}: the limit applies");
+                assert!(rows[0].get("content").is_some(), "{language:?}: body detail applies");
+            }
+            let keyless_answer = single_under_controls(&db, dir.path(), keyless.as_str(), &[]);
+            assert!(
+                keyless_answer["outcome"]["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.get("clone_certainty").is_none()),
+                "{language:?}: a subject with no clone key marks no row"
+            );
+        }
+    }
+
     // _(An empty list is typed absence)_ — a definite none, not a failure, in both renderings.
     #[test]
     fn an_empty_batch_is_a_definite_none() {
@@ -1957,7 +2105,7 @@ class Right(Base):
         /// Two sibling methods with identical bodies beside a base method that differs only in a
         /// literal: the siblings are exact clones and type-family relatives of each other, the base
         /// method a variant clone of both.
-        fn clone_family(language: Language) -> Fixture {
+        pub(super) fn clone_family(language: Language) -> Fixture {
             match language {
                 Language::Rust => Fixture {
                     language,
@@ -2182,6 +2330,82 @@ pub fn plain(text: &str) -> usize { text.len() }
                     !pair_ids(&walk(&fixture, None, None, &[RelationLabel::TestsSubject])).contains(&pair),
                     "{lang:?}: the exclusion drops the pair"
                 );
+            }
+        }
+
+        // _(A member carries the labels its row has in the other's answer)_ — a test that calls its
+        // subject is labeled as using it, and the subject as used by it, whichever sorts first.
+        #[test]
+        fn each_member_of_a_pair_carries_its_own_direction_of_labels() {
+            for fixture in [python_test_relations(), rust_test_relations()] {
+                let lang = fixture.language;
+                let walk = walk(&fixture, None, None, &[]);
+                let Outcome::Found { results } = &walk.answer.outcome else {
+                    panic!("{lang:?}: expected found pairs")
+                };
+                let (lower, upper) = pair_of(CORE, CHECKS);
+                let pair = results
+                    .iter()
+                    .find(|pair| pair.lower.symbol.canonical_id == lower && pair.upper.symbol.canonical_id == upper)
+                    .unwrap_or_else(|| panic!("{lang:?}: the test and its subject are a pair"));
+                let labels_of = |id: &CanonicalId| -> Vec<RelationLabel> {
+                    let member = if pair.lower.symbol.canonical_id == *id {
+                        &pair.lower
+                    } else {
+                        &pair.upper
+                    };
+                    member.relations.iter().map(|r| r.label).collect()
+                };
+                assert_eq!(
+                    labels_of(&decl_id(CHECKS)),
+                    [RelationLabel::UsesSubject, RelationLabel::TestsSubject],
+                    "{lang:?}"
+                );
+                assert_eq!(labels_of(&decl_id(CORE)), [RelationLabel::UsedBySubject], "{lang:?}");
+            }
+        }
+
+        // _(The exclusion is disclosed on a mutual answer)_ — a repeated label counts once, sorted.
+        #[test]
+        fn a_mutual_answer_discloses_the_excluded_labels() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = db_for(&python_relations(), dir.path());
+            let all = mutual_json(&db, dir.path(), &[], 0, None);
+            assert!(all.get("excluded_relations").is_none(), "no exclusion, no disclosure");
+            let excluded = mutual_json(
+                &db,
+                dir.path(),
+                &[
+                    RelationLabel::TypeFamily,
+                    RelationLabel::TestsSubject,
+                    RelationLabel::TestsSubject,
+                ],
+                0,
+                None,
+            );
+            assert_eq!(
+                excluded["excluded_relations"],
+                serde_json::json!(["tests_subject", "type_family"])
+            );
+        }
+
+        // _(The human rendering shows each pair's labels)_ — each member's own labels, with the rule of
+        // a test label.
+        #[test]
+        fn the_human_render_shows_each_pairs_labels() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = db_for(&rust_test_relations(), dir.path());
+            let out = mutual(&db, dir.path(), &[], 0, None, false).unwrap();
+            let pair = out
+                .lines()
+                .find(|line| line.contains("  <->  "))
+                .unwrap_or_else(|| panic!("a pair line: {out}"));
+            for shown in [
+                "[uses_subject]",
+                "[used_by_subject]",
+                "[tests_subject (rule: test_attribute)]",
+            ] {
+                assert!(pair.contains(shown), "{shown} is rendered: {out}");
             }
         }
 

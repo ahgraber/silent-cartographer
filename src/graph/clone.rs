@@ -839,6 +839,23 @@ mod tests {
         );
     }
 
+    /// Tokens alike in class and text but differing in data role are not counterparts: no run spans them.
+    #[test]
+    fn no_run_spans_tokens_of_differing_data_role() {
+        let a = spelled("{ x = y + 1 ; z = w + 2 ; }");
+        let mut b = a.clone();
+        let flipped = 4;
+        assert!(!b[flipped].data);
+        b[flipped].data = true;
+        let runs = shared_runs(&a, &b, &[(0, 0), (a.len() - 1, a.len() - 1)], 3, K);
+        assert!(!runs.is_empty());
+        assert!(
+            runs.iter()
+                .all(|run| flipped < run.a_start || run.a_start + run.length <= flipped),
+            "{runs:?}"
+        );
+    }
+
     #[test]
     fn a_renamed_run_is_variant() {
         let a = spelled("{ x = y + 1 ; }");
