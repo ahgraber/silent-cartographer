@@ -10,7 +10,7 @@ The contract covers what the surface advertises, how every invocation is scoped 
 
 ### Requirement: Tools mirror query commands
 
-The server SHALL expose exactly one tool per query command it covers — `get`, `trace`, `find`, `search`, `similar`, and `impact` — named for that command, and SHALL NOT expose a tool that answers a question no single command answers.
+The server SHALL expose exactly one tool per query command it covers — `get`, `trace`, `find`, `search`, `similar`, `clones`, and `impact` — named for that command, and SHALL NOT expose a tool that answers a question no single command answers.
 Each tool SHALL accept the bounding and projection controls its mirrored command accepts, so a caller governs result size through the tool rather than by post-processing the answer.
 
 #### Scenario: Tool list enumerates the mirrored commands
@@ -30,6 +30,24 @@ Each tool SHALL accept the bounding and projection controls its mirrored command
 - **GIVEN** a workspace whose index holds more matches than a requested cap
 - **WHEN** a tool is invoked with that cap
 - **THEN** the answer carries no more results than the cap and discloses that the result set was truncated
+
+#### Scenario: The clones tool is listed
+
+- **GIVEN** a running server
+- **WHEN** a client lists the available tools
+- **THEN** the list names a `clones` tool
+
+#### Scenario: Many subjects reach similar in one tool call
+
+- **GIVEN** a workspace with three indexed symbols
+- **WHEN** the `similar` tool is invoked once with the three references as its subject list
+- **THEN** the answer holds three per-subject answers in list order
+
+#### Scenario: Exclusions reach similar
+
+- **GIVEN** a subject whose `similar` answer holds a row carrying `tests_subject`
+- **WHEN** the `similar` tool is invoked for the subject excluding `tests_subject`
+- **THEN** the answer holds no row carrying `tests_subject`
 
 ### Requirement: The server states when to prefer it
 
