@@ -1,5 +1,5 @@
 {
-  "surface_version": 13,
+  "surface_version": 14,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -612,6 +612,15 @@
           "values": [
             "rust",
             "python"
+          ],
+          "global": false
+        },
+        {
+          "name": "python-indexer",
+          "takes_value": true,
+          "values": [
+            "ty-scip",
+            "scip-python"
           ],
           "global": false
         },

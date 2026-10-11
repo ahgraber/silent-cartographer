@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::identity::{CanonicalId, DefinitionSite, ProjectionInput, WorkspaceId, project_all};
 use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SymbolClass, SymbolKind};
-use crate::semantic::python_adapter::PythonAdapter;
+use crate::semantic::python_adapter::PythonIndexer;
 use crate::semantic::rust_adapter::RustAdapter;
 
 use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join, module_by_document};
@@ -203,7 +203,7 @@ fn occurrence_site(occ: &crate::semantic::model::ExtractedOccurrence) -> Definit
 /// with the Rust grammar would produce a silently wrong graph, where a refusal names the analyzer
 /// nobody taught the system about.
 pub fn backend_language(analyzer_name: &str) -> Result<Language, IngestError> {
-    if analyzer_name == PythonAdapter::analyzer_name() {
+    if PythonIndexer::from_analyzer_name(analyzer_name).is_some() {
         Ok(Language::Python)
     } else if analyzer_name == RustAdapter::analyzer_name() {
         Ok(Language::Rust)
@@ -1268,10 +1268,9 @@ mod tests {
     #[test]
     fn the_language_dispatch_refuses_an_analyzer_no_backend_claims() {
         assert_eq!(backend_language(RustAdapter::analyzer_name()).unwrap(), Language::Rust);
-        assert_eq!(
-            backend_language(PythonAdapter::analyzer_name()).unwrap(),
-            Language::Python
-        );
+        for indexer in [PythonIndexer::ScipPython, PythonIndexer::TyScip] {
+            assert_eq!(backend_language(indexer.analyzer_name()).unwrap(), Language::Python);
+        }
 
         let refused = backend_language("scip-typescript").expect_err("an unclaimed analyzer is refused");
         assert!(

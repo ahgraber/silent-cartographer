@@ -512,6 +512,8 @@ fn clap_tree_matches_the_recorded_flag_vocabulary() {
         "rust-analyzer",
         "language",
         "environment",
+        // `build`'s Python indexer selector.
+        "python-indexer",
         // `build`'s override for a store that already describes the workspace.
         "force",
         // `build`'s chunk parameters: the bound on each embedded chunk, and the overlap between

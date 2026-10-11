@@ -336,7 +336,7 @@ fn exemplar_scip_fixture_translates_and_passes_conformance() {
 #[test]
 #[ignore = "fixture generator; needs python3 + scip-python; run explicitly to regenerate tests/fixtures/python-conformance/index.scip"]
 fn generate_python_conformance_scip_fixture() {
-    use silent_cartographer::semantic::python_adapter::PythonAdapter;
+    use silent_cartographer::semantic::python_adapter::{PythonAdapter, PythonIndexer};
 
     let root = support::python_fixture_root();
     let venv = root.join(".venv");
@@ -349,7 +349,8 @@ fn generate_python_conformance_scip_fixture() {
         assert!(status.success(), "python3 -m venv failed");
     }
 
-    let adapter = PythonAdapter::new("scip-python", venv, "python-conformance")
+    let indexer = PythonIndexer::ScipPython;
+    let adapter = PythonAdapter::new(indexer, indexer.executable(), venv, "python-conformance")
         .expect("scip-python is required: npm install -g @sourcegraph/scip-python");
     let output = root.join("index.scip");
     adapter
@@ -362,50 +363,98 @@ fn generate_python_conformance_scip_fixture() {
     std::fs::write(root.join("SCIP-PYTHON-VERSION"), format!("{version}\n")).expect("record tool version");
 }
 
-// _(Scenario: Python definition occurrence extracted)_ — from the committed fixture index, a class
+/// One-off generator for the checked-in ty-scip fixture index. Run explicitly to (re)create it:
+/// `cargo test --test semantic_engine -- --ignored generate_ty_scip_conformance_fixture`
+///
+/// Generates THROUGH the adapter, like the scip-python generator. Needs `uv` (to create the fixture
+/// venv on first run, since ty-scip refuses an environment that does not exist) and `ty-scip` on PATH.
+#[test]
+#[ignore = "fixture generator; needs uv + ty-scip; run explicitly to regenerate tests/fixtures/python-conformance/ty-scip.scip"]
+fn generate_ty_scip_conformance_fixture() {
+    use silent_cartographer::semantic::python_adapter::{PythonAdapter, PythonIndexer};
+
+    let root = support::python_fixture_root();
+    let venv = root.join(".venv");
+    if !venv.is_dir() {
+        let status = std::process::Command::new("uv")
+            .args(["venv", "--no-project"])
+            .arg(&venv)
+            .status()
+            .expect("uv is required to create the fixture venv");
+        assert!(status.success(), "uv venv failed");
+    }
+
+    let indexer = PythonIndexer::TyScip;
+    let adapter = PythonAdapter::new(indexer, indexer.executable(), venv, "python-conformance")
+        .expect("ty-scip is required: uv tool install ty-scip");
+    let output = root.join("ty-scip.scip");
+    adapter.write_scip_index(&root, &output).expect("ty-scip index runs");
+    assert!(output.exists());
+
+    let version = adapter.provenance().analyzer_version;
+    std::fs::write(root.join("TY-SCIP-VERSION"), format!("{version}\n")).expect("record tool version");
+}
+
+/// The committed Python fixture indexes, one per Python indexer.
+const PYTHON_FIXTURE_INDEXES: [&str; 2] = ["index.scip", "ty-scip.scip"];
+
+// _(Scenario: Python definition occurrence extracted)_ — from each committed fixture index, a class
 // defined in the fixture arrives with its resolved descriptor and a definition-role occurrence
 // whose range maps through a declared encoding.
 #[test]
 fn python_definition_occurrence_extracted() {
-    let index = support::python_fixture_index();
-    let widget = index
-        .symbols
-        .iter()
-        .find(|s| s.terminal_name() == Some("Widget"))
-        .expect("Widget symbol present in the committed index");
-    assert!(widget.descriptor.is_some(), "resolved descriptor present");
-    let def = widget.definition().expect("Widget has a definition occurrence");
-    assert_eq!(def.role, OccurrenceRole::Definition);
-    assert_eq!(def.document_path, "pkg/shapes.py", "the definition maps to its module");
-    assert!(index.encoding_for(&def.document_path).is_some(), "range is mappable");
+    for file in PYTHON_FIXTURE_INDEXES {
+        let index = support::python_fixture_index_from(file);
+        let widget = index
+            .symbols
+            .iter()
+            .find(|s| s.terminal_name() == Some("Widget"))
+            .unwrap_or_else(|| panic!("{file}: Widget symbol present in the committed index"));
+        assert!(widget.descriptor.is_some(), "{file}: resolved descriptor present");
+        let def = widget
+            .definition()
+            .unwrap_or_else(|| panic!("{file}: Widget has a definition occurrence"));
+        assert_eq!(def.role, OccurrenceRole::Definition);
+        assert_eq!(
+            def.document_path, "pkg/shapes.py",
+            "{file}: the definition maps to its module"
+        );
+        assert!(
+            index.encoding_for(&def.document_path).is_some(),
+            "{file}: range is mappable"
+        );
+    }
 }
 
-// _(Scenario: Python reference occurrence extracted)_ — a symbol used in a different module than
-// the one defining it arrives with a reference-role occurrence at the use site.
+// _(Scenario: Python reference occurrence extracted)_ and _(Scenario: Each Python adapter passes the
+// conformance suite)_ — a symbol used in a different module than the one defining it arrives with a
+// reference-role occurrence at the use site, and each committed Python index passes the whole
+// contract, same clauses as Rust.
 #[test]
 fn python_reference_occurrence_extracted() {
-    let index = support::python_fixture_index();
-    let widget = index
-        .symbols
-        .iter()
-        .find(|s| s.terminal_name() == Some("Widget"))
-        .unwrap();
-    let cross_module_reference = widget
-        .occurrences
-        .iter()
-        .any(|o| o.role == OccurrenceRole::Reference && o.document_path == "pkg/consumer.py");
-    assert!(
-        cross_module_reference,
-        "Widget is referenced from the consuming module: {:?}",
-        widget.occurrences
-    );
-    // The committed Python translation satisfies the whole contract, same clauses as Rust.
-    let report = conformance::check_index(&index);
-    assert!(
-        report.is_conformant(),
-        "python fixture translation passes the suite: {:?}",
-        report.violations()
-    );
+    for file in PYTHON_FIXTURE_INDEXES {
+        let index = support::python_fixture_index_from(file);
+        let widget = index
+            .symbols
+            .iter()
+            .find(|s| s.terminal_name() == Some("Widget"))
+            .unwrap_or_else(|| panic!("{file}: Widget symbol present"));
+        let cross_module_reference = widget
+            .occurrences
+            .iter()
+            .any(|o| o.role == OccurrenceRole::Reference && o.document_path == "pkg/consumer.py");
+        assert!(
+            cross_module_reference,
+            "{file}: Widget is referenced from the consuming module: {:?}",
+            widget.occurrences
+        );
+        let report = conformance::check_index(&index);
+        assert!(
+            report.is_conformant(),
+            "{file}: python fixture translation passes the suite: {:?}",
+            report.violations()
+        );
+    }
 }
 
 // _(Scenario: Backends gate independently)_ — the suite runs the same clauses per backend; a
@@ -453,9 +502,9 @@ fn nonconformant_backend_does_not_affect_the_other() {
 // explicitly, never silently passing.
 #[test]
 fn python_live_tool_matches_committed_fixture_shape() {
-    use silent_cartographer::semantic::python_adapter::PythonAdapter;
+    use silent_cartographer::semantic::python_adapter::{PythonAdapter, PythonIndexer};
 
-    if PythonAdapter::discover_version("scip-python").is_err() {
+    if PythonAdapter::discover_version(PythonIndexer::ScipPython, PythonIndexer::ScipPython.executable()).is_err() {
         eprintln!("SKIP: scip-python not installed");
         return;
     }
@@ -482,7 +531,9 @@ fn python_live_tool_matches_committed_fixture_shape() {
         .unwrap();
     assert!(status.success(), "python3 -m venv failed");
 
-    let adapter = PythonAdapter::new("scip-python", venv, "python-conformance").expect("tool present (checked)");
+    let indexer = PythonIndexer::ScipPython;
+    let adapter =
+        PythonAdapter::new(indexer, indexer.executable(), venv, "python-conformance").expect("tool present (checked)");
     let live = adapter.analyze(root).expect("live scip-python indexes the fixture");
 
     // Shape comparison: the live run resolves exactly the committed index's in-workspace symbols.

@@ -13,6 +13,7 @@ use silent_cartographer::semantic::model::{
     AnalyzerProvenance, DuplicateGroup, EnvironmentFacts, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol,
     OccurrenceRole, PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind, normalize,
 };
+use silent_cartographer::semantic::python_adapter::PythonIndexer;
 
 use crate::support::{id_of_pkg, line_col, one_doc_index, one_occ_symbol, sources, ws};
 
@@ -6416,7 +6417,7 @@ fn python_build_persists_docstring_bearing_function_tiers() {
 fn py_synthetic_index(symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
     ExtractedIndex {
         provenance: AnalyzerProvenance {
-            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_name: PythonIndexer::ScipPython.analyzer_name().to_string(),
             analyzer_version: "0".to_string(),
         },
         documents: vec![SourceDocument {
@@ -6780,6 +6781,84 @@ fn self_name_token_for_foreign_module_stays_refused() {
     );
 }
 
+/// A module symbol in ty-scip's descriptor shape: one Module-kind segment per dotted component and
+/// no `__init__` terminal.
+fn ty_scip_module(components: &[&str], class: SymbolClass, occurrences: Vec<ExtractedOccurrence>) -> ExtractedSymbol {
+    ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "synthetic",
+            components
+                .iter()
+                .map(|c| DescriptorSegment::new(*c, SegmentKind::Module))
+                .collect(),
+        )),
+        kind: SymbolKind::Module,
+        class,
+        occurrences,
+    }
+}
+
+// _(Scenario: Module reference accepted under the module-name rule, namespace-segment shape)_ — a
+// module whose descriptor is a run of namespace segments (`pkg`, `shapes`) accepts the terminal
+// component, the full dotted name, and a relative-import token, and refuses a leading component.
+#[test]
+fn module_name_rule_reads_the_namespace_segment_shape() {
+    let source = "shapes\npkg.shapes\nfrom .shapes import W\npkg\n";
+    let module = ty_scip_module(
+        &["pkg", "shapes"],
+        SymbolClass::InWorkspace,
+        vec![
+            // The terminal component `shapes` — line 0, cols 0..6.
+            py_occ("m.py", 0, 0, 6, OccurrenceRole::Reference),
+            // The full dotted name `pkg.shapes` — line 1, cols 0..10.
+            py_occ("m.py", 1, 0, 10, OccurrenceRole::Reference),
+            // The relative-import token `.shapes` — line 2, cols 5..12.
+            py_occ("m.py", 2, 5, 12, OccurrenceRole::Reference),
+            // A leading component `pkg` standing alone — line 3, cols 0..3.
+            py_occ("m.py", 3, 0, 3, OccurrenceRole::Reference),
+        ],
+    );
+    let index = py_synthetic_index(vec![module]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
+
+    assert_eq!(acc.aligned_total(), 3, "terminal, dotted, and relative tokens align");
+    assert_eq!(acc.text_mismatch, 1, "the leading-component token is refused");
+}
+
+// _(Scenario: Module self-name token accepted for its own module, namespace-segment shape)_ — the
+// document's own module and the module a `__name__` token resolves to share the namespace-segment
+// shape; the token is accepted for the own module and refused for another.
+#[test]
+fn self_name_rule_reads_the_namespace_segment_shape() {
+    let source = "MODULE_NAME = __name__\nOTHER = __name__\n";
+    let own = ty_scip_module(
+        &["pkg", "m"],
+        SymbolClass::InWorkspace,
+        vec![
+            py_occ("m.py", 0, 0, 0, OccurrenceRole::Definition),
+            py_occ("m.py", 0, 14, 22, OccurrenceRole::Reference),
+        ],
+    );
+    let foreign = ty_scip_module(
+        &["pkg", "other"],
+        SymbolClass::External,
+        vec![py_occ("m.py", 1, 8, 16, OccurrenceRole::Reference)],
+    );
+    let index = py_synthetic_index(vec![own, foreign]);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let src = vec![("m.py".to_string(), source.to_string())];
+    let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
+
+    assert_eq!(
+        acc.accepted(AlignmentRule::SelfName),
+        1,
+        "the own module's __name__ token aligns"
+    );
+    assert_eq!(acc.text_mismatch, 1, "the foreign module's __name__ token is refused");
+}
+
 // _(Scenario: Module origin marker accepted as its definition)_ — the committed fixture's
 // zero-width document-origin markers (one per module) align under the module-marker rule as each
 // module's definition attribution; and no `contains` edge is fabricated from those empty spans (a
@@ -7109,7 +7188,7 @@ fn alias_binding_outside_document_is_not_evidence() {
     };
     let index = ExtractedIndex {
         provenance: AnalyzerProvenance {
-            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_name: PythonIndexer::ScipPython.analyzer_name().to_string(),
             analyzer_version: "0".to_string(),
         },
         documents: vec![
@@ -7530,7 +7609,7 @@ pub fn shared_helper() {}
 fn py_docs_index(paths: &[&str], symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
     ExtractedIndex {
         provenance: AnalyzerProvenance {
-            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_name: PythonIndexer::ScipPython.analyzer_name().to_string(),
             analyzer_version: "0".to_string(),
         },
         documents: paths

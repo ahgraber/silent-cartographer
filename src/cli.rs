@@ -15,6 +15,7 @@ use crate::graph::syntax::Language;
 use crate::hooks::HookEvent;
 use crate::query::search::RelationLabel;
 use crate::query::{Detail, OrderMode, Relation};
+use crate::semantic::python_adapter::PythonIndexer;
 
 /// The `c10r` CLI: precise, type-aware navigation over a persisted code graph.
 #[derive(Debug, Parser)]
@@ -575,7 +576,7 @@ impl StatusDetail {
 pub enum LanguageArg {
     /// The Rust backend (`rust-analyzer scip`).
     Rust,
-    /// The Python backend (`scip-python index`).
+    /// The Python backend (`ty-scip index` or `scip-python index`; see `--python-indexer`).
     Python,
 }
 
@@ -584,6 +585,24 @@ impl From<LanguageArg> for Language {
         match l {
             LanguageArg::Rust => Language::Rust,
             LanguageArg::Python => Language::Python,
+        }
+    }
+}
+
+/// The Python indexer selector for `build`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PythonIndexerArg {
+    /// `ty-scip`, built on the ty type checker.
+    TyScip,
+    /// Sourcegraph's `scip-python`.
+    ScipPython,
+}
+
+impl From<PythonIndexerArg> for PythonIndexer {
+    fn from(i: PythonIndexerArg) -> Self {
+        match i {
+            PythonIndexerArg::TyScip => PythonIndexer::TyScip,
+            PythonIndexerArg::ScipPython => PythonIndexer::ScipPython,
         }
     }
 }
@@ -604,6 +623,12 @@ pub struct BuildArgs {
     /// required.
     #[arg(long, value_enum)]
     pub language: Option<LanguageArg>,
+
+    /// The Python indexer to build with: `ty-scip` or `scip-python`. Without it, a build uses the
+    /// indexer recorded in the existing store, and scip-python when no store exists. Refused for a
+    /// Rust workspace.
+    #[arg(long, value_enum)]
+    pub python_indexer: Option<PythonIndexerArg>,
 
     /// An explicit interpreter-environment path (meaningful for the Python backend). Overrides
     /// `$VIRTUAL_ENV` and the workspace's `.venv`/`venv` directories.

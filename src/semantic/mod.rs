@@ -46,6 +46,11 @@ pub enum SemanticError {
     /// interpreter.
     #[error("{0}")]
     Environment(String),
+    /// The indexer refused a workspace file it cannot name a module for. The remedy states the
+    /// configuration change that excludes the file, so a caller can assert the refusal without
+    /// matching message text.
+    #[error("the indexer refused {}: {remedy}", path.display())]
+    RejectedFile { path: std::path::PathBuf, remedy: String },
 }
 
 /// The backend contract floor: the intersection every semantic backend must satisfy.

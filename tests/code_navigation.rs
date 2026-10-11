@@ -19,6 +19,7 @@ use silent_cartographer::semantic::model::{
     AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
 };
+use silent_cartographer::semantic::python_adapter::PythonIndexer;
 
 use crate::support::{
     id_of_pkg, line_col, one_doc_index, one_occ_symbol, prepend_path, sources, write_indexing_stub, ws,
@@ -132,7 +133,7 @@ fn module_tier_store() -> (GraphStore, String, CanonicalId) {
 fn py_synthetic_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
     ExtractedIndex {
         provenance: AnalyzerProvenance {
-            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_name: PythonIndexer::ScipPython.analyzer_name().to_string(),
             analyzer_version: "0".to_string(),
         },
         documents: vec![SourceDocument {
@@ -1409,12 +1410,13 @@ fn stale_after_a_changed_environment_is_fresh_once_the_refresh_command_runs() {
     // back to a fixed one when none resolves), so only the environment drifts below — never the
     // analyzer identity `current_state` would also compare.
     let analyzer_version = silent_cartographer::semantic::python_adapter::PythonAdapter::discover_version(
-        silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name(),
+        PythonIndexer::ScipPython,
+        PythonIndexer::ScipPython.executable(),
     )
     .unwrap_or_else(|_| "0.6.0".to_string());
     let index = ExtractedIndex {
         provenance: AnalyzerProvenance {
-            analyzer_name: silent_cartographer::semantic::python_adapter::PythonAdapter::analyzer_name().to_string(),
+            analyzer_name: PythonIndexer::ScipPython.analyzer_name().to_string(),
             analyzer_version: analyzer_version.clone(),
         },
         documents: vec![SourceDocument {
@@ -3870,6 +3872,7 @@ fn status_output_in(
         db,
         dir,
         "not-a-real-analyzer",
+        &silent_cartographer::commands::PythonExecutables::default(),
         json,
         true,
         false,
@@ -4007,6 +4010,7 @@ fn the_human_status_discrepancy_listing_names_each_row_by_line_and_column() {
             &db,
             dir.path(),
             "not-a-real-analyzer",
+            &silent_cartographer::commands::PythonExecutables::default(),
             json,
             true,
             true,

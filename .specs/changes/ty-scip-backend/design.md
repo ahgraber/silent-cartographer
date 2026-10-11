@@ -82,7 +82,8 @@ A distinct variant lets tests assert the refusal without matching message text.
 
 ### Decision: SelectionIsOneFunctionOverProbes
 
-**Chosen:** `select_python_indexer(explicit: Option<PythonIndexer>, recorded: Option<PythonIndexer>, probe) -> Result<PythonIndexer, SelectionError>`.
+**Chosen:** `select_python_indexer(explicit: Option<PythonIndexer>, recorded: Option<PythonIndexer>, probe) -> Result<(PythonIndexer, String), SemanticError>`, which returns the selected indexer and its probed version.
+It reuses the `Unavailable` and `Timeout` variants, which already map to the setup exit code.
 It is a pure function over the outcomes of the existing bounded version probes (`run_bounded`, `PROBE_DEADLINE`), and `build` and `status` both call it.
 `recorded` is the analyzer name in the existing store's provenance, or none when no store exists.
 The function picks one candidate: the explicit selection, else the recorded indexer, else scip-python.
@@ -125,6 +126,8 @@ Keeping the recorded indexer makes an explicit choice last until another explici
 
 - For scip-python's shape, it returns the namespace segment as today.
 - For a descriptor whose segments are all module segments, it returns the segment names joined with `.`.
+  This shape includes scip-python's single-segment symbol that a `__name__` token resolves to, so the self-name rule reads module identity through the same function.
+  On Flask and httpx2 under scip-python, the stored occurrences, symbols, edges, and join accounting match `main` (checked 2026-10-10).
 
 `classify_module_kinds` is unchanged: ty-scip's terminal namespace segment already classifies as `SymbolKind::Module` through `symbol_kind_from`.
 Both callers (`src/graph/join.rs:1387`, `:1463`) are Python-only rule arms, so Rust module descriptors are not affected.
@@ -209,7 +212,7 @@ status (no option) ──────┤        │
                          │                                          │
   candidate: explicit, else recorded, else scip-python; probe it    ▼
                          ▼                               PythonAdapter{indexer}
-          SelectionError → typed setup error              │  resolve env, facts
+  Unavailable / Timeout → typed setup error               │  resolve env, facts
                                                                   │  run <exe> index …
                                                                   │  ty-scip: map rejected file
                                                                   ▼

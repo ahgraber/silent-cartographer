@@ -32,7 +32,9 @@ use crate::query::search::{MutualPair, RelationLabel, SimilarItem, exclude_relat
 use crate::query::{Detail, OrderMode, QueryEngine, Relation};
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
 use crate::semantic::probe::PROBE_DEADLINE;
-use crate::semantic::python_adapter::{PythonAdapter, environment_facts, resolve_environment};
+use crate::semantic::python_adapter::{
+    PythonAdapter, PythonIndexer, environment_facts, resolve_environment, select_python_indexer,
+};
 use crate::semantic::{SemanticEngine, SemanticError, rust_adapter::RustAdapter};
 
 /// The file extension and skipped top-level-name directories [`collect_sources`] walks with for
@@ -323,12 +325,22 @@ type ObservedState = (
 /// [`current_state`] together with the sources discovery found, so a caller that also needs the files
 /// compares the same observation the hash was computed from.
 fn observe_state(store: &GraphStore, root: &Path, rust_analyzer: &str) -> Result<ObservedState> {
-    observe_state_from(store.read_metadata()?, root, rust_analyzer)
+    observe_state_from(
+        store.read_metadata()?,
+        root,
+        rust_analyzer,
+        &PythonExecutables::default(),
+    )
 }
 
 /// [`observe_state`] against metadata already read, so a caller holding one snapshot of the store
 /// observes the workspace against the build that snapshot recorded.
-fn observe_state_from(recorded: Option<IndexMetadata>, root: &Path, rust_analyzer: &str) -> Result<ObservedState> {
+fn observe_state_from(
+    recorded: Option<IndexMetadata>,
+    root: &Path,
+    rust_analyzer: &str,
+    python: &PythonExecutables,
+) -> Result<ObservedState> {
     // A recorded analyzer decides the language through the one dispatch, so an unrecognized one is
     // refused here as it is at build time. No recorded index at all is not that case: there is no
     // analyzer to read, and the Rust collection is the default a first build assumes.
@@ -361,23 +373,30 @@ fn observe_state_from(recorded: Option<IndexMetadata>, root: &Path, rust_analyze
             },
             Err(_) => None,
         };
-        // Prefer the live tool's version; fall back to the recorded provenance. A timeout is disclosed
-        // before the fallback; a missing tool falls back silently.
-        let provenance = match PythonAdapter::discover_version(PythonAdapter::analyzer_name()) {
-            Ok(version) => AnalyzerProvenance {
-                analyzer_name: PythonAdapter::analyzer_name().to_string(),
+        // Prefer the live version of the indexer the store records; fall back to the recorded
+        // provenance. A timeout is disclosed before the fallback; a missing tool falls back silently.
+        let recorded_provenance = recorded
+            .map(|m| m.provenance)
+            .expect("python identity implies metadata");
+        let recorded_indexer = PythonIndexer::from_analyzer_name(&recorded_provenance.analyzer_name);
+        let provenance = match select_python_indexer(None, recorded_indexer, |i| {
+            PythonAdapter::discover_version(i, python.of(i))
+        }) {
+            Ok((indexer, version)) => AnalyzerProvenance {
+                analyzer_name: indexer.analyzer_name().to_string(),
                 analyzer_version: version,
             },
             Err(e) => {
-                if matches!(e, SemanticError::Timeout(_)) {
+                if let SemanticError::Timeout(_) = e {
+                    let name = &recorded_provenance.analyzer_name;
                     disclose_probe_timeout(
-                        "the scip-python version check",
-                        "freshness compares against the scip-python version recorded at build time, not the installed one.",
+                        &format!("the {name} version check"),
+                        &format!(
+                            "freshness compares against the {name} version recorded at build time, not the installed one."
+                        ),
                     );
                 }
-                recorded
-                    .map(|m| m.provenance)
-                    .expect("python identity implies metadata")
+                recorded_provenance
             }
         };
         return Ok((provenance, hash, environment, sources));
@@ -524,8 +543,38 @@ pub fn detect_language(explicit: Option<Language>, root: &Path) -> Result<Langua
     }
 }
 
+/// The executable each Python indexer is run through. Production callers use the default, which
+/// finds both on `PATH` by their fixed names; tests substitute stubs.
+#[derive(Debug, Clone, Copy)]
+pub struct PythonExecutables<'a> {
+    pub ty_scip: &'a str,
+    pub scip_python: &'a str,
+}
+
+impl Default for PythonExecutables<'_> {
+    fn default() -> Self {
+        Self {
+            ty_scip: PythonIndexer::TyScip.executable(),
+            scip_python: PythonIndexer::ScipPython.executable(),
+        }
+    }
+}
+
+impl PythonExecutables<'_> {
+    fn of(&self, indexer: PythonIndexer) -> &str {
+        match indexer {
+            PythonIndexer::TyScip => self.ty_scip,
+            PythonIndexer::ScipPython => self.scip_python,
+        }
+    }
+}
+
 /// `build`: (re)build the index for the workspace via the ingest path, through the backend the
 /// workspace's manifest selects (or `language` explicitly names).
+///
+/// A Python build runs `python_indexer` when given, else the indexer the existing store records,
+/// else scip-python; the option on a Rust build is a usage error. An unavailable selected indexer
+/// is never replaced by the other one.
 ///
 /// Every refusal — ambiguous or missing manifests, an unresolvable Python environment, an
 /// unavailable tool — happens before the store is opened, so a failed attempt leaves an existing
@@ -536,7 +585,8 @@ pub fn run_build(
     workspace: Option<&str>,
     root: &Path,
     rust_analyzer: &str,
-    scip_python: &str,
+    python: &PythonExecutables,
+    python_indexer: Option<PythonIndexer>,
     environment: Option<&Path>,
     language: Option<Language>,
     force: bool,
@@ -561,6 +611,9 @@ pub fn run_build(
     }
     let workspace_id = resolve_workspace(workspace, root)?;
     let language = detect_language(language, root)?;
+    if language == Language::Rust && python_indexer.is_some() {
+        return Err(Failure::Usage("--python-indexer applies only to a Python workspace".to_string()).into());
+    }
 
     // The analyzer is resolved before anything is analyzed, because its identity is one of the
     // inputs the currency check compares — and resolving it once serves both the check and the
@@ -572,8 +625,12 @@ pub fn run_build(
             let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
             let resolved = resolve_environment(environment, virtual_env.as_deref(), root)
                 .map_err(|e| Failure::IndexerSetup(format!("{e}")))?;
+            let (indexer, _) = select_python_indexer(python_indexer, recorded_python_indexer(db), |candidate| {
+                PythonAdapter::discover_version(candidate, python.of(candidate))
+            })
+            .map_err(|e| Failure::IndexerSetup(format!("{e}")))?;
             Box::new(
-                PythonAdapter::new(scip_python, resolved, workspace_id.as_str())
+                PythonAdapter::new(indexer, python.of(indexer), resolved, workspace_id.as_str())
                     .map_err(|e| Failure::IndexerSetup(format!("{e}")))?,
             )
         }
@@ -902,6 +959,7 @@ pub fn run_status(
     db: &Path,
     root: &Path,
     rust_analyzer: &str,
+    python: &PythonExecutables,
     json: bool,
     discrepancies: bool,
     all: bool,
@@ -939,7 +997,8 @@ pub fn run_status(
     };
     drop(snapshot);
 
-    let (provenance, hash, environment, sources) = observe_state_from(Some(meta.clone()), root, rust_analyzer)?;
+    let (provenance, hash, environment, sources) =
+        observe_state_from(Some(meta.clone()), root, rust_analyzer, python)?;
     let reasons = stale_reasons_of(&meta, &hash, &provenance, environment.as_ref());
     let freshness = reasons.first().copied().unwrap_or(Freshness::Fresh);
 
@@ -2361,11 +2420,14 @@ pub enum Presence {
     Unresponsive,
 }
 
-/// One required indexer's readiness, as reported by `doctor`.
+/// One indexer's readiness, as reported by `doctor`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IndexerStatus {
-    /// The indexer's name (`rust-analyzer` or `scip-python`).
+    /// The indexer's name (`rust-analyzer`, `scip-python`, or `ty-scip`).
     pub name: String,
+    /// Whether a build with default settings needs this indexer. Only a required indexer that is not
+    /// ready makes `doctor` signal a setup failure.
+    pub required: bool,
     /// Whether the indexer is present, absent, or present-but-unresponsive.
     pub presence: Presence,
     /// The indexer's discovered version, when present.
@@ -2377,10 +2439,14 @@ pub struct IndexerStatus {
 }
 
 impl IndexerStatus {
-    /// Whether this indexer is ready — found and responsive. An absent or unresponsive indexer is not
-    /// ready, and both drive the indexer/setup-failure exit code.
+    /// Whether this indexer is ready — found and responsive.
     pub fn is_ready(&self) -> bool {
         matches!(self.presence, Presence::Present)
+    }
+
+    /// Whether this indexer drives the indexer/setup-failure exit code: required and not ready.
+    pub fn is_setup_failure(&self) -> bool {
+        self.required && !self.is_ready()
     }
 }
 
@@ -2443,7 +2509,7 @@ pub enum DoctorHooks {
     },
 }
 
-/// The readiness report `doctor` prints: each required indexer's presence, and the hooks section.
+/// The readiness report `doctor` prints: each indexer's presence, and the hooks section.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DoctorReport {
     pub indexers: Vec<IndexerStatus>,
@@ -2494,13 +2560,13 @@ fn doctor_hooks_report() -> DoctorHooks {
     }
 }
 
-/// `doctor`: probe each required language indexer for presence and version, by the same default
-/// executable name `build` invokes for it, and report the invocation directory's refresh-hook status.
-/// Both indexers are probed unconditionally — the report covers what a build could need, not what the
+/// `doctor`: probe each language indexer for presence and version, by the same default executable
+/// name `build` invokes for it, and report the invocation directory's refresh-hook status.
+/// Every indexer is probed unconditionally — the report covers what a build could need, not what the
 /// current workspace's language happens to be — and a tool that cannot be run for any reason
 /// (missing, unexecutable, or erroring) reports absent with an install hint rather than propagating a
-/// failure. Hook status never changes `doctor`'s exit code, which is decided from indexer readiness
-/// alone.
+/// failure. ty-scip is optional: a default build does not run it. Hook status never changes
+/// `doctor`'s exit code, which is decided from the readiness of the required indexers alone.
 pub fn run_doctor() -> DoctorReport {
     let rust_analyzer = match RustAdapter::new("rust-analyzer") {
         Ok(adapter) => present_status(RustAdapter::analyzer_name(), adapter.provenance().analyzer_version),
@@ -2510,24 +2576,41 @@ pub fn run_doctor() -> DoctorReport {
             "install: rustup component add rust-analyzer",
         ),
     };
-    let scip_python = match PythonAdapter::discover_version("scip-python") {
-        Ok(version) => present_status(PythonAdapter::analyzer_name(), version),
-        Err(SemanticError::Timeout(_)) => unresponsive_status(PythonAdapter::analyzer_name()),
+    let scip_python =
+        match PythonAdapter::discover_version(PythonIndexer::ScipPython, PythonIndexer::ScipPython.executable()) {
+            Ok(version) => present_status(PythonIndexer::ScipPython.analyzer_name(), version),
+            Err(SemanticError::Timeout(_)) => unresponsive_status(PythonIndexer::ScipPython.analyzer_name()),
+            Err(_) => absent_status(
+                PythonIndexer::ScipPython.analyzer_name(),
+                "install: npm install -g @sourcegraph/scip-python",
+            ),
+        };
+    let ty_scip = match PythonAdapter::discover_version(PythonIndexer::TyScip, PythonIndexer::TyScip.executable()) {
+        Ok(version) => present_status(PythonIndexer::TyScip.analyzer_name(), version),
+        Err(SemanticError::Timeout(_)) => unresponsive_status(PythonIndexer::TyScip.analyzer_name()),
         Err(_) => absent_status(
-            PythonAdapter::analyzer_name(),
-            "install: npm install -g @sourcegraph/scip-python",
+            PythonIndexer::TyScip.analyzer_name(),
+            "install: uv tool install ty-scip",
         ),
     };
     DoctorReport {
-        indexers: vec![rust_analyzer, scip_python],
+        indexers: vec![
+            rust_analyzer,
+            scip_python,
+            IndexerStatus {
+                required: false,
+                ..ty_scip
+            },
+        ],
         hooks: doctor_hooks_report(),
     }
 }
 
-/// A present indexer's status, carrying its discovered version and no hint.
+/// A present indexer's status (required by default), carrying its discovered version and no hint.
 fn present_status(name: &str, version: String) -> IndexerStatus {
     IndexerStatus {
         name: name.to_string(),
+        required: true,
         presence: Presence::Present,
         version: Some(version),
         hint: None,
@@ -2538,6 +2621,7 @@ fn present_status(name: &str, version: String) -> IndexerStatus {
 fn absent_status(name: &str, install_hint: &str) -> IndexerStatus {
     IndexerStatus {
         name: name.to_string(),
+        required: true,
         presence: Presence::Absent,
         version: None,
         hint: Some(install_hint.to_string()),
@@ -2549,6 +2633,7 @@ fn absent_status(name: &str, install_hint: &str) -> IndexerStatus {
 fn unresponsive_status(name: &str) -> IndexerStatus {
     IndexerStatus {
         name: name.to_string(),
+        required: true,
         presence: Presence::Unresponsive,
         version: None,
         hint: Some(format!(
@@ -2578,7 +2663,8 @@ pub fn render_doctor_report(report: &DoctorReport) -> String {
                 Presence::Unresponsive => ("unresponsive", s.hint.as_deref().unwrap_or("")),
             };
             let detail = crate::render::sanitize(detail);
-            format!("{name:<15}{status:<13}{detail}")
+            let optional = if s.required { "" } else { "(optional) " };
+            format!("{name:<15}{status:<13}{optional}{detail}")
         })
         .collect();
     lines.extend(render_doctor_hooks(&report.hooks));
@@ -3030,12 +3116,23 @@ pub fn run_hooks_uninstall(root: &Path, db: &Path, workspace: Option<&str>) -> R
 /// both a `Cargo.toml` and a `pyproject.toml` — ambiguous to detection — still refreshes once it has
 /// been built once with an explicit `--language`.
 fn recorded_language(db: &Path) -> Option<Language> {
+    crate::graph::backend_language(&recorded_analyzer_name(db)?).ok()
+}
+
+/// The Python indexer recorded by the index at `db`, or `None` when there is no readable store or its
+/// analyzer is not a Python indexer.
+fn recorded_python_indexer(db: &Path) -> Option<PythonIndexer> {
+    PythonIndexer::from_analyzer_name(&recorded_analyzer_name(db)?)
+}
+
+/// The analyzer name recorded by the readable index at `db`.
+fn recorded_analyzer_name(db: &Path) -> Option<String> {
     if !db.exists() {
         return None;
     }
     let store = GraphStore::open(db).ok()?;
     let meta = store.read_metadata().ok().flatten()?;
-    crate::graph::backend_language(&meta.provenance.analyzer_name).ok()
+    Some(meta.provenance.analyzer_name)
 }
 
 /// `hooks run`: decide whether `event` calls for a refresh of `workspace`'s index in the git worktree
@@ -3064,7 +3161,8 @@ pub fn run_hooks_run(
             workspace,
             root,
             "rust-analyzer",
-            "scip-python",
+            &PythonExecutables::default(),
+            None,
             None,
             recorded_language(db),
             false,

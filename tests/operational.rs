@@ -6,9 +6,10 @@ mod support;
 use std::path::Path;
 
 use silent_cartographer::commands::{
-    build_accounting_json, build_accounting_line, build_from_index, collect_python_sources, collect_rust_sources,
-    detect_language, resolve_workspace, run_build, run_status,
+    BuildOutcome, PythonExecutables, build_accounting_json, build_accounting_line, build_from_index,
+    collect_python_sources, collect_rust_sources, detect_language, resolve_workspace, run_build, run_status,
 };
+use silent_cartographer::exit::{ExitCode, classify};
 use silent_cartographer::graph::content_hash;
 use silent_cartographer::graph::join::{AlignmentRule, JoinAccounting};
 use silent_cartographer::graph::store::{DISCREPANCY_GROUP_CAP, GraphStore};
@@ -20,7 +21,7 @@ use silent_cartographer::semantic::model::{
     AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
 };
-use silent_cartographer::semantic::python_adapter::{PythonAdapter, environment_facts};
+use silent_cartographer::semantic::python_adapter::{PythonIndexer, environment_facts};
 use strum::VariantArray as _;
 
 use crate::support::sources;
@@ -78,6 +79,7 @@ fn status_reports_provenance_freshness_and_alignment() {
         &db,
         dir.path(),
         "definitely-not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         false,
@@ -253,6 +255,7 @@ fn discrepancy_summary_is_truncated_but_totals_cover_the_full_set() {
         &db,
         Path::new("."),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         true,
         false,
@@ -299,6 +302,7 @@ fn full_listing_returns_every_row() {
         &db,
         Path::new("."),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         true,
@@ -329,6 +333,7 @@ fn summary_group_shape_carries_kind_token_count_and_exemplar() {
         &db,
         Path::new("."),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         true,
         false,
@@ -369,6 +374,7 @@ fn discrepancy_rows_and_exemplars_carry_line_and_column() {
             &db,
             Path::new("."),
             "not-a-real-analyzer",
+            &PythonExecutables::default(),
             true,
             false,
             true,
@@ -384,6 +390,7 @@ fn discrepancy_rows_and_exemplars_carry_line_and_column() {
             &db,
             Path::new("."),
             "not-a-real-analyzer",
+            &PythonExecutables::default(),
             true,
             true,
             false,
@@ -415,6 +422,7 @@ fn discrepancy_rows_and_exemplars_carry_line_and_column() {
             &db,
             Path::new("."),
             "not-a-real-analyzer",
+            &PythonExecutables::default(),
             false,
             false,
             true,
@@ -510,6 +518,7 @@ fn query_refuses_an_incompatible_store_with_guidance() {
         &db,
         dir.path(),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         false,
@@ -560,6 +569,7 @@ fn matching_version_store_operates_normally() {
         &db,
         dir.path(),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         false,
@@ -608,6 +618,7 @@ fn status_reports_per_rule_acceptance_buckets() {
         &db,
         dir.path(),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         false,
@@ -854,6 +865,7 @@ fn duplicated_groups_are_retrievable_with_descriptor_and_definitions() {
         &db,
         dir.path(),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         false,
@@ -900,6 +912,7 @@ fn no_duplicates_is_a_definite_zero_group_count() {
         &db,
         dir.path(),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         false,
@@ -949,6 +962,7 @@ fn status_json_always_carries_the_duplicated_group_count() {
         &db,
         dir.path(),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         false,
@@ -987,7 +1001,7 @@ fn python_manifest_selects_python_backend() {
     let language = detect_language(None, dir.path()).unwrap();
     assert_eq!(language, Language::Python, "pyproject.toml marks Python");
     assert_eq!(
-        PythonAdapter::analyzer_name(),
+        PythonIndexer::ScipPython.analyzer_name(),
         "scip-python",
         "the selected backend's provenance identity"
     );
@@ -1002,7 +1016,8 @@ fn python_manifest_selects_python_backend() {
         Some("op-ws"),
         dir.path(),
         "rust-analyzer",
-        missing_tool.to_str().unwrap(),
+        &scip_python_at(missing_tool.to_str().unwrap()),
+        None,
         None,
         None,
         false,
@@ -1029,7 +1044,8 @@ fn two_manifests_without_selection_refuse() {
         Some("op-ws"),
         dir.path(),
         "rust-analyzer",
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         None,
         false,
@@ -1094,7 +1110,8 @@ fn failed_build_leaves_existing_store_untouched() {
         Some("op-ws"),
         dir.path(),
         missing_analyzer.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         None,
         false,
@@ -1116,7 +1133,8 @@ fn failed_build_leaves_existing_store_untouched() {
         Some("op-ws"),
         dir.path(),
         "rust-analyzer",
-        missing_scip.to_str().unwrap(),
+        &scip_python_at(missing_scip.to_str().unwrap()),
+        None,
         None,
         Some(Language::Python),
         false,
@@ -1149,7 +1167,8 @@ fn explicit_environment_refusal_precedes_tool_lookup() {
         Some("op-ws"),
         dir.path(),
         "rust-analyzer",
-        missing_tool.to_str().unwrap(),
+        &scip_python_at(missing_tool.to_str().unwrap()),
+        None,
         Some(missing_env.as_path()),
         None,
         false,
@@ -1231,6 +1250,7 @@ fn a_query_or_status_against_a_missing_store_creates_nothing() {
         &db,
         dir.path(),
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         false,
@@ -1443,6 +1463,7 @@ fn every_query_family_carries_the_workspace_disclosure() {
         &db,
         root,
         "not-a-real-analyzer",
+        &PythonExecutables::default(),
         true,
         false,
         false,
@@ -1568,7 +1589,8 @@ fn a_build_over_an_unchanged_workspace_analyzes_nothing() {
         Some("op-ws"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -1594,7 +1616,8 @@ fn a_changed_chunk_parameter_rebuilds() {
         Some("op-ws"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -1608,7 +1631,8 @@ fn a_changed_chunk_parameter_rebuilds() {
         Some("op-ws"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -1636,7 +1660,8 @@ fn an_explicit_rebuild_analyzes_an_unchanged_workspace() {
         Some("op-ws"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         true,
@@ -1666,7 +1691,8 @@ fn corrupt_metadata_in_a_recognized_store_rebuilds() {
         Some("op-ws"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -1695,7 +1721,8 @@ fn an_edited_source_rebuilds() {
         Some("op-ws"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -1720,7 +1747,8 @@ fn a_changed_analyzer_version_rebuilds() {
         Some("op-ws"),
         dir.path(),
         newer.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -1784,7 +1812,8 @@ fn a_changed_declared_environment_rebuilds() {
         Some("op-ws"),
         dir.path(),
         "rust-analyzer",
-        stub.to_str().unwrap(),
+        &scip_python_at(stub.to_str().unwrap()),
+        None,
         Some(venv.as_path()),
         None,
         false,
@@ -1810,7 +1839,8 @@ fn a_changed_declared_environment_rebuilds() {
         Some("op-ws"),
         dir.path(),
         "rust-analyzer",
-        stub.to_str().unwrap(),
+        &scip_python_at(stub.to_str().unwrap()),
+        None,
         Some(venv.as_path()),
         None,
         false,
@@ -1838,7 +1868,8 @@ fn an_absent_index_builds() {
         Some("op-ws"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -1871,7 +1902,8 @@ fn an_incompatible_store_builds_rather_than_reporting_it_current() {
         Some("op-ws"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -1943,7 +1975,8 @@ fn a_build_and_the_currency_check_agree_on_an_undecodable_file() {
         Some("op-ws"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -1969,7 +2002,8 @@ fn a_store_recorded_for_another_workspace_is_not_current() {
         Some("a-different-workspace"),
         dir.path(),
         stub.to_str().unwrap(),
-        "scip-python",
+        &scip_python_at("scip-python"),
+        None,
         None,
         Some(Language::Rust),
         false,
@@ -2748,4 +2782,358 @@ fn an_unresolvable_environment_does_not_render_as_a_changed_one() {
         !label.starts_with("environment changed)"),
         "the label is not the bare changed-environment claim: {header}"
     );
+}
+
+/// The executables a build is pointed at when only scip-python is of interest: `path` for scip-python
+/// and a path that is never present for ty-scip, so the result does not depend on what the host has
+/// installed.
+fn scip_python_at(path: &str) -> PythonExecutables<'_> {
+    PythonExecutables {
+        ty_scip: "/nonexistent/ty-scip",
+        scip_python: path,
+    }
+}
+
+/// A Python workspace with a fake environment and a directory for stub indexers. Each stub the test
+/// installs is found through the injected executables, so the build never reaches a real indexer.
+struct PythonWorkspace {
+    dir: tempfile::TempDir,
+    venv: std::path::PathBuf,
+}
+
+impl PythonWorkspace {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "pyproject.toml");
+        std::fs::write(dir.path().join("app.py"), "x = 1\n").unwrap();
+        let venv = write_fake_venv(dir.path());
+        std::fs::create_dir(dir.path().join(".stub-bin")).unwrap();
+        Self { dir, venv }
+    }
+
+    fn db(&self) -> std::path::PathBuf {
+        self.dir.path().join("index.db")
+    }
+
+    fn stub_bin(&self) -> std::path::PathBuf {
+        self.dir.path().join(".stub-bin")
+    }
+
+    fn tool(&self, indexer: PythonIndexer) -> String {
+        self.stub_bin().join(indexer.executable()).to_str().unwrap().to_string()
+    }
+
+    /// Install a stub for `indexer` that answers `--version` and writes an empty SCIP index.
+    fn install(&self, indexer: PythonIndexer, version: &str) {
+        support::write_indexing_stub(&self.stub_bin(), indexer.executable(), version);
+    }
+
+    fn uninstall(&self, indexer: PythonIndexer) {
+        std::fs::remove_file(self.tool(indexer)).unwrap();
+    }
+
+    fn build(&self, python_indexer: Option<PythonIndexer>) -> anyhow::Result<BuildOutcome> {
+        run_build(
+            &self.db(),
+            Some("op-ws"),
+            self.dir.path(),
+            "rust-analyzer",
+            &PythonExecutables {
+                ty_scip: &self.tool(PythonIndexer::TyScip),
+                scip_python: &self.tool(PythonIndexer::ScipPython),
+            },
+            python_indexer,
+            Some(self.venv.as_path()),
+            Some(Language::Python),
+            false,
+            &Default::default(),
+        )
+    }
+
+    /// The machine `status` report from the built `c10r`, which finds the stub indexers by their fixed
+    /// names on `PATH`, with no inherited `$VIRTUAL_ENV` so freshness depends only on the stubs.
+    fn status(&self) -> serde_json::Value {
+        let built_bin_dir = Path::new(env!("CARGO_BIN_EXE_c10r")).parent().unwrap().to_path_buf();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+            .arg("--db")
+            .arg(self.db())
+            .args(["--json", "status"])
+            .current_dir(self.dir.path())
+            .env("PATH", support::prepend_path(&[&built_bin_dir, &self.stub_bin()]))
+            .env_remove("VIRTUAL_ENV")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// The analyzer name the store records, or `None` when no store was persisted.
+    fn recorded_analyzer(&self) -> Option<String> {
+        let store = GraphStore::open(&self.db()).ok()?;
+        Some(store.read_metadata().unwrap().unwrap().provenance.analyzer_name)
+    }
+}
+
+// _(Scenario: An explicit selection names the indexer)_
+#[test]
+fn an_explicit_python_indexer_builds_the_store() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::TyScip, "0.1.0");
+    ws.install(PythonIndexer::ScipPython, "0.6.0");
+
+    ws.build(Some(PythonIndexer::TyScip)).unwrap();
+
+    assert_eq!(ws.recorded_analyzer().as_deref(), Some("ty-scip"));
+}
+
+// _(Scenario: A new store defaults to scip-python)_
+#[test]
+fn a_new_python_store_defaults_to_scip_python() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::TyScip, "0.1.0");
+    ws.install(PythonIndexer::ScipPython, "0.6.0");
+
+    ws.build(None).unwrap();
+
+    assert_eq!(ws.recorded_analyzer().as_deref(), Some("scip-python"));
+}
+
+// _(Scenario: The default indexer absent refuses instead of using ty-scip)_
+#[test]
+fn an_absent_default_indexer_refuses_instead_of_using_ty_scip() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::TyScip, "0.1.0");
+
+    let err = ws.build(None).expect_err("scip-python is absent");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("scip-python") && message.contains("npm install"),
+        "the refusal names the indexer and how to install it: {message}"
+    );
+    assert_eq!(classify(&err), ExitCode::IndexerSetup);
+    assert_eq!(ws.recorded_analyzer(), None, "no store is persisted");
+}
+
+// _(Scenario: An unresponsive selected indexer refuses instead of falling back)_
+#[test]
+fn an_unresponsive_selected_indexer_refuses_instead_of_falling_back() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::TyScip, "0.1.0");
+    support::write_hanging_stub(&ws.stub_bin(), "scip-python");
+
+    let err = ws.build(None).expect_err("scip-python does not answer");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("scip-python") && message.contains("did not answer"),
+        "the refusal names the indexer as unresponsive: {message}"
+    );
+    assert_eq!(classify(&err), ExitCode::IndexerSetup);
+    assert_eq!(ws.recorded_analyzer(), None, "no store is persisted");
+}
+
+// _(Scenario: The option on a non-Python workspace is a usage error)_
+#[test]
+fn the_python_indexer_option_on_a_rust_workspace_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "Cargo.toml");
+    let db = dir.path().join("index.db");
+
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        "rust-analyzer",
+        &scip_python_at("scip-python"),
+        Some(PythonIndexer::TyScip),
+        None,
+        None,
+        false,
+        &Default::default(),
+    )
+    .expect_err("the option does not apply to a Rust workspace");
+
+    assert_eq!(classify(&err), ExitCode::Usage);
+    assert!(!db.exists(), "no store is persisted");
+}
+
+// _(Scenario: A store keeps the indexer it was built with)_
+#[test]
+fn a_ty_scip_store_with_changed_sources_rebuilds_with_ty_scip() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::TyScip, "0.1.0");
+    ws.install(PythonIndexer::ScipPython, "0.6.0");
+    ws.build(Some(PythonIndexer::TyScip)).unwrap();
+    std::fs::write(ws.dir.path().join("app.py"), "x = 2\n").unwrap();
+
+    let outcome = ws.build(None).unwrap();
+
+    assert!(outcome.rebuilt(), "the changed source is analyzed");
+    assert_eq!(ws.recorded_analyzer().as_deref(), Some("ty-scip"));
+}
+
+// _(Scenario: An explicit selection switches the store's indexer)_
+#[test]
+fn an_explicit_selection_switches_a_ty_scip_store_to_scip_python() {
+    let ws = PythonWorkspace::new();
+    // Both stubs report the same version, so only the indexer's name can make the store stale.
+    ws.install(PythonIndexer::TyScip, "1.0.0");
+    ws.install(PythonIndexer::ScipPython, "1.0.0");
+    ws.build(Some(PythonIndexer::TyScip)).unwrap();
+
+    let switched = ws.build(Some(PythonIndexer::ScipPython)).unwrap();
+    assert!(
+        switched.rebuilt(),
+        "the unchanged sources are analyzed by the other indexer"
+    );
+    assert_eq!(ws.recorded_analyzer().as_deref(), Some("scip-python"));
+
+    let following = ws.build(None).unwrap();
+    assert!(
+        !following.rebuilt(),
+        "the store is current under the indexer it now records"
+    );
+}
+
+// _(Scenario: The recorded indexer absent refuses instead of using the other)_
+#[test]
+fn an_absent_recorded_indexer_refuses_and_leaves_the_store_untouched() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::TyScip, "0.1.0");
+    ws.install(PythonIndexer::ScipPython, "0.6.0");
+    ws.build(Some(PythonIndexer::TyScip)).unwrap();
+    let before = std::fs::read(ws.db()).unwrap();
+    ws.uninstall(PythonIndexer::TyScip);
+
+    let err = ws.build(None).expect_err("ty-scip is absent");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("ty-scip") && message.contains("uv tool install"),
+        "the refusal names the recorded indexer and how to install it: {message}"
+    );
+    assert_eq!(std::fs::read(ws.db()).unwrap(), before, "the store is byte-identical");
+}
+
+// _(Scenario: An unchanged index stays current and fresh — build half)_ — a build without the option
+// reports a store current under whichever indexer built it.
+#[test]
+fn an_unchanged_store_reads_current_on_rebuild_for_each_indexer() {
+    for indexer in [PythonIndexer::TyScip, PythonIndexer::ScipPython] {
+        let ws = PythonWorkspace::new();
+        ws.install(indexer, "1.2.3");
+        ws.build(Some(indexer)).unwrap();
+
+        let outcome = ws.build(None).unwrap();
+
+        assert!(!outcome.rebuilt(), "{} store reads current", indexer.analyzer_name());
+    }
+}
+
+// _(Scenario: An unchanged index stays current and fresh — status half)_ — `status` judges a store
+// against the live version of the indexer that built it.
+#[test]
+fn an_unchanged_store_reads_fresh_in_status_for_each_indexer() {
+    for indexer in [PythonIndexer::TyScip, PythonIndexer::ScipPython] {
+        let ws = PythonWorkspace::new();
+        ws.install(indexer, "1.2.3");
+        ws.build(Some(indexer)).unwrap();
+
+        let status = ws.status();
+
+        assert_eq!(
+            status["freshness"],
+            "fresh",
+            "{} store reads fresh: {status}",
+            indexer.analyzer_name()
+        );
+    }
+}
+
+// _(Scenario: A changed version of the recorded indexer makes the index stale)_
+#[test]
+fn a_ty_scip_store_reads_stale_in_status_when_ty_scip_reports_another_version() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::TyScip, "0.1.0");
+    ws.build(Some(PythonIndexer::TyScip)).unwrap();
+    ws.install(PythonIndexer::TyScip, "0.2.0");
+
+    let status = ws.status();
+
+    assert_eq!(status["freshness"], "stale_version", "{status}");
+}
+
+/// A workspace whose ty-scip stub refuses to index, naming `rejected` as the file it cannot give a
+/// module name, over a source file at `rejected` holding `text`.
+fn ty_scip_refusing_workspace(rejected: &str, text: &str) -> PythonWorkspace {
+    let ws = PythonWorkspace::new();
+    let file = ws.dir.path().join(rejected);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, text).unwrap();
+    support::write_refusing_stub(
+        &ws.stub_bin(),
+        "ty-scip",
+        "0.1.0",
+        &format!("project file has no importable module name: {rejected}"),
+    );
+    ws
+}
+
+// _(Scenario: A file carrying inline script metadata is refused with the script remedy)_
+#[test]
+fn a_pep_723_script_is_refused_with_the_script_remedy() {
+    let ws = ty_scip_refusing_workspace(
+        "scripts/convert.py",
+        "# /// script\n# requires-python = \">=3.12\"\n# ///\nprint(1)\n",
+    );
+
+    let err = ws
+        .build(Some(PythonIndexer::TyScip))
+        .expect_err("ty-scip refuses the script");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("scripts/convert.py") && message.contains("exclude-scripts"),
+        "the refusal names the file and the script remedy: {message}"
+    );
+    assert_eq!(ws.recorded_analyzer(), None, "no store is persisted");
+}
+
+// _(Scenario: A file whose path is not an importable name is refused with the exclude remedy)_
+#[test]
+fn a_non_importable_path_is_refused_with_the_exclude_remedy() {
+    let ws = ty_scip_refusing_workspace("test-examples/case.py", "x = 1\n");
+
+    let err = ws
+        .build(Some(PythonIndexer::TyScip))
+        .expect_err("ty-scip refuses the path");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("test-examples/case.py") && message.contains("`exclude`"),
+        "the refusal names the file and the exclude remedy: {message}"
+    );
+    assert_eq!(ws.recorded_analyzer(), None, "no store is persisted");
+}
+
+// _(Scenario: A refused build leaves the existing store untouched)_
+#[test]
+fn a_refused_ty_scip_build_leaves_the_existing_store_untouched() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::TyScip, "0.1.0");
+    ws.build(Some(PythonIndexer::TyScip)).unwrap();
+    let before = std::fs::read(ws.db()).unwrap();
+    std::fs::create_dir(ws.dir.path().join("test-examples")).unwrap();
+    std::fs::write(ws.dir.path().join("test-examples/case.py"), "x = 1\n").unwrap();
+    support::write_refusing_stub(
+        &ws.stub_bin(),
+        "ty-scip",
+        "0.1.0",
+        "project file has no importable module name: test-examples/case.py",
+    );
+
+    ws.build(None).expect_err("ty-scip refuses the new file");
+
+    assert_eq!(std::fs::read(ws.db()).unwrap(), before, "the store is byte-identical");
 }

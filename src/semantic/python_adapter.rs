@@ -1,5 +1,6 @@
-//! The Python semantic backend: `scip-python index` for cross-file identity/resolution, translated
-//! into the engine-neutral model through the shared [`super::scip`] translation.
+//! The Python semantic backend: `ty-scip index` or `scip-python index` for cross-file
+//! identity/resolution, translated into the engine-neutral model through the shared [`super::scip`]
+//! translation.
 //!
 //! Resolution meaning depends on the interpreter environment the index ran against, so the adapter
 //! resolves an environment explicitly — explicit path, then the activated `$VIRTUAL_ENV`, then a
@@ -10,7 +11,7 @@
 //! provenance so staleness can compare them.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
@@ -20,7 +21,73 @@ use super::scip::translate_index;
 use super::{Capabilities, SemanticEngine, SemanticError};
 use crate::identity::SegmentKind;
 
-/// The Python adapter, wrapping `scip-python index` and translating its output into the model.
+/// The Python indexers the adapter can drive. Both accept the same `index` invocation and emit SCIP;
+/// they differ in executable, recorded analyzer name, install guidance, and how a failed run is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonIndexer {
+    /// `ty-scip`, built on the ty type checker.
+    TyScip,
+    /// Sourcegraph's `scip-python`.
+    ScipPython,
+}
+
+impl PythonIndexer {
+    /// The executable name looked up on `PATH`.
+    pub fn executable(self) -> &'static str {
+        match self {
+            Self::TyScip => "ty-scip",
+            Self::ScipPython => "scip-python",
+        }
+    }
+
+    /// The analyzer name recorded as provenance of every index this indexer produces.
+    pub fn analyzer_name(self) -> &'static str {
+        match self {
+            Self::TyScip => "ty-scip",
+            Self::ScipPython => "scip-python",
+        }
+    }
+
+    /// The install guidance named when this indexer cannot be run.
+    pub fn install_hint(self) -> &'static str {
+        match self {
+            Self::TyScip => "install ty-scip with `uv tool install ty-scip`",
+            Self::ScipPython => "install scip-python with `npm install -g @sourcegraph/scip-python`",
+        }
+    }
+
+    /// The command that installs this indexer, named on its own when the indexer is present but broken.
+    pub fn install_command(self) -> &'static str {
+        match self {
+            Self::TyScip => "uv tool install ty-scip",
+            Self::ScipPython => "npm install -g @sourcegraph/scip-python",
+        }
+    }
+
+    /// The indexer that records `name` as its analyzer name, if any.
+    pub fn from_analyzer_name(name: &str) -> Option<Self> {
+        [Self::TyScip, Self::ScipPython]
+            .into_iter()
+            .find(|indexer| indexer.analyzer_name() == name)
+    }
+}
+
+/// Choose the indexer a build or freshness check runs and probe its version.
+///
+/// The candidate is the explicit choice, else the indexer recorded by the existing store, else
+/// scip-python. Only the candidate is probed: when it is absent or unresponsive the probe's error
+/// passes through, and the other indexer is never tried, so a host's installed tools cannot change
+/// which indexer a store is built by.
+pub fn select_python_indexer(
+    explicit: Option<PythonIndexer>,
+    recorded: Option<PythonIndexer>,
+    probe: impl Fn(PythonIndexer) -> Result<String, SemanticError>,
+) -> Result<(PythonIndexer, String), SemanticError> {
+    let candidate = explicit.or(recorded).unwrap_or(PythonIndexer::ScipPython);
+    probe(candidate).map(|version| (candidate, version))
+}
+
+/// The Python adapter, wrapping `<indexer> index` and translating its output into the model.
 ///
 /// The invocation always passes `--project-name <name> --project-version 0`: probing scip-python
 /// (0.6.6) showed its own name/version inference crashes on a non-git directory whose
@@ -29,7 +96,9 @@ use crate::identity::SegmentKind;
 /// version is safe because identity projection reads only the package name, never its version.
 #[derive(Debug)]
 pub struct PythonAdapter {
-    /// The `scip-python` executable to invoke.
+    /// The indexer this adapter drives.
+    indexer: PythonIndexer,
+    /// The indexer's executable to invoke.
     executable: String,
     /// The tool version, discovered once at construction.
     version: String,
@@ -43,29 +112,23 @@ pub struct PythonAdapter {
 /// The consequence and remedy for an environment directory that cannot be read.
 const BROKEN_ENVIRONMENT: &str = "The environment looks broken; pass `--environment <virtualenv>` or recreate it.";
 
-/// The install step named when scip-python cannot be run.
-const INSTALL_HINT: &str = "install scip-python with `npm install -g @sourcegraph/scip-python`";
-
 impl PythonAdapter {
-    /// The analyzer name this adapter reports as provenance.
-    pub fn analyzer_name() -> &'static str {
-        "scip-python"
-    }
-
-    /// Construct an adapter for the given `scip-python` executable over a resolved environment,
-    /// discovering the tool's version.
+    /// Construct an adapter for `indexer`, run through `executable` (production callers pass
+    /// [`PythonIndexer::executable`]), over a resolved environment, discovering the tool's version.
     ///
     /// Fails with a typed [`SemanticError::Unavailable`] naming the tool and how to install it when
     /// the executable cannot be run — a backend whose indexer is missing is not usable, and the
     /// caller learns so explicitly.
     pub fn new(
+        indexer: PythonIndexer,
         executable: impl Into<String>,
         environment: PathBuf,
         project_name: impl Into<String>,
     ) -> Result<Self, SemanticError> {
         let executable = executable.into();
-        let version = Self::discover_version(&executable)?;
+        let version = Self::discover_version(indexer, &executable)?;
         Ok(Self {
+            indexer,
             executable,
             version,
             environment,
@@ -73,40 +136,41 @@ impl PythonAdapter {
         })
     }
 
-    /// Discover the scip-python version by running `<executable> --version`.
+    /// Discover the indexer's version by running `<executable> --version`.
     ///
     /// The probe is bounded: a missing executable is [`SemanticError::Unavailable`] naming the tool
     /// and how to install it, and one that is present but does not answer within the probe deadline is
     /// [`SemanticError::Timeout`] — present but unresponsive, distinct from missing.
-    pub fn discover_version(executable: &str) -> Result<String, SemanticError> {
+    pub fn discover_version(indexer: PythonIndexer, executable: &str) -> Result<String, SemanticError> {
+        let (name, hint) = (indexer.analyzer_name(), indexer.install_hint());
         let mut command = Command::new(executable);
         command.arg("--version");
         let capture = match run_bounded(command, PROBE_DEADLINE) {
             Ok(ProbeOutcome::Completed(capture)) => capture,
             Ok(ProbeOutcome::TimedOut) => {
                 return Err(SemanticError::Timeout(format!(
-                    "scip-python ({executable}) did not answer `--version` within {} s, so no index was built. \
+                    "{name} ({executable}) did not answer `--version` within {} s, so no index was built. \
                      Run `{executable} --version` to see why.",
                     PROBE_DEADLINE.as_secs()
                 )));
             }
             Err(e) => {
                 return Err(SemanticError::Unavailable(format!(
-                    "cannot run scip-python ({executable}), so no index was built; {INSTALL_HINT}. The system reported: {e}"
+                    "cannot run {name} ({executable}), so no index was built; {hint}. The system reported: {e}"
                 )));
             }
         };
         if !capture.status.success() {
             return Err(SemanticError::Unavailable(format!(
-                "`{executable} --version` failed ({}), so no index was built. If the installation is damaged, \
-                 reinstall it with `npm install -g @sourcegraph/scip-python`.",
-                capture.failure_detail()
+                "`{executable} --version` failed ({}), so no index was built. If the installation is damaged, reinstall it with `{}`.",
+                capture.failure_detail(),
+                indexer.install_command()
             )));
         }
         Ok(String::from_utf8_lossy(&capture.stdout).trim().to_string())
     }
 
-    /// Run the adapter's real `scip-python index` invocation over `project_root`, writing the raw
+    /// Run the adapter's real `<indexer> index` invocation over `project_root`, writing the raw
     /// SCIP index to `output`.
     ///
     /// This is the exact command [`SemanticEngine::analyze`] runs — same flags, same activated
@@ -116,7 +180,16 @@ impl PythonAdapter {
         // Run with the resolved environment's interpreter active: its bin/ first on PATH and
         // VIRTUAL_ENV set for the child, exactly what an activated venv provides.
         let child_path = prepend_to_path(&self.environment.join("bin"))?;
-        let status = Command::new(&self.executable)
+        let name = self.indexer.analyzer_name();
+        let unavailable = |e: std::io::Error| {
+            SemanticError::Unavailable(format!(
+                "cannot run {name} ({}) index, so no index was built; {}. The system reported: {e}",
+                self.executable,
+                self.indexer.install_hint()
+            ))
+        };
+        let mut command = Command::new(&self.executable);
+        command
             .arg("index")
             // Unconditional: scip-python's own name/version inference crashes or degenerates on
             // manifest shapes without a `[project]` table (see the type-level doc-comment).
@@ -128,21 +201,66 @@ impl PythonAdapter {
             .arg(output)
             .current_dir(project_root)
             .env("VIRTUAL_ENV", &self.environment)
-            .env("PATH", child_path)
-            .status()
-            .map_err(|e| {
-                SemanticError::Unavailable(format!(
-                    "cannot run scip-python ({}) index, so no index was built; {INSTALL_HINT}. The system reported: {e}",
+            .env("PATH", child_path);
+        if self.indexer == PythonIndexer::ScipPython {
+            let status = command.status().map_err(unavailable)?;
+            if !status.success() {
+                return Err(SemanticError::Analysis(format!(
+                    "`{} index` failed ({status}). Its own error output is printed above.",
                     self.executable
+                )));
+            }
+            return Ok(());
+        }
+        // ty-scip: a refusal is read from standard error, which is replayed afterwards so the user
+        // still sees the indexer's own diagnostics.
+        let run = command.stdout(Stdio::inherit()).output().map_err(unavailable)?;
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        eprint!("{stderr}");
+        if !run.status.success() {
+            return Err(rejected_file(&stderr, project_root).unwrap_or_else(|| {
+                SemanticError::Analysis(format!(
+                    "`{} index` failed ({}). Its own error output is printed above.",
+                    self.executable, run.status
                 ))
-            })?;
-        if !status.success() {
-            return Err(SemanticError::Analysis(format!(
-                "`{} index` failed ({status}). Its own error output is printed above.",
-                self.executable
-            )));
+            }));
         }
         Ok(())
+    }
+}
+
+/// The line prefix ty-scip prints when it refuses a file that has no module name in the project.
+const REJECTED_FILE_PREFIX: &str = "project file has no importable module name: ";
+
+/// Read a ty-scip failure's standard error for a file the indexer refused, resolving a relative path
+/// against `project_root`. `None` when the text names no such file.
+fn rejected_file(stderr: &str, project_root: &Path) -> Option<SemanticError> {
+    let named = stderr
+        .lines()
+        .find_map(|line| line.split_once(REJECTED_FILE_PREFIX).map(|(_, path)| path.trim()))?;
+    let path = project_root.join(named);
+    let remedy = rejected_file_remedy(&path, named);
+    Some(SemanticError::RejectedFile { path, remedy })
+}
+
+/// The configuration change that stops ty-scip refusing `path`: a file whose leading comment lines
+/// hold a PEP 723 block is a standalone script, excluded wholesale by `exclude-scripts`; any other
+/// file (a path component that is not an identifier, say) is excluded by name.
+fn rejected_file_remedy(path: &Path, named: &str) -> String {
+    let is_script = std::fs::read_to_string(path).is_ok_and(|text| {
+        text.lines()
+            .map(str::trim)
+            .take_while(|line| line.is_empty() || line.starts_with('#'))
+            .any(|line| line == "# /// script")
+    });
+    if is_script {
+        "set `exclude-scripts = true` under `[src]` in `ty.toml`, or under `[tool.ty.src]` in `pyproject.toml`"
+            .to_string()
+    } else {
+        format!(
+            "add `{}` to `exclude` under `[src]` in `ty.toml`, or under `[tool.ty.src]` in `pyproject.toml`",
+            named
+        )
     }
 }
 
@@ -183,7 +301,7 @@ pub fn classify_module_kinds(index: &mut ExtractedIndex) {
 impl SemanticEngine for PythonAdapter {
     fn provenance(&self) -> AnalyzerProvenance {
         AnalyzerProvenance {
-            analyzer_name: Self::analyzer_name().to_string(),
+            analyzer_name: self.indexer.analyzer_name().to_string(),
             analyzer_version: self.version.clone(),
         }
     }
@@ -199,7 +317,11 @@ impl SemanticEngine for PythonAdapter {
         // produce an index with unverifiable provenance, so it refuses up front.
         let facts = environment_facts(&self.environment)?;
 
-        let output_path = std::env::temp_dir().join(format!("c10r-scip-python-{}.scip", std::process::id()));
+        let output_path = std::env::temp_dir().join(format!(
+            "c10r-{}-{}.scip",
+            self.indexer.analyzer_name(),
+            std::process::id()
+        ));
         self.write_scip_index(project_root, &output_path)?;
         let bytes = std::fs::read(&output_path).map_err(|e| {
             SemanticError::Analysis(format!(
@@ -463,7 +585,8 @@ mod tests {
     fn failed_version_probe_message_carries_exit_status_and_does_not_say_to_install() {
         let dir = tempfile::tempdir().unwrap();
         let exe = write_stub(dir.path(), "scip-python", "echo 'node crashed' >&2\nexit 4");
-        let err = PythonAdapter::discover_version(&exe).expect_err("a failing probe refuses");
+        let err =
+            PythonAdapter::discover_version(PythonIndexer::ScipPython, &exe).expect_err("a failing probe refuses");
         let text = err.to_string();
         assert!(text.contains("exit status: 4"), "{text}");
         assert!(text.contains("node crashed"), "{text}");
@@ -483,7 +606,7 @@ mod tests {
     fn adapter_over(dir: &Path, stub_body: &str) -> PythonAdapter {
         let exe = write_stub(dir, "scip-python", stub_body);
         let environment = fake_environment(&dir.join("env"), "echo 'Python 3.12.0'");
-        PythonAdapter::new(exe, environment, "fixture").unwrap()
+        PythonAdapter::new(PythonIndexer::ScipPython, exe, environment, "fixture").unwrap()
     }
 
     // A scip-python that exits nonzero from `index` names the tool, the exit status, and where its
@@ -606,7 +729,8 @@ mod tests {
     // A missing scip-python names the install command and the cause the operating system gave.
     #[test]
     fn missing_tool_message_names_install_command() {
-        let err = PythonAdapter::discover_version("/nonexistent/scip-python").expect_err("a missing tool refuses");
+        let err = PythonAdapter::discover_version(PythonIndexer::ScipPython, "/nonexistent/scip-python")
+            .expect_err("a missing tool refuses");
         let text = err.to_string();
         assert!(text.contains("npm install -g @sourcegraph/scip-python"), "{text}");
         assert!(text.contains("No such file or directory"), "{text}");
@@ -719,14 +843,203 @@ mod tests {
         assert_eq!(after, reordered, "the fingerprint is a function of the set, not order");
     }
 
+    #[test]
+    fn each_indexer_yields_its_executable_analyzer_name_and_install_hint() {
+        let cases = [
+            (PythonIndexer::TyScip, "ty-scip", "uv tool install ty-scip"),
+            (
+                PythonIndexer::ScipPython,
+                "scip-python",
+                "npm install -g @sourcegraph/scip-python",
+            ),
+        ];
+        for (indexer, name, install) in cases {
+            assert_eq!(indexer.executable(), name);
+            assert_eq!(indexer.analyzer_name(), name);
+            assert!(indexer.install_hint().contains(install), "{indexer:?}");
+            assert_eq!(PythonIndexer::from_analyzer_name(name), Some(indexer));
+        }
+        assert_eq!(PythonIndexer::from_analyzer_name("rust-analyzer"), None);
+    }
+
+    // The adapter's provenance carries the indexer's analyzer name and the version the tool reports.
+    #[test]
+    fn adapter_provenance_carries_the_indexers_analyzer_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_guard, dir) = canonical_tempdir();
+        let tool = dir.join("fake-indexer");
+        std::fs::write(&tool, "#!/bin/sh\necho 9.9.9\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for indexer in [PythonIndexer::TyScip, PythonIndexer::ScipPython] {
+            let adapter = PythonAdapter::new(indexer, tool.to_string_lossy().into_owned(), dir.clone(), "fixture")
+                .expect("fake tool answers --version");
+            let provenance = adapter.provenance();
+            assert_eq!(provenance.analyzer_name, indexer.analyzer_name());
+            assert_eq!(provenance.analyzer_version, "9.9.9");
+        }
+    }
+
+    // A missing ty-scip names ty-scip and its own install command, not scip-python's.
+    #[test]
+    fn missing_ty_scip_names_its_own_install_hint() {
+        let (_guard, dir) = canonical_tempdir();
+        let err = PythonAdapter::discover_version(PythonIndexer::TyScip, &dir.join("ty-scip").to_string_lossy())
+            .expect_err("tool is absent");
+        assert!(matches!(err, SemanticError::Unavailable(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("uv tool install ty-scip"), "{message}");
+        assert!(!message.contains("scip-python"), "{message}");
+    }
+
+    /// A probe that answers for the indexers in `present`, is unresponsive for those in `hanging`,
+    /// and is unavailable otherwise; it records which indexers were probed.
+    fn probe_over<'a>(
+        present: &'a [PythonIndexer],
+        hanging: &'a [PythonIndexer],
+        probed: &'a std::cell::RefCell<Vec<PythonIndexer>>,
+    ) -> impl Fn(PythonIndexer) -> Result<String, SemanticError> + 'a {
+        move |indexer| {
+            probed.borrow_mut().push(indexer);
+            if present.contains(&indexer) {
+                Ok(format!("{} 1.0", indexer.analyzer_name()))
+            } else if hanging.contains(&indexer) {
+                Err(SemanticError::Timeout(format!(
+                    "{} did not respond",
+                    indexer.analyzer_name()
+                )))
+            } else {
+                Err(SemanticError::Unavailable(format!(
+                    "cannot run {}; {}",
+                    indexer.analyzer_name(),
+                    indexer.install_hint()
+                )))
+            }
+        }
+    }
+
+    // Each candidate source (explicit, recorded, default) is probed alone: present, it is returned
+    // with its probed version; absent or unresponsive, its own error passes through — even while the
+    // other indexer is present, which is never probed or returned.
+    #[test]
+    fn selection_probes_only_the_candidate() {
+        use PythonIndexer::{ScipPython, TyScip};
+        let other = |i: PythonIndexer| if i == TyScip { ScipPython } else { TyScip };
+        let sources: [(Option<PythonIndexer>, Option<PythonIndexer>, PythonIndexer); 4] = [
+            (Some(TyScip), None, TyScip),
+            (Some(ScipPython), Some(TyScip), ScipPython),
+            (None, Some(TyScip), TyScip),
+            (None, None, ScipPython),
+        ];
+        for (explicit, recorded, candidate) in sources {
+            let probed = std::cell::RefCell::new(Vec::new());
+            let both = [candidate, other(candidate)];
+
+            let selected = select_python_indexer(explicit, recorded, probe_over(&both, &[], &probed)).unwrap();
+            assert_eq!(selected, (candidate, format!("{} 1.0", candidate.analyzer_name())));
+
+            let absent = select_python_indexer(explicit, recorded, probe_over(&[other(candidate)], &[], &probed))
+                .expect_err("candidate absent");
+            assert!(matches!(absent, SemanticError::Unavailable(_)), "{absent:?}");
+            assert!(absent.to_string().contains(candidate.install_hint()), "{absent}");
+
+            let hung = select_python_indexer(
+                explicit,
+                recorded,
+                probe_over(&[other(candidate)], &[candidate], &probed),
+            )
+            .expect_err("candidate unresponsive");
+            assert!(matches!(hung, SemanticError::Timeout(_)), "{hung:?}");
+            assert!(hung.to_string().contains(candidate.analyzer_name()), "{hung}");
+
+            assert!(
+                probed.borrow().iter().all(|p| *p == candidate),
+                "only the candidate is probed"
+            );
+        }
+    }
+
+    // A ty-scip refusal names the file; a PEP 723 script gets the exclude-scripts remedy, any other
+    // file gets an exclude entry for its path, and text naming no file is not a refusal.
+    #[test]
+    fn rejected_file_remedy_follows_the_named_files_header() {
+        let (_guard, root) = canonical_tempdir();
+        std::fs::write(
+            root.join("tool.py"),
+            "#!/usr/bin/env -S uv run\n# /// script\n# dependencies = []\n# ///\nprint()\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("test-examples")).unwrap();
+        std::fs::write(root.join("test-examples").join("case.py"), "x = 1\n").unwrap();
+        // A script marker below the first code line is not a leading comment.
+        std::fs::write(root.join("late.py"), "x = 1\n# /// script\n").unwrap();
+
+        let stderr = "ty-scip: indexing\nerror: project file has no importable module name: tool.py \n";
+        let Some(SemanticError::RejectedFile { path, remedy }) = rejected_file(stderr, &root) else {
+            panic!("a refusal naming a file is typed");
+        };
+        assert_eq!(path, root.join("tool.py"));
+        assert!(remedy.contains("exclude-scripts = true"), "{remedy}");
+
+        for named in ["test-examples/case.py", "late.py"] {
+            let stderr = format!("project file has no importable module name: {named}\n");
+            let Some(SemanticError::RejectedFile { remedy, .. }) = rejected_file(&stderr, &root) else {
+                panic!("typed");
+            };
+            assert!(remedy.contains(&format!("add `{named}` to `exclude`")), "{remedy}");
+        }
+
+        assert!(rejected_file("ty-scip: Failed to discover local Python environment\n", &root).is_none());
+    }
+
+    // A nonzero ty-scip run becomes a typed refusal only when its standard error names a refused
+    // file; any other nonzero exit stays an analysis failure.
+    #[test]
+    fn failed_ty_scip_run_is_classified_from_its_standard_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_guard, dir) = canonical_tempdir();
+        let tool = dir.join("ty-scip");
+        let script = |body: &str| {
+            std::fs::write(
+                &tool,
+                format!("#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 0.1.0; exit 0; }}\n{body}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let run = || {
+            let adapter = PythonAdapter::new(
+                PythonIndexer::TyScip,
+                tool.to_string_lossy().into_owned(),
+                dir.clone(),
+                "fixture",
+            )
+            .unwrap();
+            adapter.write_scip_index(&dir, &dir.join("out.scip"))
+        };
+
+        script("echo 'project file has no importable module name: a/b.py' >&2; exit 1");
+        assert!(matches!(run(), Err(SemanticError::RejectedFile { .. })));
+        script("echo 'ty-scip: Failed to discover local Python environment' >&2; exit 1");
+        assert!(matches!(run(), Err(SemanticError::Analysis(_))));
+        script("exit 0");
+        assert!(run().is_ok());
+    }
+
     // A missing indexer tool refuses with guidance naming the tool and how to install it. The tool
     // is looked up at an executable path inside an empty directory, so it is deterministically absent.
     #[test]
     fn python_adapter_reports_unavailable_when_tool_missing() {
         let (_empty_guard, empty) = canonical_tempdir();
         let missing_tool = empty.join("scip-python");
-        let err = PythonAdapter::new(missing_tool.to_string_lossy().into_owned(), empty.clone(), "fixture")
-            .expect_err("tool is absent");
+        let err = PythonAdapter::new(
+            PythonIndexer::ScipPython,
+            missing_tool.to_string_lossy().into_owned(),
+            empty.clone(),
+            "fixture",
+        )
+        .expect_err("tool is absent");
         assert!(
             matches!(err, SemanticError::Unavailable(_)),
             "typed unavailability, got: {err:?}"

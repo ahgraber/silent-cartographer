@@ -77,7 +77,8 @@ fn main() {
 }
 
 /// Run `doctor` and exit: print the readiness report to standard output unconditionally, then exit
-/// with the success code when every required indexer is present and responsive, or the
+/// with the success code when every required indexer is present and responsive (an optional indexer
+/// may be absent or unresponsive), or the
 /// indexer/setup-failure code with a diagnostic on standard error naming what is not ready — a tool
 /// that is absent or present-but-unresponsive.
 fn run_doctor(cli: &Cli) -> ! {
@@ -92,7 +93,7 @@ fn run_doctor(cli: &Cli) -> ! {
     let not_ready: Vec<String> = report
         .indexers
         .iter()
-        .filter(|s| !s.is_ready())
+        .filter(|s| s.is_setup_failure())
         .map(|s| {
             let state = match s.presence {
                 commands::Presence::Absent => "was not found",
@@ -344,7 +345,8 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
                 cli.workspace.as_deref(),
                 &args.root,
                 &args.rust_analyzer,
-                "scip-python",
+                &commands::PythonExecutables::default(),
+                args.python_indexer.map(Into::into),
                 args.environment.as_deref(),
                 args.language.map(Into::into),
                 args.force,
@@ -365,6 +367,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             &cli.db,
             &root,
             DEFAULT_ANALYZER,
+            &commands::PythonExecutables::default(),
             cli.json,
             args.discrepancies,
             args.all,

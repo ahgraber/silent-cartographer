@@ -25,6 +25,7 @@
 //! passes the ordinary alignment rules; an occurrence no locality rule settles is typed
 //! duplicate-ambiguous and attributed to no twin, rather than silently misassigned.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use strum::{EnumCount as _, VariantArray as _};
@@ -1394,7 +1395,7 @@ fn evaluate_rules_at(
                 .map(|text| (text, span)),
         };
         if let Some((text, matched_span)) = candidate
-            && trailing_component_run_matches(text, dotted_name)
+            && trailing_component_run_matches(text, &dotted_name)
         {
             return Some((AlignmentRule::ModuleName, matched_span));
         }
@@ -1407,7 +1408,7 @@ fn evaluate_rules_at(
         for construct_span in tree.enclosing_dotted_constructs(span) {
             if let Some(text) = tree.text_at(construct_span)
                 && is_relative_module_path(text)
-                && trailing_component_run_matches(text, dotted_name)
+                && trailing_component_run_matches(text, &dotted_name)
             {
                 return Some((AlignmentRule::ModuleName, construct_span));
             }
@@ -1453,22 +1454,14 @@ fn trailing_component_run_matches(text: &str, dotted_name: &str) -> bool {
     !run.is_empty() && (run == dotted_name || dotted_name.ends_with(&format!(".{run}")))
 }
 
-/// The (package, dotted namespace name) a module symbol's descriptor spells, under either shape
-/// scip-python emits for a module: the `__init__`-terminal shape (namespace segment + `__init__`
-/// meta terminal — the zero-width marker's symbol) or the bare-namespace shape (a single
-/// Module-kind segment — the symbol a `__name__`/`__file__` token's occurrence resolves to).
-/// Returns `None` for any other descriptor shape: refusal over reading the wrong segment.
-fn module_identity_parts(symbol: &ExtractedSymbol) -> Option<(&str, &str)> {
+/// The (package, dotted namespace name) a module symbol's descriptor spells, under any shape a
+/// module takes: the `__init__`-terminal shape (the zero-width marker's symbol), the bare-namespace
+/// shape (the symbol a `__name__`/`__file__` token's occurrence resolves to), or ty-scip's run of
+/// module segments. Returns `None` for any other descriptor shape: refusal over reading the wrong
+/// segment.
+fn module_identity_parts(symbol: &ExtractedSymbol) -> Option<(&str, Cow<'_, str>)> {
     let descriptor = symbol.descriptor.as_ref()?;
-    if let Some(dotted_name) = module_dotted_name(symbol) {
-        return Some((descriptor.package.as_str(), dotted_name));
-    }
-    match descriptor.segments.as_slice() {
-        [only] if only.kind == crate::identity::SegmentKind::Module => {
-            Some((descriptor.package.as_str(), only.name.as_str()))
-        }
-        _ => None,
-    }
+    Some((descriptor.package.as_str(), module_dotted_name(symbol)?))
 }
 
 /// Whether a span's raw text has the shape of a (possibly relative) Python module path: zero or
@@ -1569,22 +1562,31 @@ fn containing_module_ancestor_matches(
         .all(|(seg, name)| seg.kind == SegmentKind::Module && seg.name == *name)
 }
 
-/// The dotted namespace name of a module symbol: the descriptor segment immediately preceding the
-/// `__init__` terminal (e.g. `pkg.shapes`), whole — the module-name rule compares span text against
-/// its trailing component-runs.
+/// The dotted namespace name of a module symbol (e.g. `pkg.shapes`), whole — the module-name rule
+/// compares span text against its trailing component-runs. Two descriptor shapes spell it:
+/// scip-python's namespace segment holding the dotted name, followed by an `__init__` meta terminal
+/// (borrowed), and ty-scip's run of module segments, one per component (joined with `.`).
 ///
-/// Returns `None` when the descriptor does not carry the module shape `classify_module_kinds`
-/// classifies on (a namespace segment followed by an `__init__`/meta terminal) — a defensive
-/// fallback for a module-kind symbol whose descriptor was constructed some other way (e.g. directly
-/// in a test).
-fn module_dotted_name(symbol: &ExtractedSymbol) -> Option<&str> {
+/// Returns `None` for any other descriptor — a defensive fallback for a module-kind symbol whose
+/// descriptor was constructed some other way (e.g. directly in a test).
+fn module_dotted_name(symbol: &ExtractedSymbol) -> Option<Cow<'_, str>> {
+    use crate::identity::SegmentKind;
+
     let segments = &symbol.descriptor.as_ref()?.segments;
     let terminal = segments.last()?;
-    if terminal.name != "__init__" || terminal.kind != crate::identity::SegmentKind::Meta {
-        return None;
+    if terminal.name == "__init__" && terminal.kind == SegmentKind::Meta {
+        let namespace = segments.len().checked_sub(2).and_then(|i| segments.get(i))?;
+        return Some(Cow::Borrowed(&namespace.name));
     }
-    let namespace = segments.len().checked_sub(2).and_then(|i| segments.get(i))?;
-    Some(&namespace.name)
+    segments.iter().all(|seg| seg.kind == SegmentKind::Module).then(|| {
+        Cow::Owned(
+            segments
+                .iter()
+                .map(|seg| seg.name.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        )
+    })
 }
 
 /// Whether a source token names the descriptor's package.

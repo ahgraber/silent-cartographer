@@ -270,12 +270,22 @@ pub fn python_fixture_root() -> std::path::PathBuf {
 /// Panics if `index.scip` is missing from the fixture directory or fails to parse as a SCIP
 /// protobuf.
 pub fn python_fixture_index() -> ExtractedIndex {
+    python_fixture_index_from("index.scip")
+}
+
+/// The committed Python fixture index named `file` (`index.scip` from scip-python, `ty-scip.scip`
+/// from ty-scip), taken through the same translation as [`python_fixture_index`].
+///
+/// # Panics
+///
+/// Panics if `file` is missing from the fixture directory or fails to parse as a SCIP protobuf.
+pub fn python_fixture_index_from(file: &str) -> ExtractedIndex {
     use silent_cartographer::semantic::model::normalize;
     use silent_cartographer::semantic::python_adapter::classify_module_kinds;
     use silent_cartographer::semantic::scip::translate_index;
 
-    let path = python_fixture_root().join("index.scip");
-    let bytes = std::fs::read(&path).expect("checked-in python-conformance index.scip present");
+    let path = python_fixture_root().join(file);
+    let bytes = std::fs::read(&path).expect("checked-in python-conformance index present");
     let index: scip::types::Index = protobuf::Message::parse_from_bytes(&bytes).expect("valid SCIP protobuf");
     let provenance = AnalyzerProvenance {
         analyzer_name: index.metadata.tool_info.name.clone(),
@@ -341,6 +351,36 @@ pub fn write_indexing_stub(dir: &std::path::Path, name: &str, version: &str) -> 
     path
 }
 
+/// Write an executable stub tool that is present but never answers `--version`, so a readiness probe
+/// of it times out.
+pub fn write_hanging_stub(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    write_executable(dir, name, "#!/bin/sh\nexec sleep 600\n")
+}
+
+/// Write an executable stub indexer that answers `--version` with `version` and refuses every other
+/// invocation: it prints `message` to standard error and exits with status 1, as ty-scip does for a
+/// file it cannot give a module name.
+pub fn write_refusing_stub(dir: &std::path::Path, name: &str, version: &str, message: &str) -> std::path::PathBuf {
+    write_executable(
+        dir,
+        name,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"{version}\"\n  exit 0\nfi\necho '{message}' >&2\nexit 1\n"
+        ),
+    )
+}
+
+fn write_executable(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(name);
+    std::fs::write(&path, script).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
 /// `PATH` with `dirs` prepended, in order, ahead of the inherited value, so a stub placed in one of
 /// them is found before any same-named tool already on `PATH`.
 pub fn prepend_path(dirs: &[&std::path::Path]) -> std::ffi::OsString {
@@ -361,11 +401,11 @@ pub const LANGUAGES: [silent_cartographer::graph::syntax::Language; 2] = [
 /// The provenance a backend for `language` reports.
 pub fn backend_provenance(language: silent_cartographer::graph::syntax::Language) -> AnalyzerProvenance {
     use silent_cartographer::graph::syntax::Language;
-    use silent_cartographer::semantic::python_adapter::PythonAdapter;
+    use silent_cartographer::semantic::python_adapter::PythonIndexer;
     use silent_cartographer::semantic::rust_adapter::RustAdapter;
     let analyzer_name = match language {
         Language::Rust => RustAdapter::analyzer_name(),
-        Language::Python => PythonAdapter::analyzer_name(),
+        Language::Python => PythonIndexer::ScipPython.analyzer_name(),
     };
     AnalyzerProvenance {
         analyzer_name: analyzer_name.to_string(),

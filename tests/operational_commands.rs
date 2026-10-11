@@ -43,14 +43,15 @@ fn write_stub(dir: &Path, name: &str, version_line: &str) {
     std::fs::set_permissions(&path, perms).unwrap();
 }
 
-// _(Indexer readiness report: all indexers present)_ — with both required indexers on `PATH`, each is
-// reported present with its version and the process exits with the success code.
+// _(Indexer readiness report: all indexers present)_ — with every indexer on `PATH`, each is reported
+// present with its version and the process exits with the success code.
 #[cfg(unix)]
 #[test]
 fn doctor_reports_present_indexers_with_version_and_exits_success() {
     let bin_dir = tempfile::tempdir().unwrap();
     write_stub(bin_dir.path(), "rust-analyzer", "rust-analyzer 1.99.0-stub");
     write_stub(bin_dir.path(), "scip-python", "0.9.9-stub");
+    write_stub(bin_dir.path(), "ty-scip", "ty-scip 0.1.0-stub");
 
     let out = c10r()
         .env("PATH", bin_dir.path())
@@ -61,7 +62,7 @@ fn doctor_reports_present_indexers_with_version_and_exits_success() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "both indexers present is the success code; stderr: {}",
+        "every indexer present is the success code; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(out.stderr.is_empty(), "no diagnostic when every indexer is present");
@@ -70,7 +71,12 @@ fn doctor_reports_present_indexers_with_version_and_exits_success() {
     let statuses = report["indexers"]
         .as_array()
         .expect("the report's indexers field is a list of indexer statuses");
-    assert_eq!(statuses.len(), 2, "both required indexers are reported");
+    let names: Vec<&str> = statuses.iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        ["rust-analyzer", "scip-python", "ty-scip"],
+        "every indexer is reported"
+    );
     for status in statuses {
         assert_eq!(status["presence"], "present", "reported present: {status}");
         assert!(
@@ -108,7 +114,7 @@ fn doctor_reports_absent_indexers_with_hint_and_exits_setup_failure() {
     let statuses = report["indexers"]
         .as_array()
         .expect("the report's indexers field is a list of indexer statuses");
-    assert_eq!(statuses.len(), 2, "both required indexers are reported");
+    assert_eq!(statuses.len(), 3, "every indexer is reported");
     for status in statuses {
         assert_eq!(status["presence"], "absent", "reported absent: {status}");
         assert!(
@@ -129,6 +135,114 @@ fn doctor_reports_absent_indexers_with_hint_and_exits_setup_failure() {
     for name in ["rust-analyzer", "scip-python"] {
         assert!(stderr.contains(name), "the diagnostic names {name}: {stderr}");
     }
+    assert!(
+        !stderr.contains("ty-scip"),
+        "the optional indexer is not named as a setup failure: {stderr}"
+    );
+}
+
+/// The `doctor --json` entry for the indexer called `name`.
+fn indexer_entry<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["indexers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == name)
+        .unwrap_or_else(|| panic!("the report carries {name}: {report}"))
+}
+
+// _(Indexer readiness report: required and optional indexers)_ — each entry says whether the indexer
+// is required, and the human report marks the optional one.
+#[cfg(unix)]
+#[test]
+fn doctor_marks_only_ty_scip_optional() {
+    let bin_dir = tempfile::tempdir().unwrap();
+    write_stub(bin_dir.path(), "rust-analyzer", "rust-analyzer 1.99.0-stub");
+    write_stub(bin_dir.path(), "scip-python", "0.9.9-stub");
+    write_stub(bin_dir.path(), "ty-scip", "ty-scip 0.1.0-stub");
+
+    let out = c10r()
+        .env("PATH", bin_dir.path())
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(indexer_entry(&report, "rust-analyzer")["required"], true);
+    assert_eq!(indexer_entry(&report, "scip-python")["required"], true);
+    assert_eq!(indexer_entry(&report, "ty-scip")["required"], false);
+
+    let human = c10r().env("PATH", bin_dir.path()).arg("doctor").output().unwrap();
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    let ty_scip_line = stdout.lines().find(|l| l.starts_with("ty-scip")).unwrap();
+    assert!(
+        ty_scip_line.contains("(optional)"),
+        "ty-scip is marked optional: {stdout}"
+    );
+    assert_eq!(
+        stdout.lines().filter(|l| l.contains("(optional)")).count(),
+        1,
+        "only ty-scip is marked optional: {stdout}"
+    );
+}
+
+// _(Indexer readiness report: ty-scip absent)_ — a host without ty-scip still succeeds, and ty-scip
+// is reported absent with its install hint.
+#[cfg(unix)]
+#[test]
+fn doctor_succeeds_with_ty_scip_absent_and_reports_its_install_hint() {
+    let bin_dir = tempfile::tempdir().unwrap();
+    write_stub(bin_dir.path(), "rust-analyzer", "rust-analyzer 1.99.0-stub");
+    write_stub(bin_dir.path(), "scip-python", "0.9.9-stub");
+
+    let out = c10r()
+        .env("PATH", bin_dir.path())
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an absent optional indexer is not a setup failure; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty(), "no diagnostic for an absent optional indexer");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    let ty_scip = indexer_entry(&report, "ty-scip");
+    assert_eq!(ty_scip["presence"], "absent", "{ty_scip}");
+    assert_eq!(ty_scip["hint"], "install: uv tool install ty-scip", "{ty_scip}");
+}
+
+// _(Indexer readiness report: ty-scip unresponsive)_ — a hanging ty-scip is reported unresponsive
+// within a bounded time, and the process still succeeds.
+#[cfg(unix)]
+#[test]
+fn doctor_succeeds_with_ty_scip_unresponsive() {
+    let bin_dir = tempfile::tempdir().unwrap();
+    write_stub(bin_dir.path(), "rust-analyzer", "rust-analyzer 1.99.0-stub");
+    write_stub(bin_dir.path(), "scip-python", "0.9.9-stub");
+    write_hanging_stub(bin_dir.path(), "ty-scip");
+
+    let start = Instant::now();
+    let out = c10r()
+        .env("PATH", bin_dir.path())
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < HANG_ASSERT_WINDOW,
+        "the hanging probe is bounded, not waited on indefinitely: {elapsed:?}"
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unresponsive optional indexer is not a setup failure; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
+    assert_eq!(indexer_entry(&report, "ty-scip")["presence"], "unresponsive");
 }
 
 // _(Indexer readiness report — human rendering)_ — the default human report is a fixed-width line per

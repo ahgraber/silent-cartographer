@@ -147,5 +147,11 @@ pub fn run(engine: &dyn SemanticEngine, project_root: &Path) -> ConformanceRepor
                 detail: msg,
             }],
         },
+        Err(error @ SemanticError::RejectedFile { .. }) => ConformanceReport {
+            violations: vec![Violation {
+                clause: "analyze-succeeds",
+                detail: error.to_string(),
+            }],
+        },
     }
 }
