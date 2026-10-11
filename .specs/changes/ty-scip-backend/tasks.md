@@ -2,17 +2,15 @@
 
 ## Setup
 
-- [ ] Create the worktree `.worktrees/ty-scip-backend` on branch `ty-scip-backend` from `main`, and move the untracked change directory into it.
-  If `stale-files-and-line-positions` is being implemented at the same time, agree the merge order with the user first, because both changes edit the `status` freshness code in `src/commands.rs` and both bump `SURFACE_VERSION`.
-- [ ] Install `ty-scip` 0.1.0 with `uv tool install ty-scip==0.1.0` and record `ty-scip --version` output in `gate.md`.
+- [ ] Create the worktree `.worktrees/ty-scip-backend` on branch `ty-scip-backend` from `main`, and move the untracked change directory into it.- [ ] Install `ty-scip` 0.1.0 with `uv tool install ty-scip==0.1.0` and record `ty-scip --version` output in `gate.md`.
 
 ## Indexer profiles and selection (semantic-engine)
 
 - [ ] Add the `PythonIndexer` enum (`TyScip`, `ScipPython`) to [src/semantic/python_adapter.rs](../../../src/semantic/python_adapter.rs) with its executable name, analyzer name, and install hint.
 - [ ] Change `PythonAdapter::new` and `PythonAdapter::discover_version` to take a `PythonIndexer`, and report the indexer's analyzer name as provenance.
 - [ ] Unit test: each `PythonIndexer` variant yields its executable name, analyzer name, and install hint, and the adapter's provenance carries that analyzer name.
-- [ ] Add `select_python_indexer(explicit, probe)` as a pure function over probe outcomes, following the resolution order in `design.md` § SelectionIsOneFunctionOverProbes.
-- [ ] Unit test `select_python_indexer` for each partition: explicit present, explicit absent, explicit unresponsive; no selection with both present, only ty-scip, only scip-python, neither, and ty-scip unresponsive with scip-python present.
+- [ ] Add `select_python_indexer(explicit, recorded, probe)` as a pure function over probe outcomes, following `design.md` § SelectionIsOneFunctionOverProbes.
+- [ ] Unit test `select_python_indexer` for each candidate source (explicit; recorded with no explicit; scip-python with neither), each with the candidate present, absent, and unresponsive while the other indexer is present; and an explicit selection that differs from the recorded indexer.
 - [ ] Add `SemanticError::RejectedFile { path, remedy }` and map it to the exit code that `SemanticError::Analysis` already uses.
 - [ ] Capture ty-scip standard error, replay it to standard error after the run, and map a `project file has no importable module name: <path>` failure to `RejectedFile` with the remedy chosen by the named file's PEP 723 header.
 - [ ] Unit test the remedy choice: a file whose leading comments hold `# /// script` gets the `exclude-scripts` remedy; a file under a non-identifier directory gets the `exclude` remedy; any other nonzero exit stays `SemanticError::Analysis`.
@@ -32,18 +30,19 @@
 ## Build, status, and doctor (code-graph, command-surface)
 
 - [ ] Add `--python-indexer <ty-scip|scip-python>` to `BuildArgs` in [src/cli.rs](../../../src/cli.rs) as an `Option` with no default, and pass it from [src/main.rs](../../../src/main.rs) to `run_build` in place of the hard-coded `scip-python`.
-- [ ] In `run_build`, refuse the option with `Failure::Usage` when the selected language is Rust, and otherwise construct the adapter from `select_python_indexer`.
+- [ ] In `run_build`, refuse the option with `Failure::Usage` when the selected language is Rust, and otherwise read the recorded indexer from the existing store's provenance and construct the adapter from `select_python_indexer`.
 - [ ] Extend the fake-executable helpers already used by `tests/command_surface.rs` so a test can place fake `ty-scip` and `scip-python` executables on a temporary `PATH`, each configurable to answer `--version`, hang, or be absent, and to write a fixed SCIP index.
-- [ ] Integration tests for selection in `build` (`A Python build selects its indexer`): explicit `scip-python` with both present; no option with both present selects ty-scip; only scip-python; only ty-scip; neither refuses naming both install hints; unresponsive ty-scip refuses naming ty-scip; the option on a Rust workspace is a usage error.
+- [ ] Integration tests for selection in `build` (`A Python build selects its indexer`), with no store: explicit `ty-scip` with both present; no option with both present selects scip-python; no option with only ty-scip present refuses naming scip-python; no option with scip-python unresponsive and ty-scip present refuses naming scip-python; the option on a Rust workspace is a usage error.
   Each asserts the recorded provenance or that no store was persisted.
-- [ ] Make the build-side currency check (`current_index_accounting`) compare the recorded analyzer against `select_python_indexer` with the build's explicit selection.
-- [ ] Make the `status` freshness check in [src/commands.rs](../../../src/commands.rs) compare the recorded analyzer against `select_python_indexer(None, …)`, keeping the existing timeout disclosure and recorded-provenance fallback.
-- [ ] Change the human label for `stale_version` in [src/render.rs](../../../src/render.rs) to "stale (analyzer or analyzer version changed)", leaving the JSON value unchanged, and update the tests that assert the old label.
-- [ ] Integration test: a store built by scip-python reads stale in `status` once ty-scip becomes available, and a following build without the option rebuilds it with ty-scip provenance.
+- [ ] Make the build-side currency check (`current_index_accounting`) compare the recorded analyzer against `select_python_indexer` with the build's explicit selection and the recorded indexer.
+- [ ] Make the `status` freshness check in [src/commands.rs](../../../src/commands.rs) probe the recorded indexer's version through `select_python_indexer(None, recorded, …)` in place of the fixed scip-python probe, keeping the existing timeout disclosure and recorded-provenance fallback.
+- [ ] Integration test: a store built by ty-scip, with changed sources, is rebuilt by a build without the option with ty-scip provenance.
+- [ ] Integration test: a store built by ty-scip, with unchanged sources, is rebuilt with scip-python provenance by a build with `--python-indexer scip-python`, and a following build without the option reports it current.
+- [ ] Integration test: a store built by ty-scip, on a host where ty-scip is absent and scip-python is present, makes a build without the option refuse naming ty-scip, and the store stays byte-identical.
 - [ ] Integration test: an unchanged store reads current on rebuild and fresh in `status`, once for a store built by ty-scip and once for a store built by scip-python.
-- [ ] Integration test: a store built with `--python-indexer scip-python` while ty-scip is available reads stale in `status`.
-- [ ] Update `run_doctor` to probe rust-analyzer, ty-scip, and scip-python, add the selected Python indexer to the report and its human render, and signal the setup failure only when rust-analyzer is not ready or the Python selection fails.
-- [ ] Integration tests for `doctor` (`Indexer readiness report`): all three present names ty-scip and succeeds; rust-analyzer absent fails; a hanging sole indexer is unresponsive and fails; ty-scip absent with scip-python present names scip-python and succeeds; both Python indexers absent fails; ty-scip hanging with scip-python present fails.
+- [ ] Integration test: a store built by ty-scip reads stale in `status` when the installed ty-scip reports a different version.
+- [ ] Update `run_doctor` to probe ty-scip as an optional indexer next to rust-analyzer and scip-python, add it to the report and its human render, and signal the setup failure only for a required indexer.
+- [ ] Integration tests for `doctor` (`Indexer readiness report`): all three present succeeds; a required indexer absent fails; a hanging required indexer is unresponsive and fails; ty-scip absent succeeds and reports its install hint; ty-scip hanging is unresponsive and succeeds.
 
 ## Surface and MCP
 
@@ -53,23 +52,18 @@
 
 ## Documentation
 
-- [ ] Update the README Python section: both install commands, autodetection order, `--python-indexer`, the indexer as part of staleness, the two rejected-file remedies, and the loss of third-party references under ty-scip.
-- [ ] Update [docs/commands/build.md](../../../docs/commands/build.md) for `--python-indexer`, autodetection, and the rejected-file refusal.
-- [ ] Update [docs/commands/status.md](../../../docs/commands/status.md) for the indexer as part of freshness.
-- [ ] Update [docs/commands/doctor.md](../../../docs/commands/doctor.md) for the three indexers, the selected Python indexer, and the new failure rule.
+- [ ] Update the README Python section: both install commands, scip-python as the default, `--python-indexer`, the store keeping its indexer, the indexer as part of staleness, the two rejected-file remedies, and the loss of third-party references under ty-scip.
+- [ ] Update [docs/commands/build.md](../../../docs/commands/build.md) for `--python-indexer`, the selection rule, and the rejected-file refusal.
+- [ ] Update [docs/commands/status.md](../../../docs/commands/status.md) for freshness against the recorded indexer.
+- [ ] Update [docs/commands/doctor.md](../../../docs/commands/doctor.md) for ty-scip as an optional indexer.
 
-## Eval harness check
-
-- [ ] Find every place the eval harness runs `c10r build` on a Python workspace, record whether the treatment images could contain `ty-scip`, and report to the user.
-  Change the harness only on the user's instruction.
-
-## Comparison gate (blocks merge)
+## Comparison gate (runs before merge)
 
 - [ ] Write the comparison scripts in `._scratch/research/scip-python/gate/`: build a repository once per indexer with an explicit `--python-indexer` and separate `--db`, then report edge retention, join acceptance, answer identity, and every residual that changes an in-workspace `dependents` or `impact` answer.
 - [ ] Run the gate on Flask, httpx2, and Faker from copies of the clones in `~/.cache/silent-cartographer`, run ty-scip twice per repository, and compare the two indexes byte for byte.
 - [ ] Review a sample of 100 accepted ty-scip edges per repository, and every answer-changing residual, for wrong targets.
 - [ ] Run Flask for time and peak memory; run sympy with its documented exclude list; run sphinx with only `exclude-scripts = true` added.
-- [ ] Record all results, thresholds, and pass or fail per target in `gate.md`, and present them to the user for the merge decision.
+- [ ] Record all results, thresholds, and pass or fail per target in `gate.md`, and present them to the user before merge.
 
 ## Upstream reports (drafts only)
 

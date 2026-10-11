@@ -88,7 +88,7 @@ If the search finds no file, `c10r` reads the global file from the XDG configura
 The main design work is deciding which settings are project-scoped.
 Five settings are candidates today: the store path, the workspace identity, the analyzer language, the declared interpreter environment, and the chunk parameters.
 The proposed `ty-scip-backend` change adds a sixth: the Python indexer.
-A build detects the Python indexer from the installed tools unless `--python-indexer` names one.
+Unless `--python-indexer` names one, a build uses the indexer recorded in the existing store, and scip-python when no store exists.
 Some candidates change what an answer means, such as the chunk parameters.
 Others only locate data, such as the store path.
 Each setting needs its own argument for inclusion.
