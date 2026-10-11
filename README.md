@@ -62,9 +62,14 @@ Whichever route you install by, `c10r build` shells out to an indexer for the la
 rustup component add rust-analyzer
 # Python workspaces
 npm install -g @sourcegraph/scip-python
+# Python workspaces, optional alternative
+uv tool install ty-scip
 ```
 
 You only need the one for the languages you index.
+Python builds use scip-python by default.
+`c10r build --python-indexer ty-scip` opts in to ty-scip, and the store keeps that indexer on later builds until you pass the option again.
+See [build](docs/commands/build.md#python-indexer) for the selection rule and the limits of ty-scip.
 `c10r doctor` reports which are present and which are missing.
 
 ## Quick start

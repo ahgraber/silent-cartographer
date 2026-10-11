@@ -1,6 +1,6 @@
 # c10r doctor
 
-Report whether each required language indexer is present, and its version.
+Report whether each language indexer is present, and its version.
 
 ```sh
 c10r doctor
@@ -20,7 +20,12 @@ Run it before a first [`build`](build.md), or when a build fails with exit code 
 | Rust    | `rust-analyzer` on `PATH`, or the path given to `build --rust-analyzer` |
 | Python  | `scip-python` (`npm install -g @sourcegraph/scip-python`)               |
 
-The exit code is decided from indexer readiness alone: 0 when both indexers are ready, 5 otherwise.
+`ty-scip` (`uv tool install ty-scip`) is also reported.
+It is optional: [`build`](build.md#python-indexer) uses it only when selected.
+The human render marks it `(optional)`, and each JSON indexer entry carries a boolean `required` field.
+
+The exit code is decided from the readiness of the required indexers alone: 0 when `rust-analyzer` and `scip-python` are ready, 5 otherwise.
+An absent or unresponsive `ty-scip` still exits with 0.
 
 ## Hooks
 
@@ -42,6 +47,7 @@ A c10r file that exists but is not executable is reported `not installed`, since
 ```text
 rust-analyzer  present      rust-analyzer 1.95.0 (59807616 2026-04-14)
 scip-python    present      0.6.6
+ty-scip        present      (optional) ty-scip 0.1.0
 hooks:
   post-commit  installed  /path/to/project/.git/hooks/post-commit  workspaces: project
   post-rewrite  modified  /path/to/project/.git/hooks/post-rewrite  workspaces named: project  installation and removal replace this file; put commands of your own in post-rewrite.c10r-prior
@@ -66,13 +72,21 @@ Under `--json`, the answer is one object with an `indexers` array and a `hooks` 
   "indexers": [
     {
       "name": "rust-analyzer",
+      "required": true,
       "presence": "present",
       "version": "rust-analyzer 1.95.0 (59807616 2026-04-14)"
     },
     {
       "name": "scip-python",
+      "required": true,
       "presence": "present",
       "version": "0.6.6"
+    },
+    {
+      "name": "ty-scip",
+      "required": false,
+      "presence": "present",
+      "version": "ty-scip 0.1.0"
     }
   ],
   "hooks": {

@@ -34,6 +34,7 @@ The chunk parameters the build ran with.
 ## Why an index is stale
 
 `stale_reasons` lists every reason the index is behind, in the order `stale_content`, `stale_version`, `stale_environment`: the sources changed, the analyzer's version changed, or the interpreter environment changed.
+For a Python index, the analyzer is the recorded indexer, and `status` compares the recorded version with the installed version of that indexer.
 It is empty for a fresh index.
 `freshness` carries the first reason.
 
