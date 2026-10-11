@@ -4,6 +4,8 @@
 
 Defines the CLI envelope every command shares: a closed, canonical flag vocabulary; a distinct-code exit taxonomy; teaching rejections that name valid alternatives; non-interactive operation; the stdout/stderr and `--json`/human-render output discipline; source-faithful, injection-safe content rendering under a color gate; and the operational and introspection commands (`doctor`, `cache`, `manifest`, `completions`) that ride the same contract.
 
+External design references for this capability are listed under `command-surface` in [`REFERENCES.md`](../../REFERENCES.md).
+
 ## Requirements
 
 ### Requirement: Closed flag vocabulary
