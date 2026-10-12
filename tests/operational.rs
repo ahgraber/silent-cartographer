@@ -2194,6 +2194,89 @@ impl StatusWorkspace {
     }
 }
 
+/// Replace the executable at `path` with one that never answers.
+fn replace_with_hanging_stub(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A standard PATH inside the stub so `sleep` resolves under the test's restricted PATH.
+    std::fs::write(path, "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\nexec sleep 300\n").unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// _(Query freshness probes are bounded and their timeouts disclosed — Python)_ — a query against a
+// Python index whose environment interpreter and `scip-python` both hang still answers, and discloses
+// each unresponsive tool by name with what it means for the freshness label.
+#[test]
+fn a_query_discloses_a_hanging_interpreter_and_a_hanging_scip_python() {
+    let workspace = StatusWorkspace::build(Language::Python);
+    replace_with_hanging_stub(&workspace.dir.path().join(".venv/bin/python"));
+    replace_with_hanging_stub(&workspace.dir.path().join(".stub-bin/scip-python"));
+
+    let out = workspace.run(&["--json", "status"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the query still answers: {stderr}");
+    assert!(
+        stderr.contains("Python interpreter did not answer"),
+        "names the interpreter: {stderr}"
+    );
+    assert!(
+        stderr.contains("treated the environment as missing") && stderr.contains("Run the interpreter by hand"),
+        "states the effect and the next step for the interpreter: {stderr}"
+    );
+    assert!(
+        stderr.contains("scip-python version check did not answer"),
+        "names the version check: {stderr}"
+    );
+    assert!(
+        stderr.contains("version recorded at build time"),
+        "states the effect for the version check: {stderr}"
+    );
+}
+
+// _(Unresolvable environment refuses with guidance — hanging interpreter)_ — a rebuild whose
+// environment interpreter does not answer is refused naming the interpreter and the flag that points
+// elsewhere, and the existing store is byte-identical afterwards.
+#[test]
+fn a_hanging_interpreter_refuses_the_build_and_leaves_the_store_untouched() {
+    let workspace = StatusWorkspace::build(Language::Python);
+    let db = workspace.dir.path().join("index.db");
+    let before = std::fs::read(&db).unwrap();
+    replace_with_hanging_stub(&workspace.dir.path().join(".venv/bin/python"));
+
+    let out = workspace.run(&["build", "--language", "python", "--force"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "the build is refused: {stderr}");
+    assert!(
+        stderr.contains("bin/python") && stderr.contains("did not answer"),
+        "names the interpreter and what it failed to do: {stderr}"
+    );
+    assert!(stderr.contains("--environment"), "names the flag: {stderr}");
+    assert_eq!(std::fs::read(&db).unwrap(), before, "the store is byte-identical");
+}
+
+// _(Unavailable backend is a typed refusal, never a partial index — unresolvable environment)_ — a
+// rebuild in a workspace where no environment resolves is refused naming all three ways to supply
+// one, and the existing store is byte-identical afterwards.
+#[test]
+fn an_unresolvable_environment_refuses_the_build_and_leaves_the_store_untouched() {
+    let workspace = StatusWorkspace::build(Language::Python);
+    let db = workspace.dir.path().join("index.db");
+    let before = std::fs::read(&db).unwrap();
+    std::fs::remove_dir_all(workspace.dir.path().join(".venv")).unwrap();
+
+    let out = workspace.run(&["build", "--language", "python", "--force"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "the build is refused: {stderr}");
+    assert!(
+        stderr.contains("no Python environment resolved"),
+        "says what failed: {stderr}"
+    );
+    assert!(stderr.contains("--environment"), "names the flag: {stderr}");
+    assert!(stderr.contains("$VIRTUAL_ENV"), "names the activation route: {stderr}");
+    assert!(stderr.contains(".venv"), "names the directory route: {stderr}");
+    assert_eq!(std::fs::read(&db).unwrap(), before, "the store is byte-identical");
+}
+
 /// The `(document_path, change)` pairs of a status report's file list.
 fn listed_files(report: &serde_json::Value) -> Vec<(String, String)> {
     report["files"]
@@ -2656,5 +2739,13 @@ fn an_unresolvable_environment_does_not_render_as_a_changed_one() {
     assert!(
         header.contains("could not be checked"),
         "the label names the unobserved possibility: {header}"
+    );
+    let label = header
+        .split_once("stale (")
+        .map(|(_, rest)| rest)
+        .expect("the header carries a stale label");
+    assert!(
+        !label.starts_with("environment changed)"),
+        "the label is not the bare changed-environment claim: {header}"
     );
 }

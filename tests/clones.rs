@@ -2621,3 +2621,71 @@ fn groups_of_equal_token_count_order_by_member_count_then_lowest_identity() {
         assert_eq!(lowest, expected, "{language:?}: {answer}");
     }
 }
+
+/// Run one SQL statement against the store at `db`.
+fn edit_store(db: &Path, sql: &str) {
+    rusqlite::Connection::open(db).unwrap().execute_batch(sql).unwrap();
+}
+
+/// The `clones` command against `db` for `f1::shorter`, as a result.
+fn clones_of_shorter(db: &Path, root: &Path) -> anyhow::Result<String> {
+    silent_cartographer::commands::run_clones(
+        db,
+        root,
+        "rust-analyzer",
+        Some("f1::shorter"),
+        None,
+        0,
+        None,
+        true,
+        false,
+        PositionUnit::Line,
+    )
+}
+
+// _(A damaged index is refused with its remedy)_ — a `clones` query whose subject's document holds
+// no indexed text names the document, says the query was not answered, and names the forced build.
+#[test]
+fn missing_indexed_text_names_the_document_and_the_forced_build() {
+    let fixture = python_fragment_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture.db(dir.path());
+    edit_store(&db, "UPDATE symbols SET span_text = NULL WHERE kind = 'module'");
+
+    let err = clones_of_shorter(&db, dir.path()).expect_err("the indexed text is gone");
+    let text = format!("{err:#}");
+    assert!(text.contains(fixture.doc), "names the document: {text}");
+    assert!(text.contains("no indexed text"), "says what is missing: {text}");
+    assert!(text.contains("not answered"), "says no answer was produced: {text}");
+    assert!(text.contains("c10r build --force"), "names the forced build: {text}");
+}
+
+// _(A recorded analyzer no backend parses is refused with its remedy)_ — both the command, which
+// refuses before querying, and the engine, which refuses when asked for comparable tokens, name
+// the recorded analyzer and the forced build.
+#[test]
+fn an_unknown_recorded_analyzer_names_it_and_the_forced_build() {
+    let fixture = python_fragment_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture.db(dir.path());
+    edit_store(&db, "UPDATE index_metadata SET analyzer_name = 'scip-typescript'");
+
+    let err = clones_of_shorter(&db, dir.path()).expect_err("no backend parses the recorded analyzer");
+    let text = format!("{err:#}");
+    assert!(text.contains("scip-typescript"), "names the analyzer: {text}");
+    assert!(text.contains("c10r build --force"), "names the forced build: {text}");
+
+    let store = silent_cartographer::graph::store::GraphStore::open(&db).unwrap();
+    let provenance = silent_cartographer::semantic::model::AnalyzerProvenance {
+        analyzer_name: "scip-typescript".to_string(),
+        analyzer_version: "1".to_string(),
+    };
+    let engine = QueryEngine::new(&store, provenance, content_hash(&fixture.sources()), None);
+    let err = engine
+        .clones("f1::shorter")
+        .expect_err("the engine refuses the analyzer too");
+    let text = err.to_string();
+    assert!(text.contains("scip-typescript"), "names the analyzer: {text}");
+    assert!(text.contains("not answered"), "says no answer was produced: {text}");
+    assert!(text.contains("c10r build --force"), "names the forced build: {text}");
+}

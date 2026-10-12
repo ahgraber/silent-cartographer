@@ -128,7 +128,7 @@ impl OrderMode {
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     /// The store could not be read.
-    #[error("c10r could not read the index while answering the query: {0}. No answer was produced.")]
+    #[error("c10r could not read the index while answering the query, so it produced no answer: {0}")]
     Store(#[from] rusqlite::Error),
     /// A dependency edge named a symbol that has no row in the store — an invariant violation, since
     /// edges carry NOT NULL foreign keys to symbols.
@@ -930,6 +930,23 @@ fn is_false(flag: &bool) -> bool {
 mod tests {
     use super::{QueryError, cap_lines, window_content};
     use crate::query::output::ContentLines;
+
+    // _(Messages say what happened, why, what it means, and what to do)_ — a store failure whose own
+    // text ends in a period passes through the wrapper without a doubled period or a repeated prefix.
+    #[test]
+    fn a_store_failure_composes_without_a_doubled_period() {
+        let inner = rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(
+                "unreadable value. Run `c10r build --force` to rebuild it.",
+            )),
+        );
+        let message = QueryError::Store(inner).to_string();
+        assert!(!message.contains(".."), "{message}");
+        assert_eq!(message.matches("c10r could not read the index").count(), 1, "{message}");
+        assert!(message.ends_with("to rebuild it."), "{message}");
+    }
 
     // _(Content bounded with truncation disclosed — line cap)_ — a row-content cap keeps the first
     // `max_lines` lines and discloses the drop; the whole text passes through untouched otherwise.

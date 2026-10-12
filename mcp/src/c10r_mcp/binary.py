@@ -102,8 +102,8 @@ async def run(binary: str, args: Sequence[str], cwd: Path, stdin: bytes | None =
         )
     except OSError as exc:
         raise BinaryUnavailableError(
-            f"could not run `{binary}`: {exc}. No tool can answer until a working `{BINARY_NAME}` is installed "
-            f"(`{_INSTALL_COMMAND}`) or {BINARY_ENV_VAR} points at one."
+            f"could not run `{binary}`. No tool can answer until a working `{BINARY_NAME}` is installed "
+            f"(`{_INSTALL_COMMAND}`) or {BINARY_ENV_VAR} points at one. The system reported: {exc}"
         ) from exc
 
     try:

@@ -77,6 +77,14 @@ fn collect_sources(root: &Path, extension: &str, skip_dirs: &[&str]) -> Result<V
     Ok(out)
 }
 
+/// The context for a source path the scan cannot read; the operating system's error follows it.
+fn unreadable_source_message(path: &Path) -> String {
+    format!(
+        "c10r could not read {}, so the source scan stopped. Make it readable, or move it out of the workspace. The system reported",
+        path.display()
+    )
+}
+
 fn collect_dir(
     root: &Path,
     dir: &Path,
@@ -90,8 +98,7 @@ fn collect_dir(
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir != root => return Ok(()),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("the source scan stopped because c10r could not read {}", dir.display()));
+            return Err(e).with_context(|| unreadable_source_message(dir));
         }
     };
     for entry in entries {
@@ -139,9 +146,7 @@ fn collect_dir(
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("the source scan stopped because c10r could not read {}", path.display())
-                    });
+                    return Err(e).with_context(|| unreadable_source_message(&path));
                 }
             }
         }
@@ -596,7 +601,7 @@ pub fn run_build(
     // `analyze` runs before the store is opened, so a failure here leaves any existing store as it was.
     let index = engine.analyze(root).map_err(|e| {
         anyhow!(
-            "{} could not index the workspace. {e} No index was written; any existing index is unchanged.",
+            "{} could not index the workspace, so no index was written and any existing index is unchanged. Cause: {e}",
             engine.provenance().analyzer_name
         )
     })?;
@@ -613,8 +618,7 @@ pub fn run_build(
         &index,
         &sources,
         chunk_params,
-    )
-    .map_err(|e| anyhow!("c10r could not write the index: {e}. The index is unchanged."))?;
+    )?;
 
     // Analysis can take long enough for the workspace to change under it. The store holds the text
     // that was indexed, so it is complete and labeled by what it recorded; the files that moved since
@@ -881,8 +885,7 @@ pub fn build_from_index(
         workspace_root.as_deref(),
         index,
         sources,
-    )
-    .map_err(|e| anyhow!("c10r could not write the index: {e}. The index is unchanged."))?;
+    )?;
     Ok(())
 }
 

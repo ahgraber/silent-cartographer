@@ -328,4 +328,52 @@ mod tests {
         assert!(!text.contains("rustup component add"), "{text}");
         assert!(!text.contains("could not run"), "{text}");
     }
+
+    // An executable that answered `--version` but cannot be started for `scip` names the tool, the
+    // operating system's cause, and the install step.
+    #[test]
+    fn an_analyzer_that_cannot_start_for_scip_names_the_cause_and_install_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = write_stub(dir.path(), "rust-analyzer", "echo 1.0");
+        let adapter = RustAdapter::new(exe.clone()).unwrap();
+        std::fs::remove_file(&exe).unwrap();
+        let err = adapter.analyze(dir.path()).expect_err("the analyzer is gone");
+        assert!(matches!(err, SemanticError::Unavailable(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains(&exe) && text.contains("scip"), "{text}");
+        assert!(text.contains("No such file or directory"), "{text}");
+        assert!(text.contains("rustup component add rust-analyzer"), "{text}");
+    }
+
+    // An analyzer that exits 0 without writing its output names the tool and the unreadable output
+    // path.
+    #[test]
+    fn an_analyzer_that_writes_no_output_names_the_missing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = write_stub(dir.path(), "rust-analyzer", "exit 0");
+        let adapter = RustAdapter::new(exe.clone()).unwrap();
+        let err = adapter.analyze(dir.path()).expect_err("no output was written");
+        assert!(matches!(err, SemanticError::Analysis(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains(&exe) && text.contains("index.scip"), "{text}");
+        assert!(text.contains("could not be read"), "{text}");
+    }
+
+    // An analyzer that exits 0 with output that is not a SCIP index names the tool and the output
+    // path.
+    #[test]
+    fn an_analyzer_that_writes_garbage_names_the_invalid_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = write_stub(
+            dir.path(),
+            "rust-analyzer",
+            "if [ \"$1\" = \"--version\" ]; then echo 1.0; exit 0; fi\nprintf '\\377\\377\\377\\377' > \"$4\"",
+        );
+        let adapter = RustAdapter::new(exe.clone()).unwrap();
+        let err = adapter.analyze(dir.path()).expect_err("the output is not SCIP");
+        assert!(matches!(err, SemanticError::Analysis(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains(&exe) && text.contains("index.scip"), "{text}");
+        assert!(text.contains("not a valid SCIP index"), "{text}");
+    }
 }

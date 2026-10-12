@@ -1127,6 +1127,77 @@ fn symbols_sharing_one_region_rank_as_similar() {
     );
 }
 
+/// Two functions with the same body, the second followed by unrelated padding that adds chunks but
+/// no matching content, plus a third function with the same body as the subject of a `similar`
+/// query. `(single, multi)` name the one-chunk and many-chunk functions, so a test can swap them and
+/// show the order does not follow the names.
+fn chunk_count_store(single: &str, multi: &str) -> (GraphStore, Vec<(String, String)>) {
+    let body = "    let quartz_resonator_value = tune_quartz_resonator();\n";
+    let padding: String = (0..40).map(|i| format!("    let pad_line_{i} = {i};\n")).collect();
+    let source = format!(
+        "pub fn {single}() {{\n{body}}}\n\npub fn {multi}() {{\n{body}{padding}}}\n\npub fn probe_subject() {{\n{body}}}\n"
+    );
+    let (store, srcs) = store_over_with_params(
+        LONG_DOC,
+        &source,
+        &[single, multi, "probe_subject"],
+        &silent_cartographer::graph::chunk::ChunkParams {
+            chunk_size: 64,
+            overlap: 0,
+        },
+    );
+    assert_eq!(store.chunk_vectors_of(&sem_id(single)).unwrap().len(), 1);
+    assert!(
+        store.chunk_vectors_of(&sem_id(multi)).unwrap().len() > 1,
+        "{multi} splits into several chunks"
+    );
+    (store, srcs)
+}
+
+/// Position of `name` in `ids`.
+fn position_of(ids: &[String], name: &str) -> usize {
+    ids.iter()
+        .position(|id| id == sem_id(name).as_str())
+        .unwrap_or_else(|| panic!("{name} is among the rows: {ids:?}"))
+}
+
+// _(Search by meaning — chunk-count neutrality)_ — a symbol represented by many chunks does not rank
+// above an otherwise equal symbol represented by one, whichever of the two names each carries.
+#[test]
+fn search_does_not_rank_a_symbol_higher_for_having_more_chunks() {
+    for (single, multi) in [
+        ("calibrate_first", "calibrate_second"),
+        ("calibrate_second", "calibrate_first"),
+    ] {
+        let (store, srcs) = chunk_count_store(single, multi);
+        let order = search_order(&store, &srcs, "tune quartz resonator value", Detail::Signature);
+        assert!(
+            position_of(&order, single) < position_of(&order, multi),
+            "the one-chunk {single} ranks above the many-chunk {multi}: {order:?}"
+        );
+    }
+}
+
+// _(Similar-code lookup — chunk-count neutrality)_ — the same holds for `similar`, whether the
+// many-chunk candidate or the one-chunk candidate sorts first by name.
+#[test]
+fn similar_does_not_rank_a_symbol_higher_for_having_more_chunks() {
+    for (single, multi) in [
+        ("calibrate_first", "calibrate_second"),
+        ("calibrate_second", "calibrate_first"),
+    ] {
+        let (store, srcs) = chunk_count_store(single, multi);
+        let ids: Vec<String> = similar_rows(&store, &srcs, "probe_subject")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            position_of(&ids, single) < position_of(&ids, multi),
+            "the one-chunk {single} ranks above the many-chunk {multi}: {ids:?}"
+        );
+    }
+}
+
 // ---- Relation labels and exclusion ----
 
 mod relations {

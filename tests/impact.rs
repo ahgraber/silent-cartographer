@@ -865,6 +865,50 @@ fn a_file_with_unreadable_pre_change_content_is_unmappable_in_whole() {
     assert!(seed_names(report).is_empty(), "no region of it is located: {report}");
 }
 
+// A change whose regions match no symbol because their files are not in the index is not reported as
+// "nothing changed here": the answer says no region could be matched, that the dependents are
+// unknown, and to build and repeat.
+#[test]
+fn a_change_only_in_unindexed_files_says_dependents_are_unknown_and_names_the_build() {
+    let repo = TestRepo::new();
+    repo.write(support::DOC, support::SOURCE);
+    repo.write("other/extra.rs", extra_source());
+    repo.write("src/untouched.rs", "pub fn untouched() {}\n");
+    repo.commit_all("add fixture plus an unindexed tracked file");
+
+    let db = repo.path().join(".c10r/index.db");
+    let ws = workspace_id(&repo);
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &base_sources()).unwrap();
+    repo.write("src/untouched.rs", "pub fn untouched_edited() {}\n");
+
+    let text = run_impact_human(&repo, &db, &[]);
+    assert!(
+        text.contains("no changed region could be matched"),
+        "says what failed: {text}"
+    );
+    assert!(
+        text.contains("dependents of the change are unknown"),
+        "says what it means: {text}"
+    );
+    assert!(text.contains("c10r build"), "names the next step: {text}");
+}
+
+// A diff holding bytes that are not UTF-8 cannot be read: the command exits with the failure code
+// and names the diff and the cause.
+#[test]
+fn a_diff_with_non_utf8_bytes_fails_naming_the_diff_and_the_cause() {
+    let (repo, db, _ws) = setup_repo_with_index();
+    let mut edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self) {} // ").into_bytes();
+    edited.extend_from_slice(b"\xff\xfe\n");
+    std::fs::write(repo.path().join(support::DOC), edited).unwrap();
+
+    let out = run_impact(&repo, &db, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("diff"), "names the diff: {stderr}");
+    assert!(stderr.contains("not UTF-8"), "names the cause: {stderr}");
+}
+
 // Line and column in answers.
 
 /// Every JSON object under `value` that carries byte offsets, in document order.

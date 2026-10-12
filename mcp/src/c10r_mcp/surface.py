@@ -50,13 +50,15 @@ async def read_manifest(binary_path: str, cwd: Path) -> dict[str, Any]:
     completed = await binary.run(binary_path, ["manifest"], cwd)
     if completed.exit_code != 0:
         raise binary.BinaryUnavailableError(
-            f"`{binary_path} manifest` exited {completed.exit_code}: {completed.stderr}. {_MANIFEST_REMEDY.format(binary_path=binary_path)}"
+            f"`{binary_path} manifest` exited {completed.exit_code}. {_MANIFEST_REMEDY.format(binary_path=binary_path)} "
+            f"Its error output: {completed.stderr.strip()}"
         )
     try:
         manifest = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise binary.BinaryUnavailableError(
-            f"`{binary_path} manifest` did not emit JSON: {exc}. {_MANIFEST_REMEDY.format(binary_path=binary_path)}"
+            f"`{binary_path} manifest` did not emit JSON. {_MANIFEST_REMEDY.format(binary_path=binary_path)} "
+            f"The parser reported: {exc}"
         ) from exc
     if not isinstance(manifest, dict):
         raise binary.BinaryUnavailableError(

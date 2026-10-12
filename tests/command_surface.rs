@@ -403,6 +403,10 @@ fn a_missing_indexer_is_reported_with_its_install_step() {
     assert!(stderr.contains("no index was built"), "{stderr}");
     assert!(stderr.contains("rustup component add rust-analyzer"), "{stderr}");
     assert!(stderr.contains("--rust-analyzer"), "{stderr}");
+    assert!(
+        !stderr.contains(".."),
+        "the composed message has no doubled period: {stderr}"
+    );
     assert!(!db.exists(), "no store is created");
 }
 
@@ -1077,11 +1081,55 @@ fn a_damaged_index_names_the_forced_build() {
     );
     assert!(stderr.contains("damaged"), "says the index is damaged: {stderr}");
     assert!(
+        stderr.contains("op-ws::mycrate::net::open"),
+        "names the symbol the dependency edge points at: {stderr}"
+    );
+    assert!(
         stderr.contains("c10r build --force"),
         "names the forced build: {stderr}"
     );
     assert!(
         stderr.contains("not answered"),
         "says the query was not answered: {stderr}"
+    );
+}
+
+/// Run `args` against a fixture store after `sql` has edited it, returning the failure's standard
+/// error. Foreign keys are off for the edit so the store can be made inconsistent.
+fn stderr_of_query_on_edited_store(sql: &str, args: &[&str]) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_fixture_db(dir.path());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.execute_batch(sql).unwrap();
+    drop(conn);
+
+    let out = c10r()
+        .current_dir(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .args(args)
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0), "the query is refused");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+// A stored symbol class no enum accepts is reported as an index this binary cannot read: the message
+// says the read failed, names the stored value, and names the forced build.
+#[test]
+fn an_unreadable_stored_class_names_the_value_and_the_forced_build() {
+    let stderr = stderr_of_query_on_edited_store(
+        "UPDATE symbols SET class = 'bogus-class'",
+        &["get", "net::Client::connect", "--detail", "location"],
+    );
+    assert!(
+        stderr.contains("could not read the index"),
+        "says the read failed: {stderr}"
+    );
+    assert!(stderr.contains("bogus-class"), "names the stored value: {stderr}");
+    assert!(
+        stderr.contains("c10r build --force"),
+        "names the forced build: {stderr}"
     );
 }

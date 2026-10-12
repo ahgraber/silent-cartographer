@@ -1649,6 +1649,64 @@ fn build_excludes_an_undecodable_file_and_still_succeeds() {
     assert_eq!(report["rebuilt"], true, "the build actually ran: {report}");
 }
 
+/// Build a Rust workspace in which `locked` (a path under `src/`) has had all permissions removed,
+/// restore the permissions, and return the build's output and the locked path.
+#[cfg(unix)]
+fn build_with_locked_source(locked: &str, make: impl Fn(&Path)) -> (std::process::Output, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "# fixture manifest\n").unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let path = dir.path().join("src").join(locked);
+    make(&path);
+    let stub = write_rust_analyzer_stub(dir.path(), "rust-analyzer 1.99.0-stub");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = c10r()
+        .args(["--db"])
+        .arg(dir.path().join("index.db"))
+        .arg("build")
+        .arg(dir.path())
+        .args(["--language", "rust", "--rust-analyzer"])
+        .arg(&stub)
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (out, path)
+}
+
+// A source directory the scan cannot read stops the build and names the directory, the operating
+// system's cause.
+#[cfg(unix)]
+#[test]
+fn build_stops_naming_an_unreadable_source_directory() {
+    let (out, path) = build_with_locked_source("locked", |dir| std::fs::create_dir(dir).unwrap());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "the scan failure stops the build: {stderr}");
+    assert!(
+        stderr.contains(&path.display().to_string()),
+        "names the directory: {stderr}"
+    );
+    assert!(stderr.contains("Permission denied"), "names the cause: {stderr}");
+    assert!(stderr.contains("scan stopped"), "says what stopped: {stderr}");
+    assert!(stderr.contains("Make it readable"), "names the next step: {stderr}");
+}
+
+// A source file the scan cannot read stops the build the same way.
+#[cfg(unix)]
+#[test]
+fn build_stops_naming_an_unreadable_source_file() {
+    let (out, path) = build_with_locked_source("locked.rs", |file| std::fs::write(file, "pub fn g() {}\n").unwrap());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "the scan failure stops the build: {stderr}");
+    assert!(stderr.contains(&path.display().to_string()), "names the file: {stderr}");
+    assert!(stderr.contains("Permission denied"), "names the cause: {stderr}");
+    assert!(stderr.contains("scan stopped"), "says what stopped: {stderr}");
+    assert!(stderr.contains("Make it readable"), "names the next step: {stderr}");
+}
+
 // _(Naming no action removes nothing)_ — `cache` invoked without an action is rejected as a usage
 // error naming all three valid actions, and the index at `--db` is left in place.
 #[test]

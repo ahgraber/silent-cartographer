@@ -667,13 +667,15 @@ pub enum StoreOpenError {
         expected: i64,
     },
     /// The underlying storage failed.
-    #[error("c10r could not open or check the index store: {0}. The command did not complete and produced no answer.")]
+    #[error(
+        "c10r could not open or check the index store, so the command did not complete and produced no answer: {0}"
+    )]
     Storage(#[from] rusqlite::Error),
     /// A filesystem operation on the store's own files — recognizing, creating, renaming, or
     /// removing them — failed.
     #[error(
-        "c10r could not create, rename, or remove an index store file: {0}. \
-         The command did not complete and produced no answer."
+        "c10r could not create, rename, or remove an index store file, \
+         so the command did not complete and produced no answer: {0}"
     )]
     Io(#[from] std::io::Error),
 }
@@ -2442,6 +2444,40 @@ fn escape_like(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // _(Messages say what happened, why, what it means, and what to do)_ — storage and ingest
+    // failures whose own text ends in a period compose without a doubled period or a repeated prefix.
+    #[test]
+    fn storage_failures_compose_without_a_doubled_period() {
+        let inner = || {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(
+                    "unreadable value. Run `c10r build --force` to rebuild it.",
+                )),
+            )
+        };
+        let messages = [
+            (
+                StoreOpenError::Storage(inner()).to_string(),
+                "c10r could not open or check",
+            ),
+            (
+                StoreOpenError::Io(std::io::Error::other("disk full.")).to_string(),
+                "c10r could not create, rename, or remove",
+            ),
+            (
+                crate::graph::IngestError::Store(inner()).to_string(),
+                "c10r could not write the index",
+            ),
+        ];
+        for (message, prefix) in messages {
+            assert!(!message.contains(".."), "{message}");
+            assert_eq!(message.matches(prefix).count(), 1, "{message}");
+            assert!(message.ends_with('.'), "{message}");
+        }
+    }
 
     /// The refusal a store-opening call is expected to produce. A store handle carries a live
     /// connection and so is not printable, which is why this stands in for `expect_err`.

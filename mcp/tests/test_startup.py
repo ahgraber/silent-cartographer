@@ -154,7 +154,7 @@ async def test_a_binary_that_cannot_be_run_names_how_to_install_one(tmp_path: Pa
 @pytest.mark.parametrize(
     ("body", "cause"),
     [
-        ("echo broken >&2; exit 3", "exited 3"),
+        ("echo 'broken.' >&2; exit 3", "exited 3"),
         ("printf 'not json'", "did not emit JSON"),
     ],
 )
@@ -173,6 +173,8 @@ async def test_a_manifest_failure_says_the_server_did_not_start(
     assert cause in message, message
     assert "did not start" in message, message
     assert f"{stub} manifest" in message, message
+    assert ".." not in message, message
+    assert message == message.rstrip(), "nothing trails the outside text"
 
 
 @pytest.mark.parametrize("stdout", [b"not json", b"[]"])
@@ -183,5 +185,4 @@ def test_an_unparseable_answer_says_no_answer_was_returned(stdout: bytes) -> Non
 
     message = str(failure.value)
     assert "no answer" in message, message
-    assert "not known" in message, message
     assert BINARY_ENV_VAR in message, message

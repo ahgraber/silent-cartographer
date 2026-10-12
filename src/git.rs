@@ -41,12 +41,20 @@ pub enum GitError {
     #[error("{0} is not a valid revision in this repository")]
     BadRevspec(String),
     /// A `git` invocation completed but reported failure.
-    #[error("git {} failed: {}. c10r produced no result.", .invocation, .stderr.trim_end())]
+    #[error("git {} failed, so c10r produced no result: {}", .invocation, .stderr.trim_end())]
     Failed {
         /// The invocation that failed, named for diagnostics.
         invocation: String,
         /// The invocation's captured stderr.
         stderr: String,
+    },
+    /// A `git diff` completed, but its output holds bytes that are not UTF-8.
+    #[error(
+        "git {invocation} returned bytes that are not UTF-8, so c10r cannot read the diff and produced no result."
+    )]
+    NonUtf8Diff {
+        /// The invocation whose output could not be decoded.
+        invocation: String,
     },
 }
 
@@ -65,7 +73,7 @@ impl GitError {
                 Failure::IndexerSetup(message).into()
             }
             GitError::BadRevspec(_) => Failure::Usage(message).into(),
-            GitError::Failed { .. } => anyhow::anyhow!(message),
+            GitError::Failed { .. } | GitError::NonUtf8Diff { .. } => anyhow::anyhow!(message),
         }
     }
 }
@@ -334,10 +342,7 @@ impl GitRepo {
                 stderr: String::from_utf8_lossy(&capture.stderr).into_owned(),
             });
         }
-        String::from_utf8(capture.stdout).map_err(|_| GitError::Failed {
-            invocation: label,
-            stderr: "the diff contains bytes that are not UTF-8".to_string(),
-        })
+        String::from_utf8(capture.stdout).map_err(|_| GitError::NonUtf8Diff { invocation: label })
     }
 
     /// The content of the workspace-relative `path` at `revision`, i.e. `git show
@@ -504,6 +509,20 @@ impl GitRepo {
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
+
+    // _(Messages say what happened, why, what it means, and what to do)_ — git's own error text
+    // comes last, so a period that ends it cannot double against one c10r appends.
+    #[test]
+    fn a_failed_invocation_ends_with_git_s_own_text() {
+        let message = GitError::Failed {
+            invocation: "diff".to_string(),
+            stderr: "fatal: bad object.\n".to_string(),
+        }
+        .to_string();
+        assert!(!message.contains(".."), "{message}");
+        assert!(message.ends_with("fatal: bad object."), "{message}");
+        assert_eq!(message.matches("git diff failed").count(), 1, "{message}");
+    }
 
     /// Run `git <args>` in `dir`, isolated from the developer's own config: every ambient config
     /// source is pointed at `/dev/null` so the test outcome cannot depend on it.

@@ -40,10 +40,10 @@ pub struct PythonAdapter {
     project_name: String,
 }
 
-/// The install guidance appended to every scip-python unavailability error.
 /// The consequence and remedy for an environment directory that cannot be read.
 const BROKEN_ENVIRONMENT: &str = "The environment looks broken; pass `--environment <virtualenv>` or recreate it.";
 
+/// The install step named when scip-python cannot be run.
 const INSTALL_HINT: &str = "install scip-python with `npm install -g @sourcegraph/scip-python`";
 
 impl PythonAdapter {
@@ -92,7 +92,7 @@ impl PythonAdapter {
             }
             Err(e) => {
                 return Err(SemanticError::Unavailable(format!(
-                    "cannot run scip-python ({executable}): {e}; {INSTALL_HINT}"
+                    "cannot run scip-python ({executable}), so no index was built; {INSTALL_HINT}. The system reported: {e}"
                 )));
             }
         };
@@ -132,7 +132,7 @@ impl PythonAdapter {
             .status()
             .map_err(|e| {
                 SemanticError::Unavailable(format!(
-                    "cannot run scip-python ({}) index: {e}; {INSTALL_HINT}",
+                    "cannot run scip-python ({}) index, so no index was built; {INSTALL_HINT}. The system reported: {e}",
                     self.executable
                 ))
             })?;
@@ -230,7 +230,11 @@ fn prepend_to_path(bin: &Path) -> Result<std::ffi::OsString, SemanticError> {
     if let Some(existing) = std::env::var_os("PATH") {
         parts.extend(std::env::split_paths(&existing));
     }
-    std::env::join_paths(parts).map_err(|e| SemanticError::Analysis(format!("cannot build child PATH: {e}")))
+    std::env::join_paths(parts).map_err(|e| {
+        SemanticError::Analysis(format!(
+            "cannot build the child PATH, so no index was built. The system reported: {e}"
+        ))
+    })
 }
 
 /// Gather the declared facts of a resolved environment: interpreter version, path, and the
@@ -330,7 +334,7 @@ pub fn resolve_environment(
             return Ok(canonicalize_or(path));
         }
         return Err(SemanticError::Environment(format!(
-            "the explicit environment path {} is not a directory",
+            "the explicit environment path {} is not a directory, so no index was built. Pass `--environment <virtualenv>` with an existing directory.",
             path.display()
         )));
     }
@@ -345,8 +349,8 @@ pub fn resolve_environment(
         }
     }
     Err(SemanticError::Environment(format!(
-        "no Python environment resolved for {}: pass an explicit environment path, activate one \
-         (set $VIRTUAL_ENV), or create a .venv/ (or venv/) directory in the workspace root",
+        "no Python environment resolved for {}, so no index was built. Pass `--environment <virtualenv>`, activate one \
+         (set $VIRTUAL_ENV), or create a .venv/ (or venv/) directory in the workspace root.",
         workspace_root.display()
     )))
 }
@@ -464,6 +468,139 @@ mod tests {
         assert!(!text.contains("install scip-python"), "{text}");
     }
 
+    /// A fake environment under `root`: a `bin/python` stub running `python_body` and a
+    /// `lib/python3.12/site-packages` directory.
+    fn fake_environment(root: &Path, python_body: &str) -> PathBuf {
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        write_stub(&root.join("bin"), "python", python_body);
+        std::fs::create_dir_all(root.join("lib/python3.12/site-packages")).unwrap();
+        root.to_path_buf()
+    }
+
+    /// The Python adapter over `stub_body` as `scip-python`, with a working fake environment.
+    fn adapter_over(dir: &Path, stub_body: &str) -> PythonAdapter {
+        let exe = write_stub(dir, "scip-python", stub_body);
+        let environment = fake_environment(&dir.join("env"), "echo 'Python 3.12.0'");
+        PythonAdapter::new(exe, environment, "fixture").unwrap()
+    }
+
+    // A scip-python that exits nonzero from `index` names the tool, the exit status, and where its
+    // own error output went.
+    #[test]
+    fn a_failing_index_run_names_the_tool_and_exit_status() {
+        let (_guard, dir) = canonical_tempdir();
+        let adapter = adapter_over(
+            &dir,
+            "if [ \"$1\" = \"--version\" ]; then echo 0.6.0; exit 0; fi\nexit 3",
+        );
+        let err = adapter
+            .write_scip_index(&dir, &dir.join("out.scip"))
+            .expect_err("a nonzero exit refuses");
+        assert!(matches!(err, SemanticError::Analysis(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("scip-python") && text.contains("index"), "{text}");
+        assert!(text.contains("exit status: 3"), "{text}");
+        assert!(text.contains("error output is printed above"), "{text}");
+    }
+
+    // A scip-python that answered its version probe but cannot be started for `index` names the
+    // operating system's cause and the install step.
+    #[test]
+    fn an_indexer_that_cannot_start_names_the_cause_and_install_step() {
+        let (_guard, dir) = canonical_tempdir();
+        let adapter = adapter_over(&dir, "echo 0.6.0");
+        std::fs::remove_file(dir.join("scip-python")).unwrap();
+        let err = adapter
+            .write_scip_index(&dir, &dir.join("out.scip"))
+            .expect_err("the indexer is gone");
+        assert!(matches!(err, SemanticError::Unavailable(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("No such file or directory"), "{text}");
+        assert!(text.contains("npm install -g @sourcegraph/scip-python"), "{text}");
+    }
+
+    // An indexer that exits 0 but leaves no output, or output that is not a SCIP index, names the
+    // tool and the output path. One test, because `analyze` writes to one process-wide path.
+    #[test]
+    fn an_indexer_with_missing_or_invalid_output_names_the_output() {
+        let (_guard, dir) = canonical_tempdir();
+        let missing = adapter_over(
+            &dir,
+            "if [ \"$1\" = \"--version\" ]; then echo 0.6.0; exit 0; fi\nrm -f \"$7\"\nexit 0",
+        );
+        let err = missing.analyze(&dir).expect_err("no output was written");
+        let text = err.to_string();
+        assert!(matches!(err, SemanticError::Analysis(_)), "{err:?}");
+        assert!(
+            text.contains("c10r-scip-python") && text.contains("could not be read"),
+            "{text}"
+        );
+
+        let garbage = adapter_over(
+            &dir,
+            "if [ \"$1\" = \"--version\" ]; then echo 0.6.0; exit 0; fi\nprintf '\\377\\377\\377\\377' > \"$7\"\nexit 0",
+        );
+        let err = garbage.analyze(&dir).expect_err("the output is not SCIP");
+        let text = err.to_string();
+        assert!(matches!(err, SemanticError::Analysis(_)), "{err:?}");
+        assert!(
+            text.contains("c10r-scip-python") && text.contains("not a valid SCIP index"),
+            "{text}"
+        );
+    }
+
+    // An interpreter that cannot be run, or fails `--version`, names the interpreter, the cause, and
+    // the flag that points elsewhere.
+    #[test]
+    fn an_interpreter_that_cannot_run_or_fails_names_the_cause_and_remedy() {
+        let (_guard, dir) = canonical_tempdir();
+        let environment = fake_environment(&dir, "echo 'broken' >&2\nexit 2");
+        let err = environment_facts(&environment).expect_err("a failing interpreter refuses");
+        assert!(matches!(err, SemanticError::Environment(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("bin/python") && text.contains("exit status: 2"), "{text}");
+        assert!(text.contains("broken"), "{text}");
+        assert!(text.contains("--environment"), "{text}");
+
+        std::fs::remove_file(environment.join("bin/python")).unwrap();
+        let err = environment_facts(&environment).expect_err("a missing interpreter refuses");
+        assert!(matches!(err, SemanticError::Environment(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("bin/python") && text.contains("No such file or directory"),
+            "{text}"
+        );
+        assert!(text.contains("--environment"), "{text}");
+    }
+
+    // An unreadable directory under the environment's lib names the directory, the cause, and the
+    // remedy, whether it is `lib` itself or the site-packages directory.
+    #[test]
+    fn an_unreadable_environment_directory_names_it_and_the_remedy() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_guard, dir) = canonical_tempdir();
+        let environment = fake_environment(&dir, "echo 'Python 3.12.0'");
+        let lib = environment.join("lib");
+        let site = lib.join("python3.12/site-packages");
+        let lock = |path: &Path, mode: u32| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+
+        lock(&site, 0o000).unwrap();
+        let site_err = environment_facts(&environment);
+        lock(&site, 0o755).unwrap();
+        lock(&lib, 0o000).unwrap();
+        let lib_err = environment_facts(&environment);
+        lock(&lib, 0o755).unwrap();
+
+        for (err, unreadable) in [(site_err, &site), (lib_err, &lib)] {
+            let err = err.expect_err("an unreadable directory refuses");
+            assert!(matches!(err, SemanticError::Environment(_)), "{err:?}");
+            let text = err.to_string();
+            assert!(text.contains(&unreadable.display().to_string()), "{text}");
+            assert!(text.contains("Permission denied"), "{text}");
+            assert!(text.contains("--environment"), "{text}");
+        }
+    }
+
     // A missing scip-python names the install command and the cause the operating system gave.
     #[test]
     fn missing_tool_message_names_install_command() {
@@ -536,7 +673,7 @@ mod tests {
             "typed environment refusal, got: {err:?}"
         );
         let message = err.to_string();
-        for mechanism in ["explicit", "VIRTUAL_ENV", ".venv"] {
+        for mechanism in ["--environment", "VIRTUAL_ENV", ".venv"] {
             assert!(
                 message.contains(mechanism),
                 "the refusal names the {mechanism} mechanism: {message}"
