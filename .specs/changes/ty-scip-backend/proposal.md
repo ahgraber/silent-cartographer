@@ -62,3 +62,7 @@ The debate record is in `._scratch/research/scip-python/debate/`: round-1 and ro
 The user chose an opt-in ty-scip with scip-python as the default, and a store that keeps the indexer it was built with.
 Measurements are in `._scratch/research/scip-python/` (`raw/tyscip-*.md`, `probe-tyscip/`, `probe-unresolved/`).
 The mechanism, the refusal causes, and the gate thresholds are in `design.md`.
+
+This change depends on `canonical-identity`, which defines the identity form every Python indexer must produce.
+It is paused until that change lands, and is then rebased onto it.
+After the rebase, ty-scip's output needs no descriptor conversion, and this change carries the ty-scip evidence for `canonical-identity`'s requirement `Identity does not depend on the indexer`.

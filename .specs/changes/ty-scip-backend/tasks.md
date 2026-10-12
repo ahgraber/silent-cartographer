@@ -58,6 +58,13 @@
 - [x] Update [docs/commands/status.md](../../../docs/commands/status.md) for freshness against the recorded indexer.
 - [x] Update [docs/commands/doctor.md](../../../docs/commands/doctor.md) for ty-scip as an optional indexer.
 
+## After `canonical-identity` lands
+
+- [ ] Rebase this branch onto `main` after `canonical-identity` merges, and resolve conflicts in the join's module-name rule in favor of the canonical module form.
+- [ ] Add a test that ty-scip's index of `tests/fixtures/python-conformance/` yields exactly the Python reference identities that `canonical-identity` defines.
+- [ ] Add the repeated-assignment boundary scenario for `Identity does not depend on the indexer` (a name assigned twice: one identity under scip-python, one per assignment under ty-scip), with its test.
+- [ ] Rebuild the gate stores with both indexers and re-run identity overlap, edge retention, answer identity, and the wrong-target review, because both indexers' identities change.
+
 ## Comparison gate (runs before merge)
 
 - [ ] Write the comparison scripts in `._scratch/research/scip-python/gate/`: build a repository once per indexer with an explicit `--python-indexer` and separate `--db`, then report edge retention, join acceptance, answer identity, and every residual that changes an in-workspace `dependents` or `impact` answer.
