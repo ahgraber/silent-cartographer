@@ -34,13 +34,20 @@ use syntax::Language;
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     /// The store rejected an operation.
-    #[error("store error: {0}")]
+    #[error("c10r could not write the index: {0}. The build did not complete.")]
     Store(#[from] rusqlite::Error),
     /// The syntax tree could not be reconciled with the index because of a content-hash mismatch.
-    #[error("content-hash mismatch: sources do not match the index being joined")]
+    #[error(
+        "the sources do not match the content hash the build expected, so the build stopped. \
+         The existing index is unchanged. Run `c10r build` again."
+    )]
     ContentHashMismatch,
     /// The analyzer name names no backend this binary knows, so no syntax language follows from it.
-    #[error("analyzer {0:?} names no known language backend; this index cannot be parsed")]
+    #[error(
+        "the index records analyzer {0:?}, which names no language backend this binary has, \
+         so c10r could not read it. \
+         Upgrade c10r if a newer version built this index, or run `c10r build --force` to replace it."
+    )]
     UnknownAnalyzer(String),
 }
 

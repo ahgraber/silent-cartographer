@@ -368,6 +368,44 @@ fn indexer_setup_code_on_a_missing_indexer() {
     );
 }
 
+// _(A missing indexer is reported with its install step)_ — a Rust build on a `PATH` without
+// `rust-analyzer` fails naming the tool, the cause, that no index was built, the install command,
+// and the flag that points at another executable.
+#[test]
+fn a_missing_indexer_is_reported_with_its_install_step() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+
+    let out = c10r()
+        .current_dir(dir.path())
+        .env("PATH", empty_path.path())
+        .arg("--db")
+        .arg(&db)
+        .arg("build")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "a missing indexer is the setup-failure code"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("rust-analyzer"), "{stderr}");
+    assert!(stderr.contains("No such file or directory"), "{stderr}");
+    assert!(stderr.contains("no index was built"), "{stderr}");
+    assert!(stderr.contains("rustup component add rust-analyzer"), "{stderr}");
+    assert!(stderr.contains("--rust-analyzer"), "{stderr}");
+    assert!(!db.exists(), "no store is created");
+}
+
 // _(Output stream discipline)_ — a successful answer lands on standard output with a clean standard
 // error; a failing invocation lands its diagnostic on standard error with a clean standard output.
 #[test]
@@ -930,4 +968,120 @@ fn runs_to_completion_without_a_terminal() {
         .unwrap();
 
     assert!(out.status.code().is_some(), "the headless invocation ran to completion");
+}
+
+/// Stamp `user_version` on a store carrying c10r's ownership marker, so the file is c10r's own and
+/// the schema-version guard (not the ownership guard) decides the refusal.
+fn write_marked_store(db: &Path, user_version: i64) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.pragma_update(
+        None,
+        "application_id",
+        silent_cartographer::graph::store::APPLICATION_ID,
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", user_version).unwrap();
+}
+
+/// Run `get` against the store at `db` and return its exit code and stderr text.
+fn get_stderr(dir: &Path, db: &Path) -> (Option<i32>, String) {
+    let out = c10r()
+        .current_dir(dir)
+        .arg("--db")
+        .arg(db)
+        .args(["get", "net::Client"])
+        .output()
+        .unwrap();
+    (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+// _(Incompatible index stores are replaced or refused, never half-used: A query against a newer store
+// names the upgrade)_ — the refusal names both versions, upgrading c10r and `--db`, and does not
+// offer a build as the fix.
+#[test]
+fn a_query_against_a_newer_store_names_the_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let expected = silent_cartographer::graph::schema::SCHEMA_VERSION;
+    let newer = expected + 1;
+    write_marked_store(&db, newer);
+
+    let (code, stderr) = get_stderr(dir.path(), &db);
+
+    assert_eq!(code, Some(4), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("version {newer}")),
+        "names the store's version: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("version {expected}")),
+        "names the binary's version: {stderr}"
+    );
+    assert!(stderr.contains("Upgrade c10r"), "names the upgrade: {stderr}");
+    assert!(stderr.contains("--db"), "names the alternative path: {stderr}");
+    assert!(
+        !stderr.contains("Run `c10r build`"),
+        "does not offer a build as the fix: {stderr}"
+    );
+}
+
+// _(Incompatible index stores are replaced or refused, never half-used)_ — an older store's refusal
+// names both versions and the rebuild.
+#[test]
+fn a_query_against_an_older_store_names_the_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let expected = silent_cartographer::graph::schema::SCHEMA_VERSION;
+    write_marked_store(&db, 1);
+
+    let (code, stderr) = get_stderr(dir.path(), &db);
+
+    assert_eq!(code, Some(4), "stderr: {stderr}");
+    assert!(stderr.contains("version 1"), "names the store's version: {stderr}");
+    assert!(
+        stderr.contains(&format!("version {expected}")),
+        "names the binary's version: {stderr}"
+    );
+    assert!(stderr.contains("`c10r build`"), "names the rebuild: {stderr}");
+}
+
+// A dependent (`open` uses `connect`) whose symbol row is gone is a damaged index; the query is refused with the forced
+// build as the remedy, because a plain build reports unchanged sources current and repairs nothing.
+#[test]
+fn a_damaged_index_names_the_forced_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_fixture_db(dir.path());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.execute(
+        "DELETE FROM symbols WHERE canonical_id = ?1",
+        ["op-ws::mycrate::net::open"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = c10r()
+        .current_dir(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .args(["trace", "net::Client::connect", "--relation", "dependents"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "stderr: {stderr} stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(stderr.contains("damaged"), "says the index is damaged: {stderr}");
+    assert!(
+        stderr.contains("c10r build --force"),
+        "names the forced build: {stderr}"
+    );
+    assert!(
+        stderr.contains("not answered"),
+        "says the query was not answered: {stderr}"
+    );
 }

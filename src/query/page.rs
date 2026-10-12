@@ -661,7 +661,7 @@ mod tests {
         );
     }
 
-    // _(Dependents order selector: the selector is part of the query identity)_ — two identities
+    // _(Dependents order selector: a continuation token binds its ordering)_ — two identities
     // differing only in the order mode hash differently, so a token issued under one ordering can
     // never validate against the other.
     #[test]
@@ -673,7 +673,7 @@ mod tests {
         assert_ne!(ranked.hash(), unranked.hash());
     }
 
-    // _(Dependents order selector: the ranking model's version is part of the query identity)_ —
+    // _(Dependents order selector: a continuation token does not outlive its ranking model)_ —
     // two identities differing only in the rank version hash differently, so a token never
     // outlives its ranking model.
     #[test]

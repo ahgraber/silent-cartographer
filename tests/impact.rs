@@ -476,6 +476,11 @@ fn non_worktree_directory_exits_setup_failure() {
         stderr.contains("worktree"),
         "the diagnostic names the problem: {stderr}"
     );
+    let absolute = dir.path().canonicalize().unwrap();
+    assert!(
+        stderr.contains(&absolute.display().to_string()),
+        "the diagnostic names the directory by its absolute path, not `.`: {stderr}"
+    );
 }
 
 /// Write an executable shell script named `git` into `dir` that sleeps far past the bounded
@@ -521,8 +526,8 @@ fn hanging_git_exits_setup_failure_within_a_bounded_window() {
     // worktree" would keep this test green without the diagnostic assertion.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("bounded deadline"),
-        "the diagnostic reports a bounded timeout, not a misclassified worktree failure: {stderr}"
+        stderr.contains("did not answer within 10 s"),
+        "the diagnostic reports a timeout, not a misclassified worktree failure: {stderr}"
     );
 }
 
@@ -824,6 +829,40 @@ fn unmappable_regions_are_disclosed_on_an_approximate_answer() {
         unmappable.iter().any(|u| u["document_path"] == "src/untouched.rs"),
         "the region in the unindexed tracked file is disclosed: {report}"
     );
+}
+
+// _(A file whose pre-change content cannot be obtained is unmappable in whole)_ — the index holds a
+// document for `net.rs`, but the committed blob is not valid UTF-8, so its pre-change side cannot be
+// read. The whole file is disclosed as unmappable rather than its regions being dropped as overlapping
+// no declaration.
+#[test]
+fn a_file_with_unreadable_pre_change_content_is_unmappable_in_whole() {
+    let repo = TestRepo::new();
+    // The invalid bytes sit far below the edited line and are unchanged by the edit, so the diff text
+    // stays valid UTF-8 while the committed blob does not.
+    let tail = [&[b'\n'; 20][..], b"// \xff\xfe not utf-8\n"].concat();
+    let with_tail = |source: &str| [source.as_bytes(), &tail[..]].concat();
+    let doc = repo.path().join(support::DOC);
+    std::fs::create_dir_all(doc.parent().unwrap()).unwrap();
+    std::fs::write(&doc, with_tail(support::SOURCE)).unwrap();
+    repo.write("other/extra.rs", extra_source());
+    repo.commit_all("commit a source that is not valid UTF-8");
+
+    let db = repo.path().join(".c10r/index.db");
+    let ws = workspace_id(&repo);
+    build_from_index(&db, &ws, repo.path(), &extended_fixture_index(), &base_sources()).unwrap();
+
+    let edited = edit_line(support::SOURCE, 4, "        pub fn connect(&self, extra: bool) {}");
+    std::fs::write(&doc, with_tail(&edited)).unwrap();
+
+    let answer = run_impact_json(&repo, &db, &[]);
+    let report = report(&answer);
+    let unmappable = report["unmappable"].as_array().expect("unmappable regions disclosed");
+    assert!(
+        unmappable.iter().any(|u| u["document_path"] == support::DOC),
+        "the whole file is disclosed as unmappable: {report}"
+    );
+    assert!(seed_names(report).is_empty(), "no region of it is located: {report}");
 }
 
 // Line and column in answers.

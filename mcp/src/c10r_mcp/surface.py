@@ -32,6 +32,11 @@ moves, having re-checked the affected tools against the new surface.
 """
 
 
+_MANIFEST_REMEDY = (
+    "The server did not start. Run `{binary_path} manifest` yourself, or check that the binary is a current c10r."
+)
+
+
 class SurfaceMismatchError(RuntimeError):
     """The installed binary's command surface is not the one this server knows."""
 
@@ -45,12 +50,14 @@ async def read_manifest(binary_path: str, cwd: Path) -> dict[str, Any]:
     completed = await binary.run(binary_path, ["manifest"], cwd)
     if completed.exit_code != 0:
         raise binary.BinaryUnavailableError(
-            f"`{binary_path} manifest` exited {completed.exit_code}: {completed.stderr}"
+            f"`{binary_path} manifest` exited {completed.exit_code}: {completed.stderr}. {_MANIFEST_REMEDY.format(binary_path=binary_path)}"
         )
     try:
         manifest = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise binary.BinaryUnavailableError(f"`{binary_path} manifest` did not emit JSON: {exc}") from exc
+        raise binary.BinaryUnavailableError(
+            f"`{binary_path} manifest` did not emit JSON: {exc}. {_MANIFEST_REMEDY.format(binary_path=binary_path)}"
+        ) from exc
     if not isinstance(manifest, dict):
         raise binary.BinaryUnavailableError(
             f"`{binary_path} manifest` emitted {type(manifest).__name__} rather than a "

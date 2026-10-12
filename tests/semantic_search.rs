@@ -502,7 +502,7 @@ pub fn dup(y: u32) -> u32 {
     ingest(&mut store, &ws(), Some(WS_ROOT), &index, &srcs).unwrap();
     let engine = engine_over(&store, &srcs);
     let answer = engine.similar("dup", Detail::Signature, None).unwrap();
-    // The refusal terminates before any ranking is derived: no estimation marker, and so no
+    // The refusal contains no estimation-derived content: no estimation marker, and so no
     // semantic-index provenance either — the marker asserts a derivation, never the command
     // invoked, and the provenance rides inside the marker rather than beside it.
     assert_eq!(answer.classification, None);
@@ -1088,8 +1088,8 @@ fn a_multi_chunk_symbol_appears_at_most_once() {
     assert_eq!(unique.len(), order.len(), "no symbol appears twice: {order:?}");
 }
 
-// _(Scenario: A multi-chunk subject excludes only itself)_ — the subject's own chunks contribute
-// no row of their own, and every other corpus symbol is still ranked.
+// _(Scenario: A multi-chunk subject excludes only itself)_ — no returned row is the subject,
+// however many chunks represent it, and every other corpus symbol is still ranked.
 #[test]
 fn a_multi_chunk_subject_excludes_only_itself() {
     let (store, srcs) = long_store();

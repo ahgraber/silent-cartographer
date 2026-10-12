@@ -394,21 +394,30 @@ impl std::fmt::Display for InstallRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InstallRefusal::Disagreement(files) => {
-                write!(f, "hook files disagree on the installed workspaces:")?;
+                write!(
+                    f,
+                    "the installed hook files name different workspaces, so nothing was changed:"
+                )?;
                 for (path, workspaces) in files {
                     let names: Vec<&str> = workspaces.iter().map(|line| line.workspace.as_str()).collect();
                     write!(f, "\n  {} names [{}]", path.display(), names.join(", "))?;
                 }
-                Ok(())
+                write!(
+                    f,
+                    "\nRun `c10r hooks uninstall` for each workspace listed, then install again."
+                )
             }
             InstallRefusal::DanglingSymlink(path) => write!(
                 f,
-                "{} is a dangling symbolic link; refusing to write through it",
+                "{} is a dangling symbolic link, so c10r did not write through it. Remove the link or point it at an existing hook file.",
                 path.display()
             ),
             InstallRefusal::PriorCollision(path) => write!(f, "{}", prior_collision_message(path)),
             InstallRefusal::LineBreak(field) => {
-                write!(f, "{field} contains a line break, which a hook file cannot carry")
+                write!(
+                    f,
+                    "{field} contains a line break, which a hook file cannot carry, so nothing was installed. Use a name or path without a line break."
+                )
             }
         }
     }

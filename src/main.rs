@@ -14,6 +14,7 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use silent_cartographer::cli::{CacheAction, Cli, Command, CompletionsArgs, HookAction, HooksArgs};
 use silent_cartographer::commands;
 use silent_cartographer::exit::{ExitCode, Failure, classify};
+use silent_cartographer::hooks::HookEvent;
 use silent_cartographer::manifest;
 use silent_cartographer::render;
 
@@ -88,19 +89,27 @@ fn run_doctor(cli: &Cli) -> ! {
     };
     println!("{output}");
 
-    let not_ready: Vec<&str> = report
+    let not_ready: Vec<String> = report
         .indexers
         .iter()
         .filter(|s| !s.is_ready())
-        .map(|s| s.name.as_str())
+        .map(|s| {
+            let state = match s.presence {
+                commands::Presence::Absent => "was not found",
+                _ => "did not answer its readiness check",
+            };
+            format!(
+                "{} {state}, so `c10r build` cannot index that language. The report above gives the hint.",
+                s.name
+            )
+        })
         .collect();
     if not_ready.is_empty() {
         std::process::exit(ExitCode::Success.code());
     }
-    eprintln!(
-        "{}",
-        render::sanitize(&format!("indexer setup failure: {}", not_ready.join(", ")))
-    );
+    for line in &not_ready {
+        eprintln!("{}", render::sanitize(line));
+    }
     std::process::exit(ExitCode::IndexerSetup.code());
 }
 
@@ -127,7 +136,10 @@ fn validate_hooks_args(args: &HooksArgs) -> Result<(), Failure> {
     match args.action {
         HookAction::Run => {
             if args.event.is_none() {
-                return Err(Failure::Usage("`hooks run` requires an event".to_string()));
+                return Err(Failure::Usage(format!(
+                    "`hooks run` requires an event: one of {}",
+                    HookEvent::ALL.map(HookEvent::as_str).join(", ")
+                )));
             }
             if args.root.is_none() {
                 return Err(Failure::Usage("`hooks run` requires --root".to_string()));

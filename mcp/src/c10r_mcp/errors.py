@@ -96,6 +96,12 @@ def failure(completed: Completed) -> ToolResult:
     )
 
 
+_UNPARSED_REMEDY = (
+    "The call returned no answer and the cause is not known. "
+    "Check that C10R_BINARY or PATH points at the c10r this server was built for."
+)
+
+
 def answer(completed: Completed) -> dict[str, Any]:
     """Return the structured answer a successful invocation produced.
 
@@ -106,9 +112,14 @@ def answer(completed: Completed) -> dict[str, Any]:
     try:
         parsed = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise ToolError(f"`c10r` exited successfully but its answer did not parse as JSON: {exc}") from exc
+        raise ToolError(
+            f"`c10r` exited successfully but its answer did not parse as JSON: {exc}. {_UNPARSED_REMEDY}"
+        ) from exc
     if not isinstance(parsed, dict):
-        raise ToolError(f"`c10r` exited successfully but its answer was {type(parsed).__name__}, not a JSON object")
+        raise ToolError(
+            f"`c10r` exited successfully but its answer was {type(parsed).__name__}, not a JSON object. "
+            f"{_UNPARSED_REMEDY}"
+        )
     return parsed
 
 

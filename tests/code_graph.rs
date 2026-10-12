@@ -96,7 +96,7 @@ fn edges_are_deduplicated_and_rebuild_is_idempotent() {
 
 // _(Whole-build supersession)_ — a build over an existing same-version store wholly supersedes every
 // derived table: rebuilding the identical index leaves byte-identical symbol, occurrence, and edge
-// row sets (no accumulation), and a symbol absent from the next index leaves no stale row behind.
+// rows (no accumulation), and a symbol absent from the next index leaves no stale row behind.
 #[test]
 fn rebuilding_over_the_same_store_supersedes_all_derived_rows() {
     let snapshot = |store: &GraphStore| {
@@ -133,7 +133,7 @@ fn rebuilding_over_the_same_store_supersedes_all_derived_rows() {
         "sanity: the first build produced symbol, occurrence, and edge rows"
     );
 
-    // Second build of the identical index over the same store: every derived row set is superseded,
+    // Second build of the identical index over the same store: every derived row is superseded,
     // not accumulated — equal counts AND equal content.
     ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
     let second = snapshot(&store);
@@ -1450,7 +1450,7 @@ fn changed_content_marks_stale() {
 
 // _(Staleness reflects underlying change — version write-site)_
 #[test]
-fn changed_analyzer_version_marks_stale_and_flags_reindex() {
+fn changed_analyzer_version_marks_stale() {
     let store = ingest_fixture();
     let newer = AnalyzerProvenance {
         analyzer_name: "rust-analyzer".to_string(),
@@ -1458,12 +1458,12 @@ fn changed_analyzer_version_marks_stale_and_flags_reindex() {
     };
     let f = freshness(&store, &sources(), &newer, None).unwrap();
     assert_eq!(f, Some(Freshness::StaleVersion));
-    assert!(f.unwrap().is_stale(), "version drift flags reindex");
+    assert!(f.unwrap().is_stale(), "version drift marks the result stale");
 }
 
 // _(Staleness reflects underlying change — environment write-site; scenario: Changed environment
 // marks stale)_ — a recorded interpreter environment differing from the one in effect (here by its
-// installed-package fingerprint) marks results stale and flags reindex.
+// installed-package fingerprint) marks results stale.
 #[test]
 fn changed_environment_marks_stale() {
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -1474,7 +1474,7 @@ fn changed_environment_marks_stale() {
     let drifted = env_facts("fp-b");
     let f = freshness(&store, &sources(), &support::provenance(), Some(&drifted)).unwrap();
     assert_eq!(f, Some(Freshness::StaleEnvironment));
-    assert!(f.unwrap().is_stale(), "environment drift flags reindex");
+    assert!(f.unwrap().is_stale(), "environment drift marks the result stale");
 
     // An environment that can no longer be resolved is drift too, never reported fresh.
     let f = freshness(&store, &sources(), &support::provenance(), None).unwrap();

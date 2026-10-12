@@ -657,10 +657,7 @@ pub enum StoreOpenError {
     },
     /// The store was written under a different schema version than this binary expects. A pre-guard
     /// store carries no stamp and reads as version 0.
-    #[error(
-        "index store at {path} carries schema version {found}, but this binary expects version {expected}; \
-         run `c10r build` to rebuild it (or delete the file)"
-    )]
+    #[error("{}", schema_mismatch_message(.path, *.found, *.expected))]
     SchemaVersionMismatch {
         /// The store's path, for the teaching message.
         path: String,
@@ -670,12 +667,38 @@ pub enum StoreOpenError {
         expected: i64,
     },
     /// The underlying storage failed.
-    #[error("store error: {0}")]
+    #[error("c10r could not open or check the index store: {0}. The command did not complete and produced no answer.")]
     Storage(#[from] rusqlite::Error),
     /// A filesystem operation on the store's own files — recognizing, creating, renaming, or
     /// removing them — failed.
-    #[error("index store file operation failed: {0}")]
+    #[error(
+        "c10r could not create, rename, or remove an index store file: {0}. \
+         The command did not complete and produced no answer."
+    )]
     Io(#[from] std::io::Error),
+}
+
+/// Appended to a stored value this binary cannot interpret: such a row is unreadable here, and a
+/// plain build would report the index current, so only a forced build repairs it.
+const UNREADABLE_INDEX_REMEDY: &str = "This binary cannot read the index; run `c10r build --force` to rebuild it.";
+
+/// The refusal text for a store stamped with a schema version other than the binary's. An older
+/// store is rebuilt; a newer one is still in use by the newer c10r that wrote it, so the remedy is
+/// to upgrade or point elsewhere, and the text says a build would replace it.
+fn schema_mismatch_message(path: &str, found: i64, expected: i64) -> String {
+    if found < expected {
+        format!(
+            "index store at {path} carries schema version {found}, but this binary expects version {expected}. \
+             c10r could not read it and produced no answer. Run `c10r build` to rebuild it, or delete the file."
+        )
+    } else {
+        format!(
+            "index store at {path} was written by a newer c10r (schema version {found}; this binary expects \
+             version {expected}). c10r could not read it and produced no answer. \
+             Upgrade c10r, or pass `--db` with another path. \
+             Running `c10r build` with this binary would replace the newer store."
+        )
+    }
 }
 
 /// The SQLite-backed graph store.
@@ -1527,7 +1550,7 @@ impl GraphStore {
                 3,
                 rusqlite::types::Type::Text,
                 Box::new(std::io::Error::other(format!(
-                    "symbol class {class_tag:?} is not a persisted class"
+                    "symbol class {class_tag:?} is not a persisted class. {UNREADABLE_INDEX_REMEDY}"
                 ))),
             )
         })?;
@@ -2022,7 +2045,7 @@ impl GraphStore {
                         1,
                         rusqlite::types::Type::Text,
                         Box::new(std::io::Error::other(format!(
-                            "edge kind {kind:?} is not a dependency kind the traversal walks"
+                            "edge kind {kind:?} is not a dependency kind the traversal walks. {UNREADABLE_INDEX_REMEDY}"
                         ))),
                     )
                 })?;
@@ -2378,7 +2401,7 @@ fn read_aligned_counts(
         rusqlite::Error::FromSqlConversionFailure(
             5,
             rusqlite::types::Type::Text,
-            Box::new(std::io::Error::other(detail)),
+            Box::new(std::io::Error::other(format!("{detail}. {UNREADABLE_INDEX_REMEDY}"))),
         )
     };
     let stored: std::collections::BTreeMap<String, u64> =
@@ -2398,7 +2421,7 @@ fn read_aligned_counts(
     if !missing.is_empty() {
         return Err(conversion_failure(format!(
             "stored alignment counts name no bucket for {}; the store was built under a different \
-             rule vocabulary and describes a different graph — rebuild it",
+             rule vocabulary and describes a different graph",
             missing.join(", ")
         )));
     }

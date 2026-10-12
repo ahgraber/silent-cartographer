@@ -562,7 +562,10 @@ impl HumanRender for ImpactReport {
                 // A resolution gap: at least one changed region sat in a document the index never
                 // saw, so this is not a confident "nothing changed here."
                 SeedOutcome::NoneResolvable => {
-                    lines.push("unresolved: no changed region resolved against this index".to_string());
+                    lines.push(
+                        "unresolved: no changed region could be matched to a symbol in this index, so the dependents of the change are unknown. If the changed files are new to the index, run `c10r build` and repeat."
+                            .to_string(),
+                    );
                 }
                 SeedOutcome::Seeded => {
                     lines.push(bold(&format!("{} seeds", report.seeds.len()), styled));
@@ -579,7 +582,10 @@ impl HumanRender for ImpactReport {
                 }
             }
             if !report.unmappable.is_empty() {
-                lines.push(bold("regions this index cannot resolve", styled));
+                lines.push(bold(
+                    "regions this index cannot resolve (file not in the index, or not readable before the change)",
+                    styled,
+                ));
                 for region in &report.unmappable {
                     let path = sanitize(&region.document_path);
                     lines.push(
@@ -634,12 +640,13 @@ fn header_line<T>(answer: &Answer<T>, styled: bool) -> String {
 fn workspace_relation_line<T>(answer: &Answer<T>) -> Option<String> {
     match answer.workspace_relation.as_ref()? {
         WorkspaceRelation::Mismatched { recorded_root } => Some(format!(
-            "warning: this index describes a different workspace (built for {})",
+            "warning: this index describes a different workspace (built for {}), so this answer may describe code that is not in this workspace. Run `c10r build` here to index this workspace, or pass a separate `--db`.",
             sanitize(recorded_root)
         )),
-        WorkspaceRelation::Unknown => {
-            Some("warning: whether this index describes this workspace could not be determined".to_string())
-        }
+        WorkspaceRelation::Unknown => Some(
+            "warning: c10r could not compare this index's workspace with this one, so this answer may describe a different workspace. Run `c10r build` here to record this workspace."
+                .to_string(),
+        ),
     }
 }
 
@@ -684,11 +691,11 @@ mod workspace_disclosure_tests {
 
         let unknown = to_human(&answer(Some(WorkspaceRelation::Unknown)), false, PositionUnit::Line);
         assert!(
-            unknown.contains("could not be determined"),
+            unknown.contains("could not compare") && unknown.contains("c10r build"),
             "an unevaluable comparison reads as undetermined, not as a match: {unknown}"
         );
         assert!(
-            !unknown.contains("different workspace"),
+            !unknown.contains("built for"),
             "an unevaluable comparison is not reported as a mismatch: {unknown}"
         );
     }
@@ -763,7 +770,7 @@ fn push_content(lines: &mut Vec<String>, content: Option<&str>) {
 /// by `--max-lines`. Nothing is appended for an untruncated result.
 fn push_truncation(lines: &mut Vec<String>, truncated: bool) {
     if truncated {
-        lines.push("  … (content truncated)".to_string());
+        lines.push("  … (content truncated by --max-lines; raise it, or use 0 for the full text)".to_string());
     }
 }
 
@@ -844,7 +851,7 @@ fn freshness_label(freshness: crate::query::output::FreshnessLabel) -> &'static 
         FreshnessLabel::Fresh => "fresh",
         FreshnessLabel::StaleContent => "stale (content changed)",
         FreshnessLabel::StaleVersion => "stale (analyzer version changed)",
-        FreshnessLabel::StaleEnvironment => "stale (environment changed)",
+        FreshnessLabel::StaleEnvironment => "stale (environment changed or could not be checked)",
     }
 }
 

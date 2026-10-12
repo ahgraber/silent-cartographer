@@ -15,9 +15,11 @@ import stat
 
 from c10r_mcp import surface
 from c10r_mcp.__main__ import main
-from c10r_mcp.binary import BINARY_ENV_VAR, BinaryUnavailableError, locate_binary
+from c10r_mcp.binary import BINARY_ENV_VAR, BinaryUnavailableError, Completed, locate_binary, run
+from c10r_mcp.errors import answer
 from c10r_mcp.server import create_server
 from conftest import client
+from fastmcp.exceptions import ToolError
 import pytest
 
 STUB_TEMPLATE = """\
@@ -133,3 +135,53 @@ def test_an_unrunnable_binary_is_a_distinct_startup_failure(tmp_path: Path, monk
 
     with pytest.raises(BinaryUnavailableError, match=str(not_executable)):
         locate_binary()
+
+
+async def test_a_binary_that_cannot_be_run_names_how_to_install_one(tmp_path: Path) -> None:
+    """The refusal says no tool can answer and names the install command and the override."""
+    missing = tmp_path / "absent" / "c10r"
+
+    with pytest.raises(BinaryUnavailableError) as failure:
+        await run(str(missing), ["manifest"], tmp_path)
+
+    message = str(failure.value)
+    assert str(missing) in message, message
+    assert "No tool can answer" in message, message
+    assert "cargo install" in message, message
+    assert BINARY_ENV_VAR in message, message
+
+
+@pytest.mark.parametrize(
+    ("body", "cause"),
+    [
+        ("echo broken >&2; exit 3", "exited 3"),
+        ("printf 'not json'", "did not emit JSON"),
+    ],
+)
+async def test_a_manifest_failure_says_the_server_did_not_start(
+    tmp_path: Path, indexed_workspace: Path, body: str, cause: str
+) -> None:
+    """A manifest the server cannot read names the cause and the command to run by hand."""
+    stub = tmp_path / "c10r"
+    stub.write_text(f"#!/bin/sh\n{body}\n")
+    stub.chmod(0o755)
+
+    with pytest.raises(BinaryUnavailableError) as failure:
+        await surface.check(str(stub), indexed_workspace)
+
+    message = str(failure.value)
+    assert cause in message, message
+    assert "did not start" in message, message
+    assert f"{stub} manifest" in message, message
+
+
+@pytest.mark.parametrize("stdout", [b"not json", b"[]"])
+def test_an_unparseable_answer_says_no_answer_was_returned(stdout: bytes) -> None:
+    """The cause is stated as unknown and the binary override is named."""
+    with pytest.raises(ToolError) as failure:
+        answer(Completed(stdout=stdout, stderr="", exit_code=0))
+
+    message = str(failure.value)
+    assert "no answer" in message, message
+    assert "not known" in message, message
+    assert BINARY_ENV_VAR in message, message

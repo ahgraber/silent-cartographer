@@ -109,8 +109,8 @@ fn index_records_analyzer_provenance() {
     assert!(!index.provenance.analyzer_version.is_empty());
 }
 
-// _(Optional capabilities are queryable)_ — a backend declaring enclosure is detected and relied
-// upon.
+// _(Optional capabilities are queryable)_ — a backend declaring enclosure is reported as supplying
+// it.
 #[test]
 fn declared_capability_is_present() {
     let engine = FixtureEngine::new(support::fixture_index()).with_capabilities(Capabilities::none().with_enclosure());

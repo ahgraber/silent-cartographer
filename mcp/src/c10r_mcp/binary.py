@@ -22,6 +22,8 @@ BINARY_NAME = "c10r"
 BINARY_ENV_VAR = "C10R_BINARY"
 """An explicit path to the binary, overriding the `PATH` lookup."""
 
+_INSTALL_COMMAND = "cargo install --git https://github.com/ahgraber/silent-cartographer --tag <tag> --locked"
+
 TERMINATE_GRACE_SECONDS = 5.0
 """How long a cancelled command may take to exit before it is killed outright."""
 
@@ -60,7 +62,8 @@ def locate_binary() -> str:
     found = shutil.which(BINARY_NAME)
     if found is None:
         raise BinaryUnavailableError(
-            f"no `{BINARY_NAME}` binary on PATH. Install it, or set {BINARY_ENV_VAR} to the path of one."
+            f"no `{BINARY_NAME}` binary on PATH, so no tool can answer. Install it with `{_INSTALL_COMMAND}`, "
+            f"or set {BINARY_ENV_VAR} to the path of one."
         )
     return str(Path(found).resolve())
 
@@ -98,7 +101,10 @@ async def run(binary: str, args: Sequence[str], cwd: Path, stdin: bytes | None =
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as exc:
-        raise BinaryUnavailableError(f"could not run `{binary}`: {exc}") from exc
+        raise BinaryUnavailableError(
+            f"could not run `{binary}`: {exc}. No tool can answer until a working `{BINARY_NAME}` is installed "
+            f"(`{_INSTALL_COMMAND}`) or {BINARY_ENV_VAR} points at one."
+        ) from exc
 
     try:
         stdout, stderr = await process.communicate(stdin)

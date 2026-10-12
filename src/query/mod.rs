@@ -128,30 +128,45 @@ impl OrderMode {
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
     /// The store could not be read.
-    #[error("store error: {0}")]
+    #[error("c10r could not read the index while answering the query: {0}. No answer was produced.")]
     Store(#[from] rusqlite::Error),
     /// A dependency edge named a symbol that has no row in the store — an invariant violation, since
     /// edges carry NOT NULL foreign keys to symbols.
-    #[error("store corruption: dependency edge references missing symbol {0}")]
+    #[error(
+        "the index is damaged: a dependency edge names symbol {0}, which the index does not hold, \
+         so the query was not answered. Run `c10r build --force` to rebuild it."
+    )]
     MissingSymbol(CanonicalId),
     /// A `search` or `similar` was asked of a store recording no semantic-index identity. Every
     /// estimation-graded answer must name the regime its ranking derives under, so there is no
     /// honest answer to give — an invariant violation, since a completed build always records one.
-    #[error("store corruption: no semantic-index identity recorded; rebuild the index")]
+    #[error(
+        "the index is damaged: it records no semantic-index identity, so the query was not answered. \
+         Run `c10r build --force` to rebuild it."
+    )]
     MissingSemanticIndex,
     /// A `clones` query was asked of a store recording no fragment parameters, so the guaranteed
     /// fragment length its answer must state is unknown — an invariant violation, since a completed
     /// build always records them.
-    #[error("store corruption: no fragment parameters recorded; rebuild the index")]
+    #[error(
+        "the index is damaged: it records no fragment parameters, so the query was not answered. \
+         Run `c10r build --force` to rebuild it."
+    )]
     MissingFragmentParameters,
     /// A `clones` query needed the indexed text behind a symbol holding fragment evidence, and the
     /// store holds none for its document — an invariant violation, since a build fingerprints only
     /// symbols of documents it indexed whole.
-    #[error("store corruption: no indexed text for {0}; rebuild the index")]
+    #[error(
+        "the index is damaged: it holds no indexed text for {0}, so the query was not answered. \
+         Run `c10r build --force` to rebuild it."
+    )]
     MissingIndexedText(String),
     /// The store records an analyzer whose language no backend parses — an invariant violation,
     /// since a build refuses such an analyzer.
-    #[error("store corruption: unrecognized analyzer {0}; rebuild the index")]
+    #[error(
+        "the index records analyzer {0}, which this binary does not know, so the query was not answered. \
+         Run `c10r build --force` to rebuild it, or upgrade c10r if a newer version built this index."
+    )]
     UnknownAnalyzer(String),
 }
 
@@ -913,7 +928,7 @@ fn is_false(flag: &bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_lines, window_content};
+    use super::{QueryError, cap_lines, window_content};
     use crate::query::output::ContentLines;
 
     // _(Content bounded with truncation disclosed — line cap)_ — a row-content cap keeps the first
@@ -1000,5 +1015,18 @@ mod tests {
 
         // No content passes through with no disclosure.
         assert_eq!(window_content(None, 1, Some(3)), (None, None, false));
+    }
+
+    // These two errors guard metadata a completed build always records, so no command reaches them;
+    // their text is checked directly. Each says the index is damaged and that the query was not
+    // answered, and names the forced build, since a plain build repairs nothing over unchanged sources.
+    #[test]
+    fn unreachable_damaged_store_errors_name_the_forced_build() {
+        for error in [QueryError::MissingSemanticIndex, QueryError::MissingFragmentParameters] {
+            let text = error.to_string();
+            assert!(text.contains("damaged"), "{text}");
+            assert!(text.contains("not answered"), "{text}");
+            assert!(text.contains("c10r build --force"), "{text}");
+        }
     }
 }

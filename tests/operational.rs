@@ -1305,7 +1305,7 @@ fn a_different_workspace_carries_the_marker_in_both_renderings() {
 
     let human = get_answer(&db, queried_from.path(), false);
     assert!(
-        human.contains("different workspace") && human.contains(&recorded),
+        human.contains("different workspace") && human.contains(&recorded) && human.contains("c10r build"),
         "the human render names the mismatch and the recorded root: {human}"
     );
 }
@@ -1371,7 +1371,7 @@ fn a_store_recording_no_workspace_is_disclosed_as_unknown() {
 
     let human = get_answer(&db, dir.path(), false);
     assert!(
-        human.contains("could not be determined"),
+        human.contains("could not compare") && human.contains("c10r build"),
         "the human render says so too: {human}"
     );
 }
@@ -1619,7 +1619,7 @@ fn a_changed_chunk_parameter_rebuilds() {
     )
     .expect_err("a changed chunk size drives the build to analyze, which the stub refuses");
     assert!(
-        err.to_string().contains("indexing failed"),
+        err.to_string().contains("could not index the workspace"),
         "the changed-parameter build attempted analysis: {err}"
     );
 }
@@ -1644,7 +1644,7 @@ fn an_explicit_rebuild_analyzes_an_unchanged_workspace() {
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
-        err.to_string().contains("indexing failed"),
+        err.to_string().contains("could not index the workspace"),
         "the forced build attempted analysis: {err}"
     );
 }
@@ -1674,7 +1674,7 @@ fn corrupt_metadata_in_a_recognized_store_rebuilds() {
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
-        err.to_string().contains("indexing failed"),
+        err.to_string().contains("could not index the workspace"),
         "corrupt metadata drove the build to analyze: {err}"
     );
 }
@@ -1703,7 +1703,7 @@ fn an_edited_source_rebuilds() {
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
-        err.to_string().contains("indexing failed"),
+        err.to_string().contains("could not index the workspace"),
         "the changed source drove the build to analyze: {err}"
     );
 }
@@ -1728,7 +1728,7 @@ fn a_changed_analyzer_version_rebuilds() {
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
-        err.to_string().contains("indexing failed"),
+        err.to_string().contains("could not index the workspace"),
         "the changed analyzer version drove the build to analyze: {err}"
     );
 }
@@ -1818,7 +1818,7 @@ fn a_changed_declared_environment_rebuilds() {
     )
     .expect_err("the stub indexer refuses to analyze");
     assert!(
-        err.to_string().contains("indexing failed"),
+        err.to_string().contains("could not index the workspace"),
         "the changed environment drove the build to analyze: {err}"
     );
 }
@@ -1846,7 +1846,7 @@ fn an_absent_index_builds() {
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
-        err.to_string().contains("indexing failed"),
+        err.to_string().contains("could not index the workspace"),
         "the absent index drove the build to analyze: {err}"
     );
 }
@@ -1977,7 +1977,7 @@ fn a_store_recorded_for_another_workspace_is_not_current() {
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
-        err.to_string().contains("indexing failed"),
+        err.to_string().contains("could not index the workspace"),
         "the workspace mismatch drove the build to analyze: {err}"
     );
 }
@@ -2635,4 +2635,26 @@ fn status_names_only_the_environment_when_only_it_changed() {
     );
     let human = workspace.status_human(&[]);
     assert!(human.contains("stale reasons: stale_environment"), "{human}");
+}
+
+// _(A stale label claims no cause the system did not observe)_ — an environment that no longer
+// resolves is indistinguishable from one that changed, so the label names both possibilities rather
+// than asserting a change; the machine value is unchanged.
+#[test]
+fn an_unresolvable_environment_does_not_render_as_a_changed_one() {
+    let workspace = StatusWorkspace::build(Language::Python);
+    std::fs::remove_dir_all(workspace.dir.path().join(".venv")).unwrap();
+
+    let machine = workspace.run(&["--json", "get", "a_one"]);
+    let answer: serde_json::Value = serde_json::from_slice(&machine.stdout).unwrap();
+    assert_eq!(answer["freshness"], "stale_environment", "{answer}");
+
+    let human = workspace.run(&["--color", "never", "get", "a_one"]);
+    let header = String::from_utf8(human.stdout).unwrap();
+    let header = header.lines().next().expect("the answer has a header line");
+    assert!(header.contains("stale"), "{header}");
+    assert!(
+        header.contains("could not be checked"),
+        "the label names the unobserved possibility: {header}"
+    );
 }

@@ -24,13 +24,15 @@ pub enum SeedMode {
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
     /// No usable `git` executable could be spawned.
-    #[error("git could not be run ({0}); `impact` requires a working `git` to seed a diff")]
+    #[error("git could not be run ({0}), so c10r cannot read the repository. Install git or put it on PATH.")]
     Absent(String),
     /// The directory is not inside a git worktree.
-    #[error("{0} is not inside a git worktree")]
+    #[error(
+        "{0} is not inside a git worktree, so c10r cannot read its git history or install hooks for it. Run the command from inside a git repository."
+    )]
     NotAWorktree(String),
     /// A `git` invocation did not complete within the bounded deadline.
-    #[error("git {invocation} did not complete within the {secs}-second bounded deadline", secs = PROBE_DEADLINE.as_secs())]
+    #[error("git {invocation} did not answer within {secs} s, so c10r stopped waiting and produced no answer. Run the same git command in the workspace to see why it is slow.", secs = PROBE_DEADLINE.as_secs())]
     Timeout {
         /// The invocation that timed out, named for diagnostics.
         invocation: String,
@@ -39,7 +41,7 @@ pub enum GitError {
     #[error("{0} is not a valid revision in this repository")]
     BadRevspec(String),
     /// A `git` invocation completed but reported failure.
-    #[error("git {invocation} failed: {stderr}")]
+    #[error("git {} failed: {}. c10r produced no result.", .invocation, .stderr.trim_end())]
     Failed {
         /// The invocation that failed, named for diagnostics.
         invocation: String,
@@ -127,6 +129,15 @@ fn spawn_payload(dir: &Path, args: &[&str], label: &str) -> Result<ProbeCapture,
     }
 }
 
+/// `root` as an absolute path for a message, so a relative root such as `.` names the directory;
+/// falls back to `root` as given when it cannot be resolved.
+fn absolute_display(root: &Path) -> String {
+    root.canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string()
+}
+
 /// The git worktree an impact assessment draws its diff from: the workspace root `git` is invoked in,
 /// together with that root's path prefix relative to the repository root.
 ///
@@ -151,12 +162,12 @@ impl GitRepo {
         let label = "rev-parse --is-inside-work-tree --show-prefix";
         let capture = spawn_metadata(root, &["rev-parse", "--is-inside-work-tree", "--show-prefix"], label)?;
         if !capture.status.success() {
-            return Err(GitError::NotAWorktree(root.display().to_string()));
+            return Err(GitError::NotAWorktree(absolute_display(root)));
         }
         let stdout = String::from_utf8_lossy(&capture.stdout);
         let mut lines = stdout.lines();
         if lines.next() != Some("true") {
-            return Err(GitError::NotAWorktree(root.display().to_string()));
+            return Err(GitError::NotAWorktree(absolute_display(root)));
         }
         let prefix = lines.next().unwrap_or("").to_string();
         Ok(GitRepo {
@@ -325,7 +336,7 @@ impl GitRepo {
         }
         String::from_utf8(capture.stdout).map_err(|_| GitError::Failed {
             invocation: label,
-            stderr: "the patch was not valid UTF-8".to_string(),
+            stderr: "the diff contains bytes that are not UTF-8".to_string(),
         })
     }
 

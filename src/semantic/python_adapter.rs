@@ -41,6 +41,9 @@ pub struct PythonAdapter {
 }
 
 /// The install guidance appended to every scip-python unavailability error.
+/// The consequence and remedy for an environment directory that cannot be read.
+const BROKEN_ENVIRONMENT: &str = "The environment looks broken; pass `--environment <virtualenv>` or recreate it.";
+
 const INSTALL_HINT: &str = "install scip-python with `npm install -g @sourcegraph/scip-python`";
 
 impl PythonAdapter {
@@ -82,7 +85,8 @@ impl PythonAdapter {
             Ok(ProbeOutcome::Completed(capture)) => capture,
             Ok(ProbeOutcome::TimedOut) => {
                 return Err(SemanticError::Timeout(format!(
-                    "scip-python ({executable}) --version did not respond within {}s",
+                    "scip-python ({executable}) did not answer `--version` within {} s, so no index was built. \
+                     Run `{executable} --version` to see why.",
                     PROBE_DEADLINE.as_secs()
                 )));
             }
@@ -94,7 +98,9 @@ impl PythonAdapter {
         };
         if !capture.status.success() {
             return Err(SemanticError::Unavailable(format!(
-                "scip-python ({executable}) --version failed; {INSTALL_HINT}"
+                "`{executable} --version` failed ({}), so no index was built. If the installation is damaged, \
+                 reinstall it with `npm install -g @sourcegraph/scip-python`.",
+                capture.failure_detail()
             )));
         }
         Ok(String::from_utf8_lossy(&capture.stdout).trim().to_string())
@@ -132,7 +138,8 @@ impl PythonAdapter {
             })?;
         if !status.success() {
             return Err(SemanticError::Analysis(format!(
-                "scip-python index exited with status {status}"
+                "`{} index` failed ({status}). Its own error output is printed above.",
+                self.executable
             )));
         }
         Ok(())
@@ -194,10 +201,20 @@ impl SemanticEngine for PythonAdapter {
 
         let output_path = std::env::temp_dir().join(format!("c10r-scip-python-{}.scip", std::process::id()));
         self.write_scip_index(project_root, &output_path)?;
-        let bytes = std::fs::read(&output_path)
-            .map_err(|e| SemanticError::Analysis(format!("cannot read {}: {e}", output_path.display())))?;
-        let index: scip::types::Index = protobuf::Message::parse_from_bytes(&bytes)
-            .map_err(|e| SemanticError::Analysis(format!("cannot parse SCIP index: {e}")))?;
+        let bytes = std::fs::read(&output_path).map_err(|e| {
+            SemanticError::Analysis(format!(
+                "`{} index` finished, but its output {} could not be read ({e}).",
+                self.executable,
+                output_path.display()
+            ))
+        })?;
+        let index: scip::types::Index = protobuf::Message::parse_from_bytes(&bytes).map_err(|e| {
+            SemanticError::Analysis(format!(
+                "`{} index` finished, but its output {} is not a valid SCIP index ({e}).",
+                self.executable,
+                output_path.display()
+            ))
+        })?;
         // library_roots stays empty at launch: Python supplies no package→root map yet, so twin
         // groups fall back to the refusal path by construction.
         let mut extracted = translate_index(&index, &self.provenance());
@@ -228,22 +245,26 @@ pub fn environment_facts(environment: &Path) -> Result<EnvironmentFacts, Semanti
         Ok(ProbeOutcome::Completed(capture)) => capture,
         Ok(ProbeOutcome::TimedOut) => {
             return Err(SemanticError::Timeout(format!(
-                "the environment's interpreter {} --version did not respond within {}s",
+                "the environment's interpreter {} did not answer `--version` within {} s. \
+                 Run it by hand to see why, or pass a different `--environment <virtualenv>`.",
                 interpreter.display(),
                 PROBE_DEADLINE.as_secs()
             )));
         }
         Err(e) => {
             return Err(SemanticError::Environment(format!(
-                "cannot run the environment's interpreter {}: {e}",
+                "could not run the environment's interpreter {} ({e}). \
+                 Pass `--environment <virtualenv>`, or recreate the environment.",
                 interpreter.display()
             )));
         }
     };
     if !capture.status.success() {
         return Err(SemanticError::Environment(format!(
-            "{} --version failed",
-            interpreter.display()
+            "the environment's interpreter {} --version failed ({}). \
+             Pass `--environment <virtualenv>`, or recreate the environment.",
+            interpreter.display(),
+            capture.failure_detail()
         )));
     }
     // Python prints its version on stdout (stderr on some older builds); take whichever spoke.
@@ -267,8 +288,9 @@ pub fn environment_facts(environment: &Path) -> Result<EnvironmentFacts, Semanti
 /// The environment's site-packages directory: `<env>/lib/python<X.Y>/site-packages`.
 fn site_packages_dir(environment: &Path) -> Result<PathBuf, SemanticError> {
     let lib = environment.join("lib");
-    let entries = std::fs::read_dir(&lib)
-        .map_err(|e| SemanticError::Environment(format!("cannot read {}: {e}", lib.display())))?;
+    let entries = std::fs::read_dir(&lib).map_err(|e| {
+        SemanticError::Environment(format!("could not read {} ({e}). {BROKEN_ENVIRONMENT}", lib.display()))
+    })?;
     for entry in entries.flatten() {
         if entry.file_name().to_string_lossy().starts_with("python") {
             let candidate = entry.path().join("site-packages");
@@ -278,8 +300,10 @@ fn site_packages_dir(environment: &Path) -> Result<PathBuf, SemanticError> {
         }
     }
     Err(SemanticError::Environment(format!(
-        "no site-packages directory found under {}",
-        lib.display()
+        "{} holds no python*/site-packages directory, so {} does not look like a virtualenv. \
+         Pass `--environment <virtualenv>`.",
+        lib.display(),
+        environment.display()
     )))
 }
 
@@ -338,12 +362,20 @@ fn canonicalize_or(path: &Path) -> PathBuf {
 /// Sorting makes the fingerprint a function of the installed set, not enumeration order; installs,
 /// upgrades, and removals all change a dist-info name, so each changes the fingerprint.
 pub fn package_fingerprint(site_packages: &Path) -> Result<String, SemanticError> {
-    let entries = std::fs::read_dir(site_packages)
-        .map_err(|e| SemanticError::Environment(format!("cannot read {}: {e}", site_packages.display())))?;
+    let entries = std::fs::read_dir(site_packages).map_err(|e| {
+        SemanticError::Environment(format!(
+            "could not read {} ({e}). {BROKEN_ENVIRONMENT}",
+            site_packages.display()
+        ))
+    })?;
     let mut names = Vec::new();
     for entry in entries {
-        let entry =
-            entry.map_err(|e| SemanticError::Environment(format!("cannot read {}: {e}", site_packages.display())))?;
+        let entry = entry.map_err(|e| {
+            SemanticError::Environment(format!(
+                "could not read {} ({e}). {BROKEN_ENVIRONMENT}",
+                site_packages.display()
+            ))
+        })?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.ends_with(".dist-info") && entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             names.push(name);
@@ -408,6 +440,50 @@ mod tests {
         };
         classify_module_kinds(&mut index);
         assert_eq!(index.symbols[0].kind, SymbolKind::Module);
+    }
+
+    /// An executable shell stub named `name` in `dir` running `body`.
+    fn write_stub(dir: &Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    // A scip-python that is installed but fails its version probe reports the exit status and error
+    // output, and does not tell the user to install what is already there.
+    #[test]
+    fn failed_version_probe_message_carries_exit_status_and_does_not_say_to_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = write_stub(dir.path(), "scip-python", "echo 'node crashed' >&2\nexit 4");
+        let err = PythonAdapter::discover_version(&exe).expect_err("a failing probe refuses");
+        let text = err.to_string();
+        assert!(text.contains("exit status: 4"), "{text}");
+        assert!(text.contains("node crashed"), "{text}");
+        assert!(!text.contains("install scip-python"), "{text}");
+    }
+
+    // A missing scip-python names the install command and the cause the operating system gave.
+    #[test]
+    fn missing_tool_message_names_install_command() {
+        let err = PythonAdapter::discover_version("/nonexistent/scip-python").expect_err("a missing tool refuses");
+        let text = err.to_string();
+        assert!(text.contains("npm install -g @sourcegraph/scip-python"), "{text}");
+        assert!(text.contains("No such file or directory"), "{text}");
+    }
+
+    // An environment whose lib/ holds no site-packages names the directory, the environment, and
+    // the flag that points elsewhere.
+    #[test]
+    fn environment_without_site_packages_names_the_flag() {
+        let (_guard, root) = canonical_tempdir();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        let err = site_packages_dir(&root).expect_err("no site-packages refuses");
+        let text = err.to_string();
+        assert!(text.contains("site-packages"), "{text}");
+        assert!(text.contains(&root.display().to_string()), "{text}");
+        assert!(text.contains("--environment"), "{text}");
     }
 
     // Precedence among the three environment-resolution mechanisms: an explicit path outranks an

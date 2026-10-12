@@ -1018,7 +1018,7 @@ fn the_human_report_states_each_hook_state() {
     assert!(merge.contains("fix: cd "), "{merge}");
     assert!(merge.contains("c10r hooks install"), "{merge}");
     assert!(
-        !lines.iter().any(|l| l.contains("disagree")),
+        !lines.iter().any(|l| l.contains("different workspaces")),
         "one workspace set never disagrees: {lines:?}"
     );
 }
@@ -1059,7 +1059,7 @@ fn the_human_report_states_disagreeing_hooks() {
         "{lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("disagree")),
+        lines.iter().any(|l| l.contains("different workspaces")),
         "the report states the files disagree: {lines:?}"
     );
 }
@@ -1617,6 +1617,20 @@ fn build_excludes_an_undecodable_file_and_still_succeeds() {
     assert!(
         stderr.contains("undecodable.rs"),
         "the diagnostic names the excluded file: {stderr}"
+    );
+    // _(A skipped file is reported with its effect and remedy)_ — the warning also states the cause,
+    // what the skip means for answers, and the way to get the file indexed.
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "the diagnostic names the cause: {stderr}"
+    );
+    assert!(
+        stderr.contains("No answer shows the code"),
+        "the diagnostic states the effect on answers: {stderr}"
+    );
+    assert!(
+        stderr.contains("Re-save the file as UTF-8"),
+        "the diagnostic names the remedy: {stderr}"
     );
 
     // With this stub, standard output is exactly the `--json` answer: the exclusion diagnostic

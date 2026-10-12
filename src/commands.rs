@@ -89,7 +89,10 @@ fn collect_dir(
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir != root => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("the source scan stopped because c10r could not read {}", dir.display()));
+        }
     };
     for entry in entries {
         let entry = entry?;
@@ -117,7 +120,7 @@ fn collect_dir(
                 eprintln!(
                     "{}",
                     crate::render::sanitize(&format!(
-                        "warning: {} has a path that is not valid Unicode; excluded from the build",
+                        "warning: c10r skipped {} because its path is not valid Unicode. No answer shows the code in it. Rename the file to index it.",
                         rel_path.to_string_lossy()
                     ))
                 );
@@ -130,12 +133,16 @@ fn collect_dir(
                     eprintln!(
                         "{}",
                         crate::render::sanitize(&format!(
-                            "warning: {rel} is not valid UTF-8; excluded from the build"
+                            "warning: c10r skipped {rel} because it is not valid UTF-8. No answer shows the code in it. Re-save the file as UTF-8 to index it."
                         ))
                     );
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("the source scan stopped because c10r could not read {}", path.display())
+                    });
+                }
             }
         }
     }
@@ -221,6 +228,15 @@ pub fn render<T: serde::Serialize + crate::render::HumanRender>(
     }
 }
 
+/// The refusal for a missing index file. The default `--db` path is relative to the current
+/// directory, so a query run from another directory looks for the index in the wrong place.
+fn no_index_message(db: &Path) -> String {
+    format!(
+        "no index found at {}. The default index path is relative to the current directory: run from the workspace root, pass `--db` to name the index, or run `c10r build` there to create one",
+        db.display()
+    )
+}
+
 /// Open an existing index store for a read-only query, refusing to create one as a side effect.
 ///
 /// A query must never bring an empty store into being merely by being asked, so a missing database
@@ -232,7 +248,7 @@ pub fn render<T: serde::Serialize + crate::render::HumanRender>(
 /// no build has actually run against it.
 fn open_query_store(db: &Path) -> Result<GraphStore> {
     if !db.exists() {
-        return Err(Failure::NoIndex(format!("no index found at {}; run `c10r build` first", db.display())).into());
+        return Err(Failure::NoIndex(no_index_message(db)).into());
     }
     let store = GraphStore::open(db).context("opening index database")?;
     if store.read_metadata()?.is_none() {
@@ -330,7 +346,10 @@ fn observe_state_from(recorded: Option<IndexMetadata>, root: &Path, rust_analyze
                 Err(SemanticError::Timeout(_)) => {
                     // A present-but-unresponsive interpreter is disclosed, then the environment is
                     // treated as absent — the same machine-answer shape a failed read already yields.
-                    disclose_probe_timeout("the environment's python interpreter", "environment treated as absent");
+                    disclose_probe_timeout(
+                        "the environment's Python interpreter",
+                        "c10r treated the environment as missing, so the freshness label may report it as changed. Run the interpreter by hand to see why it is slow.",
+                    );
                     None
                 }
                 Err(_) => None,
@@ -346,7 +365,10 @@ fn observe_state_from(recorded: Option<IndexMetadata>, root: &Path, rust_analyze
             },
             Err(e) => {
                 if matches!(e, SemanticError::Timeout(_)) {
-                    disclose_probe_timeout("scip-python version", "freshness reflects recorded provenance");
+                    disclose_probe_timeout(
+                        "the scip-python version check",
+                        "freshness compares against the scip-python version recorded at build time, not the installed one.",
+                    );
                 }
                 recorded
                     .map(|m| m.provenance)
@@ -364,7 +386,10 @@ fn observe_state_from(recorded: Option<IndexMetadata>, root: &Path, rust_analyze
         Ok(adapter) => adapter.provenance(),
         Err(e) => {
             if matches!(e, SemanticError::Timeout(_)) {
-                disclose_probe_timeout("rust-analyzer version", "freshness reflects recorded provenance");
+                disclose_probe_timeout(
+                    "the rust-analyzer version check",
+                    "freshness compares against the rust-analyzer version recorded at build time, not the installed one.",
+                );
             }
             recorded.map(|m| m.provenance).unwrap_or(AnalyzerProvenance {
                 analyzer_name: RustAdapter::analyzer_name().to_string(),
@@ -439,7 +464,7 @@ fn disclose_probe_timeout(probe: &str, consequence: &str) {
     eprintln!(
         "{}",
         crate::render::sanitize(&format!(
-            "warning: {probe} probe timed out after {}s; {consequence}",
+            "warning: {probe} did not answer within {} s, so {consequence}",
             PROBE_DEADLINE.as_secs()
         ))
     );
@@ -536,10 +561,7 @@ pub fn run_build(
     // inputs the currency check compares — and resolving it once serves both the check and the
     // analysis that may follow.
     let engine: Box<dyn SemanticEngine> = match language {
-        Language::Rust => Box::new(
-            RustAdapter::new(rust_analyzer)
-                .map_err(|e| Failure::IndexerSetup(format!("rust-analyzer unavailable: {e}")))?,
-        ),
+        Language::Rust => Box::new(RustAdapter::new(rust_analyzer).map_err(|e| Failure::IndexerSetup(e.to_string()))?),
         Language::Python => {
             // $VIRTUAL_ENV is read here, at the outer edge; resolution itself is pure.
             let virtual_env = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
@@ -571,7 +593,13 @@ pub fn run_build(
         return Ok(BuildOutcome::AlreadyCurrent(accounting));
     }
 
-    let index = engine.analyze(root).map_err(|e| anyhow!("indexing failed: {e}"))?;
+    // `analyze` runs before the store is opened, so a failure here leaves any existing store as it was.
+    let index = engine.analyze(root).map_err(|e| {
+        anyhow!(
+            "{} could not index the workspace. {e} No index was written; any existing index is unchanged.",
+            engine.provenance().analyzer_name
+        )
+    })?;
     ensure_parent_dir(db)?;
     let workspace_root = canonical_root(root)?;
     // The write path replaces an incompatible store of its own outright: the index is derived,
@@ -586,7 +614,7 @@ pub fn run_build(
         &sources,
         chunk_params,
     )
-    .map_err(|e| anyhow!("ingest failed: {e}"))?;
+    .map_err(|e| anyhow!("c10r could not write the index: {e}. The index is unchanged."))?;
 
     // Analysis can take long enough for the workspace to change under it. The store holds the text
     // that was indexed, so it is complete and labeled by what it recorded; the files that moved since
@@ -854,7 +882,7 @@ pub fn build_from_index(
         index,
         sources,
     )
-    .map_err(|e| anyhow!("ingest failed: {e}"))?;
+    .map_err(|e| anyhow!("c10r could not write the index: {e}. The index is unchanged."))?;
     Ok(())
 }
 
@@ -893,7 +921,7 @@ pub fn run_status(
     // analyzer probe run; a build committing while they run cannot mix its values into the report.
     let snapshot = store.read_snapshot()?;
     let Some(meta) = store.read_metadata()? else {
-        return Err(Failure::NoIndex(format!("no index built at {}; run `c10r build` first", db.display())).into());
+        return Err(Failure::NoIndex(no_index_message(db)).into());
     };
     let recorded_files = store.source_files()?;
     let duplicated_groups = store.duplicated_groups()?;
@@ -2567,7 +2595,7 @@ fn render_doctor_hooks(hooks: &DoctorHooks) -> Vec<String> {
             let mut lines = vec!["hooks:".to_string()];
             lines.extend(events.iter().map(render_doctor_hook_event));
             if *disagreement {
-                lines.push("  the hook files disagree on the installed workspaces".to_string());
+                lines.push("  the installed hook files name different workspaces, so some events refresh workspaces that others skip. Run `c10r hooks uninstall` for each workspace, then `c10r hooks install`.".to_string());
             }
             lines
         }
@@ -2666,7 +2694,12 @@ pub fn run_cache(db: &Path) -> Result<CacheOutcome> {
             ))
         );
     }
-    std::fs::remove_file(db).with_context(|| format!("failed to remove index at {}", db.display()))?;
+    std::fs::remove_file(db).with_context(|| {
+        format!(
+            "c10r could not remove the index at {}; the index is still in place",
+            db.display()
+        )
+    })?;
     // Build the WAL/SHM sidecar paths by pushing the suffix onto the primary path's os-string, so a
     // non-UTF-8 `--db` path is preserved byte-for-byte rather than lossily round-tripped through
     // `display()`.
@@ -3044,9 +3077,14 @@ pub fn run_hooks_run(
             eprintln!(
                 "{}",
                 crate::render::sanitize(&format!(
-                    "c10r hooks run {}: refreshing workspace {} failed: {error:#}",
+                    "c10r hooks run {}: could not refresh the index for workspace {}. \
+                     The index is stale: it does not reflect the checked-out commit. \
+                     Run `c10r build {} --db={}{}` to refresh it. Cause: {error:#}",
                     event.as_str(),
-                    workspace.unwrap_or("(unspecified)")
+                    workspace.unwrap_or("(unspecified)"),
+                    shell_quote(&root.display().to_string()),
+                    shell_quote(&absolute_db_path(db).display().to_string()),
+                    workspace.map_or(String::new(), |w| format!(" --workspace={}", shell_quote(w))),
                 ))
             );
             None

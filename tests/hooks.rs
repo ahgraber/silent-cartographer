@@ -506,6 +506,31 @@ fn prek_uninstall(hooks_dir: &Path, event: &str) {
 // Refresh-hook installation: hook content and executability (the four-event layout).
 // ---------------------------------------------------------------------------------------------
 
+// _(Absent git)_ — `hooks install` with no `git` on `PATH` exits with the setup-failure code and its
+// diagnostic does not blame `impact`, which the user did not run.
+#[test]
+fn absent_git_for_hooks_install_does_not_name_impact() {
+    let repo = TestRepo::new();
+    let empty_path = tempfile::tempdir().unwrap();
+    let out = repo
+        .c10r()
+        .env("PATH", empty_path.path())
+        .args(["hooks", "install"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(5), "absent git is a setup failure");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("git could not be run"),
+        "names the unrunnable tool: {stderr}"
+    );
+    assert!(
+        !stderr.contains("impact"),
+        "does not name a command that was not run: {stderr}"
+    );
+}
+
 // _(Hooks installed where none exist)_ — `hooks install` writes an executable hook for each refresh
 // event that runs `c10r hooks run`, reports each path written (matching where git actually resolves
 // it), and exits with the success code. Exercised under both the human rendering and `--json`.
@@ -1595,7 +1620,10 @@ fn a_failed_refresh_does_not_fail_a_branch_checkout() {
         stderr.contains("post-checkout"),
         "the refresh failure names the event: {stderr}"
     );
-    assert!(stderr.contains("failed"), "{stderr}");
+    assert!(
+        stderr.contains("stale") && stderr.contains("c10r build"),
+        "the failure says the index is stale and names the refresh command: {stderr}"
+    );
 }
 
 // _(Hook builds and the stale refresh command use the backend the index records)_ — a workspace with
@@ -2761,4 +2789,21 @@ fn a_hooks_run_root_outside_a_git_worktree_fails_softly_naming_event_and_workspa
         stderr.contains("post-commit") && stderr.contains("ws-identity"),
         "the failure names the event and the workspace: {stderr}"
     );
+    assert!(
+        stderr.contains("stale") && stderr.contains("c10r build"),
+        "the failure says the index is stale and names the refresh command: {stderr}"
+    );
+}
+
+// _(A usage error names the accepted input)_ — `hooks run` without an event lists every event it
+// accepts.
+#[test]
+fn hooks_run_without_an_event_lists_every_accepted_event() {
+    let repo = TestRepo::new();
+    let out = repo.c10r().args(["hooks", "run"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for event in ["post-commit", "post-rewrite", "post-checkout", "post-merge"] {
+        assert!(stderr.contains(event), "the usage error lists {event}: {stderr}");
+    }
 }

@@ -45,6 +45,20 @@ pub struct ProbeCapture {
     pub status: ExitStatus,
 }
 
+impl ProbeCapture {
+    /// The child's exit status and any standard error it wrote, as `exit status: 1: <stderr>`, for
+    /// naming why a probe that ran did not succeed.
+    pub fn failure_detail(&self) -> String {
+        let stderr = String::from_utf8_lossy(&self.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            self.status.to_string()
+        } else {
+            format!("{}: {stderr}", self.status)
+        }
+    }
+}
+
 /// The outcome of a bounded probe: the child either completed within the deadline, or the deadline
 /// expired and the child was killed.
 #[derive(Debug)]

@@ -27,22 +27,24 @@ pub use model::{
 use thiserror::Error;
 
 /// An error a semantic backend can return while producing an index.
+///
+/// Each variant's text is a complete message naming its tool and next step; `Display` adds no prefix.
 #[derive(Debug, Error)]
 pub enum SemanticError {
     /// The backend could not analyze the project.
-    #[error("semantic analysis failed: {0}")]
+    #[error("{0}")]
     Analysis(String),
     /// The backend's tool was not available in the environment.
-    #[error("semantic backend unavailable: {0}")]
+    #[error("{0}")]
     Unavailable(String),
     /// A bounded probe of the backend's tool (a version/readiness check) did not respond within the
     /// deadline — the tool is present but unresponsive, distinct from missing.
-    #[error("semantic backend probe timed out: {0}")]
+    #[error("{0}")]
     Timeout(String),
     /// The project's interpreter environment could not be resolved well enough to produce a
     /// faithful index — a typed refusal naming the remedy, never a silent fallback to a system
     /// interpreter.
-    #[error("python environment unresolved: {0}")]
+    #[error("{0}")]
     Environment(String),
 }
 

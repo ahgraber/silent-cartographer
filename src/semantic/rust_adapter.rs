@@ -15,6 +15,9 @@ use super::probe::{PROBE_DEADLINE, ProbeOutcome, run_bounded};
 pub use super::scip::translate_index;
 use super::{Capabilities, SemanticEngine, SemanticError};
 
+/// The remedy for a `rust-analyzer` that cannot be started.
+const INSTALL_STEP: &str = "Install it with `rustup component add rust-analyzer`, or pass `--rust-analyzer <path>` if it is installed elsewhere.";
+
 /// The Rust adapter, wrapping `rust-analyzer scip` and translating its output into the model.
 pub struct RustAdapter {
     /// The `rust-analyzer` executable to invoke.
@@ -37,14 +40,23 @@ impl RustAdapter {
             Ok(ProbeOutcome::Completed(capture)) => capture,
             Ok(ProbeOutcome::TimedOut) => {
                 return Err(SemanticError::Timeout(format!(
-                    "{executable} --version did not respond within {}s",
+                    "{executable} did not answer `--version` within {} s, so no index was built. \
+                     Run `{executable} --version` to see why, or pass `--rust-analyzer <path>` to use another build.",
                     PROBE_DEADLINE.as_secs()
                 )));
             }
-            Err(e) => return Err(SemanticError::Unavailable(format!("cannot run {executable}: {e}"))),
+            Err(e) => {
+                return Err(SemanticError::Unavailable(format!(
+                    "could not run `{executable}` ({e}), so no index was built. {INSTALL_STEP}"
+                )));
+            }
         };
         if !capture.status.success() {
-            return Err(SemanticError::Unavailable(format!("{executable} --version failed")));
+            return Err(SemanticError::Unavailable(format!(
+                "`{executable} --version` failed ({}), so no index was built. Reinstall with \
+                 `rustup component add rust-analyzer`, or pass `--rust-analyzer <path>` to use another build.",
+                capture.failure_detail()
+            )));
         }
         let version = String::from_utf8_lossy(&capture.stdout).trim().to_string();
         Ok(Self { executable, version })
@@ -78,16 +90,32 @@ impl SemanticEngine for RustAdapter {
             .arg("--output")
             .arg(&output_path)
             .status()
-            .map_err(|e| SemanticError::Unavailable(format!("cannot run {} scip: {e}", self.executable)))?;
+            .map_err(|e| {
+                SemanticError::Unavailable(format!(
+                    "could not start `{} scip` ({e}). {INSTALL_STEP}",
+                    self.executable
+                ))
+            })?;
         if !status.success() {
             return Err(SemanticError::Analysis(format!(
-                "rust-analyzer scip exited with status {status}"
+                "`{} scip` failed ({status}). Its own error output is printed above.",
+                self.executable
             )));
         }
-        let bytes = std::fs::read(&output_path)
-            .map_err(|e| SemanticError::Analysis(format!("cannot read {}: {e}", output_path.display())))?;
-        let index: scip_types::Index = protobuf::Message::parse_from_bytes(&bytes)
-            .map_err(|e| SemanticError::Analysis(format!("cannot parse SCIP index: {e}")))?;
+        let bytes = std::fs::read(&output_path).map_err(|e| {
+            SemanticError::Analysis(format!(
+                "`{} scip` finished, but its output {} could not be read ({e}).",
+                self.executable,
+                output_path.display()
+            ))
+        })?;
+        let index: scip_types::Index = protobuf::Message::parse_from_bytes(&bytes).map_err(|e| {
+            SemanticError::Analysis(format!(
+                "`{} scip` finished, but its output {} is not a valid SCIP index ({e}).",
+                self.executable,
+                output_path.display()
+            ))
+        })?;
         let mut extracted = translate_index(&index, &self.provenance());
         extracted.library_roots = library_roots(project_root);
         Ok(normalize(extracted))
@@ -247,5 +275,57 @@ mod tests {
     fn library_roots_degrade_to_empty_when_cargo_cannot_run() {
         let roots = library_roots(Path::new("/nonexistent/definitely-not-a-project"));
         assert!(roots.is_empty(), "spawn failure degrades to an empty map: {roots:?}");
+    }
+
+    /// An executable shell stub named `name` in `dir` running `body`.
+    fn write_stub(dir: &Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    // A tool that cannot be started names the install command, the flag that points elsewhere, and
+    // the cause the operating system gave.
+    #[test]
+    fn missing_tool_message_names_install_command_flag_and_cause() {
+        let err = RustAdapter::new("/nonexistent/rust-analyzer")
+            .err()
+            .expect("a missing tool refuses");
+        assert!(matches!(err, SemanticError::Unavailable(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("/nonexistent/rust-analyzer"), "{text}");
+        assert!(text.contains("No such file or directory"), "{text}");
+        assert!(text.contains("no index was built"), "{text}");
+        assert!(text.contains("rustup component add rust-analyzer"), "{text}");
+        assert!(text.contains("--rust-analyzer"), "{text}");
+    }
+
+    // A tool that ran but failed its version probe reports the exit status and the error output it
+    // wrote.
+    #[test]
+    fn failed_version_probe_message_carries_exit_status_and_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = write_stub(dir.path(), "rust-analyzer", "echo 'toolchain is broken' >&2\nexit 3");
+        let err = RustAdapter::new(exe).err().expect("a failing probe refuses");
+        let text = err.to_string();
+        assert!(text.contains("exit status: 3"), "{text}");
+        assert!(text.contains("toolchain is broken"), "{text}");
+        assert!(text.contains("--version"), "{text}");
+    }
+
+    // A tool that is present but silent past the probe deadline is reported as not answering, never
+    // as missing.
+    #[test]
+    fn unresponsive_tool_message_is_not_called_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = write_stub(dir.path(), "rust-analyzer", "sleep 30");
+        let err = RustAdapter::new(exe).err().expect("an unresponsive tool refuses");
+        assert!(matches!(err, SemanticError::Timeout(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("did not answer"), "{text}");
+        assert!(!text.contains("rustup component add"), "{text}");
+        assert!(!text.contains("could not run"), "{text}");
     }
 }

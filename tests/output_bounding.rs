@@ -1339,7 +1339,7 @@ fn get_answers_despite_a_hanging_analyzer_and_discloses_the_timeout() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("rust-analyzer") && stderr.to_lowercase().contains("timed out"),
+        stderr.contains("rust-analyzer") && stderr.contains("did not answer"),
         "the timeout is disclosed on standard error: {stderr}"
     );
 }

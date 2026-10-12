@@ -3470,9 +3470,9 @@ fn empty_tests_json_keeps_the_marker() {
     );
 }
 
-// _(Scenario: Unresolved subject carries no marker)_ — an absent answer terminates before
-// classification is consulted and contains no classification-derived content, so the marker — which
-// asserts a derivation, never merely the relation requested — stays off.
+// _(Scenario: Unresolved subject carries no marker)_ — an absent answer
+// contains no classification-derived content, so the marker — which asserts a derivation, never
+// merely the relation requested — stays off.
 #[test]
 fn unresolved_tests_subject_carries_no_marker() {
     let store = tr_store();
@@ -4530,7 +4530,7 @@ fn an_at_argument_of_line_and_column_inside_a_method_body_returns_the_method() {
 }
 
 // _(Scenario: A cursor is bound to the position unit)_ — a `get --at` answer never spans pages, so no
-// token is issued for it; a token minted over the same query identity under the line unit is accepted
+// token is issued for it; a token minted for the same query under the line unit is accepted
 // under that unit and refused under the byte unit.
 #[test]
 fn a_get_at_cursor_is_refused_under_the_other_position_unit() {
