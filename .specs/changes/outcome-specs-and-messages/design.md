@@ -66,6 +66,46 @@ Printing only during a build is an open question in the proposal.
 **Rationale:** the store's metadata columns these errors guard are `NOT NULL` in one row, so no test can build the state through the CLI.
 The text still matters if a future schema change makes them reachable.
 
+### Decision: WrappersNeverAppendAfterTheMessageTheyWrap
+
+**Chosen:** a wrapper whose inner message is c10r's own complete text passes it through unchanged.
+A wrapper that adds context to text c10r does not control (git's output, SQLite's error text, a subprocess's standard error) puts its own sentence first and the outside text last.
+
+**Rationale:** verification found composed messages such as `…did not complete.. The index is unchanged.`, because wrappers appended a sentence after an inner message that already ended with a period.
+With the inner or outside text always last, nothing follows text whose ending c10r cannot predict, so the defect cannot occur.
+
+**Alternatives considered:** a helper that trims the inner message's trailing period before appending.
+The user rejected it as handling the symptom; the ordering rule removes the cause.
+
+## Verification Waivers
+
+These rewritten messages have no test that produces them, because a test cannot cause their failure reliably.
+Their text is checked by review against `Messages say what happened, why, what it means, and what to do`.
+
+| Requirement                                                                     | Message                                                                      | Reason automation is infeasible                                                                 | Manual evidence                      | Recorded   |
+| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------ | ---------- |
+| command-surface: Messages say what happened, why, what it means, and what to do | SQLite failure while opening or checking a store (`StoreOpenError::Storage`) | needs SQLite to fail on an otherwise valid store                                                | review of the text at the variant    | 2026-10-12 |
+| same                                                                            | file operation failure on a store (`StoreOpenError::Io`)                     | needs a rename or remove to fail partway                                                        | review of the text at the variant    | 2026-10-12 |
+| same                                                                            | failure while writing a build (`IngestError::Store`)                         | needs SQLite to fail inside the write transaction                                               | review of the text at the variant    | 2026-10-12 |
+| same                                                                            | a path that is not valid Unicode                                             | the test hosts' file systems refuse such a path                                                 | review of the text at the warning    | 2026-10-12 |
+| same                                                                            | content-hash mismatch during ingest (`IngestError::ContentHashMismatch`)     | only test code reaches it                                                                       | review of the text at the variant    | 2026-10-12 |
+| same                                                                            | failure to remove an index file in `cache`                                   | needs a read-only file system                                                                   | review of the text at the removal    | 2026-10-12 |
+| same                                                                            | an unreadable stored edge kind                                               | the traversal reads only the three dependency kinds, so stored data cannot reach the conversion | review of the text at the conversion | 2026-10-12 |
+
+## Known Gaps That Predate This Change
+
+Verification listed coverage gaps in requirements this change restated.
+They existed before the change, and the restatement did not create them.
+The user chose to fix only the gaps likely to hide a bug; these stay open:
+
+- No production code calls the capability queries of `Optional capabilities are queryable`.
+- No test selects eval trials by instance.
+- The failed-build clause of `Builds wholly supersede prior derived state` is tested by dropping the write transaction, not by an injected ingest failure.
+- The whole-file unmappable clause is tested only for a file the index holds.
+- No test passes a twin-bearing index through a live adapter.
+- The no-confirmation sentence is tested for `build` only; `hooks_install` uses the same check.
+- No test builds over a store a newer c10r wrote; whether `build` should replace such a store is an open question in the proposal.
+
 ## Architecture
 
 ```text

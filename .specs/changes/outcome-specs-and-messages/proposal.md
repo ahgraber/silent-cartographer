@@ -17,7 +17,8 @@ For example:
 - `stale (environment changed)` is also shown when the environment could not be checked at all.
 
 This change restates the affected requirements as observable outcomes, adds one requirement for what every message must say, and rewrites the 59 messages.
-No value in a machine answer and no exit code changes.
+No exit code and no enumerated value in a machine answer changes.
+Free-text fields that carry a message, such as `hooks.reason` in `doctor --json`, carry the new wording.
 
 ## User Stories
 
@@ -57,7 +58,7 @@ Each `Serves:` line repeats the story names from the change that introduced the 
   - the `uses` edge kind, which appears in `dependents` output;
   - the scenarios that check the stored chunk parameters, because recording them is itself a code-graph requirement;
   - the dependents scenario that checks answer order, because the requirement promises an unchanged answer and order is part of the answer.
-- Any change to values in a machine answer or to exit codes.
+- Any change to exit codes or to enumerated values in a machine answer.
   The three questions below are revisited after this change.
 
 ## Approach
@@ -77,3 +78,8 @@ To revisit after this change, at the user's request:
 - Should the machine answer distinguish an environment that changed from one that could not be checked?
   That needs a new `stale_*` value, which changes published output.
 - Should the warnings about undecodable file paths print only during a build, instead of on every query?
+
+## Resolved Questions
+
+- 2026-10-12: free-text fields in a machine answer that carry a message text, such as `hooks.reason` in `doctor --json`, carry the rewritten wording.
+  The statement that no machine-answer value changes now covers exit codes and enumerated values only.

@@ -67,3 +67,15 @@ Every message test asserts facts, not whole strings (`TestsAssertFactsNotWording
 
 - [x] Run the full Rust test suite, the MCP test suite, and the eval test suite.
 - [x] Run the pre-commit hooks on every changed and new file, and fix any failure.
+
+## Verification remediation
+
+- [x] Apply `WrappersNeverAppendAfterTheMessageTheyWrap`: pass `IngestError` through the two build write wrappers in `src/commands.rs` unchanged, and drop the false "The index is unchanged"; pass the store-conversion text through `QueryError::Store` and `StoreOpenError::Storage` without an appended sentence; reorder `GitError::Failed`, the adapter build wrapper, and the MCP manifest messages so outside text comes last.
+- [x] One unit test per remaining wrapper: an inner text ending in "." composes with no ".." and no repeated prefix.
+- [x] Add what each event means to `A8`, `A10`, `A12`, `A17`, and `A18`.
+- [x] Fix the `INSTALL_HINT` doc comment in `src/semantic/python_adapter.rs` so it describes where the hint is used.
+- [x] Tighten `an_unresolvable_environment_does_not_render_as_a_changed_one` to assert the label is not the bare `stale (environment changed)`.
+- [x] Tests that produce the reachable untested messages: `A4`, `A6` (Rust and Python), `A11`, `A13`/`A14`, `A15`, `C1`, the `C18` timeout disclosures, `G5` (non-UTF-8 diff), `R6`, `Q1`, `Q7`, `S8`, `MissingIndexedText`, and the query-side unknown analyzer; each asserts the facts the message must state.
+- [x] Test that a symbol represented by many chunks does not rank above an otherwise equal symbol represented by one chunk, in `search` and in `similar`.
+- [x] Test that an environment that cannot be resolved refuses the build and leaves an existing store byte-identical.
+- [x] Run the full Rust and MCP suites and the pre-commit hooks.
