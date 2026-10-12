@@ -54,7 +54,7 @@ When the hook files for different events name different workspace sets, `doctor`
 Outside a git worktree, or when the worktree's hooks directory cannot be resolved, the report states that hook status does not apply and names why:
 
 ```text
-hooks: not applicable (. is not inside a git worktree)
+hooks: not applicable (/home/me/scratch is not inside a git worktree, so c10r cannot read its git history or install hooks for it. Run the command from inside a git repository.)
 ```
 
 ### JSON shape
@@ -121,7 +121,7 @@ Outside a git worktree, `hooks` carries only a `reason`:
 
 ```json
 {
-  "reason": ". is not inside a git worktree"
+  "reason": "/home/me/scratch is not inside a git worktree, so c10r cannot read its git history or install hooks for it. Run the command from inside a git repository."
 }
 ```
 
