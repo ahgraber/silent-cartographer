@@ -2699,7 +2699,7 @@ pub fn run_cache(db: &Path) -> Result<CacheOutcome> {
     }
     std::fs::remove_file(db).with_context(|| {
         format!(
-            "c10r could not remove the index at {}; the index is still in place",
+            "c10r could not remove the index at {}, so the index is still in place. Check the permissions of the file and its directory, or remove it by hand. The system reported",
             db.display()
         )
     })?;

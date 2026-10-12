@@ -230,9 +230,11 @@ fn prepend_to_path(bin: &Path) -> Result<std::ffi::OsString, SemanticError> {
     if let Some(existing) = std::env::var_os("PATH") {
         parts.extend(std::env::split_paths(&existing));
     }
-    std::env::join_paths(parts).map_err(|e| {
+    // The existing entries come from splitting PATH, so only `bin` can hold the separator.
+    std::env::join_paths(parts).map_err(|_| {
         SemanticError::Analysis(format!(
-            "cannot build the child PATH, so no index was built. The system reported: {e}"
+            "could not put {} on the PATH for scip-python, because the path contains the PATH separator, so no index was built. Move the environment to a path without that character, or pass `--environment <virtualenv>`.",
+            bin.display()
         ))
     })
 }
@@ -620,6 +622,21 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("site-packages"), "{text}");
         assert!(text.contains(&root.display().to_string()), "{text}");
+        assert!(text.contains("--environment"), "{text}");
+    }
+
+    // An environment whose path holds the PATH separator cannot be put on scip-python's PATH; the
+    // refusal names the directory, the cause, and the remedy.
+    #[cfg(unix)]
+    #[test]
+    fn an_environment_path_holding_the_separator_names_the_cause_and_remedy() {
+        let bin = Path::new("/envs/my:env/bin");
+        let text = prepend_to_path(bin)
+            .expect_err("a separator in the path refuses")
+            .to_string();
+        assert!(text.contains("/envs/my:env/bin"), "{text}");
+        assert!(text.contains("PATH separator"), "{text}");
+        assert!(text.contains("no index was built"), "{text}");
         assert!(text.contains("--environment"), "{text}");
     }
 
