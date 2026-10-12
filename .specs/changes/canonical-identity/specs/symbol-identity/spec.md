@@ -26,7 +26,10 @@ Serves: saved-identity-stays-valid
 
 > Previously: a disambiguator was introduced wherever the resolved descriptor collided, so same-descriptor declarations in two units of one package received numbered twin identities.
 
-The system SHALL guarantee that within one workspace no two distinct symbols share a canonical identity, introducing a disambiguator only where the owner and the resolved descriptor would otherwise both collide; distinct symbols with distinct owners SHALL be distinguished by their owners alone, with no disambiguator; when distinct symbols with one owner share an identical resolved descriptor, their disambiguation SHALL be anchored to the symbols' definition locations, such that each symbol's identity is the same across indexing runs regardless of the order in which files or symbols are encountered.
+The system SHALL guarantee that within one workspace no two distinct symbols share a canonical identity.
+Symbols with different owners SHALL differ by owner alone and carry no disambiguator.
+Only distinct symbols with the same owner and the same qualified name SHALL carry a disambiguator.
+A disambiguated identity SHALL stay the same on every run over unchanged sources, whatever order the files and symbols are read in.
 
 Serves: saved-identity-stays-valid
 
@@ -42,11 +45,11 @@ Serves: saved-identity-stays-valid
 - **WHEN** identities are assigned for that language
 - **THEN** no disambiguator suffix is added, and uniqueness still holds
 
-#### Scenario: True duplicates keep definition-anchored identities
+#### Scenario: True duplicates receive distinct identities
 
 - **GIVEN** two distinct definitions with one owner that the semantic backend describes with an identical resolved descriptor
 - **WHEN** canonical identities are assigned
-- **THEN** each definition receives a distinct identity determined by its own definition location
+- **THEN** each definition receives a distinct identity
 
 #### Scenario: Duplicate identities stable across discovery order
 
@@ -144,8 +147,8 @@ Serves: saved-identity-stays-valid, identity-reads-as-qualified-name
 #### Scenario: Source compiled into two units has one shared identity
 
 - **GIVEN** a Cargo package `libbin` whose integration tests `tests/a.rs` and `tests/b.rs` each declare `mod common;` loading `tests/common/mod.rs`, which defines `pub fn fixture()`, and each call `common::fixture()`
-- **WHEN** canonical identities are assigned and references are attributed
-- **THEN** `fixture` has the one identity `<workspace>::libbin+shared::common::fixture`, and the references from both tests are attributed to it
+- **WHEN** canonical identities are assigned
+- **THEN** `fixture` has the one identity `<workspace>::libbin+shared::common::fixture`
 
 #### Scenario: Adding a target changes no other unit's identities
 
@@ -159,9 +162,9 @@ Serves: saved-identity-stays-valid, identity-reads-as-qualified-name
 - **WHEN** canonical identities are assigned
 - **THEN** the identity of `Widget` is `<workspace>::python-conformance::pkg::shapes::Widget`
 
-#### Scenario: Unavailable target description degrades to package-only owners with disclosure
+#### Scenario: Unavailable list of targets degrades to package-only owners with disclosure
 
-- **GIVEN** a Cargo package `libbin` with a library and a binary `tool`, on a host where the build tool's target description does not answer within the probe bound
+- **GIVEN** a Cargo package `libbin` with a library and a binary `tool`, on a host where the build tool does not return the package's list of targets within the probe bound
 - **WHEN** the workspace is built
 - **THEN** the build succeeds, every declaration of the package carries the owner `libbin` with no unit marker, and the build answer discloses that the crate targets of `libbin` could not be determined and why
 
@@ -178,19 +181,17 @@ This guarantee does not cover a declaration that one indexer reports and another
 
 Serves: saved-identity-stays-valid
 
-Each supported language's shared conformance project SHALL carry a reference list of the canonical identities of its declarations, and every conforming backend for that language SHALL yield exactly the reference identity for each declaration of that project it reports.
-
 #### Scenario: scip-python yields the Python reference identities
 
-- **GIVEN** the shared Python conformance project and its reference list of canonical identities
+- **GIVEN** the shared Python conformance project and its reference list of canonical identities, written from the identity form this spec defines
 - **WHEN** the project is indexed through scip-python and canonical identities are projected
-- **THEN** every module, class, function, method, and module global the index reports has exactly its reference identity, and the cross-module reference to `Widget` resolves to the reference identity of `Widget`
+- **THEN** every module, class, function, method, and module global the index reports has the identity the reference list gives it
 
 #### Scenario: rust-analyzer yields the Rust reference identities
 
-- **GIVEN** the shared Rust conformance project and its reference list of canonical identities
+- **GIVEN** the shared Rust conformance project and its reference list of canonical identities, written from the identity form this spec defines
 - **WHEN** the project is indexed through rust-analyzer and canonical identities are projected
-- **THEN** every module, struct, function, and method the index reports, in the library and in the binary, has exactly its reference identity, and the binary's call `libbin::util::load()` resolves to the reference identity of the library's `load`
+- **THEN** every module, struct, function, and method the index reports, in the library and in the binary, has the identity the reference list gives it
 
 ### Requirement: Identity does not depend on source location
 

@@ -146,6 +146,8 @@ A reference through a `use` import (`use libbin::util::load; load()`) keeps its 
 
 **Rationale:** `libbin::util::load()` names the library by its spelling, regardless of the document it sits in.
 Verified on the sample by the `references` of the library's `load` gaining `src/bin/tool.rs:14`.
+The store keeps the locality rule that selected each attribution, for diagnosis.
+No answer shows it, so the spec does not promise it.
 
 ### Decision: TargetDescriptionIsACurrencyInput
 
@@ -214,6 +216,8 @@ Python: `tests/fixtures/python-conformance/IDENTITIES.txt` against `index.scip` 
 Rust: a new `tests/fixtures/rust-conformance/` project with a library and a binary `tool` that both declare `mod util { pub struct Config; pub fn load() }`, the binary's `main` calling `util::load()` and `libbin::util::load()`, two integration tests sharing `tests/common/mod.rs`, a committed `index.scip` from `rust-analyzer scip`, a `RUST-ANALYZER-VERSION` file, and `IDENTITIES.txt`.
 
 **Rationale:** the user requires per-backend evidence, not a constructed imitation index.
+When every backend for a language matches one list, any two of them give the same identity, so the lists are the evidence for `Identity does not depend on the indexer`.
+The spec states that outcome; the lists are test fixtures, so they are recorded here and not in the spec.
 The list is the contract a later backend (ty-scip) is held to.
 The Rust project also carries the owner scenarios, so one fixture serves both requirements.
 
