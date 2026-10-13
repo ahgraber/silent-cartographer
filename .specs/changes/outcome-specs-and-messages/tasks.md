@@ -79,3 +79,5 @@ Every message test asserts facts, not whole strings (`TestsAssertFactsNotWording
 - [x] Test that a symbol represented by many chunks does not rank above an otherwise equal symbol represented by one chunk, in `search` and in `similar`.
 - [x] Test that an environment that cannot be resolved refuses the build and leaves an existing store byte-identical.
 - [x] Run the full Rust and MCP suites and the pre-commit hooks.
+- [x] Make the child-PATH message name its real cause (a PATH separator in the environment path) and remedy, and add a test that produces it.
+- [x] Add a next step to the index removal failure in `cache`.
