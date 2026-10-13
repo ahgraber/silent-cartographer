@@ -50,7 +50,7 @@ A backend SHALL be usable through this contract if and only if it satisfies the 
 
 ### Requirement: Same-descriptor definitions extracted as distinct symbols
 
-When a backend's output contains more than one distinct definition under an identical resolved descriptor, extraction through the backend contract SHALL yield one symbol per definition — distinct definitions SHALL never be merged on descriptor equality — and SHALL preserve every non-definition occurrence of the duplicated descriptor for downstream attribution rather than assigning it to any single one of the definitions at extraction.
+When a backend's output contains more than one distinct definition under an identical resolved descriptor, extraction through the backend contract SHALL yield one symbol per definition — distinct definitions SHALL never be merged on descriptor equality — and SHALL return every non-definition occurrence of the duplicated descriptor without assigning it to any single one of the definitions.
 
 #### Scenario: Twin definitions yield distinct symbols
 
@@ -89,6 +89,7 @@ The system SHALL obtain, with every index a backend produces, the backend's anal
 ### Requirement: Unavailable backend is a typed refusal, never a partial index
 
 When a backend's external toolchain is unavailable, or the project's environment cannot be resolved well enough to produce a faithful index, indexing SHALL fail with a typed, actionable error naming what is missing, and SHALL NOT produce or persist a partial or degraded index in its place.
+Indexing that fails this way SHALL leave any existing store unchanged.
 
 #### Scenario: Missing indexer tool refuses with guidance
 
@@ -110,13 +111,13 @@ The system SHALL expose capabilities that not every backend guarantees — such 
 
 - **GIVEN** a backend that declares it supplies enclosure information
 - **WHEN** the system queries that capability before use
-- **THEN** the capability is reported present and the system relies on it
+- **THEN** the capability is reported present
 
 #### Scenario: Undeclared capability is not assumed
 
 - **GIVEN** a backend that does not declare base-index eligibility
 - **WHEN** the system inspects the backend
-- **THEN** the backend is not used as an authoritative base index, and its absence is represented explicitly rather than inferred as present
+- **THEN** the capability is reported absent, and the backend is not used as an authoritative base index
 
 ## Technical Notes
 

@@ -281,9 +281,7 @@ The system SHALL persist, for every in-workspace symbol whose definition span is
 The signature and interface tiers are derived from the source; the body tier is the source, verbatim.
 A symbol carrying no documentation SHALL have an interface tier equal to its signature tier, and a declaration with no distinct body SHALL have a signature tier equal to its full declaration.
 A module defined by a document rather than an in-document declaration carries no declaration form in source, so its signature tier SHALL be its qualified name.
-Tier content SHALL be extracted from the same build's fresh syntax tree that anchors the guarded join, and SHALL be persisted with the build, wholly superseded by each subsequent build.
-
-> The definition span's own text was persisted under this same extraction rule, and the corpus-eligibility predicate already read it as one of the symbol's tiers, but it was not named as a tier here.
+Tier content SHALL be taken from the sources as they were when the build ran, SHALL be persisted with the build, and SHALL be wholly superseded by each subsequent build.
 
 #### Scenario: Documented Rust function tiers
 
@@ -386,17 +384,17 @@ While none has changed, the result SHALL be reported as fresh.
 
 - **GIVEN** an index recorded under one analyzer version
 - **WHEN** the analyzer in effect is a different version
-- **THEN** results from that index are reported as stale and flagged for reindex
+- **THEN** results from that index are reported as stale
 
 #### Scenario: Changed environment marks stale
 
 - **GIVEN** an index recorded with a declared interpreter environment as provenance
 - **WHEN** the environment in effect no longer matches the recorded one
-- **THEN** results from that index are reported as stale and flagged for reindex
+- **THEN** results from that index are reported as stale
 
 ### Requirement: Reference occurrences carry enclosing-declaration attribution
 
-The system SHALL attribute every aligned reference occurrence to the nearest enclosing persisted declaration in the fresh syntax tree, and SHALL attribute an occurrence enclosed by no narrower declaration to its module — never to a fabricated declaration.
+The system SHALL attribute every aligned reference occurrence to the nearest persisted declaration that encloses it in the indexed source, and SHALL attribute an occurrence enclosed by no narrower declaration to its module — never to a fabricated declaration.
 Where more than one persisted definition shares a location, the system SHALL NOT attribute an occurrence to any of them, and SHALL attribute it as though no persisted declaration enclosed it.
 The work performed to resolve one occurrence's attribution SHALL be bounded by that occurrence's enclosing-declaration chain, and SHALL NOT grow with the number of definitions the build persists.
 
@@ -518,13 +516,13 @@ When more than one distinct definition shares an identical resolved descriptor, 
 
 ### Requirement: Builds wholly supersede prior derived state
 
-After a build completes, the store SHALL describe exactly that build's sources: every persisted symbol, occurrence, edge, and discrepancy row derives from the completed build, no row from any prior build remains, and a build that fails SHALL leave the prior build's state intact and authoritative.
+After a build completes, the store SHALL describe exactly that build's sources: every symbol, occurrence, edge, and discrepancy the store holds derives from the completed build, nothing from any prior build remains, and a build that fails SHALL leave the prior build's state intact and authoritative.
 
 #### Scenario: Rebuild over unchanged sources is idempotent
 
 - **GIVEN** a store built from a set of sources
 - **WHEN** the same sources are built into the same store again
-- **THEN** the persisted symbol, occurrence, and edge row sets are identical to the first build's
+- **THEN** the symbols, occurrences, and edges the store holds are identical to the first build's
 
 #### Scenario: Rows for vanished entities do not linger
 
@@ -578,7 +576,7 @@ For every semantic occurrence whose join outcome is not aligned, the system SHAL
 
 ### Requirement: Incompatible index stores are replaced or refused, never half-used
 
-The system SHALL record the schema version in every store it creates; a build over a store the system recognizes as its own whose recorded schema version differs from the version the binary writes SHALL replace the store and succeed; and every query against such a recognized, version-mismatched store SHALL refuse with an error naming the store's version, the expected version, and the recovery action — never surfacing a storage-level failure mid-operation.
+The system SHALL record the schema version in every store it creates; a build over a store the system recognizes as its own whose recorded schema version differs from the version the binary writes SHALL replace the store and succeed; and every query against such a recognized, version-mismatched store SHALL refuse with an error naming the store's version, the expected version, and the recovery that applies — rebuilding when the store is older than the binary, and upgrading the binary or using another store path when the store is newer — never surfacing a storage-level failure mid-operation.
 A file not recognized as the system's own store is outside replacement's reach and is governed by the Store ownership recognition requirement.
 
 #### Scenario: Build replaces an incompatible store
@@ -598,6 +596,12 @@ A file not recognized as the system's own store is outside replacement's reach a
 - **GIVEN** a store the system created, recorded under the schema version the binary expects
 - **WHEN** any command runs against it
 - **THEN** it operates normally with no version error
+
+#### Scenario: A query against a newer store names the upgrade
+
+- **GIVEN** a store the system recognizes as its own, recorded under a schema version newer than the one the binary writes
+- **WHEN** a query runs against it
+- **THEN** the query is refused with an error naming both versions and directing the user to upgrade the binary or use another store path, never to rebuild
 
 ### Requirement: Declaration-level dependency edges (uses)
 

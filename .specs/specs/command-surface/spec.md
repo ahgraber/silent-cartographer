@@ -340,7 +340,7 @@ The reported index state SHALL distinguish an absent index, a file at the index 
 
 ### Requirement: Shell completion scripts
 
-The system SHALL provide a command that emits, on standard output, a completion script for a named supported shell, derived from the same command definition the parser executes, so that the completed surface cannot drift from the real one, and SHALL reject an unsupported shell name as a usage error naming the supported shells.
+The system SHALL provide a command that emits, on standard output, a completion script for a named supported shell that offers exactly the commands and flags the command line accepts, and SHALL reject an unsupported shell name as a usage error naming the supported shells.
 
 #### Scenario: A supported shell emits a completion script
 
@@ -381,9 +381,7 @@ When a refresh hook for one event is missing and the remaining refresh hooks agr
 When the present refresh hooks disagree on the installed workspaces, installation SHALL refuse before changing any file and SHALL name the hook files that disagree, unless they differ only by the workspace being installed; then installation SHALL complete, so a retry finishes an installation that failed partway.
 Installation SHALL NOT write git configuration.
 Installation SHALL refuse, before changing any file, a workspace root, index path, or workspace identity that contains a line break, because the hook file cannot carry it.
-Installation outside a git worktree SHALL be reported through the same typed environment failure the diff-seeded assessment raises for that condition.
-
-The hooks are the freshness discipline the diff-seeded assessment depends on: its pre-change side is a committed state, so an index refreshed whenever the checked-out commit changes is the state that assessment resolves against.
+Installation outside a git worktree SHALL fail with the environment/setup-failure exit code and state that the directory is not a git worktree.
 
 #### Scenario: Hooks installed where none exist
 
@@ -448,6 +446,7 @@ The hooks are the freshness discipline the diff-seeded assessment depends on: it
 ### Requirement: Refresh timing
 
 After a git operation that changes the checked-out commit completes — a commit, an amended commit, a completed rebase, a branch checkout, or a merge or pull — the installed hooks SHALL have refreshed each installed workspace's index, so the index matches the checked-out state.
+An amended commit SHALL cause exactly one refresh.
 A rebase with git's default backend SHALL cause at most one refresh, after the rebase completes, whatever the number of commits it replays.
 A rebase with git's apply backend SHALL cause at most two refreshes, whatever the number of commits it replays.
 The hooks SHALL NOT refresh the index for a commit that a rebase in progress creates, SHALL NOT refresh it for a checkout that restores files without changing the checked-out commit, and SHALL NOT refresh it for a squash merge, which leaves the checked-out commit unchanged.
@@ -790,6 +789,38 @@ A supplied value SHALL be validated at the boundary: a chunk size that cannot ad
 - **GIVEN** a workspace to index
 - **WHEN** `build` is invoked with a chunk size too small to admit content beside a passage's header
 - **THEN** the invocation is rejected as a usage error and no build is performed
+
+### Requirement: Messages say what happened, why, what it means, and what to do
+
+Every warning, refusal, and error the system reports SHALL state what failed or was skipped, and name the thing it concerns.
+It SHALL state the cause when the system knows the cause, and SHALL NOT state a cause the system did not observe.
+It SHALL state what the event means for the answer or the store: what is missing, what may be wrong, or what is left unchanged.
+It SHALL name the next step when one exists: a command, a flag, or a setting.
+A usage error is the one exception: it SHALL name the accepted input, and need not state a cause or what the error means.
+
+#### Scenario: A skipped file is reported with its effect and remedy
+
+- **GIVEN** a workspace that holds a source file whose content is not valid UTF-8
+- **WHEN** the workspace is built
+- **THEN** a warning names the file, states that it was skipped because it is not valid UTF-8, states that no answer shows the code it holds, and says to re-save the file as UTF-8
+
+#### Scenario: A missing indexer is reported with its install step
+
+- **GIVEN** a Rust workspace on a host where `rust-analyzer` cannot be run
+- **WHEN** the workspace is built
+- **THEN** the error names `rust-analyzer`, states why it could not be run, states that no index was built, and names the install command and the flag that selects another `rust-analyzer`
+
+#### Scenario: A stale label claims no cause the system did not observe
+
+- **GIVEN** an index recorded with a declared interpreter environment, on a host where that environment cannot be checked
+- **WHEN** a query runs
+- **THEN** the answer is labeled stale, and the label does not state that the environment changed
+
+#### Scenario: A usage error names the accepted input
+
+- **GIVEN** the refresh-hook action invoked with no event
+- **WHEN** the command runs
+- **THEN** the error names the accepted events
 
 ## Technical Notes
 

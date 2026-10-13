@@ -273,6 +273,7 @@ An unacknowledged invocation SHALL leave every store, file, and repository it wo
 ### Requirement: A lifecycle operation proceeds only on confirmed consent
 
 A lifecycle tool SHALL obtain the caller's confirmation before performing its operation, through the mechanism the negotiated protocol era defines, and SHALL leave every store, file, and repository unchanged when that confirmation is declined or cancelled.
+A lifecycle tool SHALL NOT ask for confirmation of an invocation that lacks its acknowledgment.
 When the connected client offers no elicitation capability, the tool SHALL NOT perform its operation and SHALL NOT issue a request the client cannot answer; it SHALL refuse, state that the client cannot be asked to confirm, and name the command that performs the operation.
 
 #### Scenario: A handshake-era client is asked and confirms

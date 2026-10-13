@@ -396,7 +396,7 @@ The impact set SHALL be exactly the reverse-reachability closure of the seed set
 The system SHALL seed the impact assessment from a git diff selected by a seed mode — the working-tree change (default), the staged change, or a revision range — optionally narrowed to a set of paths, and SHALL recognize a renamed file as the same file across the change, so that path narrowing reaches it by either its pre-change or post-change path.
 The seed SHALL be taken from the change's pre-change side — content and path alike — so that a symbol removed or renamed by the change is still resolved to its prior identity and its dependents are still reported.
 Because a revision range's dependents are drawn from the single current index rather than from either endpoint, an answer seeded from a range SHALL disclose which snapshot its dependents reflect.
-The change a continuation token was issued against SHALL be part of the query identity that token binds to, so a token presented after the seeding change has moved is rejected rather than resumed against a different change's results.
+A continuation token presented after the seeding change has moved SHALL be rejected rather than resumed against a different change's results.
 
 #### Scenario: A range answer discloses which snapshot its dependents reflect
 
@@ -484,7 +484,7 @@ The system SHALL treat obtaining the diff as an external boundary with typed fai
 
 Because the index is a point-in-time snapshot that may not match the change being asked about, the system SHALL label every impact answer as either exact — the index matches the change's pre-change state, meaning the workspace's discovered sources with the change reverted — or approximate — it does not.
 A change whose pre-change side the system cannot reconstruct from the workspace SHALL be labeled approximate rather than assumed to match.
-A changed region in a document the index does not hold SHALL be reported as unmappable rather than silently dropped; a region the index holds a document for but no declaration at SHALL NOT be reported unmappable, because a span index cannot distinguish a region that never held a declaration from one whose declaration this index is missing, and an approximate answer already discloses that declarations may be absent entirely.
+A changed region in a document the index does not hold SHALL be reported as unmappable rather than silently dropped; a region in a document the index holds, where the index has no declaration, SHALL NOT be reported unmappable, because an approximate answer already discloses that declarations may be missing.
 A changed file whose pre-change content cannot be obtained at all SHALL be reported unmappable in whole, whether or not the index holds that document: no region within it can be located, so this is not the case above of a located region that no declaration overlaps.
 An approximate answer SHALL carry a runnable recovery procedure that names the resolved base revision, the index location, and the workspace identity needed to produce an exact answer, so the caller is never left to reconstruct those by hand.
 The procedure SHALL NOT modify the index the query was answered from, and following it SHALL yield an exact answer for the seed mode it was emitted for.
@@ -547,7 +547,7 @@ The procedure SHALL NOT modify the index the query was answered from, and follow
 
 The system SHALL carry, in every `tests` answer — in the machine answer and in the human rendering alike — a structural marker identifying the answer as derived from convention-based test classification rather than from resolved semantic fact; each returned site SHALL carry, as provenance, the convention rule that classified its enclosing declaration; and the marker SHALL accompany, never replace, the provenance and freshness labeling every answer carries.
 An empty `tests` answer asserts only that no convention-classified reference site was found — never that nothing tests the subject — and SHALL carry the marker like any other `tests` answer.
-An ambiguous-reference or unresolved-subject answer terminates before classification is consulted and contains no classification-derived content, so it SHALL NOT carry the marker — the marker asserts a derivation, never merely the relation requested.
+An ambiguous-reference or unresolved-subject answer contains no classification-derived content, so it SHALL NOT carry the marker — the marker asserts a derivation, never merely the relation requested.
 An answer of a relation derived only from resolved reference evidence SHALL NOT carry the heuristic-grade marker.
 
 #### Scenario: Machine answer carries the marker
@@ -645,7 +645,7 @@ When the result limit truncates the detailed rows, the rows returned SHALL be th
 The system SHALL support, on `dependents` traces and `impact` assessments, a per-query order selector offering exactly two orderings: `ranked` (the default) — distance first, then structural importance within each layer — and `unranked` — derived only from the answer's own stable structural keys: distance, then dependency kind, then canonical identity.
 The selector SHALL be accepted only where its orderings are defined — a `dependents` trace or an `impact` assessment — and an order requested anywhere else SHALL be rejected as a usage error before any traversal.
 The selector SHALL NOT alter which symbols the answer contains.
-The selector and the ranking model's version SHALL be part of the query identity a continuation token binds to, so a token issued under one ordering, or under a prior ranking model, is rejected rather than resumed against a differently-ordered sequence.
+A continuation token SHALL be rejected, rather than resumed, when it is presented with a different ordering or a different ranking-model version than the one it was issued under.
 
 #### Scenario: No selector yields the ranked ordering
 
@@ -716,8 +716,9 @@ The disclosure SHALL accompany, never replace, the provenance and freshness labe
 ### Requirement: Search by meaning
 
 The system SHALL provide a CLI command `search` that, given a natural-language query, returns corpus-contributing symbols ordered by estimated relevance to the query, most relevant first, where a symbol's name, its documentation, and its source content all serve as relevance evidence — including name words the source spells within one compound token — and sharing exact tokens with the query is not a precondition for a symbol to be returned.
-A symbol whose passage is represented by several chunks SHALL be ranked by its best-matching one, so that content anywhere in a long symbol can surface it and, among the candidates a signal considers, no symbol is advantaged by the number of chunks representing it.
-A signal MAY draw its candidates from a bounded pool; a bounded pool is part of the candidates-not-completeness framing every answer carries, and it never changes how the candidates within it are ranked.
+A symbol whose passage is represented by several chunks SHALL be ranked by its best-matching chunk, so that content anywhere in a long symbol can surface it.
+Among the candidates each ranking method considers, no symbol SHALL rank higher because more chunks represent it.
+An answer MAY be drawn from a bounded set of candidates; every answer already states that its rows are candidates and not a complete list, and the bound never changes the order of the candidates the answer returns.
 Each result row SHALL identify its symbol and location and carry content at a per-query detail level — location, signature, interface, or body — with signature as the default, and the chosen detail SHALL NOT alter which symbols are returned or their order.
 Each corpus-contributing symbol SHALL appear at most once in a search answer, and a search against a store whose corpus is empty SHALL be a typed-empty answer, not a failure.
 
@@ -772,8 +773,9 @@ Each corpus-contributing symbol SHALL appear at most once in a search answer, an
 ### Requirement: Similar-code lookup
 
 The system SHALL provide a CLI command `similar` that, given a subject symbol supplied as a symbol reference or a source position — resolved under the symbol-reference resolution contract, a position resolving to the symbol enclosing it — returns other corpus-contributing symbols ordered by estimated similarity of their content to the subject's, most similar first.
-Where either the subject's passage or a candidate's is represented by several chunks, similarity SHALL be their best-matching pair, so that two symbols sharing one region of content rank as similar and, among the candidates a signal considers, neither is advantaged by the number of chunks representing it.
-A signal MAY draw its candidates from a bounded pool, under the same candidates-not-completeness framing `search` carries.
+Where either the subject's passage or a candidate's is represented by several chunks, similarity SHALL be their best-matching pair of chunks, so that two symbols sharing one region of content rank as similar.
+Among the candidates each ranking method considers, neither SHALL rank higher because more chunks represent it.
+An answer MAY be drawn from a bounded set of candidates; like a `search` answer, it states that its rows are candidates and not a complete list.
 The subject SHALL NOT appear in its own answer.
 Each result row SHALL identify its symbol and location and carry content at the same per-query detail axis as `search`, with signature as the default, and the chosen detail SHALL NOT alter which symbols are returned or their order.
 An ambiguous subject reference SHALL yield the typed candidate set, and a corpus containing no symbol other than the subject SHALL yield a typed-empty answer.
@@ -788,7 +790,7 @@ An ambiguous subject reference SHALL yield the typed candidate set, and a corpus
 
 - **GIVEN** an indexed subject whose passage is represented by several chunks
 - **WHEN** `similar` is invoked for that subject
-- **THEN** no returned row is the subject, and the subject's own chunks contribute no row of their own
+- **THEN** no returned row is the subject
 
 #### Scenario: Symbols sharing one region rank as similar
 
@@ -1260,9 +1262,9 @@ The answer SHALL be bounded and resumable, ordered deterministically with longer
 
 ### Requirement: Clone answers are labeled as token equivalence
 
-Every `clones` answer that reaches the clone evidence, a typed-empty answer included, SHALL carry, in the machine answer and the human rendering alike, a structural marker identifying its rows as deterministic token equivalence, never behavioral equivalence, and SHALL carry the guaranteed fragment length in effect.
+Every `clones` answer, a typed-empty answer included, SHALL carry, in the machine answer and the human rendering alike, a structural marker identifying its rows as deterministic token equivalence, never behavioral equivalence, and SHALL carry the guaranteed fragment length in effect.
 A `clones` answer SHALL NOT carry the estimation marker or the semantic-index identity, and SHALL carry no similarity score.
-An ambiguous-reference or unresolved-subject answer terminates before the clone evidence is read, so it SHALL NOT carry the token-equivalence marker.
+The one exception is an ambiguous-reference or unresolved-subject answer, which SHALL NOT carry the token-equivalence marker.
 The marker SHALL accompany, never replace, the provenance and freshness labeling every answer carries.
 The machine answer and the human rendering SHALL both name every symbol not compared completely.
 
@@ -1300,7 +1302,7 @@ The machine answer and the human rendering SHALL both name every symbol not comp
 
 Every `search` and `similar` answer — a typed-empty answer included — SHALL carry, in the machine answer and the human rendering alike, a structural marker identifying the ranking as model-derived estimation rather than resolved semantic fact, and SHALL carry the store's recorded semantic-index identity as provenance.
 The machine answer SHALL carry the recorded identity whole — it is the consumer's attribution of a ranking to the regime that produced it; the human rendering MAY present the identity in condensed form.
-An ambiguous-reference or unresolved-subject answer terminates before any ranking is derived and contains no estimation-derived content, so it SHALL NOT carry the marker or the semantic-index provenance — the marker asserts a derivation, never merely the command invoked.
+An ambiguous-reference or unresolved-subject answer contains no estimation-derived content, so it SHALL NOT carry the marker or the semantic-index provenance — the marker asserts a derivation, never merely the command invoked.
 The human rendering and the commands' self-descriptions SHALL present the results as the nearest candidates the index holds — never as the complete set of relevant code, and an empty or truncated answer never as evidence that no relevant code exists.
 A clone-certainty marker derives from deterministic equivalence and SHALL NOT be presented as part of the estimated ranking's heuristic grade.
 The marker SHALL accompany, never replace, the provenance, freshness, and staleness labeling every answer carries.
