@@ -193,7 +193,7 @@ pub fn translate_index(index: &scip_types::Index, provenance: &AnalyzerProvenanc
         documents,
         symbols,
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }

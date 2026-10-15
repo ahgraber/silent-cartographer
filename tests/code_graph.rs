@@ -10,8 +10,9 @@ use silent_cartographer::graph::store::{
 use silent_cartographer::graph::{content_hash, freshness, ingest, join_guarded};
 use silent_cartographer::identity::{CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId};
 use silent_cartographer::semantic::model::{
-    AnalyzerProvenance, DuplicateGroup, EnvironmentFacts, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol,
-    OccurrenceRole, PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind, normalize,
+    AnalyzerProvenance, BuildTarget, DuplicateGroup, EnvironmentFacts, ExtractedIndex, ExtractedOccurrence,
+    ExtractedSymbol, OccurrenceRole, PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind,
+    TargetInventory, normalize,
 };
 use silent_cartographer::semantic::python_adapter::PythonIndexer;
 
@@ -299,7 +300,7 @@ use thing::Thing;
             },
         ],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -397,7 +398,7 @@ fn shared_module_symbol_maps_to_every_document_it_defines() {
         ],
         symbols: vec![module, alpha, beta],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -1169,7 +1170,7 @@ fn text_mismatch_is_refused_and_surfaced() {
             }],
         }],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -1201,7 +1202,7 @@ fn text_mismatch_is_refused_and_surfaced() {
             }],
         }],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store2 = GraphStore::open_in_memory().unwrap();
@@ -1240,7 +1241,7 @@ fn semantic_only_occurrence_is_unaligned() {
             }],
         }],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -1502,6 +1503,7 @@ fn environment_provenance_round_trips_through_metadata() {
         accounting: Default::default(),
         environment: Some(env_facts("fp-a")),
         chunk_params: Default::default(),
+        targets: Default::default(),
     };
     store.write_metadata(&meta).unwrap();
     let read = store.read_metadata().unwrap().expect("metadata present");
@@ -1541,6 +1543,7 @@ fn a_sparse_accounting_rides_metadata() {
         accounting,
         environment: None,
         chunk_params: Default::default(),
+        targets: Default::default(),
     };
     store.write_metadata(&meta).unwrap();
     let read = store.read_metadata().unwrap().expect("metadata present");
@@ -1571,6 +1574,7 @@ fn new_rule_counts_ride_metadata() {
         accounting,
         environment: None,
         chunk_params: Default::default(),
+        targets: Default::default(),
     };
     store.write_metadata(&meta).unwrap();
     let read = store.read_metadata().unwrap().expect("metadata present");
@@ -1637,7 +1641,7 @@ impl Client {
             },
         ],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -1738,7 +1742,7 @@ use thing::Thing;
             },
         ],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -1832,7 +1836,7 @@ fn external_symbol_persists_without_definition_span() {
             },
         ],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -1891,7 +1895,7 @@ fn external_symbol_persists_null_tiers() {
             },
         ],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -1996,8 +2000,8 @@ fn accounting_conserves_occurrence_total() {
         descriptor: Some(Descriptor::new(
             "synthetic",
             vec![
-                DescriptorSegment::new("pkg.shapes", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("shapes", SegmentKind::Module),
             ],
         )),
         kind: SymbolKind::Module,
@@ -2014,8 +2018,8 @@ fn accounting_conserves_occurrence_total() {
         descriptor: Some(Descriptor::new(
             "synthetic",
             vec![
-                DescriptorSegment::new("pkg.m", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("m", SegmentKind::Module),
             ],
         )),
         kind: SymbolKind::Module,
@@ -2026,7 +2030,10 @@ fn accounting_conserves_occurrence_total() {
     let py_self_name = ExtractedSymbol {
         descriptor: Some(Descriptor::new(
             "synthetic",
-            vec![DescriptorSegment::new("pkg.m", SegmentKind::Module)],
+            vec![
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("m", SegmentKind::Module),
+            ],
         )),
         kind: SymbolKind::Module,
         class: SymbolClass::External,
@@ -2258,12 +2265,12 @@ fn duplicate_index() -> ExtractedIndex {
         }],
         symbols: vec![twin_a, twin_b],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }
 
-// _(Occurrences of duplicated descriptors are never arbitrarily attributed — definition branch)_ —
+// _(Two duplicates keep separate definition locations)_ —
 // each definition occurrence of a duplicated descriptor attaches to the definition at its own
 // location.
 #[test]
@@ -2298,7 +2305,7 @@ fn duplicate_definitions_attach_by_co_location() {
     assert_eq!(spans.len(), 2, "definitions attach to distinct locations");
 }
 
-// _(Occurrences of duplicated descriptors are never arbitrarily attributed — reference branch)_ — a
+// _(A reference outside every duplicate's unit is ambiguous)_ — a
 // reference of a duplicated descriptor is recorded duplicate-ambiguous and attributed to no twin.
 #[test]
 fn duplicate_reference_is_ambiguous_and_unattributed() {
@@ -2325,7 +2332,7 @@ fn duplicate_reference_is_ambiguous_and_unattributed() {
     );
 }
 
-// _(Occurrences of duplicated descriptors are never arbitrarily attributed — unduplicated branch)_ —
+// _(A descriptor with one definition has no ambiguous references)_ —
 // references of a single-definition descriptor attribute through the ordinary guarded join.
 #[test]
 fn unduplicated_references_are_never_marked_ambiguous() {
@@ -2444,7 +2451,7 @@ fn text_mismatch_detail_is_persisted() {
             }],
         }],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -2493,7 +2500,7 @@ fn discrepancies_are_superseded_per_build() {
             }],
         }],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     ingest(
@@ -2614,7 +2621,7 @@ fn oversized_found_text_is_classified_on_full_bytes_and_truncated_on_a_boundary(
             }],
         }],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -2955,6 +2962,7 @@ fn rust_doc_module_derived_from_whole_document_definition() {
         &ws(),
         &[ProjectionInput {
             descriptor: module.descriptor.clone().unwrap(),
+            unit: None,
             definition: Some(DefinitionSite {
                 document_path: "mymod.rs".to_string(),
                 range: SourceRange::new(0, 0, 1, 0),
@@ -4783,7 +4791,7 @@ fn duplicate_group_index(
             descriptor,
             occurrences: group_occurrences,
         }],
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }
@@ -4792,7 +4800,7 @@ fn widget_descriptor() -> Descriptor {
     Descriptor::new("dupcrate", vec![DescriptorSegment::new("Widget", SegmentKind::Type)])
 }
 
-// _(Reference in one duplicate's territory is attributed to it — defining-document branch)_ — a
+// _(A reference in one duplicate's unit is attributed to it — defining-document branch)_ — a
 // group reference sitting in a twin's own defining document attributes to that twin, carrying
 // `defining_document` locality provenance.
 #[test]
@@ -4863,7 +4871,7 @@ fn reference_in_twins_defining_document_attributes_via_defining_document_localit
     assert!(b_refs.is_empty(), "the other twin owns no reference");
 }
 
-// _(Reference in one duplicate's territory is attributed to it — provenance round-trip)_ — the
+// _(A reference in one duplicate's unit is attributed to it — provenance round-trip)_ — the
 // locality rule that selected a group reference's twin is persisted alongside the attribution and
 // retrieved unchanged; an ordinary (non-duplicated) attribution's locality is absent.
 #[test]
@@ -4922,7 +4930,7 @@ fn locality_provenance_round_trips_through_the_store() {
     );
 }
 
-// _(Reference in one duplicate's territory is attributed to it — module-chain branch)_ — a group
+// _(A reference in one duplicate's unit is attributed to it — module-chain branch)_ — a group
 // reference sitting in a document reachable only through one twin's module-declaration chain
 // attributes to that twin, carrying `module_chain` locality provenance.
 #[test]
@@ -4990,7 +4998,7 @@ fn reference_reachable_only_through_one_twins_module_chain_attributes_via_module
             descriptor: widget_descriptor(),
             occurrences: vec![group_occ],
         }],
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
 
@@ -5112,7 +5120,7 @@ fn use_style_module_references_derive_no_parent_and_group_reference_stays_ambigu
             descriptor: widget_descriptor(),
             occurrences: vec![group_occ],
         }],
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
 
@@ -5138,17 +5146,17 @@ fn use_style_module_references_derive_no_parent_and_group_reference_stays_ambigu
     }
 }
 
-// _(Package-name reference without target metadata is typed ambiguous)_ — a package-name token
+// _(A reference by package name with no unit list is ambiguous)_ — a package-name token
 // denotes the package's library target no matter which document it sits in, so containing-document
 // locality must never hand it to the containing file's own crate root; with no authoritative target
-// description available (the index's library-root map is empty), it is refused to
+// description available (the index's target inventory is not applicable), it is refused to
 // duplicate-ambiguous. The `crate`-keyword form in the same document is target-relative by
 // construction and keeps its locality attribution.
 #[test]
 fn package_name_reference_among_duplicated_crate_roots_is_ambiguous_while_crate_keyword_attributes() {
     // Two crate-root twins sharing descriptor `dupcrate` + terminal segment `crate` (package name
-    // differs from the terminal name). root_a.rs carries BOTH reference forms. `library_roots` is
-    // empty (the `duplicate_group_index` helper's default): no target metadata is available.
+    // differs from the terminal name). root_a.rs carries BOTH reference forms. the target inventory is
+    // not applicable (the `duplicate_group_index` helper's default): no target metadata is available.
     let root_a_source = "use dupcrate::thing;\nuse crate::other;\n";
     let root_b_source = "fn placeholder() {}\n";
 
@@ -5236,7 +5244,7 @@ fn package_name_reference_among_duplicated_crate_roots_is_ambiguous_while_crate_
     );
 }
 
-// _(Package-name reference resolves to the library target)_ — with the build system's target
+// _(A reference by package name is attributed to the library)_ — with the build system's target
 // description available, a package-name token attributes to the twin defined at the package's
 // library root — never to the containing document's own crate root — under `target_metadata`
 // locality provenance; the `crate`-keyword token in the same document keeps ordinary locality.
@@ -5284,7 +5292,25 @@ fn package_name_reference_resolves_to_the_library_twin_via_target_metadata() {
             descriptor: crate_descriptor(),
             occurrences: vec![pkg_occ, kw_occ],
         }],
-        library_roots: [("dupcrate".to_string(), "root_b.rs".to_string())].into(),
+        targets: TargetInventory::Available {
+            targets: vec![
+                BuildTarget {
+                    package: "dupcrate".to_string(),
+                    kind: "bin".to_string(),
+                    name: "other".to_string(),
+                    root: "root_a.rs".to_string(),
+                    manifest: "Cargo.toml".to_string(),
+                },
+                BuildTarget {
+                    package: "dupcrate".to_string(),
+                    kind: "lib".to_string(),
+                    name: "dupcrate".to_string(),
+                    root: "root_b.rs".to_string(),
+                    manifest: "Cargo.toml".to_string(),
+                },
+            ],
+            manifests: Default::default(),
+        },
         environment: None,
     };
     let src = vec![
@@ -5343,9 +5369,9 @@ fn package_name_reference_resolves_to_the_library_twin_via_target_metadata() {
     );
 }
 
-// _(Locality does not bypass the guarded join)_ — a group reference in exactly one twin's
-// defining document, whose source text does not spell the expected name, is refused as
-// text-mismatch rather than attributed.
+// _(A reference in one duplicate's unit is not attributed if no alignment rule accepts it)_ — a
+// group reference in exactly one twin's defining document, whose source text does not spell the
+// expected name, is refused as text-mismatch rather than attributed.
 #[test]
 fn locality_selected_occurrence_with_mismatched_text_is_refused_not_attributed() {
     let a_source = "struct Widget;\nfn use_a() { let _w = OTHER; }\n";
@@ -5410,11 +5436,11 @@ fn locality_selected_occurrence_with_mismatched_text_is_refused_not_attributed()
 /// `rank` (the getter's twin ranks 0 — its definition precedes the setter's in `pkg/shapes.py`).
 fn py_size_self_twin_id(rank: u32) -> CanonicalId {
     CanonicalId::from_raw(format!(
-        "py-ws::python-conformance::pkg.shapes::Widget::size::self#{rank}"
+        "py-ws::python-conformance::pkg::shapes::Widget::size::self#{rank}"
     ))
 }
 
-// _(Scenario: Same-document reference inside exactly one twin's scope is attributed to it)_ — the
+// _(A reference in a declaration that holds exactly one duplicate is attributed to it)_ — the
 // fixture's `size` property getter/setter pair share one `self`-param descriptor (a real
 // same-document twin group in the committed index); the getter-body `self` reference attributes to
 // the getter's twin and the setter-body `self` reference to the setter's twin, each carrying
@@ -5477,7 +5503,7 @@ fn same_document_reference_inside_one_twin_scope_attributes() {
     );
 }
 
-// _(Scenario: Same-document reference whose deciding scope holds several twins stays ambiguous)_ —
+// _(A reference in a declaration that holds several duplicates is ambiguous)_ —
 // two twin definitions inside one declaration (a module block) and a reference in a sibling
 // function of that block: the innermost twin-bearing declaration (the block) holds both twins, so
 // the reference stays duplicate-ambiguous.
@@ -5523,7 +5549,7 @@ mod holder {
     }
 }
 
-// _(Scenario: Same-document reference enclosed by no twin-bearing declaration stays ambiguous)_ —
+// _(A reference outside every declaration that holds a duplicate is ambiguous)_ —
 // two twins at document top level and a reference inside a function: no enclosing declaration
 // contains a twin definition (the document itself is not a deciding scope), so the reference stays
 // duplicate-ambiguous.
@@ -5619,7 +5645,7 @@ fn b() {
     }
 }
 
-// _(Reference outside every duplicate's territory is typed ambiguous)_ — a group reference whose
+// _(A reference outside every duplicate's unit is ambiguous)_ — a group reference whose
 // document is associated with no twin (no defining-document match, no module-chain path) is typed
 // duplicate-ambiguous.
 #[test]
@@ -5669,7 +5695,7 @@ fn reference_outside_every_twins_territory_is_ambiguous() {
     }
 }
 
-// _(Reference outside every duplicate's territory is typed ambiguous — inspectability)_ — the
+// _(A reference outside every duplicate's unit is ambiguous — inspectability)_ — the
 // surfaced group-ambiguous discrepancy carries the group's shared identity base (the twins' common
 // identity with the `#<rank>` disambiguator stripped), never an empty symbol, so an inspecting
 // consumer sees which descriptor group the ambiguity belongs to.
@@ -5720,6 +5746,9 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
         &identities,
         silent_cartographer::graph::syntax::Language::Rust,
         &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &[],
+        &std::collections::HashMap::new(),
     );
     let ambiguous = result
         .unaligned
@@ -5745,6 +5774,9 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
         &no_identities,
         silent_cartographer::graph::syntax::Language::Rust,
         &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &[],
+        &std::collections::HashMap::new(),
     );
     let ambiguous = result
         .unaligned
@@ -5757,8 +5789,9 @@ fn group_ambiguous_discrepancy_names_the_group_identity() {
     );
 }
 
-// _(Reference in shared territory is typed ambiguous)_ — a group reference whose document is the
-// defining document of more than one twin (a genuinely shared document) is typed duplicate-ambiguous.
+// _(A reference outside every declaration that holds a duplicate is ambiguous)_ — a group reference whose
+// document is the defining document of more than one twin (a genuinely shared document) is typed
+// duplicate-ambiguous.
 #[test]
 fn reference_in_shared_territory_is_ambiguous() {
     // Both twins define from the same document (a file compiled into two targets, the design's
@@ -5841,7 +5874,7 @@ fn conservation_holds_with_locality_attributed_and_ambiguous_group_references() 
             descriptor: widget_descriptor(),
             occurrences: vec![settled_occ, ambiguous_occ],
         }],
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let total_occurrences = 2 /* definitions */ + 2 /* group references */;
@@ -5935,7 +5968,7 @@ fn twin_crate_roots_produce_per_target_imports_edges_after_normalization() {
         ],
         symbols: vec![merged_root, alpha, beta],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     // The normalization pass every backend flows through: splits the merged crate root into two
@@ -6118,27 +6151,43 @@ fn py_id(segments: &[(&str, SegmentKind)]) -> CanonicalId {
 }
 
 fn py_widget_id() -> CanonicalId {
-    py_id(&[("pkg.shapes", SegmentKind::Module), ("Widget", SegmentKind::Type)])
+    py_id(&[
+        ("pkg", SegmentKind::Module),
+        ("shapes", SegmentKind::Module),
+        ("Widget", SegmentKind::Type),
+    ])
 }
 
 fn py_base_id() -> CanonicalId {
-    py_id(&[("pkg.shapes", SegmentKind::Module), ("Base", SegmentKind::Type)])
+    py_id(&[
+        ("pkg", SegmentKind::Module),
+        ("shapes", SegmentKind::Module),
+        ("Base", SegmentKind::Type),
+    ])
 }
 
 fn py_mixin_id() -> CanonicalId {
-    py_id(&[("pkg.shapes", SegmentKind::Module), ("Mixin", SegmentKind::Type)])
+    py_id(&[
+        ("pkg", SegmentKind::Module),
+        ("shapes", SegmentKind::Module),
+        ("Mixin", SegmentKind::Type),
+    ])
 }
 
 fn py_gadget_id() -> CanonicalId {
-    py_id(&[("pkg.shapes", SegmentKind::Module), ("Gadget", SegmentKind::Type)])
+    py_id(&[
+        ("pkg", SegmentKind::Module),
+        ("shapes", SegmentKind::Module),
+        ("Gadget", SegmentKind::Type),
+    ])
 }
 
 fn py_consumer_module_id() -> CanonicalId {
-    py_id(&[("pkg.consumer", SegmentKind::Module), ("__init__", SegmentKind::Meta)])
+    py_id(&[("pkg", SegmentKind::Module), ("consumer", SegmentKind::Module)])
 }
 
 fn py_shapes_module_id() -> CanonicalId {
-    py_id(&[("pkg.shapes", SegmentKind::Module), ("__init__", SegmentKind::Meta)])
+    py_id(&[("pkg", SegmentKind::Module), ("shapes", SegmentKind::Module)])
 }
 
 fn ingest_python_fixture() -> GraphStore {
@@ -6147,6 +6196,33 @@ fn ingest_python_fixture() -> GraphStore {
     let sources = support::python_fixture_sources();
     ingest(&mut store, &py_ws(), Some(WS_ROOT), &index, &sources).unwrap();
     store
+}
+
+// _(Python declaration in a package initializer belongs to the package)_ — a class declared in
+// `pkg/__init__.py` projects under the package, with no `__init__` segment.
+#[test]
+fn package_initializer_declaration_belongs_to_package() {
+    let store = ingest_python_fixture();
+    let client = py_id(&[("pkg", SegmentKind::Module), ("Client", SegmentKind::Type)]);
+    assert_eq!(client.as_str(), "py-ws::python-conformance::pkg::Client");
+    let row = store
+        .symbol(&client)
+        .unwrap()
+        .expect("Client is persisted under the package");
+    assert_eq!(row.document_path.as_deref(), Some("pkg/__init__.py"));
+}
+
+// _(Python module global is one segment)_ — an annotated module global, which scip-python names
+// twice, projects with its name once.
+#[test]
+fn annotated_module_global_projects_with_one_segment() {
+    let store = ingest_python_fixture();
+    let global = py_id(&[
+        ("pkg", SegmentKind::Module),
+        ("consumer", SegmentKind::Module),
+        ("current_app", SegmentKind::Term),
+    ]);
+    assert!(store.symbol(&global).unwrap().is_some(), "{global} is persisted");
 }
 
 // Python modules are named by their module, not by scip-python's `__init__` terminal segment, and a
@@ -6160,10 +6236,7 @@ fn python_module_and_callable_display_and_kind() {
         (shapes.display_name.as_str(), shapes.kind.as_str()),
         ("shapes", "module")
     );
-    let package = store
-        .symbol(&py_id(&[("pkg", SegmentKind::Module), ("__init__", SegmentKind::Meta)]))
-        .unwrap()
-        .unwrap();
+    let package = store.symbol(&py_id(&[("pkg", SegmentKind::Module)])).unwrap().unwrap();
     assert_eq!(package.display_name, "pkg");
     assert!(store.symbols_by_shortname("__init__").unwrap().is_empty());
     let found: Vec<_> = store
@@ -6176,7 +6249,8 @@ fn python_module_and_callable_display_and_kind() {
 
     let build = store
         .symbol(&py_id(&[
-            ("pkg.consumer", SegmentKind::Module),
+            ("pkg", SegmentKind::Module),
+            ("consumer", SegmentKind::Module),
             ("build", SegmentKind::Method),
         ]))
         .unwrap()
@@ -6184,7 +6258,8 @@ fn python_module_and_callable_display_and_kind() {
     assert_eq!(build.kind, "function");
     let render = store
         .symbol(&py_id(&[
-            ("pkg.shapes", SegmentKind::Module),
+            ("pkg", SegmentKind::Module),
+            ("shapes", SegmentKind::Module),
             ("Widget", SegmentKind::Type),
             ("render", SegmentKind::Method),
         ]))
@@ -6367,6 +6442,123 @@ fn python_module_import_produces_module_to_module_edge() {
     );
 }
 
+/// The committed Python fixture indexes, one per Python indexer: the relative-import scenarios hold
+/// for both.
+const PYTHON_FIXTURE_INDEXES: [&str; 2] = ["index.scip", "ty-scip.scip"];
+
+fn ingest_python_fixture_from(file: &str) -> GraphStore {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let index = support::python_fixture_index_from(file);
+    let sources = support::python_fixture_sources();
+    ingest(&mut store, &py_ws(), Some(WS_ROOT), &index, &sources).unwrap();
+    store
+}
+
+fn py_module_id(path: &[&str]) -> CanonicalId {
+    let segments: Vec<_> = path.iter().map(|name| (*name, SegmentKind::Module)).collect();
+    py_id(&segments)
+}
+
+/// The one-based lines of `document` holding a reference to `id`, in order.
+fn reference_lines_in(store: &GraphStore, id: &CanonicalId, document: &str) -> Vec<u32> {
+    let mut lines: Vec<u32> = store
+        .references_of(id)
+        .unwrap()
+        .iter()
+        .filter(|row| row.document_path == document)
+        .map(|row| row.line_column.expect("a located reference").start.line)
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// The identities the `importers` relation reports for `subject`, through the query layer.
+fn py_importers_of(store: &GraphStore, subject: &CanonicalId) -> Vec<CanonicalId> {
+    use silent_cartographer::query::output::Outcome;
+    use silent_cartographer::query::{QueryEngine, TraceItem, TraceRelation};
+
+    let sources = support::python_fixture_sources();
+    let engine = QueryEngine::new(store, support::provenance(), content_hash(&sources), None);
+    let answer = engine
+        .trace(subject.as_str(), TraceRelation::Importers, None, None)
+        .unwrap();
+    let Outcome::Found { results } = answer.outcome else {
+        panic!("expected importers of {subject}, got {:?}", answer.outcome);
+    };
+    results
+        .iter()
+        .map(|item| match item {
+            TraceItem::Symbol { symbol, .. } => symbol.canonical_id.clone(),
+            other => panic!("expected a symbol row, got {other:?}"),
+        })
+        .collect()
+}
+
+// _(Python import from the same package)_ — `from .shapes import Widget` in `pkg/relative.py` is a
+// reference to `pkg.shapes`, and `pkg.relative` is one of its importers.
+#[test]
+fn python_same_package_relative_import_references_the_sibling_module() {
+    for file in PYTHON_FIXTURE_INDEXES {
+        let store = ingest_python_fixture_from(file);
+        let shapes = py_shapes_module_id();
+        assert!(
+            reference_lines_in(&store, &shapes, "pkg/relative.py").contains(&1),
+            "{file}: the `.shapes` import is a reference to pkg.shapes"
+        );
+        let importers = py_importers_of(&store, &shapes);
+        assert!(
+            importers.contains(&py_module_id(&["pkg", "relative"])),
+            "{file}: pkg.relative imports pkg.shapes: {importers:?}"
+        );
+    }
+}
+
+// _(Python import from a parent package)_ — `from ..shapes import Widget` in `pkg/sub/deep.py` is a
+// reference to `pkg.shapes`.
+#[test]
+fn python_parent_package_relative_import_references_the_parent_sibling() {
+    for file in PYTHON_FIXTURE_INDEXES {
+        let store = ingest_python_fixture_from(file);
+        assert_eq!(
+            reference_lines_in(&store, &py_shapes_module_id(), "pkg/sub/deep.py"),
+            vec![1],
+            "{file}"
+        );
+    }
+}
+
+// _(Python name bound by a relative import)_ — `from . import shapes` and the later `shapes.Widget()`
+// are both references to `pkg.shapes`.
+#[test]
+fn python_name_bound_by_relative_import_references_its_module() {
+    for file in PYTHON_FIXTURE_INDEXES {
+        let store = ingest_python_fixture_from(file);
+        let lines = reference_lines_in(&store, &py_shapes_module_id(), "pkg/relative.py");
+        assert!(
+            lines.contains(&2) && lines.contains(&7),
+            "{file}: the import (line 2) and the use (line 7) reference pkg.shapes: {lines:?}"
+        );
+    }
+}
+
+// _(Same relative name in two packages)_ — `from .app import run` refers to the `app` module of the
+// importing module's own package.
+#[test]
+fn python_same_relative_name_in_two_packages_resolves_per_package() {
+    for file in PYTHON_FIXTURE_INDEXES {
+        let store = ingest_python_fixture_from(file);
+        let own = |package: &[&str], document: &str| {
+            let mut path = package.to_vec();
+            path.push("app");
+            reference_lines_in(&store, &py_module_id(&path), document)
+        };
+        assert_eq!(own(&["pkg"], "pkg/relative.py"), vec![3], "{file}");
+        assert_eq!(own(&["pkg", "sub"], "pkg/sub/deep.py"), vec![2], "{file}");
+        assert_eq!(own(&["pkg"], "pkg/sub/deep.py"), Vec::<u32>::new(), "{file}");
+        assert_eq!(own(&["pkg", "sub"], "pkg/relative.py"), Vec::<u32>::new(), "{file}");
+    }
+}
+
 // _(Scenario: Python function tiers carry the docstring)_ — a built Python function with a docstring
 // persists a signature tier that is its header through the header-ending `:`, and an interface tier
 // that additionally carries the docstring.
@@ -6426,7 +6618,7 @@ fn py_synthetic_index(symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
         }],
         symbols,
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }
@@ -6452,8 +6644,8 @@ fn nested_module_bare_terminal_aligns_and_prefix_refused() {
         descriptor: Some(Descriptor::new(
             "synthetic",
             vec![
-                DescriptorSegment::new("pkg.shapes", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("shapes", SegmentKind::Module),
             ],
         )),
         kind: SymbolKind::Module,
@@ -6478,26 +6670,26 @@ fn nested_module_bare_terminal_aligns_and_prefix_refused() {
     assert_eq!(acc.text_mismatch, 1, "the non-terminal-component token is refused");
 }
 
-// _(Scenario: Module-kind symbol without __init__ terminal is outside the module-name rule)_ — the
-// module-name rule reconciles only the `__init__`/meta-terminal descriptor shape; any other
+// _(Scenario: Module-kind symbol that is not module-only is outside the module-name rule)_ — the
+// module-name rule reconciles only the module-only descriptor shape; any other
 // descriptor shape refuses rather than reading a component from the wrong segment.
 #[test]
-fn module_kind_without_init_terminal_is_outside_module_name_rule() {
+fn module_kind_that_is_not_module_only_is_outside_module_name_rule() {
     let source = "pkg\n";
     let module = ExtractedSymbol {
-        // Two plain segments, no `__init__` terminal: were the rule to read the second-to-last
-        // segment without checking the terminal shape, the `pkg` token would misalign here.
+        // A module segment followed by a type segment: were the rule to read the module segments
+        // without checking that every segment is one, the `pkg` token would misalign here.
         descriptor: Some(Descriptor::new(
             "synthetic",
             vec![
                 DescriptorSegment::new("pkg", SegmentKind::Module),
-                DescriptorSegment::new("shapes", SegmentKind::Module),
+                DescriptorSegment::new("shapes", SegmentKind::Type),
             ],
         )),
         kind: SymbolKind::Module,
         class: SymbolClass::InWorkspace,
         // "pkg" at line 0, cols 0..3 — spells neither "shapes" (the default rule's expectation)
-        // nor any admissible module-name component (the descriptor lacks the module shape).
+        // nor any admissible module-name component (the descriptor is not module-only).
         occurrences: vec![py_occ("m.py", 0, 0, 3, OccurrenceRole::Reference)],
     };
     let index = py_synthetic_index(vec![module]);
@@ -6508,7 +6700,7 @@ fn module_kind_without_init_terminal_is_outside_module_name_rule() {
     assert_eq!(
         acc.accepted(AlignmentRule::ModuleName),
         0,
-        "the module-name rule refuses a descriptor without the __init__ terminal"
+        "the module-name rule refuses a descriptor that is not module-only"
     );
     assert_eq!(acc.aligned_total(), 0, "no rule accepts the occurrence");
     assert_eq!(acc.text_mismatch, 1, "the occurrence is refused");
@@ -6555,10 +6747,7 @@ fn rust_kind_scoped_rules_do_not_fire_for_python() {
     let module = ExtractedSymbol {
         descriptor: Some(Descriptor::new(
             "synthetic",
-            vec![
-                DescriptorSegment::new("pkg", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
-            ],
+            vec![DescriptorSegment::new("pkg", SegmentKind::Module)],
         )),
         kind: SymbolKind::Module,
         class: SymbolClass::InWorkspace,
@@ -6594,8 +6783,8 @@ fn python_module_relative_import_aligns_under_module_name_rule() {
         descriptor: Some(Descriptor::new(
             "synthetic",
             vec![
-                DescriptorSegment::new("pkg.shapes", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("shapes", SegmentKind::Module),
             ],
         )),
         kind: SymbolKind::Module,
@@ -6645,8 +6834,8 @@ fn python_module_prefix_token_stays_refused() {
         descriptor: Some(Descriptor::new(
             "synthetic",
             vec![
-                DescriptorSegment::new("pkg.shapes", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("shapes", SegmentKind::Module),
             ],
         )),
         kind: SymbolKind::Module,
@@ -6680,8 +6869,8 @@ fn module_reference_accepted_through_enclosing_dotted_construct() {
         descriptor: Some(Descriptor::new(
             "synthetic",
             vec![
-                DescriptorSegment::new("pkg.sub", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("sub", SegmentKind::Module),
             ],
         )),
         kind: SymbolKind::Module,
@@ -6712,7 +6901,7 @@ fn module_reference_accepted_through_enclosing_dotted_construct() {
 /// The canonical identity of the bare-namespace module symbol a `__name__` token's occurrence
 /// resolves to in the committed fixture (a single Module-kind segment, no `__init__` terminal).
 fn py_consumer_namespace_id() -> CanonicalId {
-    py_id(&[("pkg.consumer", SegmentKind::Module)])
+    py_id(&[("pkg", SegmentKind::Module), ("consumer", SegmentKind::Module)])
 }
 
 // _(Scenario: Module self-name token accepted for its own module)_ — the fixture's
@@ -6744,8 +6933,8 @@ fn self_name_token_for_foreign_module_stays_refused() {
         descriptor: Some(Descriptor::new(
             "synthetic",
             vec![
-                DescriptorSegment::new("pkg.m", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("m", SegmentKind::Module),
             ],
         )),
         kind: SymbolKind::Module,
@@ -6756,7 +6945,10 @@ fn self_name_token_for_foreign_module_stays_refused() {
     let foreign_module = ExtractedSymbol {
         descriptor: Some(Descriptor::new(
             "synthetic",
-            vec![DescriptorSegment::new("pkg.other", SegmentKind::Module)],
+            vec![
+                DescriptorSegment::new("pkg", SegmentKind::Module),
+                DescriptorSegment::new("other", SegmentKind::Module),
+            ],
         )),
         kind: SymbolKind::Module,
         class: SymbolClass::External,
@@ -6978,10 +7170,7 @@ fn python_module_marker_persists_whole_document_and_docstring() {
     let module = ExtractedSymbol {
         descriptor: Some(Descriptor::new(
             "synthetic",
-            vec![
-                DescriptorSegment::new("m", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
-            ],
+            vec![DescriptorSegment::new("m", SegmentKind::Module)],
         )),
         kind: SymbolKind::Module,
         class: SymbolClass::InWorkspace,
@@ -6994,13 +7183,7 @@ fn python_module_marker_persists_whole_document_and_docstring() {
 
     let id = silent_cartographer::identity::project_one(
         &ws(),
-        &Descriptor::new(
-            "synthetic",
-            vec![
-                DescriptorSegment::new("m", SegmentKind::Module),
-                DescriptorSegment::new("__init__", SegmentKind::Meta),
-            ],
-        ),
+        &Descriptor::new("synthetic", vec![DescriptorSegment::new("m", SegmentKind::Module)]),
     );
     let row = store.symbol(&id).unwrap().expect("module symbol persisted");
     assert_eq!(
@@ -7203,7 +7386,7 @@ fn alias_binding_outside_document_is_not_evidence() {
         ],
         symbols: vec![n_symbol],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -7298,7 +7481,7 @@ fn rust_use_alias_accepted_under_document_binding() {
         }],
         symbols: vec![b_symbol],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -7346,7 +7529,7 @@ fn docs_index(paths: &[&str], symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
             .collect(),
         symbols,
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }
@@ -7621,7 +7804,7 @@ fn py_docs_index(paths: &[&str], symbols: Vec<ExtractedSymbol>) -> ExtractedInde
             .collect(),
         symbols,
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }
@@ -8419,7 +8602,7 @@ fn source_file_rows_equal_the_analyzed_files_and_sum_to_the_aggregate_hash() {
         .map(|(path, text)| (path.clone(), silent_cartographer::graph::text_hash(text)))
         .collect();
     expected.sort();
-    assert_eq!(expected.len(), 3);
+    assert_eq!(expected.len(), 8);
     assert_eq!(
         silent_cartographer::graph::text_hash("abc"),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -8658,5 +8841,663 @@ fn every_stored_header_end_denotes_its_byte_offset() {
             checked += 1;
         }
         assert!(checked > 0, "{name}: no header end was checked");
+    }
+}
+
+// ---- Rust conformance project: unit units in identities ----
+
+/// Ingest the Rust conformance fixture over `index`, returning the store and the unit disclosure.
+fn ingest_rust_fixture_with(
+    index: &ExtractedIndex,
+) -> (GraphStore, silent_cartographer::graph::units::UndeterminedUnits) {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let (_, disclosure) = silent_cartographer::graph::ingest_with_params(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        index,
+        &support::rust_fixture_sources(),
+        &silent_cartographer::graph::chunk::ChunkParams::default(),
+    )
+    .unwrap();
+    (store, disclosure)
+}
+
+/// The identities of the fixture's declarations named `name`, sorted.
+fn rust_identities_named(store: &GraphStore, name: &str) -> Vec<String> {
+    let mut ids: Vec<String> = store
+        .symbols_by_shortname(name)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.canonical_id.as_str().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+// _(Rust library declarations are unmarked)_, _(Rust binary declarations are marked by kind and
+// name)_, _(Source compiled into two units has one shared identity)_ — over the Rust conformance
+// project: the library's `Config` is unmarked, the binary's carries `+bin.tool`, and the helper
+// both integration tests declare is `+shared`.
+#[test]
+fn rust_conformance_identities_carry_units() {
+    let (store, _) = ingest_rust_fixture_with(&support::rust_fixture_index());
+    assert_eq!(
+        rust_identities_named(&store, "Config"),
+        [
+            "test-ws::libbin+bin.tool::util::Config",
+            "test-ws::libbin::util::Config"
+        ]
+    );
+    assert_eq!(
+        rust_identities_named(&store, "fixture"),
+        ["test-ws::libbin+shared::common::fixture"]
+    );
+    assert_eq!(
+        rust_identities_named(&store, "a"),
+        ["test-ws::libbin+test.a::a"],
+        "a test target's own function carries the test target"
+    );
+}
+
+// _(Same declaration in two units carries no disambiguator)_ — the library and binary `util::Config`
+// are one twin group (the backend gives both the same symbol), so both are flagged duplicated and
+// the group addresses the references to `load`, yet their identities differ by unit and carry no
+// `#` suffix.
+#[test]
+fn cross_target_twins_stay_one_group_with_distinct_identities() {
+    let index = support::rust_fixture_index();
+    assert!(
+        index
+            .duplicate_groups
+            .iter()
+            .any(|group| { group.descriptor.terminal_name() == Some("load") }),
+        "the references to the twins' `load` are addressed to one unit-free group"
+    );
+    let (store, _) = ingest_rust_fixture_with(&index);
+    for name in ["Config", "load"] {
+        let rows = store.symbols_by_shortname(name).unwrap();
+        assert_eq!(rows.len(), 2, "{name}: one row per target");
+        assert!(
+            rows.iter().all(|row| row.duplicated),
+            "{name}: both twins are flagged duplicated"
+        );
+        assert!(
+            rows.iter().all(|row| !row.canonical_id.as_str().contains('#')),
+            "{name}: distinct units need no disambiguator"
+        );
+    }
+}
+
+// _(Duplicated descriptors are disclosed)_ — the library's and the binary's `util::Config` and
+// `util::load` differ by unit, so no `#` suffix joins them, yet each pair is reported as one group
+// holding both definitions.
+#[test]
+fn cross_target_twins_are_reported_as_duplicated_groups() {
+    let (store, _) = ingest_rust_fixture_with(&support::rust_fixture_index());
+    let groups = store.duplicated_groups().unwrap();
+    for name in ["test-ws::libbin::util::Config", "test-ws::libbin::util::load"] {
+        let group = groups
+            .iter()
+            .find(|group| group.descriptor_base == name)
+            .unwrap_or_else(|| panic!("{name} is a duplicated group: {groups:?}"));
+        let definitions: std::collections::BTreeSet<&str> =
+            group.definitions.iter().map(|row| row.canonical_id.as_str()).collect();
+        let binary = name.replace("libbin::", "libbin+bin.tool::");
+        assert_eq!(definitions, std::collections::BTreeSet::from([name, binary.as_str()]));
+    }
+}
+
+#[test]
+fn unit_disclosure_is_empty_when_all_determined() {
+    let (_, disclosure) = ingest_rust_fixture_with(&support::rust_fixture_index());
+    assert_eq!(disclosure, Default::default());
+}
+
+// _(Package whose units cannot be listed has no markers)_ — with the
+// inventory withheld, every `libbin` identity is unmarked and the disclosure names the package.
+#[test]
+fn missing_inventory_discloses_undetermined_package() {
+    use silent_cartographer::semantic::model::InventoryFailure;
+
+    let mut index = support::rust_fixture_index();
+    index.targets = TargetInventory::Unavailable(InventoryFailure::MetadataTimeout);
+    let (store, disclosure) = ingest_rust_fixture_with(&index);
+
+    let marked: Vec<String> = ["Config", "load", "fixture", "util", "crate", "a"]
+        .iter()
+        .flat_map(|name| rust_identities_named(&store, name))
+        .filter(|id| id.contains('+'))
+        .collect();
+    assert!(
+        marked.is_empty(),
+        "no libbin identity carries a unit marker: {marked:?}"
+    );
+    assert_eq!(
+        serde_json::to_value(&disclosure).unwrap(),
+        serde_json::json!({
+            "packages": [{"package": "libbin", "reason": "metadata_timeout"}],
+            "documents": []
+        })
+    );
+}
+
+/// The byte span of the `load` in `call` within the Rust fixture's `src/bin/tool.rs`.
+fn tool_call_load_span(call: &str) -> (usize, usize) {
+    let (_, text) = support::rust_fixture_sources()
+        .into_iter()
+        .find(|(path, _)| path == "src/bin/tool.rs")
+        .unwrap();
+    let start = text.find(call).expect("call present") + call.len() - "load()".len();
+    (start, start + "load".len())
+}
+
+// _(A path that starts with the package name is attributed to the library)_ — `libbin::util::load()`
+// in the binary's `main` attributes to the library's `load` under `target_metadata`, while the
+// binary's own `util::load()` attributes to the binary's `load`.
+#[test]
+fn package_qualified_path_resolves_to_library() {
+    let (store, _) = ingest_rust_fixture_with(&support::rust_fixture_index());
+    let library = CanonicalId::from_raw("test-ws::libbin::util::load");
+    let binary = CanonicalId::from_raw("test-ws::libbin+bin.tool::util::load");
+
+    let library_refs = store.references_of(&library).unwrap();
+    let qualified = tool_call_load_span("libbin::util::load()");
+    assert_eq!(
+        library_refs
+            .iter()
+            .map(|r| (r.document_path.as_str(), r.span))
+            .collect::<Vec<_>>(),
+        [("src/bin/tool.rs", qualified)],
+        "the library's `load` is referenced exactly at the qualified call"
+    );
+    assert_eq!(library_refs[0].locality.as_deref(), Some("target_metadata"));
+
+    let binary_refs = store.references_of(&binary).unwrap();
+    let plain = tool_call_load_span("    util::load()");
+    assert_eq!(
+        binary_refs.iter().map(|r| r.span).collect::<Vec<_>>(),
+        [plain],
+        "the unqualified call attributes to the binary's own `load`"
+    );
+}
+
+// _(A path that starts with the package name is attributed to the library)_ — without the target
+// inventory no twin is known to be the library's, so the qualified call is duplicate-ambiguous and
+// attributed to neither `load`.
+#[test]
+fn package_qualified_path_without_inventory_is_ambiguous() {
+    use silent_cartographer::semantic::model::InventoryFailure;
+
+    let mut index = support::rust_fixture_index();
+    index.targets = TargetInventory::Unavailable(InventoryFailure::MetadataTimeout);
+    let (store, _) = ingest_rust_fixture_with(&index);
+
+    let qualified = tool_call_load_span("libbin::util::load()");
+    let ambiguous = store
+        .all_discrepancies()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.outcome == "duplicate_ambiguous" && r.expected_name == "load")
+        .map(|r| r.span)
+        .collect::<Vec<_>>();
+    assert!(
+        ambiguous.contains(&Some(qualified)),
+        "the qualified call is duplicate-ambiguous: {ambiguous:?}"
+    );
+    for id in rust_identities_named(&store, "load") {
+        let refs = store.references_of(&CanonicalId::from_raw(&id)).unwrap();
+        assert!(
+            refs.iter().all(|r| r.span != qualified),
+            "{id} is not handed the qualified call"
+        );
+    }
+}
+
+// _(Adding a binary changes no other unit's identities)_ — a real rust-analyzer build of a copy of
+// the project, then a second binary added and the project rebuilt: every earlier identity is
+// byte-identical and the new binary's declarations carry `+bin.second`. Skips explicitly when
+// rust-analyzer is not installed.
+#[test]
+fn adding_a_binary_changes_no_other_identity() {
+    use silent_cartographer::commands::collect_rust_sources;
+    use silent_cartographer::semantic::SemanticEngine;
+    use silent_cartographer::semantic::rust_adapter::RustAdapter;
+
+    let Ok(adapter) = RustAdapter::new("rust-analyzer") else {
+        eprintln!("SKIP: rust-analyzer not installed");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let fixture = support::rust_fixture_root();
+    std::fs::copy(fixture.join("Cargo.toml"), root.join("Cargo.toml")).unwrap();
+    for rel in support::RUST_FIXTURE_FILES {
+        let to = root.join(rel);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(fixture.join(rel), to).unwrap();
+    }
+
+    let identities = |root: &std::path::Path| -> std::collections::BTreeSet<String> {
+        let index = adapter.analyze(root).expect("rust-analyzer indexes the project");
+        let mut store = GraphStore::open_in_memory().unwrap();
+        ingest(
+            &mut store,
+            &ws(),
+            Some(WS_ROOT),
+            &index,
+            &collect_rust_sources(root).unwrap(),
+        )
+        .unwrap();
+        ["Config", "load", "fixture", "util", "crate", "main", "a", "b", "common"]
+            .iter()
+            .flat_map(|name| rust_identities_named(&store, name))
+            .collect()
+    };
+
+    let before = identities(root);
+    std::fs::write(
+        root.join("src/bin/second.rs"),
+        "mod util {\n    pub struct Config;\n    pub fn load() {}\n}\n\nfn main() {}\n",
+    )
+    .unwrap();
+    let after = identities(root);
+
+    assert!(
+        before.is_subset(&after),
+        "no earlier identity changed: {before:?} vs {after:?}"
+    );
+    let added: Vec<&String> = after.difference(&before).collect();
+    assert!(
+        added.iter().all(|id| id.contains("+bin.second")),
+        "only the new binary's declarations are new: {added:?}"
+    );
+    assert!(
+        after.contains("test-ws::libbin+bin.second::util::Config"),
+        "the new binary's Config: {after:?}"
+    );
+}
+
+/// The `libbin` package of a library (`src/lib.rs` loading `util` and `caller`) and a binary `tool`
+/// that holds its own `util::load`: the library's `load` and the binary's are one twin group, and the
+/// only reference to it sits in the library's `src/caller.rs`.
+fn sibling_caller_index() -> (ExtractedIndex, Vec<(String, String)>) {
+    let sources = [
+        ("src/lib.rs", "pub mod util;\npub mod caller;\n"),
+        ("src/util.rs", "pub fn load() {}\n"),
+        ("src/caller.rs", "pub fn call() {\n    crate::util::load();\n}\n"),
+        ("src/bin/tool.rs", "mod util {\n    pub fn load() {}\n}\n"),
+    ];
+    let module = |name: &str| Descriptor::new("libbin", vec![DescriptorSegment::new(name, SegmentKind::Module)]);
+    let load = Descriptor::new(
+        "libbin",
+        vec![
+            DescriptorSegment::new("util", SegmentKind::Module),
+            DescriptorSegment::new("load", SegmentKind::Method),
+        ],
+    );
+    let mut module_util = twin(
+        module("util"),
+        SymbolKind::Module,
+        "src/util.rs",
+        SourceRange::new(0, 0, 1, 0),
+    );
+    module_util
+        .occurrences
+        .push(group_ref("src/lib.rs", SourceRange::new(0, 8, 0, 12)));
+    let mut module_caller = twin(
+        module("caller"),
+        SymbolKind::Module,
+        "src/caller.rs",
+        SourceRange::new(0, 0, 3, 0),
+    );
+    module_caller
+        .occurrences
+        .push(group_ref("src/lib.rs", SourceRange::new(1, 8, 1, 14)));
+    let library_load = twin(
+        load.clone(),
+        SymbolKind::Function,
+        "src/util.rs",
+        SourceRange::new(0, 7, 0, 11),
+    );
+    let binary_load = twin(
+        load.clone(),
+        SymbolKind::Function,
+        "src/bin/tool.rs",
+        SourceRange::new(1, 11, 1, 15),
+    );
+    let call = group_ref("src/caller.rs", SourceRange::new(1, 17, 1, 21));
+    let mut index = duplicate_group_index(
+        &sources.map(|(path, _)| path),
+        vec![module_util, module_caller, library_load, binary_load],
+        load,
+        vec![call],
+    );
+    let target = |kind: &str, name: &str, root: &str| BuildTarget {
+        package: "libbin".to_string(),
+        kind: kind.to_string(),
+        name: name.to_string(),
+        root: root.to_string(),
+        manifest: "Cargo.toml".to_string(),
+    };
+    index.targets = TargetInventory::Available {
+        targets: vec![
+            target("lib", "libbin", "src/lib.rs"),
+            target("bin", "tool", "src/bin/tool.rs"),
+        ],
+        manifests: Default::default(),
+    };
+    let sources = sources
+        .map(|(path, text)| (path.to_string(), text.to_string()))
+        .to_vec();
+    (index, sources)
+}
+
+// _(A reference in one duplicate's unit is attributed to it)_ — the call to `load` sits in the
+// library's `src/caller.rs`, a sibling of the file defining the library's `load`: no defining document
+// or module chain reaches a twin, yet the call's document belongs to exactly the library target and
+// one twin is the library's, so the call attributes to it with `unit_membership` locality.
+#[test]
+fn reference_in_a_sibling_file_of_one_target_attributes_to_that_targets_twin() {
+    let (index, sources) = sibling_caller_index();
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let accounting = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+
+    assert_eq!(accounting.duplicate_ambiguous, 0);
+    let library = store
+        .references_of(&CanonicalId::from_raw("test-ws::libbin::util::load"))
+        .unwrap();
+    assert_eq!(library.len(), 1, "{library:?}");
+    assert_eq!(library[0].document_path, "src/caller.rs");
+    assert_eq!(library[0].locality.as_deref(), Some("unit_membership"));
+    assert!(
+        store
+            .references_of(&CanonicalId::from_raw("test-ws::libbin+bin.tool::util::load"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A `libbin` index whose `load` is defined in each of `load_docs` (one twin group), with one
+/// reference to it in `reference_doc`.
+///
+/// `modules` lists `(name, definition document)`; each gets a module symbol referenced at every
+/// `mod <name>;` declaration in `sources`, which gives the `mod` chain the unit reach follows.
+/// `targets` lists `(kind, name, root)`. The reference is the last `load(` in `reference_doc`.
+fn unit_rule_index(
+    sources: &[(&str, &str)],
+    modules: &[(&str, &str)],
+    load_docs: &[&str],
+    reference_doc: &str,
+    targets: &[(&str, &str, &str)],
+) -> (ExtractedIndex, Vec<(String, String)>) {
+    let text_of = |path: &str| sources.iter().find(|(p, _)| *p == path).unwrap().1;
+    let range_of = |path: &str, pos: usize, len: usize| {
+        let (line, column) = line_col(text_of(path), pos);
+        SourceRange::new(line, column, line, column + len as u32)
+    };
+    let mut symbols = Vec::new();
+    for (name, document) in modules {
+        let descriptor = Descriptor::new("libbin", vec![DescriptorSegment::new(*name, SegmentKind::Module)]);
+        let lines = text_of(document).lines().count() as u32;
+        let mut module = twin(
+            descriptor,
+            SymbolKind::Module,
+            document,
+            SourceRange::new(0, 0, lines, 0),
+        );
+        let declaration = format!("mod {name};");
+        for (path, text) in sources {
+            if let Some(at) = text.find(&declaration) {
+                module
+                    .occurrences
+                    .push(group_ref(path, range_of(path, at + "mod ".len(), name.len())));
+            }
+        }
+        symbols.push(module);
+    }
+    let load = Descriptor::new(
+        "libbin",
+        vec![
+            DescriptorSegment::new("util", SegmentKind::Module),
+            DescriptorSegment::new("load", SegmentKind::Method),
+        ],
+    );
+    for document in load_docs {
+        let at = text_of(document).find("fn load").unwrap() + "fn ".len();
+        symbols.push(twin(
+            load.clone(),
+            SymbolKind::Function,
+            document,
+            range_of(document, at, "load".len()),
+        ));
+    }
+    let reference_at = text_of(reference_doc).rfind("load(").unwrap();
+    let reference = group_ref(reference_doc, range_of(reference_doc, reference_at, "load".len()));
+    let mut index = duplicate_group_index(
+        &sources.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        symbols,
+        load,
+        vec![reference],
+    );
+    index.targets = TargetInventory::Available {
+        targets: targets
+            .iter()
+            .map(|(kind, name, root)| BuildTarget {
+                package: "libbin".to_string(),
+                kind: kind.to_string(),
+                name: name.to_string(),
+                root: root.to_string(),
+                manifest: "Cargo.toml".to_string(),
+            })
+            .collect(),
+        manifests: Default::default(),
+    };
+    let sources = sources
+        .iter()
+        .map(|(path, text)| (path.to_string(), text.to_string()))
+        .collect();
+    (index, sources)
+}
+
+/// Ingest `index` and assert its one group reference, in `reference_doc`, was recorded
+/// duplicate-ambiguous and is stored on no `load` at all.
+fn assert_group_reference_is_ambiguous(index: &ExtractedIndex, sources: &[(String, String)], reference_doc: &str) {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let accounting = ingest(&mut store, &ws(), Some(WS_ROOT), index, sources).unwrap();
+
+    assert_eq!(accounting.duplicate_ambiguous, 1);
+    let ambiguous: Vec<_> = store
+        .all_discrepancies()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.outcome == "duplicate_ambiguous" && row.expected_name == "load")
+        .map(|row| row.document_path)
+        .collect();
+    assert_eq!(ambiguous, [reference_doc]);
+    for id in rust_identities_named(&store, "load") {
+        let refs = store.references_of(&CanonicalId::from_raw(&id)).unwrap();
+        assert!(
+            refs.iter().all(|r| r.document_path != reference_doc),
+            "{id} is not handed the reference: {refs:?}"
+        );
+    }
+}
+
+// _(A reference outside every duplicate's unit is ambiguous)_ — the library and a binary each define
+// `load`, and the call sits in a test target's file: that file belongs to the test's unit, which
+// holds neither duplicate, so the call is attributed to neither.
+#[test]
+fn reference_in_a_unit_holding_no_duplicate_is_ambiguous() {
+    let (index, sources) = unit_rule_index(
+        &[
+            ("src/lib.rs", "pub mod util;\n"),
+            ("src/util.rs", "pub fn load() {}\n"),
+            ("src/bin/tool.rs", "fn load() {}\nfn main() {}\n"),
+            ("tests/it.rs", "fn check() {\n    util::load();\n}\n"),
+        ],
+        &[("util", "src/util.rs")],
+        &["src/util.rs", "src/bin/tool.rs"],
+        "tests/it.rs",
+        &[
+            ("lib", "libbin", "src/lib.rs"),
+            ("bin", "tool", "src/bin/tool.rs"),
+            ("test", "it", "tests/it.rs"),
+        ],
+    );
+    assert_group_reference_is_ambiguous(&index, &sources, "tests/it.rs");
+}
+
+// A reference whose file belongs to one unit that holds two of the duplicates: two library files
+// each define `load`, the call sits in a third library file on neither's `mod` chain, and no
+// declaration encloses the call with a duplicate in it, so no rule picks between the two.
+#[test]
+fn reference_in_a_unit_holding_two_duplicates_is_ambiguous() {
+    let (index, sources) = unit_rule_index(
+        &[
+            ("src/lib.rs", "pub mod a;\npub mod b;\npub mod caller;\n"),
+            ("src/a.rs", "pub fn load() {}\n"),
+            ("src/b.rs", "pub fn load() {}\n"),
+            ("src/caller.rs", "pub fn call() {\n    util::load();\n}\n"),
+        ],
+        &[("a", "src/a.rs"), ("b", "src/b.rs"), ("caller", "src/caller.rs")],
+        &["src/a.rs", "src/b.rs"],
+        "src/caller.rs",
+        &[("lib", "libbin", "src/lib.rs")],
+    );
+    assert_group_reference_is_ambiguous(&index, &sources, "src/caller.rs");
+}
+
+// A reference whose file is compiled into two units: `src/caller.rs` is loaded by both the library
+// and the binary, which also holds a `load`, so the file has no single unit and the call is
+// attributed to neither duplicate.
+#[test]
+fn reference_in_a_file_shared_by_two_units_is_ambiguous() {
+    let (index, sources) = unit_rule_index(
+        &[
+            ("src/lib.rs", "pub mod util;\npub mod caller;\n"),
+            ("src/util.rs", "pub fn load() {}\n"),
+            (
+                "src/bin/tool.rs",
+                "#[path = \"../caller.rs\"]\nmod caller;\nmod local {\n    pub fn load() {}\n}\n",
+            ),
+            ("src/caller.rs", "pub fn call() {\n    util::load();\n}\n"),
+        ],
+        &[("util", "src/util.rs"), ("caller", "src/caller.rs")],
+        &["src/util.rs", "src/bin/tool.rs"],
+        "src/caller.rs",
+        &[("lib", "libbin", "src/lib.rs"), ("bin", "tool", "src/bin/tool.rs")],
+    );
+    assert_group_reference_is_ambiguous(&index, &sources, "src/caller.rs");
+}
+
+// _(Occurrences of duplicated descriptors are never arbitrarily attributed)_ — two binaries each
+// define `util::load` and the library defines none: a call written `libbin::util::load()` has no
+// library duplicate to name, so it is duplicate-ambiguous even though it sits in a file that
+// defines one of the duplicates.
+#[test]
+fn package_qualified_path_with_duplicates_only_in_binaries_is_ambiguous() {
+    let (index, sources) = unit_rule_index(
+        &[
+            ("src/lib.rs", "pub fn unrelated() {}\n"),
+            (
+                "src/bin/one.rs",
+                "mod util {\n    pub fn load() {}\n}\n\nfn main() {\n    libbin::util::load();\n}\n",
+            ),
+            (
+                "src/bin/two.rs",
+                "mod util {\n    pub fn load() {}\n}\n\nfn main() {}\n",
+            ),
+        ],
+        &[],
+        &["src/bin/one.rs", "src/bin/two.rs"],
+        "src/bin/one.rs",
+        &[
+            ("lib", "libbin", "src/lib.rs"),
+            ("bin", "one", "src/bin/one.rs"),
+            ("bin", "two", "src/bin/two.rs"),
+        ],
+    );
+    assert_group_reference_is_ambiguous(&index, &sources, "src/bin/one.rs");
+}
+
+// _(Symbol reference resolution)_ — a qualified name that begins with the package's name denotes the
+// library's declaration even when a binary declares a nested module of the same name: the library's
+// identity matches directly after the workspace, the binary's only by suffix.
+#[test]
+fn package_qualified_name_resolves_to_the_library_over_a_binary_nested_module() {
+    use silent_cartographer::query::resolve::{Resolution, resolve};
+
+    let config = |segments: &[(&str, SegmentKind)]| {
+        Descriptor::new(
+            "libbin",
+            segments
+                .iter()
+                .map(|(name, kind)| DescriptorSegment::new(*name, *kind))
+                .collect(),
+        )
+    };
+    let library = twin(
+        config(&[("util", SegmentKind::Module), ("Config", SegmentKind::Type)]),
+        SymbolKind::Type,
+        "src/lib.rs",
+        SourceRange::new(1, 15, 1, 21),
+    );
+    let binary = twin(
+        config(&[
+            ("libbin", SegmentKind::Module),
+            ("util", SegmentKind::Module),
+            ("Config", SegmentKind::Type),
+        ]),
+        SymbolKind::Type,
+        "src/bin/tool.rs",
+        SourceRange::new(2, 19, 2, 25),
+    );
+    let mut index = duplicate_group_index(
+        &["src/lib.rs", "src/bin/tool.rs"],
+        vec![library, binary],
+        config(&[("util", SegmentKind::Module)]),
+        Vec::new(),
+    );
+    index.duplicate_groups.clear();
+    index.targets = TargetInventory::Available {
+        targets: vec![
+            BuildTarget {
+                package: "libbin".to_string(),
+                kind: "lib".to_string(),
+                name: "libbin".to_string(),
+                root: "src/lib.rs".to_string(),
+                manifest: "Cargo.toml".to_string(),
+            },
+            BuildTarget {
+                package: "libbin".to_string(),
+                kind: "bin".to_string(),
+                name: "tool".to_string(),
+                root: "src/bin/tool.rs".to_string(),
+                manifest: "Cargo.toml".to_string(),
+            },
+        ],
+        manifests: Default::default(),
+    };
+    let sources = vec![
+        (
+            "src/lib.rs".to_string(),
+            "pub mod util {\n    pub struct Config;\n}\n".to_string(),
+        ),
+        (
+            "src/bin/tool.rs".to_string(),
+            "mod libbin {\n    pub mod util {\n        pub struct Config;\n    }\n}\nfn main() {}\n".to_string(),
+        ),
+    ];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+
+    match resolve(&store, "libbin::util::Config").unwrap() {
+        Resolution::Unique(row) => assert_eq!(row.canonical_id.as_str(), "test-ws::libbin::util::Config"),
+        other => panic!("expected the library's declaration, got {other:?}"),
+    }
+    match resolve(&store, "util::Config").unwrap() {
+        Resolution::Ambiguous(rows) => assert_eq!(rows.len(), 2, "{rows:?}"),
+        other => panic!("a name that is no package path stays ambiguous: {other:?}"),
     }
 }

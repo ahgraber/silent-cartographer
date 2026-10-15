@@ -131,17 +131,9 @@ impl ExtractedSymbol {
         self.descriptor.as_ref().and_then(|d| d.terminal_name())
     }
 
-    /// The name a human reads for the symbol: the terminal name, except that a Python module
-    /// (scip-python's `__init__` meta terminal after the module's namespace segment) is named by the
-    /// last component of its dotted module name. Identity still projects from the whole descriptor.
+    /// The name a human reads for the symbol: its terminal name. Identity still projects from the
+    /// whole descriptor.
     pub fn display_name(&self) -> Option<&str> {
-        let segments = &self.descriptor.as_ref()?.segments;
-        if let [.., namespace, terminal] = segments.as_slice()
-            && terminal.name == "__init__"
-            && terminal.kind == SegmentKind::Meta
-        {
-            return namespace.name.rsplit('.').next();
-        }
         self.terminal_name()
     }
 }
@@ -195,6 +187,63 @@ pub struct DuplicateGroup {
     pub occurrences: Vec<ExtractedOccurrence>,
 }
 
+/// One compilation target of a package, as the build system declares it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildTarget {
+    /// The package the target belongs to.
+    pub package: String,
+    /// The target's kind (`lib`, `bin`, `test`, `example`, `bench`, `custom-build`, ...).
+    pub kind: String,
+    /// The target's name.
+    pub name: String,
+    /// The workspace-relative document path of the target's root source file, matching SCIP
+    /// document paths.
+    pub root: String,
+    /// The workspace-relative path of the manifest of the package that declares the target.
+    pub manifest: String,
+}
+
+impl BuildTarget {
+    /// Whether this target is a library artifact, the package's default unit: the target a
+    /// package-name path resolves to, as opposed to a bin, test, example, or bench.
+    pub fn is_library(&self) -> bool {
+        matches!(
+            self.kind.as_str(),
+            "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro"
+        )
+    }
+}
+
+/// Why a backend could not supply its build targets. Serialized as `{"reason": <tag>}`, with
+/// `detail` alongside for a failure that carries one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum InventoryFailure {
+    /// The build system's description did not arrive within the probe deadline.
+    MetadataTimeout,
+    /// The workspace has no manifest to describe.
+    NoManifest,
+    /// The build system's description failed or could not be read; `detail` is the first line of its
+    /// error output.
+    MetadataFailed { detail: String },
+}
+
+/// The build targets a backend reports for the project.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetInventory {
+    /// The language has no units below the package (Python), so there is nothing to inventory.
+    #[default]
+    NotApplicable,
+    /// Every target of every package, with the text digest of each manifest the targets were read
+    /// from (the workspace root's and every package's), keyed by workspace-relative path.
+    Available {
+        targets: Vec<BuildTarget>,
+        manifests: std::collections::BTreeMap<String, String>,
+    },
+    /// The inventory could not be obtained.
+    Unavailable(InventoryFailure),
+}
+
 /// The full result a backend produces for a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedIndex {
@@ -212,12 +261,11 @@ pub struct ExtractedIndex {
     /// same-descriptor duplicate definitions.
     #[serde(default)]
     pub duplicate_groups: Vec<DuplicateGroup>,
-    /// The build system's authoritative library-target roots: package name → workspace-relative
-    /// document path of that package's library-target root (matching SCIP document paths). Supplied
-    /// by the backend as enrichment (e.g. from `cargo metadata --no-deps`); empty when unavailable —
-    /// consumers degrade to their typed refusals, never guess.
+    /// The build targets of the project's packages, as the build system declares them. Supplied by
+    /// the backend as enrichment (e.g. from `cargo metadata --no-deps`);
+    /// [`TargetInventory::NotApplicable`] for a backend whose packages have no units below them.
     #[serde(default)]
-    pub library_roots: std::collections::BTreeMap<String, String>,
+    pub targets: TargetInventory,
     /// The interpreter-environment facts the backend declares material to this index's meaning.
     /// Declared by the Python adapter; `None` for backends without an environment dependency (Rust).
     #[serde(default)]
@@ -298,7 +346,7 @@ pub fn normalize(index: ExtractedIndex) -> ExtractedIndex {
         documents: index.documents,
         symbols,
         duplicate_groups,
-        library_roots: index.library_roots,
+        targets: index.targets,
         environment: index.environment,
     }
 }
@@ -358,7 +406,7 @@ mod tests {
             ],
             symbols,
             duplicate_groups: Vec::new(),
-            library_roots: Default::default(),
+            targets: Default::default(),
             environment: None,
         }
     }

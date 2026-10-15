@@ -161,6 +161,22 @@ pub struct AliasBinding {
     pub binding_span: ByteSpan,
 }
 
+/// One Python relative import statement: `from <dots><module> import <names>`.
+///
+/// `module` holds the dotted components after the dots (empty for `from . import x`), and `names` the
+/// imported names with aliases dropped (a wildcard import has none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelativeImport {
+    /// The byte span of the whole statement.
+    pub span: ByteSpan,
+    /// The number of leading dots.
+    pub dots: usize,
+    /// The components of the module path after the dots.
+    pub module: Vec<String>,
+    /// The imported names, in source order.
+    pub names: Vec<String>,
+}
+
 /// The syntactic construct located at a byte span: its node kind, full span, and — for
 /// operator-shaped expressions — the operator token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +198,17 @@ pub struct CfgTestModule {
     pub name_span: ByteSpan,
     /// The whole `mod` item's span when the body is inline; `None` for `mod name;`.
     pub inline_span: Option<ByteSpan>,
+}
+
+/// What an out-of-line `mod name;` declaration says about the file that holds its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleFileRequest {
+    /// The declared module name.
+    pub name: String,
+    /// The names of the inline modules enclosing the declaration, outermost first.
+    pub inline_parents: Vec<String>,
+    /// The value of the declaration's `#[path = "..."]` attribute, when it has one.
+    pub path_attribute: Option<String>,
 }
 
 /// The shape of a Rust range construct (`range_expression` or `range_pattern`) at its operator
@@ -470,6 +497,70 @@ impl SyntaxTree {
         out
     }
 
+    /// Every Python relative import statement in the file, at any nesting depth, in no guaranteed
+    /// order. Empty for a Rust tree.
+    pub fn relative_imports(&self) -> Vec<RelativeImport> {
+        if self.language != Language::Python {
+            return Vec::new();
+        }
+        let root = self.tree.root_node();
+        let mut out = Vec::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "import_from_statement"
+                && let Some(import) = self.relative_import(node)
+            {
+                out.push(import);
+            }
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// The relative import an `import_from_statement` node declares, or `None` for an absolute import.
+    fn relative_import(&self, node: Node) -> Option<RelativeImport> {
+        let module = node.child_by_field_name("module_name")?;
+        if module.kind() != "relative_import" {
+            return None;
+        }
+        let mut cursor = module.walk();
+        let mut dots = 0;
+        let mut components = Vec::new();
+        for child in module.children(&mut cursor) {
+            match child.kind() {
+                "import_prefix" => dots = child.end_byte() - child.start_byte(),
+                "dotted_name" => components = self.dotted_components(child),
+                _ => {}
+            }
+        }
+        let mut cursor = node.walk();
+        let names = node
+            .children_by_field_name("name", &mut cursor)
+            .filter_map(|name| match name.kind() {
+                "aliased_import" => name.child_by_field_name("name"),
+                _ => Some(name),
+            })
+            .flat_map(|name| self.dotted_components(name))
+            .collect();
+        Some(RelativeImport {
+            span: span_of(node),
+            dots,
+            module: components,
+            names,
+        })
+    }
+
+    /// The identifier texts of a `dotted_name` node.
+    fn dotted_components(&self, node: Node) -> Vec<String> {
+        self.source[node.start_byte()..node.end_byte()]
+            .split('.')
+            .map(|part| part.trim().to_string())
+            .collect()
+    }
+
     /// Rust alias bindings, read from `use_as_clause` nodes under `use`/`pub use` declarations.
     ///
     /// The target token span is the terminal segment of the `path` field: the whole node for a bare
@@ -617,32 +708,66 @@ impl SyntaxTree {
     /// containment must gate reference occurrences through this check rather than trusting any
     /// reference.
     pub fn is_module_declaration_name(&self, span: ByteSpan) -> bool {
+        self.module_declaration_name_node(span).is_some()
+    }
+
+    /// The identifier node at `span` when it is the `name` field of a `mod_item`.
+    fn module_declaration_name_node(&self, span: ByteSpan) -> Option<Node<'_>> {
         // Python has no `mod`-style declaration, so the module-chain locality rule this check backs
         // is inert for Python: every Python span reports no module-declaration site.
         if self.language != Language::Rust {
-            return false;
+            return None;
         }
         let root = self.tree.root_node();
         let end = span.end.max(span.start + 1).min(root.end_byte());
-        let Some(mut node) = root.descendant_for_byte_range(span.start, end) else {
-            return false;
-        };
+        let mut node = root.descendant_for_byte_range(span.start, end)?;
         while !node.is_named() {
-            let Some(parent) = node.parent() else {
-                return false;
-            };
-            node = parent;
+            node = node.parent()?;
         }
         if node.kind() != "identifier" {
-            return false;
+            return None;
         }
-        let Some(parent) = node.parent() else {
-            return false;
-        };
-        parent.kind() == "mod_item"
+        let parent = node.parent()?;
+        let is_name = parent.kind() == "mod_item"
             && parent
                 .child_by_field_name("name")
-                .is_some_and(|name| span_of(name) == span_of(node))
+                .is_some_and(|name| span_of(name) == span_of(node));
+        is_name.then_some(node)
+    }
+
+    /// Where the out-of-line `mod name;` declaration named at `name_span` asks for its file.
+    ///
+    /// `None` when `name_span` is not the name of a `mod name;` declaration (an inline `mod name { .. }`
+    /// has no file). Rust only.
+    pub fn module_file_request(&self, name_span: ByteSpan) -> Option<ModuleFileRequest> {
+        let name = self.module_declaration_name_node(name_span)?;
+        let item = name.parent()?;
+        if item.child_by_field_name("body").is_some() {
+            return None;
+        }
+        let path_attribute = preceding_attributes(item)
+            .into_iter()
+            .filter(|attr| self.attribute_path_terminal(*attr) == Some("path"))
+            .find_map(|attr| {
+                let literal = self.text_at(span_of(attr.child_by_field_name("value")?))?;
+                Some(literal.strip_prefix('"')?.strip_suffix('"')?.to_string())
+            });
+        let mut inline_parents = Vec::new();
+        let mut ancestor = item.parent();
+        while let Some(node) = ancestor {
+            if node.kind() == "mod_item"
+                && let Some(parent_name) = node.child_by_field_name("name")
+            {
+                inline_parents.push(self.text_at(span_of(parent_name))?.to_string());
+            }
+            ancestor = node.parent();
+        }
+        inline_parents.reverse();
+        Some(ModuleFileRequest {
+            name: self.text_at(span_of(name))?.to_string(),
+            inline_parents,
+            path_attribute,
+        })
     }
 
     /// The span of the terminal segment of the nearest enclosing use path, for a `span` sitting on a
@@ -750,6 +875,37 @@ impl SyntaxTree {
             node = n.parent();
         }
         chain
+    }
+
+    /// The span of the first (leftmost) component of the Rust path whose final component is the name
+    /// token at `name_span`: `libbin` for the `load` of `libbin::util::load`, for a value path
+    /// (`scoped_identifier`) or a type path (`scoped_type_identifier`).
+    ///
+    /// Returns `None` when the token is not the final component of a path, or when the path does not
+    /// start with a plain identifier (`crate::`, `self::`, `super::`, or a leading `::`).
+    pub fn rust_path_first_component(&self, name_span: ByteSpan) -> Option<ByteSpan> {
+        if self.language != Language::Rust {
+            return None;
+        }
+        let mut path = self
+            .tree
+            .root_node()
+            .descendant_for_byte_range(name_span.start, name_span.end)?
+            .parent()
+            .filter(|parent| {
+                is_rust_scoped_path(*parent)
+                    && parent
+                        .child_by_field_name("name")
+                        .is_some_and(|name| span_of(name) == name_span)
+            })?;
+        loop {
+            let first = path.child_by_field_name("path")?;
+            if is_rust_scoped_path(first) {
+                path = first;
+            } else {
+                return (first.kind() == "identifier").then(|| span_of(first));
+            }
+        }
     }
 
     /// Every persisted declaration in the file, each with its name and full span.
@@ -1254,6 +1410,11 @@ fn is_tuple_field_index(node: Node) -> bool {
     })
 }
 
+/// Whether a node is a Rust value path (`a::b`) or type path (`A::B` in a type position).
+fn is_rust_scoped_path(node: Node) -> bool {
+    matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")
+}
+
 /// The terminal segment of a Rust `use_as_clause`'s `path` field: the node itself for a bare
 /// `identifier` or the path keyword `crate`/`self`/`super`, or the `name` field's identifier for a
 /// `scoped_identifier` (`a::b` → `b`). Returns `None` for a path shape with no resolvable terminal
@@ -1510,6 +1671,33 @@ mod net {
         let connect_def = span_of_token("connect", 1);
         let name = tree.name_node_containing(connect_def).unwrap();
         assert_eq!(tree.text_at(name), Some("connect"));
+    }
+
+    #[test]
+    fn rust_path_first_component_reads_value_and_type_paths() {
+        const PATHS: &str = "fn f() {\n    libbin::util::load();\n    let _: libbin::util::Config;\n    \
+                             crate::util::load();\n    self::util::load();\n    super::util::load();\n    \
+                             ::libbin::util::load();\n    util::load();\n}\n";
+        let tree = SyntaxTree::parse(PATHS, Language::Rust).unwrap();
+        let first = |token: &str, n: usize| {
+            let start = PATHS.match_indices(token).nth(n).unwrap().0;
+            let span = ByteSpan {
+                start,
+                end: start + token.len(),
+            };
+            tree.rust_path_first_component(span).map(|s| tree.text_at(s).unwrap())
+        };
+        // `load` occurrences: 0 qualified, 1 crate::, 2 self::, 3 super::, 4 ::libbin::, 5 util::.
+        assert_eq!(first("load", 0), Some("libbin"));
+        assert_eq!(first("Config", 0), Some("libbin"));
+        assert_eq!(first("load", 1), None);
+        assert_eq!(first("load", 2), None);
+        assert_eq!(first("load", 3), None);
+        assert_eq!(first("load", 4), None);
+        assert_eq!(first("load", 5), Some("util"));
+        // A middle component is the final component of the shorter path before it.
+        assert_eq!(first("util", 0), Some("libbin"));
+        assert_eq!(first("libbin", 0), None);
     }
 
     #[test]
@@ -1933,6 +2121,49 @@ TOP_LEVEL = 1
                 && b.alias_name_span == from_alias
                 && b.binding_span == from_binding),
             "`from m import n as c2` binds alias `c2` to target `n` across binding span `n as c2`: {bindings:?}"
+        );
+    }
+
+    // Each relative import form yields its dots, module components, and imported names (aliases
+    // dropped); absolute imports and nested statements are handled.
+    #[test]
+    fn python_relative_imports_enumerate() {
+        let src = "from .shapes import W\nfrom . import (a, b as c)\nfrom ..x.y import *\nfrom m import n\nimport o\n\
+                   def f():\n    from ... import z\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+        let mut imports = tree.relative_imports();
+        imports.sort_by_key(|i| (i.dots, i.module.clone()));
+        let expected = |dots: usize, module: &[&str], names: &[&str]| {
+            (
+                dots,
+                module.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            imports
+                .iter()
+                .map(|i| (i.dots, i.module.clone(), i.names.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                expected(1, &[], &["a", "b"]),
+                expected(1, &["shapes"], &["W"]),
+                expected(2, &["x", "y"], &[]),
+                expected(3, &[], &["z"]),
+            ]
+        );
+    }
+
+    // A relative import carries the byte span of its whole statement.
+    #[test]
+    fn python_relative_import_spans_cover_the_statement() {
+        let src = "x = 1\nfrom .shapes import W\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+        let imports = tree.relative_imports();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(
+            &src[imports[0].span.start..imports[0].span.end],
+            "from .shapes import W"
         );
     }
 

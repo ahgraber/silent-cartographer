@@ -84,7 +84,7 @@ A symbol reported as a whole-symbol clone has no fragment rows.
 One symbol can have several fragment rows, one for each separate run it shares with the subject.
 
 Fragment rows are ordered by `token_length` descending, then by the other symbol's canonical identity, then by the start of the subject run, then by the start of the other run.
-The human rendering prints each run's span under its row, in the unit `--position` selects.
+The human rendering prints each run's span under its row, in the form `--position` selects.
 
 Runs are read from the text the index was built from, not from the files in the workspace.
 After a file changes without a rebuild, the answer still reports the runs of the indexed text and is marked stale.

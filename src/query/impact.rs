@@ -625,6 +625,7 @@ mod tests {
                 accounting: JoinAccounting::default(),
                 environment: None,
                 chunk_params: Default::default(),
+                targets: Default::default(),
             })
             .unwrap();
     }

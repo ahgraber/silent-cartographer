@@ -77,7 +77,7 @@ fn non_conformant_backend_is_rejected() {
             }],
         }],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let engine = FixtureEngine::new(broken);
@@ -183,7 +183,7 @@ fn merged_twins_are_split_through_the_backend_contract() {
             ],
         }],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
 
@@ -284,6 +284,31 @@ fn generate_exemplar_scip_fixture() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exemplar.scip");
     scip::write_message_to_file(&path, exemplar_scip_index()).expect("write fixture");
     assert!(path.exists());
+}
+
+// _(Module classification stays in the Python adapter)_ — the Rust translation reports every
+// symbol's kind itself; module classification (a module-only descriptor is a module) would change
+// none of them, and the Rust path does not apply it.
+#[test]
+fn rust_translation_kinds_are_not_reclassified() {
+    use silent_cartographer::semantic::python_adapter::classify_module_kinds;
+    use silent_cartographer::semantic::rust_adapter::translate_index;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exemplar.scip");
+    let bytes = std::fs::read(&path).expect("checked-in exemplar.scip fixture present");
+    let index: scip::types::Index = protobuf::Message::parse_from_bytes(&bytes).expect("valid SCIP protobuf");
+    let provenance = AnalyzerProvenance {
+        analyzer_name: index.metadata.tool_info.name.clone(),
+        analyzer_version: index.metadata.tool_info.version.clone(),
+    };
+    let translated = translate_index(&index, &provenance);
+
+    let mut classified = translated.clone();
+    classify_module_kinds(&mut classified);
+    let kinds = |index: &silent_cartographer::semantic::model::ExtractedIndex| {
+        index.symbols.iter().map(|s| s.kind).collect::<Vec<_>>()
+    };
+    assert_eq!(kinds(&translated), kinds(&classified));
 }
 
 // _(Mandatory extraction contract — exemplar write-site)_ — a checked-in SCIP index fixture run
@@ -395,6 +420,28 @@ fn generate_ty_scip_conformance_fixture() {
     std::fs::write(root.join("TY-SCIP-VERSION"), format!("{version}\n")).expect("record tool version");
 }
 
+/// One-off generator for the checked-in Rust fixture index. Run explicitly to (re)create it:
+/// `cargo test --release --test semantic_engine generate_rust_conformance_scip_fixture -- --ignored --exact`
+///
+/// Generates THROUGH the adapter, whose `analyze` writes `index.scip` into the project directory, so
+/// the committed bytes reflect exactly what a build would parse. Needs `rust-analyzer` on PATH.
+#[test]
+#[ignore = "fixture generator; needs rust-analyzer; run explicitly to regenerate tests/fixtures/rust-conformance/index.scip"]
+fn generate_rust_conformance_scip_fixture() {
+    use silent_cartographer::semantic::SemanticEngine;
+    use silent_cartographer::semantic::rust_adapter::RustAdapter;
+
+    let root = support::rust_fixture_root();
+    let adapter =
+        RustAdapter::new("rust-analyzer").expect("rust-analyzer is required: rustup component add rust-analyzer");
+    adapter.analyze(&root).expect("rust-analyzer scip runs");
+    assert!(root.join("index.scip").exists());
+
+    // Record the tool version the committed index was generated with, inside the fixture dir.
+    let version = adapter.provenance().analyzer_version;
+    std::fs::write(root.join("RUST-ANALYZER-VERSION"), format!("{version}\n")).expect("record tool version");
+}
+
 /// The committed Python fixture indexes, one per Python indexer.
 const PYTHON_FIXTURE_INDEXES: [&str; 2] = ["index.scip", "ty-scip.scip"];
 
@@ -482,7 +529,7 @@ fn nonconformant_backend_does_not_affect_the_other() {
             }],
         }],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let broken = FixtureEngine::new(broken_index);
@@ -519,9 +566,9 @@ fn python_live_tool_matches_committed_fixture_shape() {
     let root = dir.path();
     let fixture = support::python_fixture_root();
     std::fs::copy(fixture.join("pyproject.toml"), root.join("pyproject.toml")).unwrap();
-    std::fs::create_dir(root.join("pkg")).unwrap();
-    for rel in ["pkg/__init__.py", "pkg/consumer.py", "pkg/shapes.py"] {
-        std::fs::copy(fixture.join(rel), root.join(rel)).unwrap();
+    for (rel, _) in support::python_fixture_sources() {
+        std::fs::create_dir_all(root.join(&rel).parent().unwrap()).unwrap();
+        std::fs::copy(fixture.join(&rel), root.join(&rel)).unwrap();
     }
     let venv = root.join(".venv");
     let status = std::process::Command::new("python3")

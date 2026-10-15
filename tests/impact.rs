@@ -1040,7 +1040,7 @@ fn python_located_repo() -> LocatedRepo {
             ),
         ],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
 
@@ -1671,7 +1671,7 @@ fn diff_larger_than_64kib_seeds_every_touched_symbol() {
         }],
         symbols: Vec::new(),
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     index.symbols.push(ExtractedSymbol {

@@ -12,12 +12,13 @@ pub mod rank;
 pub mod schema;
 pub mod store;
 pub mod syntax;
+pub mod units;
 
 use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::identity::{CanonicalId, DefinitionSite, ProjectionInput, WorkspaceId, project_all};
+use crate::identity::{CanonicalId, DefinitionSite, ProjectionInput, WorkspaceId, project_all, project_one};
 use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SymbolClass, SymbolKind};
 use crate::semantic::python_adapter::PythonIndexer;
 use crate::semantic::rust_adapter::RustAdapter;
@@ -26,9 +27,11 @@ use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join, module_by_docu
 use prepared::PreparedCorpus;
 use range::{ByteSpan, LineColumnSpan, PositionIndex};
 use store::{
-    DiscrepancyRow, EdgeKind, Freshness, GraphStore, IndexMetadata, OccurrenceRow, PersistedClass, SymbolRow,
+    DiscrepancyRow, EdgeKind, Freshness, GraphStore, IndexMetadata, OccurrenceRow, PersistedClass, RecordedTargets,
+    SymbolRow,
 };
 use syntax::Language;
+use units::{UndeterminedUnits, Unit, assign_units, declared_from, document_units, single_parent_map};
 
 /// An error during ingest.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +77,15 @@ pub fn text_hash(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     hex_digest(hasher)
+}
+
+/// The only item of `items`, or `None` when there are none or several.
+pub(crate) fn exactly_one<I: IntoIterator>(items: I) -> Option<I::Item> {
+    let mut items = items.into_iter();
+    match (items.next(), items.next()) {
+        (Some(item), None) => Some(item),
+        _ => None,
+    }
 }
 
 /// How a source file differs between an indexed source list and a discovered one.
@@ -158,8 +170,9 @@ fn kind_tag(kind: SymbolKind) -> &'static str {
 /// Project canonical identities for the persisted symbols of `index` under `workspace`.
 ///
 /// Local symbols (no descriptor) receive `None` and are excluded from the persisted base; every
-/// other symbol receives an identity via collision-only disambiguation.
-fn project_identities(workspace: &WorkspaceId, index: &ExtractedIndex) -> Vec<Option<CanonicalId>> {
+/// other symbol receives an identity via collision-only disambiguation. `units[i]` places
+/// `index.symbols[i]` in its build unit; the descriptors themselves carry no unit.
+fn project_identities(workspace: &WorkspaceId, index: &ExtractedIndex, units: &[Unit]) -> Vec<Option<CanonicalId>> {
     // Gather the projection inputs of persisted symbols, remembering their positions. Each input
     // carries its definition location so a collision group ranks by where each twin is defined, not
     // by the order symbols were encountered; the first occurrence is the fallback for a symbol the
@@ -173,6 +186,7 @@ fn project_identities(workspace: &WorkspaceId, index: &ExtractedIndex) -> Vec<Op
         if let Some(d) = &sym.descriptor {
             inputs.push(ProjectionInput {
                 descriptor: d.clone(),
+                unit: units[idx].unit_marker(),
                 definition: sym.definition().map(occurrence_site),
                 fallback: sym.occurrences.first().map(occurrence_site),
             });
@@ -238,10 +252,12 @@ pub fn ingest(
         sources,
         &chunk::ChunkParams::default(),
     )
+    .map(|(accounting, _)| accounting)
 }
 
 /// [`ingest`] under explicit chunk parameters: the parameters shape every chunk the build embeds
-/// and are recorded with the store as part of the semantic-index identity.
+/// and are recorded with the store as part of the semantic-index identity. Returns the join
+/// accounting and the disclosure of every declaration unit that could not be determined.
 pub fn ingest_with_params(
     store: &mut GraphStore,
     workspace: &WorkspaceId,
@@ -249,18 +265,33 @@ pub fn ingest_with_params(
     index: &ExtractedIndex,
     sources: &[(String, String)],
     chunk_params: &chunk::ChunkParams,
-) -> Result<JoinAccounting, IngestError> {
-    let identities = project_identities(workspace, index);
+) -> Result<(JoinAccounting, UndeterminedUnits), IngestError> {
     let language = backend_language(&index.provenance.analyzer_name)?;
     let corpus = SourceCorpus::new(sources.iter().map(|(p, t)| (p.as_str(), t.as_str())));
     // One parse per document: every syntax-reading derivation below borrows this corpus rather
     // than parsing anything itself.
     let prepared = PreparedCorpus::prepare(&corpus, language);
+    // The `mod`-declaration evidence feeds two consumers: the unit derivation that decides each
+    // identity, and the join's module-chain locality.
+    let declarations = declared_from(index, &prepared);
+    let (units, unit_disclosure) = assign_units(index, &declarations);
+    let identities = project_identities(workspace, index, &units);
+    let parent_of = single_parent_map(&declarations);
+    let document_unit = document_units(index, &declarations);
     // The document→module derivation runs before the join: the join's self-name and super-keyword
     // rules compare each occurrence against its containing document's own module, and the module
     // bookkeeping below reads the same map — one derivation, two consumers.
     let doc_module = module_by_document(index, &identities, &prepared, language);
-    let join_result = join(index, &prepared, &identities, language, &doc_module);
+    let join_result = join(
+        index,
+        &prepared,
+        &identities,
+        language,
+        &doc_module,
+        &parent_of,
+        &units,
+        &document_unit,
+    );
 
     let content = content_hash(sources);
 
@@ -397,6 +428,9 @@ pub fn ingest_with_params(
     // The rows are retained after insertion: the semantic-corpus pass below reads their tier
     // content and containment to assemble the corpus.
     let mut symbol_rows: Vec<SymbolRow> = Vec::new();
+    // The unit-free identity of each duplicated symbol's descriptor, so twins belonging to different
+    // units still group together.
+    let mut duplicate_keys: Vec<(CanonicalId, String)> = Vec::new();
     for (idx, sym) in index.symbols.iter().enumerate() {
         let Some(Some(id)) = identities.get(idx) else {
             continue;
@@ -435,6 +469,10 @@ pub fn ingest_with_params(
                 .descriptor
                 .as_ref()
                 .is_some_and(|d| definition_count_by_descriptor.get(d).copied().unwrap_or(0) > 1);
+        if duplicated && let Some(descriptor) = &sym.descriptor {
+            let key = project_one(workspace, descriptor);
+            duplicate_keys.push((id.clone(), key.as_str().to_string()));
+        }
         let content = definition_content(sym, id, &def_name_span, &prepared);
         let symbol_line_column = match (&content.document_path, content.span) {
             (Some(document), Some((start, end))) => line_column(document, start, end),
@@ -466,6 +504,7 @@ pub fn ingest_with_params(
     for row in &symbol_rows {
         store.insert_symbol(row)?;
     }
+    store.record_duplicate_keys(&duplicate_keys)?;
     // Which symbols contribute passages, decided from tier content alone. Containment for
     // corpus purposes counts contributing children only — a symbol enclosing nothing but name-only
     // symbols (a Python function over its parameter symbols) stays a leaf — so both containment
@@ -791,13 +830,17 @@ pub fn ingest_with_params(
         accounting: join_result.accounting,
         environment: index.environment.clone(),
         chunk_params: *chunk_params,
+        targets: RecordedTargets {
+            inventory: index.targets.clone(),
+            undetermined_units: unit_disclosure.clone(),
+        },
     })?;
 
     // The single commit publishes the whole build atomically: a crash anywhere above rolls back to
     // the prior build wholesale, so fresh metadata can never coexist with another build's rows.
     tx.commit()?;
 
-    Ok(join_result.accounting)
+    Ok((join_result.accounting, unit_disclosure))
 }
 
 /// Refuse to join a fresh syntax tree against a stale index: verify the sources hash to the recorded
@@ -1228,7 +1271,7 @@ pub(crate) mod work_bound_fixture {
                 .collect(),
             symbols: docs.iter().flat_map(|(_, symbols)| symbols.clone()).collect(),
             duplicate_groups: Vec::new(),
-            library_roots: Default::default(),
+            targets: Default::default(),
             environment: None,
         }
     }

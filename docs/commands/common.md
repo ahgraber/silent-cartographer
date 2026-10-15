@@ -4,13 +4,13 @@ Flags and behavior shared by the whole command surface.
 
 ## Shared flags
 
-| Flag                            | Default                             | Meaning                                                                  |
-| ------------------------------- | ----------------------------------- | ------------------------------------------------------------------------ |
-| `--db <PATH>`                   | `.c10r/index.db`                    | Path to the SQLite index                                                 |
-| `--workspace <NAME>`            | the workspace root's directory name | The workspace identity that symbols are namespaced under                 |
-| `--json`                        | off                                 | Print the structured answer instead of the human rendering               |
-| `--color <auto\|always\|never>` | `auto`                              | `auto` styles only when standard output is a terminal                    |
-| `--position <line\|byte>`       | `line`                              | The unit of printed locations and of `--at`; see [positions](#positions) |
+| Flag                            | Default                             | Meaning                                                                                               |
+| ------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `--db <PATH>`                   | `.c10r/index.db`                    | Path to the SQLite index                                                                              |
+| `--workspace <NAME>`            | the workspace root's directory name | The workspace identity that symbols are namespaced under                                              |
+| `--json`                        | off                                 | Print the structured answer instead of the human rendering                                            |
+| `--color <auto\|always\|never>` | `auto`                              | `auto` styles only when standard output is a terminal                                                 |
+| `--position <line\|byte>`       | `line`                              | Whether printed locations and `--at` use line and column or byte offsets; see [positions](#positions) |
 
 Result-bearing commands (`get`, `trace`, `find`, `search`, `similar`, `clones`, `impact`) also take:
 
@@ -29,13 +29,52 @@ Result-bearing commands (`get`, `trace`, `find`, `search`, `similar`, `clones`, 
 
 An ambiguous reference returns the candidate set to choose from.
 
+### The canonical identity
+
+A canonical identity has the form `workspace::package[+marker]::segments`.
+The `workspace` part is the `--workspace` name.
+The `package` part is the Cargo package or the Python project.
+A package unit is the part of a package that is compiled or loaded as one piece.
+The optional `+unit` marker names it:
+
+| Marker       | Names                                                                             |
+| ------------ | --------------------------------------------------------------------------------- |
+| none         | The package's default unit: the Rust library, or a Python project                 |
+| `+kind.name` | Another Cargo target, for example `+bin.tool`, `+test.a`, or `+example.x`         |
+| `+shared`    | A file that more than one target compiles, for example a helper used by two tests |
+
+The `segments` part follows the language's own qualified name.
+In Python, there is one segment per component of the module path, and no segment for `__init__`.
+In Rust, there is one segment per module, starting below the crate root.
+The crate root is not a segment of the items below it.
+
+In a workspace `rust-libbin` with a package `libbin` that has a library and a binary `tool`, where both declare `mod util { Config }`:
+
+```text
+rust-libbin::libbin::util::Config
+rust-libbin::libbin+bin.tool::util::Config
+```
+
+In a Python workspace `flask` with a project `flask`, the class `Flask` in the module `flask.app` has this identity:
+
+```text
+flask::flask::flask::app::Flask
+```
+
+A reference resolves in these ways:
+
+- A package-qualified Rust path such as `libbin::util::Config` resolves to the library's declaration only.
+- A path that two targets declare, such as `util::Config`, returns both as candidates.
+- A full identity with a marker, such as `rust-libbin::libbin+bin.tool::util::Config`, resolves exactly.
+- A Python dotted name such as `flask.app.Flask` resolves to the declaration with that module path.
+
 `get`, `similar`, and `clones` also accept `--at` instead of a reference, which resolves to a symbol by source position; see [positions](#positions).
 
 ## Positions
 
 Every location in an answer is a file path plus a position in that file's text.
-`--position` selects the unit the human rendering prints and the unit `--at` reads.
-It does not change the `--json` answer, which carries both units.
+`--position` selects whether the human rendering prints locations, and `--at` reads them, as line and column or as byte offsets.
+It does not change the `--json` answer, which carries both forms.
 
 Under the default `--position line`, a location prints as `path:line:column`, the form editors and terminals open as a link:
 
@@ -54,7 +93,7 @@ Under `--position byte`, a location prints as its byte span, `path:start-end`, a
 src/client.rs:240-318
 ```
 
-Every location object in a `--json` answer carries both units: `span_start` and `span_end` are byte offsets, and `start_line`, `start_column`, `end_line`, and `end_column` are the line and column of the same two positions.
+Every location object in a `--json` answer carries both forms: `span_start` and `span_end` are byte offsets, and `start_line`, `start_column`, `end_line`, and `end_column` are the line and column of the same two positions.
 Where a location has no byte offsets, the four line and column fields are `null` too.
 Lines and columns describe the text that was indexed, so in a stale answer they can differ from the file as it is now.
 
@@ -77,7 +116,7 @@ Under `--position byte`, `--at path:byte_offset` resolves to the innermost symbo
 The position is split from the right, so a path that contains `:` stays usable.
 A path whose own name ends in `:<digits>` is the exception: under `--position line`, `dir/a:12:5` reads as `dir/a`, line 12, column 5.
 
-A continuation token from a paged `--at` query is bound to the unit it was issued under and is refused under the other.
+A continuation token from a paged `--at` query is bound to the `--position` setting it was issued under and is refused under the other.
 
 ## Content detail
 
@@ -98,7 +137,7 @@ Its default also differs per command.
 
 ## Reading an answer
 
-Provenance, freshness, typed absence, and heuristic labels work the same way for every command; see [reading an answer](../../README.md#reading-an-answer).
+Provenance, freshness, typed absence, and heuristic labels work the same way for every command.
 
 ## The `refresh` field
 

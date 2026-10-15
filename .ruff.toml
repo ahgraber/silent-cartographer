@@ -16,6 +16,8 @@ extend-exclude = [
   ".git",
   ".nox",
   ".tox",
+  # Fixture projects are indexer input whose committed indexes record exact source positions.
+  "tests/fixtures",
 ]
 extend-include = ["*.ipynb"]
 

@@ -1,0 +1,15 @@
+libbin+bin.tool::crate
+libbin+bin.tool::main
+libbin+bin.tool::util
+libbin+bin.tool::util::Config
+libbin+bin.tool::util::load
+libbin+shared::common
+libbin+shared::common::fixture
+libbin+test.a::a
+libbin+test.a::crate
+libbin+test.b::b
+libbin+test.b::crate
+libbin::crate
+libbin::util
+libbin::util::Config
+libbin::util::load

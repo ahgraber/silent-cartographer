@@ -109,6 +109,19 @@ Add `--json` to any query for the machine-readable answer.
 
 Agents should start with `c10r manifest`, which prints the whole command surface — commands, flags, valid values, defaults — as JSON, versioned so a cached copy can be invalidated.
 
+### Symbol identities
+
+Every answer names a symbol by its canonical identity: `workspace::package[+marker]::segments`.
+A marker such as `+bin.tool` or `+test.a` shows that the symbol belongs to a Cargo target other than the library.
+A short name, a qualified name, a Python dotted name, or the full identity selects a symbol:
+
+```sh
+c10r get libbin::util::Config                       # the library's declaration
+c10r get rust-libbin::libbin+bin.tool::util::Config # the binary's declaration
+```
+
+See [naming a symbol](docs/commands/common.md#naming-a-symbol) for the grammar and the resolution rules.
+
 ## Commands
 
 | Command                                       | Question it answers                                                                                             |

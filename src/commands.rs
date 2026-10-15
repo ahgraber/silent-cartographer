@@ -16,8 +16,9 @@ use crate::git::{GitError, GitRepo, SeedMode};
 use crate::graph::chunk::ChunkParams;
 use crate::graph::join::JoinAccounting;
 use crate::graph::range::LineColumn;
-use crate::graph::store::{Freshness, GraphStore, IndexMetadata, StoreOpenError, stale_reasons_of};
+use crate::graph::store::{Freshness, GraphStore, IndexMetadata, RecordedTargets, StoreOpenError, stale_reasons_of};
 use crate::graph::syntax::Language;
+use crate::graph::units::UndeterminedUnits;
 use crate::graph::{SourceChange, SourceDifference, compare_source_files, content_hash, ingest, text_hash};
 use crate::identity::WorkspaceId;
 use crate::query::diff::{self, FileChange};
@@ -30,7 +31,9 @@ use crate::query::page::{
 use crate::query::resolve::SourcePosition;
 use crate::query::search::{MutualPair, RelationLabel, SimilarItem, exclude_relations};
 use crate::query::{Detail, OrderMode, QueryEngine, Relation};
-use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex};
+use crate::semantic::model::{
+    AnalyzerProvenance, EnvironmentFacts, ExtractedIndex, InventoryFailure, TargetInventory,
+};
 use crate::semantic::probe::PROBE_DEADLINE;
 use crate::semantic::python_adapter::{
     PythonAdapter, PythonIndexer, environment_facts, resolve_environment, select_python_indexer,
@@ -641,7 +644,7 @@ pub fn run_build(
     // Nothing to do when the store already describes this workspace under this analyzer,
     // environment, and chunk parameters: analyzing would reproduce the rows it already holds.
     if !force
-        && let Some(accounting) = current_index_accounting(
+        && let Some(current) = current_index_accounting(
             db,
             &workspace_id,
             &sources,
@@ -652,7 +655,12 @@ pub fn run_build(
             chunk_params,
         )?
     {
-        return Ok(BuildOutcome::AlreadyCurrent(accounting));
+        return Ok(BuildOutcome {
+            accounting: current.accounting,
+            undetermined_units: current.undetermined_units,
+            changed_during_build: Vec::new(),
+            rebuilt: false,
+        });
     }
 
     // `analyze` runs before the store is opened, so a failure here leaves any existing store as it was.
@@ -668,7 +676,7 @@ pub fn run_build(
     // replayable data, so rebuild is the migration. A file c10r did not create is refused instead.
     let mut store = GraphStore::open_or_replace(db).context("opening index database")?;
     disclose_workspace_handoff(&store, workspace_root.as_deref());
-    let accounting = crate::graph::ingest_with_params(
+    let (accounting, undetermined_units) = crate::graph::ingest_with_params(
         &mut store,
         &workspace_id,
         workspace_root.as_deref(),
@@ -685,10 +693,12 @@ pub fn run_build(
         .iter()
         .map(|(p, t)| (p.clone(), text_hash(t)))
         .collect();
-    Ok(BuildOutcome::Rebuilt(
+    Ok(BuildOutcome {
         accounting,
-        compare_source_files(&indexed, &rediscovered),
-    ))
+        undetermined_units,
+        changed_during_build: compare_source_files(&indexed, &rediscovered),
+        rebuilt: true,
+    })
 }
 
 /// The `(document_path, text)` sources discovery finds under `root` for `language`.
@@ -701,39 +711,24 @@ fn collect_language_sources(language: Language, root: &Path) -> Result<Vec<(Stri
 
 /// The outcome of a build request: the workspace was analyzed and the store rewritten, or the store
 /// already described the workspace and nothing was analyzed or written.
-///
-/// Both carry the same accounting — the freshly produced one, or the one the store recorded when it
-/// was built — so a caller renders one answer shape either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BuildOutcome {
-    /// The workspace was analyzed and the store rebuilt, with the source files that differed between
-    /// the list indexed and a second discovery pass after the store write.
-    Rebuilt(crate::graph::join::JoinAccounting, Vec<SourceDifference>),
-    /// The stored index already described the workspace's sources, analyzer, and environment.
-    AlreadyCurrent(crate::graph::join::JoinAccounting),
+pub struct BuildOutcome {
+    /// The join accounting the build produced, or the one the current store already recorded.
+    pub accounting: crate::graph::join::JoinAccounting,
+    /// The packages and documents whose units the build could not determine; for an index found
+    /// current, those the build that wrote it recorded. Empty when every unit was determined.
+    pub undetermined_units: UndeterminedUnits,
+    /// The source files that differed between the list indexed and a second discovery pass after the
+    /// store write; empty when nothing moved or nothing was analyzed.
+    pub changed_during_build: Vec<SourceDifference>,
+    /// Whether the workspace was analyzed and the store rewritten, rather than found already current.
+    pub rebuilt: bool,
 }
 
-impl BuildOutcome {
-    /// The join accounting the build produced, or the one the current store already recorded.
-    pub fn accounting(&self) -> crate::graph::join::JoinAccounting {
-        match self {
-            BuildOutcome::Rebuilt(accounting, _) | BuildOutcome::AlreadyCurrent(accounting) => *accounting,
-        }
-    }
-
-    /// The source files that changed, appeared, or disappeared while the build ran; empty when
-    /// nothing moved or nothing was analyzed.
-    pub fn changed_during_build(&self) -> &[SourceDifference] {
-        match self {
-            BuildOutcome::Rebuilt(_, changed) => changed,
-            BuildOutcome::AlreadyCurrent(_) => &[],
-        }
-    }
-
-    /// Whether the workspace was analyzed and the store rewritten.
-    pub fn rebuilt(&self) -> bool {
-        matches!(self, BuildOutcome::Rebuilt(..))
-    }
+/// What a store that already describes the workspace recorded when it was built.
+struct CurrentIndex {
+    accounting: crate::graph::join::JoinAccounting,
+    undetermined_units: UndeterminedUnits,
 }
 
 /// The accounting recorded by a store that already describes `sources` under `engine`'s analyzer,
@@ -753,7 +748,7 @@ fn current_index_accounting(
     environment: Option<&Path>,
     root: &Path,
     chunk_params: &ChunkParams,
-) -> Result<Option<crate::graph::join::JoinAccounting>> {
+) -> Result<Option<CurrentIndex>> {
     if !db.exists() {
         return Ok(None);
     }
@@ -789,9 +784,33 @@ fn current_index_accounting(
     if metadata.chunk_params != *chunk_params {
         return Ok(None);
     }
+    // Declaration units come from the build targets, which no source file spells out: a manifest
+    // edit can rename or move a target without touching a source. The recorded manifests plus the
+    // source comparison below determine the targets, so this check never runs `cargo metadata`.
+    if language == Language::Rust && !recorded_targets_are_current(&metadata.targets, root) {
+        return Ok(None);
+    }
     let hash = content_hash(sources);
     let fresh = crate::graph::store::freshness_of(&metadata, &hash, &engine.provenance(), environment_facts.as_ref());
-    Ok((fresh == Freshness::Fresh).then_some(metadata.accounting))
+    Ok((fresh == Freshness::Fresh).then_some(CurrentIndex {
+        accounting: metadata.accounting,
+        undetermined_units: metadata.targets.undetermined_units,
+    }))
+}
+
+/// Whether the build targets a Rust store recorded still describe the project at `root`: the
+/// inventory was obtained, the root manifest and every manifest a target names have a recorded
+/// digest, and each digest matches. A manifest that is gone or unreadable counts as changed.
+fn recorded_targets_are_current(recorded: &RecordedTargets, root: &Path) -> bool {
+    let TargetInventory::Available { targets, manifests } = &recorded.inventory else {
+        return false;
+    };
+    crate::semantic::rust_adapter::required_manifests(targets)
+        .into_iter()
+        .all(|path| manifests.contains_key(path))
+        && manifests.iter().all(|(path, digest)| {
+            std::fs::read_to_string(root.join(path)).is_ok_and(|text| text_hash(&text) == *digest)
+        })
 }
 
 /// The canonicalized workspace root a build records and a query compares against, or `None` when the
@@ -869,35 +888,78 @@ fn aligned_buckets_json(accounting: &JoinAccounting) -> serde_json::Value {
 /// `<change> during build: path` line per source file that moved while it ran, or a statement that
 /// the stored index already described the workspace and nothing was analyzed.
 pub fn build_outcome_line(outcome: &BuildOutcome) -> String {
-    match outcome {
-        BuildOutcome::Rebuilt(accounting, changed) => {
-            let mut lines = vec![build_accounting_line(accounting)];
-            lines.extend(changed.iter().map(|difference| {
-                crate::render::sanitize(&format!(
-                    "{} during build: {}",
-                    difference.change.label(),
-                    difference.document_path
-                ))
-            }));
-            lines.join("\n")
-        }
-        BuildOutcome::AlreadyCurrent(_) => {
-            "already current: sources, analyzer, and environment match the stored index; nothing built \
-             (use --force to build anyway)"
-                .to_string()
-        }
-    }
+    let mut lines = vec![if outcome.rebuilt {
+        build_accounting_line(&outcome.accounting)
+    } else {
+        "already current: sources, analyzer, and environment match the stored index; nothing built \
+         (use --force to build anyway)"
+            .to_string()
+    }];
+    lines.extend(unit_warnings(&outcome.undetermined_units));
+    lines.extend(outcome.changed_during_build.iter().map(|difference| {
+        crate::render::sanitize(&format!(
+            "{} during build: {}",
+            difference.change.label(),
+            difference.document_path
+        ))
+    }));
+    lines.join("\n")
+}
+
+/// One warning per declaration unit the build could not determine: what c10r could not do, why,
+/// what it means for answers, and what the user can do.
+fn unit_warnings(undetermined_units: &UndeterminedUnits) -> Vec<String> {
+    let consequence = "Code in its binaries, tests, and examples is labeled as library code, so a reference \
+                       between same-named items in different targets may point to the wrong one.";
+    let packages = undetermined_units.packages.iter().map(|entry| {
+        let package = crate::render::sanitize(&entry.package);
+        let (cause, remedy) = match &entry.cause {
+            InventoryFailure::MetadataTimeout => (
+                format!(
+                    "`cargo metadata` did not finish within {} s",
+                    PROBE_DEADLINE.as_secs()
+                ),
+                "Run `c10r build` again; if this repeats, run `cargo metadata --no-deps` in the workspace to see \
+                 what is slow."
+                    .to_string(),
+            ),
+            InventoryFailure::NoManifest => (
+                "the workspace has no `Cargo.toml` (the build was forced with `--language rust`)".to_string(),
+                "Build from a directory that has a `Cargo.toml` to label each target's code.".to_string(),
+            ),
+            InventoryFailure::MetadataFailed { detail } => (
+                format!("`cargo metadata` failed: {}", crate::render::sanitize(detail)),
+                "Fix the error, then run `c10r build` again.".to_string(),
+            ),
+        };
+        format!(
+            "warning: could not determine the Cargo targets of package {package}, because {cause}.\n  {consequence}\n  {remedy}"
+        )
+    });
+    let documents = undetermined_units.documents.iter().map(|entry| {
+        format!(
+            "warning: could not place {} in any Cargo target, because no `mod` declaration in a target loads it.\n  \
+             Its code is labeled as library code. If the file is no longer used, deleting it removes this warning.",
+            crate::render::sanitize(&entry.document_path)
+        )
+    });
+    packages.chain(documents).collect()
 }
 
 /// The structured `build` answer: the accounting projection, plus whether this invocation rebuilt
-/// the store or found it already current, and the files that moved while it ran.
+/// the store or found it already current, the files that moved while it ran, and the packages and
+/// documents whose units could not be determined.
 pub fn build_outcome_json(outcome: &BuildOutcome) -> serde_json::Value {
-    let mut value = build_accounting_json(&outcome.accounting());
+    let mut value = build_accounting_json(&outcome.accounting);
     if let Some(object) = value.as_object_mut() {
-        object.insert("rebuilt".to_string(), serde_json::Value::Bool(outcome.rebuilt()));
+        object.insert("rebuilt".to_string(), serde_json::Value::Bool(outcome.rebuilt));
         object.insert(
             "changed_during_build".to_string(),
-            serde_json::to_value(outcome.changed_during_build()).unwrap_or_default(),
+            serde_json::to_value(&outcome.changed_during_build).unwrap_or_default(),
+        );
+        object.insert(
+            "undetermined_units".to_string(),
+            serde_json::to_value(&outcome.undetermined_units).unwrap_or_default(),
         );
     }
     value
@@ -3367,6 +3429,76 @@ mod tests {
     use crate::graph::store::IndexMetadata;
     use crate::query::diff::ChangeKind;
 
+    fn package_warning(cause: InventoryFailure) -> String {
+        let undetermined_units = UndeterminedUnits {
+            packages: vec![crate::graph::units::UndeterminedPackage {
+                package: "libbin".to_string(),
+                cause,
+            }],
+            documents: Vec::new(),
+        };
+        let warnings = unit_warnings(&undetermined_units);
+        assert_eq!(warnings.len(), 1, "one warning per entry: {warnings:?}");
+        warnings.into_iter().next().unwrap()
+    }
+
+    // Each warning names the package, states its cause after "because", and says what the
+    // degradation means for answers.
+    #[test]
+    fn package_warnings_name_the_package_cause_and_consequence() {
+        let timeout = package_warning(InventoryFailure::MetadataTimeout);
+        let seconds = PROBE_DEADLINE.as_secs();
+        assert!(
+            timeout.contains(&format!(
+                "package libbin, because `cargo metadata` did not finish within {seconds} s."
+            )),
+            "{timeout}"
+        );
+
+        let no_manifest = package_warning(InventoryFailure::NoManifest);
+        assert!(
+            no_manifest.contains(
+                "package libbin, because the workspace has no `Cargo.toml` (the build was forced with `--language rust`)."
+            ),
+            "{no_manifest}"
+        );
+
+        let failed = package_warning(InventoryFailure::MetadataFailed {
+            detail: "error: bad manifest".to_string(),
+        });
+        assert!(
+            failed.contains("package libbin, because `cargo metadata` failed: error: bad manifest."),
+            "{failed}"
+        );
+
+        for warning in [timeout, no_manifest, failed] {
+            assert!(warning.starts_with("warning: "), "{warning}");
+            assert!(warning.contains("labeled as library code"), "{warning}");
+            assert!(warning.contains("may point to the wrong one"), "{warning}");
+        }
+    }
+
+    #[test]
+    fn document_warning_names_the_document_cause_and_consequence() {
+        let undetermined_units = UndeterminedUnits {
+            packages: Vec::new(),
+            documents: vec![crate::graph::units::UndeterminedDocument {
+                document_path: "src/old.rs".to_string(),
+                reason: crate::graph::units::DocumentReason::NoTargetLoadsIt,
+            }],
+        };
+        let warnings = unit_warnings(&undetermined_units);
+        assert_eq!(warnings.len(), 1);
+        let warning = &warnings[0];
+        assert!(
+            warning.contains(
+                "could not place src/old.rs in any Cargo target, because no `mod` declaration in a target loads it."
+            ),
+            "{warning}"
+        );
+        assert!(warning.contains("labeled as library code"), "{warning}");
+    }
+
     #[test]
     fn a_subdirectory_that_vanished_is_absent_but_a_missing_root_fails() {
         let dir = tempfile::tempdir().unwrap();
@@ -3394,6 +3526,7 @@ mod tests {
                 accounting: JoinAccounting::default(),
                 environment: None,
                 chunk_params: Default::default(),
+                targets: Default::default(),
             })
             .unwrap();
         store
@@ -3664,5 +3797,147 @@ mod tests {
             bare.dir, ".",
             "a bare filename has no parent, so it reports the working directory"
         );
+    }
+
+    // The answer for an index found current warns about the recorded undetermined units exactly as a build does.
+    #[test]
+    fn a_current_build_warns_about_the_recorded_units() {
+        let undetermined_units = UndeterminedUnits {
+            packages: Vec::new(),
+            documents: vec![crate::graph::units::UndeterminedDocument {
+                document_path: "src/old.rs".to_string(),
+                reason: crate::graph::units::DocumentReason::NoTargetLoadsIt,
+            }],
+        };
+        let outcome = BuildOutcome {
+            accounting: JoinAccounting::default(),
+            undetermined_units: undetermined_units.clone(),
+            changed_during_build: Vec::new(),
+            rebuilt: false,
+        };
+        let line = build_outcome_line(&outcome);
+        assert!(line.starts_with("already current:"), "{line}");
+        assert!(line.contains("src/old.rs"), "{line}");
+        assert_eq!(
+            build_outcome_json(&outcome)["undetermined_units"],
+            serde_json::to_value(undetermined_units).unwrap()
+        );
+    }
+
+    fn target(kind: &str, name: &str, root: &str, manifest: &str) -> crate::semantic::model::BuildTarget {
+        crate::semantic::model::BuildTarget {
+            package: "libbin".to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            root: root.to_string(),
+            manifest: manifest.to_string(),
+        }
+    }
+
+    // A recorded inventory that names a manifest with no recorded digest cannot be shown current, even
+    // when every digest that was recorded still matches.
+    #[test]
+    fn recorded_targets_need_a_digest_for_every_manifest_the_inventory_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("member")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join("member/Cargo.toml"), "[package]\n").unwrap();
+        let recorded_with = |manifests: BTreeMap<String, String>| RecordedTargets {
+            inventory: TargetInventory::Available {
+                targets: vec![
+                    target("lib", "libbin", "member/src/lib.rs", "member/Cargo.toml"),
+                    target("bin", "tool", "member/src/bin/tool.rs", "member/Cargo.toml"),
+                ],
+                manifests,
+            },
+            ..Default::default()
+        };
+        let mut manifests = BTreeMap::from([("Cargo.toml".to_string(), text_hash("[workspace]\n"))]);
+        assert!(
+            !recorded_targets_are_current(&recorded_with(manifests.clone()), root),
+            "the member manifest has no digest"
+        );
+
+        manifests.insert("member/Cargo.toml".to_string(), text_hash("[package]\n"));
+        assert!(recorded_targets_are_current(&recorded_with(manifests), root));
+    }
+
+    // An unchanged build reports the undetermined units the build that wrote the index could not determine: the
+    // disclosure is stored with the targets and returned when the index is found current.
+    #[test]
+    fn a_current_index_returns_the_recorded_unit_disclosure() {
+        use crate::identity::{Descriptor, DescriptorSegment, SegmentKind};
+        use crate::semantic::fixture::FixtureEngine;
+        use crate::semantic::model::{
+            ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding, SourceDocument, SourceRange,
+            SymbolClass, SymbolKind,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifest = "[package]\nname = \"libbin\"\n";
+        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+        let sources = vec![
+            ("src/lib.rs".to_string(), "pub struct A;\n".to_string()),
+            ("src/old.rs".to_string(), "pub struct B;\n".to_string()),
+        ];
+        let symbol = |name: &str, document: &str| ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "libbin",
+                vec![DescriptorSegment::new(name, SegmentKind::Type)],
+            )),
+            kind: SymbolKind::Type,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![ExtractedOccurrence {
+                document_path: document.to_string(),
+                range: SourceRange::new(0, 11, 0, 12),
+                role: OccurrenceRole::Definition,
+            }],
+        };
+        let index = ExtractedIndex {
+            provenance: AnalyzerProvenance {
+                analyzer_name: "rust-analyzer".to_string(),
+                analyzer_version: "0".to_string(),
+            },
+            documents: sources
+                .iter()
+                .map(|(path, _)| SourceDocument {
+                    path: path.clone(),
+                    encoding: PositionEncoding::Utf8,
+                })
+                .collect(),
+            symbols: vec![symbol("A", "src/lib.rs"), symbol("B", "src/old.rs")],
+            duplicate_groups: Vec::new(),
+            targets: TargetInventory::Available {
+                targets: vec![target("lib", "libbin", "src/lib.rs", "Cargo.toml")],
+                manifests: BTreeMap::from([("Cargo.toml".to_string(), text_hash(manifest))]),
+            },
+            environment: None,
+        };
+        let db = root.join("index.db");
+        let workspace = WorkspaceId::new("ws");
+        let params = ChunkParams::default();
+        let written = {
+            let mut store = GraphStore::open_or_replace(&db).unwrap();
+            crate::graph::ingest_with_params(
+                &mut store,
+                &workspace,
+                canonical_root(root).unwrap().as_deref(),
+                &index,
+                &sources,
+                &params,
+            )
+            .unwrap()
+            .1
+        };
+        assert_eq!(written.documents.len(), 1, "src/old.rs is placed in no target");
+
+        let engine = FixtureEngine::new(index);
+        let current =
+            current_index_accounting(&db, &workspace, &sources, &engine, Language::Rust, None, root, &params)
+                .unwrap()
+                .expect("the unchanged workspace is current");
+        assert_eq!(current.undetermined_units, written);
     }
 }

@@ -10,16 +10,16 @@ use silent_cartographer::commands::{
     collect_python_sources, collect_rust_sources, detect_language, resolve_workspace, run_build, run_status,
 };
 use silent_cartographer::exit::{ExitCode, classify};
-use silent_cartographer::graph::content_hash;
 use silent_cartographer::graph::join::{AlignmentRule, JoinAccounting};
 use silent_cartographer::graph::store::{DISCREPANCY_GROUP_CAP, GraphStore};
 use silent_cartographer::graph::syntax::Language;
+use silent_cartographer::graph::{content_hash, text_hash};
 use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one};
 use silent_cartographer::query::output::Outcome;
 use silent_cartographer::query::{Detail, QueryEngine};
 use silent_cartographer::semantic::model::{
-    AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
-    SourceDocument, SourceRange, SymbolClass, SymbolKind,
+    AnalyzerProvenance, BuildTarget, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole,
+    PositionEncoding, SourceDocument, SourceRange, SymbolClass, SymbolKind, TargetInventory,
 };
 use silent_cartographer::semantic::python_adapter::{PythonIndexer, environment_facts};
 use strum::VariantArray as _;
@@ -229,7 +229,7 @@ fn build_n_discrepancy_groups_in(language: Language, n: usize) -> (tempfile::Tem
         }],
         symbols,
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let dir = tempfile::tempdir().unwrap();
@@ -553,6 +553,60 @@ fn query_refuses_an_incompatible_store_with_guidance() {
     );
 }
 
+// _(Incompatible index stores are replaced or refused — build branch)_,
+// _(Incompatible index stores are replaced or refused — query branch)_ — a Python store written under
+// the previous schema version (the dotted module identities) is replaced by a build and refused by a
+// query.
+#[test]
+fn previous_version_python_store_is_replaced_on_build_and_refused_on_query() {
+    use silent_cartographer::graph::schema::SCHEMA_VERSION;
+
+    let stamp = |db: &Path, version: i64| {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let build = || {
+        build_from_index(
+            &db,
+            "op-ws",
+            dir.path(),
+            &support::python_fixture_index(),
+            &support::python_fixture_sources(),
+        )
+        .unwrap()
+    };
+    build();
+
+    stamp(&db, SCHEMA_VERSION - 1);
+    let err = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        &PythonExecutables::default(),
+        true,
+        false,
+        false,
+        false,
+        silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
+    )
+    .expect_err("status against the previous schema version must refuse");
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains(&format!("version {}", SCHEMA_VERSION - 1)) && chain.contains("c10r build"),
+        "names the store's version and the recovery action: {chain}"
+    );
+
+    build();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let stamped: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(stamped, SCHEMA_VERSION, "the build replaced the previous-version store");
+}
+
 // _(Incompatible index stores are replaced or refused — matching branch)_ — a current-version store
 // opens and operates normally under every command.
 #[test]
@@ -787,14 +841,24 @@ fn build_json_projection_carries_every_bucket() {
 fn build_outcome_renders_distinguish_a_skip_from_a_build() {
     let accounting = JoinAccounting::default();
 
-    let skip = silent_cartographer::commands::BuildOutcome::AlreadyCurrent(accounting);
+    let skip = silent_cartographer::commands::BuildOutcome {
+        accounting,
+        undetermined_units: Default::default(),
+        changed_during_build: Vec::new(),
+        rebuilt: false,
+    };
     let line = silent_cartographer::commands::build_outcome_line(&skip);
     assert!(line.contains("already current"), "the skip line says so: {line}");
     assert!(line.contains("--force"), "the skip line names the escape hatch: {line}");
     let json = silent_cartographer::commands::build_outcome_json(&skip);
     assert_eq!(json["rebuilt"], serde_json::Value::Bool(false), "a skip: {json}");
 
-    let built = silent_cartographer::commands::BuildOutcome::Rebuilt(accounting, Vec::new());
+    let built = silent_cartographer::commands::BuildOutcome {
+        accounting,
+        undetermined_units: Default::default(),
+        changed_during_build: Vec::new(),
+        rebuilt: true,
+    };
     let line = silent_cartographer::commands::build_outcome_line(&built);
     assert!(
         line.starts_with("built:"),
@@ -835,7 +899,7 @@ fn duplicated_group_index() -> ExtractedIndex {
         ],
         symbols: vec![widget("a.rs"), widget("b.rs")],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }
@@ -988,6 +1052,24 @@ fn status_json_always_carries_the_duplicated_group_count() {
 /// Write a minimal manifest of the given name into `dir`.
 fn write_manifest(dir: &Path, name: &str) {
     std::fs::write(dir.join(name), "# fixture manifest\n").unwrap();
+}
+
+/// The fixture index as a Rust build records it: with the target inventory its package declares and the
+/// digest of the manifest `dir` holds, which the currency check compares.
+fn fixture_index_with_targets(dir: &Path) -> ExtractedIndex {
+    let mut index = support::fixture_index();
+    let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+    index.targets = TargetInventory::Available {
+        targets: vec![BuildTarget {
+            package: "mycrate".to_string(),
+            kind: "lib".to_string(),
+            name: "mycrate".to_string(),
+            root: support::DOC.to_string(),
+            manifest: "Cargo.toml".to_string(),
+        }],
+        manifests: [("Cargo.toml".to_string(), text_hash(&manifest))].into(),
+    };
+    index
 }
 
 // _(Scenario: Single-language workspace selects its backend)_ — a workspace declaring only a
@@ -1570,7 +1652,14 @@ fn already_built_workspace() -> (tempfile::TempDir, std::path::PathBuf, std::pat
     std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
 
     let db = dir.path().join("index.db");
-    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &sources()).unwrap();
+    build_from_index(
+        &db,
+        "op-ws",
+        dir.path(),
+        &fixture_index_with_targets(dir.path()),
+        &sources(),
+    )
+    .unwrap();
 
     let stub = write_version_only_stub(dir.path(), "rust-analyzer", &support::provenance().analyzer_version);
     (dir, db, stub)
@@ -1598,7 +1687,7 @@ fn a_build_over_an_unchanged_workspace_analyzes_nothing() {
     )
     .expect("an already-current index is not an error");
 
-    assert!(!outcome.rebuilt(), "the build reports the index already current");
+    assert!(!outcome.rebuilt, "the build reports the index already current");
     assert_eq!(std::fs::read(&db).unwrap(), before, "the store is byte-identical");
 }
 
@@ -1624,7 +1713,7 @@ fn a_changed_chunk_parameter_rebuilds() {
         &Default::default(),
     )
     .expect("unchanged parameters remain current");
-    assert!(!outcome.rebuilt(), "the unchanged-parameter arm skips");
+    assert!(!outcome.rebuilt, "the unchanged-parameter arm skips");
 
     let err = run_build(
         &db,
@@ -1645,6 +1734,42 @@ fn a_changed_chunk_parameter_rebuilds() {
     assert!(
         err.to_string().contains("could not index the workspace"),
         "the changed-parameter build attempted analysis: {err}"
+    );
+}
+
+// _(Scenario: A renamed binary rebuilds)_, unavailable arm — a Rust store recorded while the
+// target inventory was unavailable carries no unit marker, so it is never current: the next build
+// analyzes (which the stub refuses), however unchanged the workspace is.
+#[test]
+fn a_rust_store_recorded_without_an_inventory_is_not_current() {
+    use silent_cartographer::semantic::model::InventoryFailure;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "Cargo.toml");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+    let mut index = fixture_index_with_targets(dir.path());
+    index.targets = TargetInventory::Unavailable(InventoryFailure::MetadataTimeout);
+    let db = dir.path().join("index.db");
+    build_from_index(&db, "op-ws", dir.path(), &index, &sources()).unwrap();
+    let stub = write_version_only_stub(dir.path(), "rust-analyzer", &support::provenance().analyzer_version);
+
+    let err = run_build(
+        &db,
+        Some("op-ws"),
+        dir.path(),
+        stub.to_str().unwrap(),
+        &scip_python_at("scip-python"),
+        None,
+        None,
+        Some(Language::Rust),
+        false,
+        &Default::default(),
+    )
+    .expect_err("an unavailable recorded inventory drives the build to analyze, which the stub refuses");
+    assert!(
+        err.to_string().contains("could not index the workspace"),
+        "the build attempted analysis: {err}"
     );
 }
 
@@ -1798,7 +1923,7 @@ fn a_changed_declared_environment_rebuilds() {
         documents: vec![],
         symbols: vec![],
         duplicate_groups: vec![],
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: Some(environment_facts(&canonical_venv).unwrap()),
     };
     let db = dir.path().join("index.db");
@@ -1820,10 +1945,7 @@ fn a_changed_declared_environment_rebuilds() {
         &Default::default(),
     )
     .expect("an unchanged environment is current");
-    assert!(
-        !outcome.rebuilt(),
-        "the unchanged environment reports the index current"
-    );
+    assert!(!outcome.rebuilt, "the unchanged environment reports the index current");
 
     // Install one more distribution: the package fingerprint drifts.
     std::fs::create_dir(
@@ -1911,7 +2033,7 @@ fn an_incompatible_store_builds_rather_than_reporting_it_current() {
     )
     .expect("an incompatible store is c10r's own to replace, not a refusal");
 
-    assert!(outcome.rebuilt(), "the incompatible store drove the build to analyze");
+    assert!(outcome.rebuilt, "the incompatible store drove the build to analyze");
     let conn = rusqlite::Connection::open(&db).unwrap();
     let stamped: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     assert_eq!(
@@ -1967,7 +2089,14 @@ fn a_build_and_the_currency_check_agree_on_an_undecodable_file() {
 
     let collected = collect_rust_sources(dir.path()).unwrap();
     let db = dir.path().join("index.db");
-    build_from_index(&db, "op-ws", dir.path(), &support::fixture_index(), &collected).unwrap();
+    build_from_index(
+        &db,
+        "op-ws",
+        dir.path(),
+        &fixture_index_with_targets(dir.path()),
+        &collected,
+    )
+    .unwrap();
 
     let stub = write_version_only_stub(dir.path(), "rust-analyzer", &support::provenance().analyzer_version);
     let outcome = run_build(
@@ -1985,7 +2114,7 @@ fn a_build_and_the_currency_check_agree_on_an_undecodable_file() {
     .expect("the seeded index is current");
 
     assert!(
-        !outcome.rebuilt(),
+        !outcome.rebuilt,
         "the currency check sees the same discovered set the seeding build did"
     );
 }
@@ -2111,11 +2240,18 @@ impl StatusWorkspace {
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join(".stub-bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        let (manifest, tool) = match language {
-            Language::Rust => ("Cargo.toml", "rust-analyzer"),
-            Language::Python => ("pyproject.toml", "scip-python"),
+        let (manifest, tool, manifest_text) = match language {
+            // A manifest `cargo metadata` can read, so the build records the target inventory the
+            // currency check requires of a Rust store.
+            Language::Rust => (
+                "Cargo.toml",
+                "rust-analyzer",
+                "[package]\nname = \"status-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [lib]\npath = \"src/a.rs\"\n\n[workspace]\n",
+            ),
+            Language::Python => ("pyproject.toml", "scip-python", "# fixture manifest\n"),
         };
-        std::fs::write(dir.path().join(manifest), "# fixture manifest\n").unwrap();
+        std::fs::write(dir.path().join(manifest), manifest_text).unwrap();
         support::write_indexing_stub(&bin_dir, tool, "1.85.0");
         if language == Language::Python {
             let venv_bin = dir.path().join(".venv/bin");
@@ -2969,7 +3105,7 @@ fn a_ty_scip_store_with_changed_sources_rebuilds_with_ty_scip() {
 
     let outcome = ws.build(None).unwrap();
 
-    assert!(outcome.rebuilt(), "the changed source is analyzed");
+    assert!(outcome.rebuilt, "the changed source is analyzed");
     assert_eq!(ws.recorded_analyzer().as_deref(), Some("ty-scip"));
 }
 
@@ -2984,14 +3120,14 @@ fn an_explicit_selection_switches_a_ty_scip_store_to_scip_python() {
 
     let switched = ws.build(Some(PythonIndexer::ScipPython)).unwrap();
     assert!(
-        switched.rebuilt(),
+        switched.rebuilt,
         "the unchanged sources are analyzed by the other indexer"
     );
     assert_eq!(ws.recorded_analyzer().as_deref(), Some("scip-python"));
 
     let following = ws.build(None).unwrap();
     assert!(
-        !following.rebuilt(),
+        !following.rebuilt,
         "the store is current under the indexer it now records"
     );
 }
@@ -3027,7 +3163,7 @@ fn an_unchanged_store_reads_current_on_rebuild_for_each_indexer() {
 
         let outcome = ws.build(None).unwrap();
 
-        assert!(!outcome.rebuilt(), "{} store reads current", indexer.analyzer_name());
+        assert!(!outcome.rebuilt, "{} store reads current", indexer.analyzer_name());
     }
 }
 
@@ -3136,4 +3272,68 @@ fn a_refused_ty_scip_build_leaves_the_existing_store_untouched() {
     ws.build(None).expect_err("ty-scip refuses the new file");
 
     assert_eq!(std::fs::read(ws.db()).unwrap(), before, "the store is byte-identical");
+}
+
+// _(Package whose units cannot be listed has no markers)_ — a build whose `cargo metadata` never
+// answers still succeeds, and both answers name the package whose units could not be determined and
+// why: the machine answer in `undetermined_units.packages`, the human answer as a warning line.
+// Driven through the built binary with a hanging `cargo` first on `PATH`; each build waits out the
+// probe's full deadline.
+#[test]
+fn a_build_whose_target_list_times_out_names_the_package_in_both_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = support::rust_fixture_root();
+    std::fs::copy(fixture.join("Cargo.toml"), dir.path().join("Cargo.toml")).unwrap();
+    for rel in support::RUST_FIXTURE_FILES {
+        let to = dir.path().join(rel);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(fixture.join(rel), to).unwrap();
+    }
+    // The analyzer answers with the committed index, whose in-workspace symbols belong to `libbin`.
+    let bin_dir = dir.path().join(".stub-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let analyzer = bin_dir.join("rust-analyzer");
+    std::fs::write(
+        &analyzer,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"1.85.0\"\n  exit 0\nfi\n\
+             cp '{}' \"$4\"\n",
+            fixture.join("index.scip").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&analyzer, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    support::write_hanging_stub(&bin_dir, "cargo");
+    let path = support::prepend_path(&[&bin_dir]);
+
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+            .arg("--db")
+            .arg(dir.path().join("index.db"))
+            .args(args)
+            .current_dir(dir.path())
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the build succeeds: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    let json: serde_json::Value = serde_json::from_str(&run(&["--json", "build", "--language", "rust"])).unwrap();
+    assert_eq!(json["rebuilt"], serde_json::Value::Bool(true), "{json}");
+    assert_eq!(
+        json["undetermined_units"]["packages"],
+        serde_json::json!([{"package": "libbin", "reason": "metadata_timeout"}]),
+        "{json}"
+    );
+
+    let human = run(&["build", "--language", "rust"]);
+    assert!(
+        human.contains("warning: could not determine the Cargo targets of package libbin"),
+        "the human answer carries the warning: {human}"
+    );
 }

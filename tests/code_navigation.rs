@@ -142,7 +142,7 @@ fn py_synthetic_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedInd
         }],
         symbols,
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }
@@ -1425,7 +1425,7 @@ fn stale_after_a_changed_environment_is_fresh_once_the_refresh_command_runs() {
         }],
         symbols: vec![],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: Some(facts),
     };
     let db = dir.path().join("index.db");
@@ -2834,23 +2834,32 @@ fn py_id(segments: &[(&str, SegmentKind)]) -> CanonicalId {
 }
 
 fn py_widget_id() -> CanonicalId {
-    py_id(&[("pkg.shapes", SegmentKind::Module), ("Widget", SegmentKind::Type)])
+    py_id(&[
+        ("pkg", SegmentKind::Module),
+        ("shapes", SegmentKind::Module),
+        ("Widget", SegmentKind::Type),
+    ])
 }
 
 fn py_render_id() -> CanonicalId {
     py_id(&[
-        ("pkg.shapes", SegmentKind::Module),
+        ("pkg", SegmentKind::Module),
+        ("shapes", SegmentKind::Module),
         ("Widget", SegmentKind::Type),
         ("render", SegmentKind::Method),
     ])
 }
 
 fn py_build_id() -> CanonicalId {
-    py_id(&[("pkg.consumer", SegmentKind::Module), ("build", SegmentKind::Method)])
+    py_id(&[
+        ("pkg", SegmentKind::Module),
+        ("consumer", SegmentKind::Module),
+        ("build", SegmentKind::Method),
+    ])
 }
 
 fn py_consumer_module_id() -> CanonicalId {
-    py_id(&[("pkg.consumer", SegmentKind::Module), ("__init__", SegmentKind::Meta)])
+    py_id(&[("pkg", SegmentKind::Module), ("consumer", SegmentKind::Module)])
 }
 
 fn py_store() -> GraphStore {
@@ -3046,6 +3055,70 @@ fn python_dotted_qualified_name_resolves() {
     }
 }
 
+fn rust_conformance_store() -> GraphStore {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &support::rust_fixture_index(),
+        &support::rust_fixture_sources(),
+    )
+    .unwrap();
+    store
+}
+
+fn rust_conformance_ids(resolution: Resolution) -> Vec<String> {
+    let rows = match resolution {
+        Resolution::Unique(row) => vec![*row],
+        Resolution::Ambiguous(rows) => rows,
+        Resolution::None => Vec::new(),
+    };
+    rows.iter().map(|row| row.canonical_id.as_str().to_string()).collect()
+}
+
+// _(Package-qualified name resolves to the library's declaration)_ — `libbin::util::Config` names the
+// library's `Config` and not the binary's.
+#[test]
+fn package_qualified_name_resolves_to_library_only() {
+    let store = rust_conformance_store();
+    let engine = engine_over(&store, support::rust_fixture_index().provenance);
+    match engine.resolve("libbin::util::Config").unwrap() {
+        Resolution::Unique(row) => assert_eq!(row.canonical_id.as_str(), "test-ws::libbin::util::Config"),
+        other => panic!("expected a unique resolution, got {other:?}"),
+    }
+}
+
+// _(Path declared in two units returns candidates)_ — `util::Config` is declared in the library and
+// the binary, so resolution returns both as a typed candidate set.
+#[test]
+fn path_in_two_units_returns_candidates() {
+    let store = rust_conformance_store();
+    let engine = engine_over(&store, support::rust_fixture_index().provenance);
+    let resolution = engine.resolve("util::Config").unwrap();
+    assert!(matches!(resolution, Resolution::Ambiguous(_)), "{resolution:?}");
+    assert_eq!(
+        rust_conformance_ids(resolution),
+        [
+            "test-ws::libbin+bin.tool::util::Config",
+            "test-ws::libbin::util::Config"
+        ]
+    );
+}
+
+// _(Identity with a marker round-trips)_ — the full identity of the binary's `Config`, marker
+// included, resolves to exactly that symbol.
+#[test]
+fn unit_marked_identity_round_trips() {
+    let store = rust_conformance_store();
+    let engine = engine_over(&store, support::rust_fixture_index().provenance);
+    let identity = "test-ws::libbin+bin.tool::util::Config";
+    match engine.resolve(identity).unwrap() {
+        Resolution::Unique(row) => assert_eq!(row.canonical_id.as_str(), identity),
+        other => panic!("expected a unique resolution, got {other:?}"),
+    }
+}
+
 const TR_LIB_DOC: &str = "src/lib.rs";
 const TR_API_DOC: &str = "tests/api.rs";
 
@@ -3207,7 +3280,7 @@ fn tr_store() -> GraphStore {
         ],
         symbols,
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let mut store = GraphStore::open_in_memory().unwrap();
@@ -3389,7 +3462,7 @@ fn trace_tests_python_site_returned() {
         ],
         symbols,
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     };
     let sources = vec![

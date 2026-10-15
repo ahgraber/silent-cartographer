@@ -1,7 +1,7 @@
 //! Canonical symbol identity.
 //!
 //! A canonical identity is a deterministic, workspace-namespaced projection of a symbol's resolved
-//! semantic descriptor, of the conceptual form `<workspace>::<module_path>::<qualname>[#disambiguator]`.
+//! semantic descriptor, of the conceptual form `<workspace>::<package>[+<marker>]::<segments>[#disambiguator]`.
 //! It is the join key across the syntax and semantic oracles and the machine round-trip key exposed
 //! to consumers.
 //!
@@ -75,6 +75,21 @@ impl DescriptorSegment {
     }
 }
 
+/// The build unit within a package that a symbol's source belongs to, when it is not the package's
+/// default unit.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum UnitMarker {
+    /// A single named unit of the given kind, written `+kind.name`.
+    Unit {
+        /// The unit's kind as the build tool declares it.
+        kind: String,
+        /// The unit's name as the build tool declares it.
+        name: String,
+    },
+    /// Source compiled into more than one unit of the package, written `+shared`.
+    Shared,
+}
+
 /// A resolved, engine-neutral descriptor: the ordered path of segments a semantic backend resolved
 /// for a global symbol.
 ///
@@ -106,10 +121,24 @@ impl Descriptor {
         self.segments.last().map(|s| s.name.as_str())
     }
 
-    /// The base (pre-disambiguation) projection body: package and segment names joined by `::`.
-    fn projection_body(&self) -> String {
+    /// The segment names when the descriptor is made only of module segments, `None` otherwise (including
+    /// for a descriptor with no segments).
+    pub fn module_names(&self) -> Option<impl Iterator<Item = &str>> {
+        let all_modules = !self.segments.is_empty() && self.segments.iter().all(|seg| seg.kind == SegmentKind::Module);
+        all_modules.then(|| self.segments.iter().map(|seg| seg.name.as_str()))
+    }
+
+    /// The base (pre-disambiguation) projection body: the package, its unit marker when present,
+    /// then the segment names, joined by `::`.
+    fn projection_body(&self, unit: Option<&UnitMarker>) -> String {
+        let mut head = self.package.clone();
+        match unit {
+            Some(UnitMarker::Unit { kind, name }) => head.push_str(&format!("+{kind}.{name}")),
+            Some(UnitMarker::Shared) => head.push_str("+shared"),
+            None => {}
+        }
         let mut parts = Vec::with_capacity(self.segments.len() + 1);
-        parts.push(self.package.as_str());
+        parts.push(head.as_str());
         for seg in &self.segments {
             parts.push(seg.name.as_str());
         }
@@ -145,8 +174,8 @@ impl std::fmt::Display for CanonicalId {
 
 /// The base projection of a single descriptor under a workspace, before collision-only
 /// disambiguation. Deterministic and independent of any other symbol.
-fn base_projection(workspace: &WorkspaceId, descriptor: &Descriptor) -> String {
-    format!("{}::{}", workspace.as_str(), descriptor.projection_body())
+fn base_projection(workspace: &WorkspaceId, descriptor: &Descriptor, unit: Option<&UnitMarker>) -> String {
+    format!("{}::{}", workspace.as_str(), descriptor.projection_body(unit))
 }
 
 /// A source location a projection ranks a duplicate by: the document it sits in and its range there.
@@ -161,7 +190,8 @@ pub struct DefinitionSite {
     pub range: SourceRange,
 }
 
-/// One symbol to project: its resolved descriptor and the locations that anchor duplicate ranking.
+/// One symbol to project: its resolved descriptor, its build unit, and the locations that anchor
+/// duplicate ranking.
 ///
 /// When a collision group forms, members are ranked by `definition` when present; a member without a
 /// definition occurrence sorts after those with one, by its `fallback` (first-occurrence) location.
@@ -169,6 +199,8 @@ pub struct DefinitionSite {
 pub struct ProjectionInput {
     /// The resolved descriptor to project.
     pub descriptor: Descriptor,
+    /// The build unit within the package, or `None` for the package's default unit.
+    pub unit: Option<UnitMarker>,
     /// The symbol's definition location, if the backend produced a definition occurrence.
     pub definition: Option<DefinitionSite>,
     /// A fallback location — the symbol's first occurrence — used to rank a member that has no
@@ -203,7 +235,7 @@ pub fn project_all(workspace: &WorkspaceId, inputs: &[ProjectionInput]) -> Vec<C
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, input) in inputs.iter().enumerate() {
         groups
-            .entry(base_projection(workspace, &input.descriptor))
+            .entry(base_projection(workspace, &input.descriptor, input.unit.as_ref()))
             .or_default()
             .push(idx);
     }
@@ -226,10 +258,11 @@ pub fn project_all(workspace: &WorkspaceId, inputs: &[ProjectionInput]) -> Vec<C
     out.into_iter().map(|id| id.expect("every index assigned")).collect()
 }
 
-/// Project a single descriptor with no collision context. Used where the caller has already
-/// established uniqueness (e.g. resolving a supplied identity); it yields the base projection.
+/// Project a single descriptor of the package's default unit with no collision context. Used where
+/// the caller has already established uniqueness (e.g. resolving a supplied identity); it yields the
+/// base projection.
 pub fn project_one(workspace: &WorkspaceId, descriptor: &Descriptor) -> CanonicalId {
-    CanonicalId(base_projection(workspace, descriptor))
+    CanonicalId(base_projection(workspace, descriptor, None))
 }
 
 #[cfg(test)]
@@ -249,6 +282,7 @@ mod tests {
     fn input(descriptor: Descriptor) -> ProjectionInput {
         ProjectionInput {
             descriptor,
+            unit: None,
             definition: None,
             fallback: None,
         }
@@ -258,6 +292,7 @@ mod tests {
     fn input_at(descriptor: Descriptor, document_path: &str, range: SourceRange) -> ProjectionInput {
         ProjectionInput {
             descriptor,
+            unit: None,
             definition: Some(DefinitionSite {
                 document_path: document_path.to_string(),
                 range,
@@ -438,5 +473,52 @@ mod tests {
         // The `a.rs` twin is index 0 forward, index 1 reversed; its identity is the same both times.
         assert_eq!(forward[0], reversed[1], "a.rs twin identity is stable across order");
         assert_eq!(forward[1], reversed[0], "b.rs twin identity is stable across order");
+    }
+
+    #[test]
+    fn projection_writes_unit_marker_after_package() {
+        let ws = WorkspaceId::new("ws");
+        let segments = vec![seg("util", SegmentKind::Module), seg("Config", SegmentKind::Type)];
+        let plain = Descriptor::new("libbin", segments.clone());
+        let unit = ProjectionInput {
+            unit: Some(UnitMarker::Unit {
+                kind: "bin".to_string(),
+                name: "tool".to_string(),
+            }),
+            ..input(Descriptor::new("libbin", segments))
+        };
+        let shared = ProjectionInput {
+            unit: Some(UnitMarker::Shared),
+            ..input(Descriptor::new(
+                "libbin",
+                vec![seg("common", SegmentKind::Module), seg("fixture", SegmentKind::Method)],
+            ))
+        };
+        assert_eq!(project_one(&ws, &plain).as_str(), "ws::libbin::util::Config");
+        let ids = project_all(&ws, &[unit, shared]);
+        assert_eq!(ids[0].as_str(), "ws::libbin+bin.tool::util::Config");
+        assert_eq!(ids[1].as_str(), "ws::libbin+shared::common::fixture");
+    }
+
+    // _(Same descriptor in two units carries no disambiguator)_
+    #[test]
+    fn distinct_units_need_no_disambiguator() {
+        let ws = WorkspaceId::new("ws");
+        let segments = vec![seg("util", SegmentKind::Module), seg("Config", SegmentKind::Type)];
+        let lib = Descriptor::new("libbin", segments.clone());
+        let bin = ProjectionInput {
+            unit: Some(UnitMarker::Unit {
+                kind: "bin".to_string(),
+                name: "tool".to_string(),
+            }),
+            ..input_at(
+                Descriptor::new("libbin", segments),
+                "src/bin/tool.rs",
+                SourceRange::new(0, 0, 0, 1),
+            )
+        };
+        let ids = project_all(&ws, &[input_at(lib, "src/lib.rs", SourceRange::new(0, 0, 0, 1)), bin]);
+        assert_eq!(ids[0].as_str(), "ws::libbin::util::Config");
+        assert_eq!(ids[1].as_str(), "ws::libbin+bin.tool::util::Config");
     }
 }

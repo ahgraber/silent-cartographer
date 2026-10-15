@@ -33,6 +33,7 @@ pub fn stamp_metadata(store: &GraphStore, workspace: &str, root: &std::path::Pat
             accounting: JoinAccounting::default(),
             environment: None,
             chunk_params: Default::default(),
+            targets: Default::default(),
         })
         .unwrap();
 }
@@ -56,6 +57,7 @@ pub fn stamp_fresh_metadata(store: &GraphStore, workspace: &str, root: &std::pat
             accounting: JoinAccounting::default(),
             environment: None,
             chunk_params: Default::default(),
+            targets: Default::default(),
         })
         .unwrap();
 }
@@ -183,7 +185,7 @@ pub fn fixture_index() -> ExtractedIndex {
         }],
         symbols: vec![module, client, connect, disconnect, open],
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }
@@ -222,7 +224,7 @@ pub fn one_doc_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedInde
         }],
         symbols,
         duplicate_groups: Vec::new(),
-        library_roots: Default::default(),
+        targets: Default::default(),
         environment: None,
     }
 }
@@ -257,6 +259,60 @@ pub fn line_col(source: &str, pos: usize) -> (u32, u32) {
     (line, (pos - line_start) as u32)
 }
 
+/// The committed Rust conformance fixture directory (`tests/fixtures/rust-conformance`).
+pub fn rust_fixture_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust-conformance")
+}
+
+/// The Rust conformance fixture's source files, workspace-relative.
+pub const RUST_FIXTURE_FILES: [&str; 5] = [
+    "src/lib.rs",
+    "src/bin/tool.rs",
+    "tests/a.rs",
+    "tests/b.rs",
+    "tests/common/mod.rs",
+];
+
+/// The committed Rust fixture SCIP index, taken through the shared translation and normalization
+/// exactly as `RustAdapter::analyze` takes the tool's live output, with the target inventory the
+/// adapter reads from `cargo metadata` for the fixture project.
+///
+/// # Panics
+///
+/// Panics if `index.scip` is missing from the fixture directory or fails to parse as a SCIP
+/// protobuf.
+pub fn rust_fixture_index() -> ExtractedIndex {
+    use silent_cartographer::semantic::model::normalize;
+    use silent_cartographer::semantic::rust_adapter::{cargo_targets, translate_index};
+
+    let root = rust_fixture_root();
+    let bytes = std::fs::read(root.join("index.scip")).expect("checked-in rust-conformance index present");
+    let index: scip::types::Index = protobuf::Message::parse_from_bytes(&bytes).expect("valid SCIP protobuf");
+    let provenance = AnalyzerProvenance {
+        analyzer_name: index.metadata.tool_info.name.clone(),
+        analyzer_version: index.metadata.tool_info.version.clone(),
+    };
+    let mut extracted = translate_index(&index, &provenance);
+    extracted.targets = cargo_targets(&root);
+    normalize(extracted)
+}
+
+/// The Rust fixture's sources, `(scip_document_path, text)`, read from the committed project.
+///
+/// # Panics
+///
+/// Panics if any of the fixture's source files is missing.
+pub fn rust_fixture_sources() -> Vec<(String, String)> {
+    let root = rust_fixture_root();
+    RUST_FIXTURE_FILES
+        .iter()
+        .map(|rel| {
+            let text = std::fs::read_to_string(root.join(rel)).expect("fixture source present");
+            (rel.to_string(), text)
+        })
+        .collect()
+}
+
 /// The committed Python conformance fixture directory (`tests/fixtures/python-conformance`).
 pub fn python_fixture_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python-conformance")
@@ -280,8 +336,7 @@ pub fn python_fixture_index() -> ExtractedIndex {
 ///
 /// Panics if `file` is missing from the fixture directory or fails to parse as a SCIP protobuf.
 pub fn python_fixture_index_from(file: &str) -> ExtractedIndex {
-    use silent_cartographer::semantic::model::normalize;
-    use silent_cartographer::semantic::python_adapter::classify_module_kinds;
+    use silent_cartographer::semantic::python_adapter::{PythonIndexer, finish_translation};
     use silent_cartographer::semantic::scip::translate_index;
 
     let path = python_fixture_root().join(file);
@@ -291,9 +346,9 @@ pub fn python_fixture_index_from(file: &str) -> ExtractedIndex {
         analyzer_name: index.metadata.tool_info.name.clone(),
         analyzer_version: index.metadata.tool_info.version.clone(),
     };
-    let mut extracted = translate_index(&index, &provenance);
-    classify_module_kinds(&mut extracted);
-    normalize(extracted)
+    let indexer =
+        PythonIndexer::from_analyzer_name(&provenance.analyzer_name).expect("committed fixture from a known indexer");
+    finish_translation(translate_index(&index, &provenance), indexer, &python_fixture_root())
 }
 
 /// The Python fixture's sources, `(scip_document_path, text)`, read from the committed project.
@@ -303,13 +358,22 @@ pub fn python_fixture_index_from(file: &str) -> ExtractedIndex {
 /// Panics if any of the fixture's source files is missing.
 pub fn python_fixture_sources() -> Vec<(String, String)> {
     let root = python_fixture_root();
-    ["pkg/__init__.py", "pkg/consumer.py", "pkg/shapes.py"]
-        .iter()
-        .map(|rel| {
-            let text = std::fs::read_to_string(root.join(rel)).expect("fixture source present");
-            (rel.to_string(), text)
-        })
-        .collect()
+    [
+        "pkg/__init__.py",
+        "pkg/app.py",
+        "pkg/consumer.py",
+        "pkg/relative.py",
+        "pkg/shapes.py",
+        "pkg/sub/__init__.py",
+        "pkg/sub/app.py",
+        "pkg/sub/deep.py",
+    ]
+    .iter()
+    .map(|rel| {
+        let text = std::fs::read_to_string(root.join(rel)).expect("fixture source present");
+        (rel.to_string(), text)
+    })
+    .collect()
 }
 
 /// Write an executable stub tool that answers `--version` with `version`, and — for any other

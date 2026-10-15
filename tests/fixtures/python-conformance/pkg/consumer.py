@@ -13,3 +13,6 @@ def build():
 def build_aliased():
     w = W()
     return w.render()
+
+
+current_app: Widget = Widget()

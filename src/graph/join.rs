@@ -25,7 +25,6 @@
 //! passes the ordinary alignment rules; an occurrence no locality rule settles is typed
 //! duplicate-ambiguous and attributed to no twin, rather than silently misassigned.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use strum::{EnumCount as _, VariantArray as _};
@@ -36,6 +35,7 @@ use crate::semantic::model::{ExtractedIndex, ExtractedOccurrence, ExtractedSymbo
 use super::prepared::{PreparedCorpus, PreparedDocument};
 use super::range::{ByteSpan, range_to_span};
 use super::syntax::{ConstructAt, Language, RangeShape, SyntaxDeclaration, SyntaxTree};
+use super::units::Unit;
 
 /// The named alignment rule that accepted an attribution. Stored as provenance on every aligned
 /// occurrence; each rule also carries its own acceptance bucket in the accounting.
@@ -135,6 +135,9 @@ pub enum LocalityRule {
     /// library target regardless of the containing document; the twin defined at the library
     /// target's root — per the build system's authoritative target description — is selected.
     TargetMetadata,
+    /// The occurrence's document is compiled by exactly one build target, and exactly one twin belongs
+    /// to that target's unit.
+    UnitMembership,
     /// The innermost declaration enclosing the occurrence that contains any same-document twin's
     /// definition contains exactly one of them; that twin is selected.
     DeclarationScope,
@@ -147,6 +150,7 @@ impl LocalityRule {
             LocalityRule::DefiningDocument => "defining_document",
             LocalityRule::ModuleChain => "module_chain",
             LocalityRule::TargetMetadata => "target_metadata",
+            LocalityRule::UnitMembership => "unit_membership",
             LocalityRule::DeclarationScope => "declaration_scope",
         }
     }
@@ -417,13 +421,20 @@ pub fn module_by_document(
 /// (e.g. those the caller chose not to persist) are skipped. `doc_module` is the document→module
 /// derivation from [`module_by_document`], computed by the caller before the join so the self-name
 /// and super-keyword rules can compare an occurrence's resolved module against its containing
-/// document's own module.
+/// document's own module. `parent_of` maps a document to the one document declaring it (see
+/// [`super::units::single_parent_map`]), `units[i]` is the unit of `index.symbols[i]`, and
+/// `document_unit` gives the unit of each document that exactly one target compiles (see
+/// [`super::units::document_units`]).
+#[allow(clippy::too_many_arguments)] // the join's derived inputs (modules, parents, units) travel together
 pub fn join(
     index: &ExtractedIndex,
     corpus: &PreparedCorpus,
     identities: &[Option<CanonicalId>],
     language: Language,
     doc_module: &HashMap<String, usize>,
+    parent_of: &HashMap<String, String>,
+    units: &[Unit],
+    document_unit: &HashMap<String, Unit>,
 ) -> JoinResult {
     // The prepared documents the index references — the join reads syntax through the corpus's
     // one-parse-per-document map rather than parsing anything itself.
@@ -582,7 +593,11 @@ pub fn join(
     // Group-addressed occurrences of duplicated descriptors: locality selects a unique twin, then the
     // occurrence still runs the ordinary alignment rules against that twin's expected name.
     let twins_by_descriptor = twin_symbols_by_descriptor(index, identities);
-    let parent_of = parent_document_map(index, &prepared);
+    let unit_of_identity: HashMap<&CanonicalId, &Unit> = units
+        .iter()
+        .zip(identities)
+        .filter_map(|(unit, identity)| Some((identity.as_ref()?, unit)))
+        .collect();
     for group in &index.duplicate_groups {
         // The identity the group's own discrepancies are surfaced under: the twins' shared base
         // (their identity with the `#<rank>` disambiguator stripped), so inspection sees which
@@ -622,27 +637,35 @@ pub fn join(
                 range_to_span(d.tree.source(), &d.line_index, occ.range, encoding)
             });
 
-            // Package-name resolution via build-target metadata (design.md, 2026-07-07 second
-            // amendment): a token spelling the package's own name denotes the package's library
-            // target no matter which document it sits in, so containing-document locality is never
-            // consulted for it. The library twin comes from the build system's authoritative target
-            // description (`library_roots`); when that is unavailable, or names no persisted twin,
+            // Package-name resolution via build-target metadata: a token spelling the package's own
+            // name, or the final component of a path whose first component spells it
+            // (`libbin::util::load`), denotes the package's library target no matter which document
+            // it sits in, so containing-document locality is never consulted for it. The library
+            // twin is the one twin belonging to the package's default unit, which the build system's
+            // target description decides; when that is unavailable, or leaves no single such twin,
             // the occurrence degrades to the typed duplicate-ambiguous refusal — honesty, never a
             // guess. The token comparison reuses the crate-root rule's normalization; the
-            // terminal-name guard keeps this path off groups whose own name spells the package
-            // name. Scoped to duplicated groups only — a unique crate root's package-name reference
-            // still aligns through the ordinary join.
+            // terminal-name guard keeps the bare-token trigger off groups whose own name spells the
+            // package name. Scoped to duplicated groups only — a unique crate root's package-name
+            // reference still aligns through the ordinary join. A path reached through a `use`
+            // import is not recognized.
             if let Some(d) = doc
                 && let Some(span) = span
                 && let Some(name_span) = d.tree.name_node_containing(span)
-                && let Some(token) = d.tree.text_at(name_span)
-                && token != expected_name
-                && package_matches(token, &group.descriptor.package)
+                && (d
+                    .tree
+                    .text_at(name_span)
+                    .is_some_and(|token| token != expected_name && package_matches(token, &group.descriptor.package))
+                    || d.tree
+                        .rust_path_first_component(name_span)
+                        .and_then(|first| d.tree.text_at(first))
+                        .is_some_and(|first| package_matches(first, &group.descriptor.package)))
             {
-                let library_twin = index
-                    .library_roots
-                    .get(&group.descriptor.package)
-                    .and_then(|root| twins.iter().find(|(_, _, def_doc)| *def_doc == root.as_str()));
+                let library_twin = super::exactly_one(twins.iter().filter(|(_, identity, _)| {
+                    unit_of_identity
+                        .get(identity)
+                        .is_some_and(|unit| **unit == Unit::Default)
+                }));
                 match library_twin {
                     Some((twin_symbol, identity, _)) => join_group_occurrence(
                         occ,
@@ -672,15 +695,17 @@ pub fn join(
                 continue;
             }
 
-            // Document-grained locality first (defining-document, then module-chain); when both
-            // decline, declaration-scope locality tries to settle a same-document twin group from
-            // the occurrence's enclosing-declaration chain.
-            let selection = select_twin(&occ.document_path, twins, &parent_of).or_else(|| {
-                let d = doc?;
-                let span = span?;
-                let encoding = index.encoding_for(&occ.document_path)?;
-                select_twin_by_scope(&occ.document_path, span, twins, d, encoding)
-            });
+            // Document-grained locality first (defining-document, module-chain, then target
+            // membership); when all decline, declaration-scope locality tries to settle a
+            // same-document twin group from the occurrence's enclosing-declaration chain.
+            let selection = select_twin(&occ.document_path, twins, parent_of)
+                .or_else(|| select_twin_by_unit(&occ.document_path, twins, document_unit, &unit_of_identity))
+                .or_else(|| {
+                    let d = doc?;
+                    let span = span?;
+                    let encoding = index.encoding_for(&occ.document_path)?;
+                    select_twin_by_scope(&occ.document_path, span, twins, d, encoding)
+                });
             let Some((twin_symbol, identity, locality)) = selection else {
                 record_group_ambiguous(
                     occ,
@@ -1020,61 +1045,6 @@ fn twin_symbols_by_descriptor<'a>(
     by_descriptor
 }
 
-/// The document a module symbol's definition is declared from: for every in-workspace module symbol,
-/// its definition document maps to the document containing that module's declaration site (`mod
-/// name;` / `mod name { .. }`).
-///
-/// Built from evidence in the index cross-checked against the syntax oracle: a module symbol is
-/// referenced from every `use`/path segment naming it across the workspace, so a reference
-/// occurrence counts as declaration evidence only when its span is the name token of a `mod` item in
-/// the parsed document. Per definition document, exactly one distinct declaring document yields a
-/// parent edge; zero (a crate root, declared by no one) or more than one (conflicting evidence)
-/// yields no entry — the chain stops there and the occurrence falls to duplicate-ambiguous, refusal
-/// over guessing.
-fn parent_document_map(index: &ExtractedIndex, prepared: &PreparedView<'_>) -> HashMap<String, String> {
-    // Every declaration-site document observed per definition document.
-    let mut declared_from: HashMap<String, HashSet<String>> = HashMap::new();
-    for symbol in &index.symbols {
-        if symbol.kind != SymbolKind::Module {
-            continue;
-        }
-        let Some(def) = symbol.definition() else {
-            continue;
-        };
-        for occ in &symbol.occurrences {
-            if occ.role != OccurrenceRole::Reference {
-                continue;
-            }
-            let Some(doc) = prepared.get(occ.document_path.as_str()) else {
-                continue;
-            };
-            let Some(encoding) = index.encoding_for(&occ.document_path) else {
-                continue;
-            };
-            let Some(span) = range_to_span(doc.tree.source(), &doc.line_index, occ.range, encoding) else {
-                continue;
-            };
-            if doc.tree.is_module_declaration_name(span) {
-                declared_from
-                    .entry(def.document_path.clone())
-                    .or_default()
-                    .insert(occ.document_path.clone());
-            }
-        }
-    }
-
-    declared_from
-        .into_iter()
-        .filter_map(|(def_doc, declaring)| {
-            if declaring.len() == 1 {
-                Some((def_doc, declaring.into_iter().next().expect("one element")))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 /// Select the unique twin a group occurrence's document is associated with, in evidence order:
 /// defining-document, then module-chain. Returns `None` when no twin or more than one twin is
 /// associated — the occurrence is then typed duplicate-ambiguous.
@@ -1116,6 +1086,25 @@ fn select_twin<'a>(
             None => return None,
         }
     }
+}
+
+/// Select the twin belonging to the one target that compiles the occurrence's document.
+///
+/// Declines when the document belongs to no target or to several, or when that unit holds
+/// none or more than one twin.
+fn select_twin_by_unit<'a>(
+    document_path: &str,
+    twins: &[(&'a ExtractedSymbol, &'a CanonicalId, &'a str)],
+    document_unit: &HashMap<String, Unit>,
+    unit_of_identity: &HashMap<&CanonicalId, &Unit>,
+) -> Option<(&'a ExtractedSymbol, &'a CanonicalId, LocalityRule)> {
+    let unit = document_unit.get(document_path)?;
+    let belonging = twins.iter().filter(|(_, identity, _)| {
+        unit_of_identity
+            .get(identity)
+            .is_some_and(|twin_unit| *twin_unit == unit)
+    });
+    super::exactly_one(belonging).map(|(symbol, identity, _)| (*symbol, *identity, LocalityRule::UnitMembership))
 }
 
 /// Select the unique twin by declaration scope: the innermost declaration enclosing the occurrence
@@ -1216,8 +1205,12 @@ fn evaluate_rules_at(
 ) -> Option<(AlignmentRule, ByteSpan)> {
     let name_span = tree.name_node_containing(span);
 
-    // Default rule: name-token equality at the matched name node.
-    if let Some(ns) = name_span
+    // Default rule: name-token equality at the matched name node. A Python module reference is the
+    // module-name rule's alone: its bare terminal is one of the trailing component-runs that rule
+    // accepts, and the rule is the provenance such a reference is persisted under.
+    let python_module = language == Language::Python && symbol.kind == SymbolKind::Module;
+    if !python_module
+        && let Some(ns) = name_span
         && tree.text_at(ns) == Some(expected_name)
     {
         return Some((AlignmentRule::Exact, ns));
@@ -1417,11 +1410,9 @@ fn evaluate_rules_at(
 
     // Self-name rule (Python only): a module occurrence at a token spelling exactly `__name__` or
     // `__file__` is accepted iff the resolved module is the containing document's own module. The
-    // occurrence's symbol arrives in the bare-namespace descriptor shape (a single Module-kind
-    // segment spelling the dotted name) while the document's module — per the zero-width-marker
-    // derivation — carries the `__init__`-terminal shape, so the equality compares (package, dotted
-    // namespace name), the module identity both shapes spell. A `__name__` token resolving to any
-    // other module, or any non-module symbol, fails and stays refused.
+    // occurrence's symbol and the document's module (per the zero-width-marker derivation) are
+    // compared by (package, dotted module name). A `__name__` token resolving to any other module,
+    // or any non-module symbol, fails and stays refused.
     if language == Language::Python
         && symbol.kind == SymbolKind::Module
         && let Some(ns) = name_span
@@ -1454,12 +1445,10 @@ fn trailing_component_run_matches(text: &str, dotted_name: &str) -> bool {
     !run.is_empty() && (run == dotted_name || dotted_name.ends_with(&format!(".{run}")))
 }
 
-/// The (package, dotted namespace name) a module symbol's descriptor spells, under any shape a
-/// module takes: the `__init__`-terminal shape (the zero-width marker's symbol), the bare-namespace
-/// shape (the symbol a `__name__`/`__file__` token's occurrence resolves to), or ty-scip's run of
-/// module segments. Returns `None` for any other descriptor shape: refusal over reading the wrong
-/// segment.
-fn module_identity_parts(symbol: &ExtractedSymbol) -> Option<(&str, Cow<'_, str>)> {
+/// The (package, dotted namespace name) a module symbol's descriptor spells: its package and its
+/// run of module segments joined with `.`. Returns `None` for any other descriptor shape: refusal
+/// over reading the wrong segment.
+fn module_identity_parts(symbol: &ExtractedSymbol) -> Option<(&str, String)> {
     let descriptor = symbol.descriptor.as_ref()?;
     Some((descriptor.package.as_str(), module_dotted_name(symbol)?))
 }
@@ -1562,31 +1551,11 @@ fn containing_module_ancestor_matches(
         .all(|(seg, name)| seg.kind == SegmentKind::Module && seg.name == *name)
 }
 
-/// The dotted namespace name of a module symbol (e.g. `pkg.shapes`), whole — the module-name rule
-/// compares span text against its trailing component-runs. Two descriptor shapes spell it:
-/// scip-python's namespace segment holding the dotted name, followed by an `__init__` meta terminal
-/// (borrowed), and ty-scip's run of module segments, one per component (joined with `.`).
-///
-/// Returns `None` for any other descriptor — a defensive fallback for a module-kind symbol whose
-/// descriptor was constructed some other way (e.g. directly in a test).
-fn module_dotted_name(symbol: &ExtractedSymbol) -> Option<Cow<'_, str>> {
-    use crate::identity::SegmentKind;
-
-    let segments = &symbol.descriptor.as_ref()?.segments;
-    let terminal = segments.last()?;
-    if terminal.name == "__init__" && terminal.kind == SegmentKind::Meta {
-        let namespace = segments.len().checked_sub(2).and_then(|i| segments.get(i))?;
-        return Some(Cow::Borrowed(&namespace.name));
-    }
-    segments.iter().all(|seg| seg.kind == SegmentKind::Module).then(|| {
-        Cow::Owned(
-            segments
-                .iter()
-                .map(|seg| seg.name.as_str())
-                .collect::<Vec<_>>()
-                .join("."),
-        )
-    })
+/// The dotted namespace name of a module symbol (e.g. `pkg.shapes`): its module segments joined with `.`.
+/// Returns `None` for a descriptor of any other shape.
+fn module_dotted_name(symbol: &ExtractedSymbol) -> Option<String> {
+    let names: Vec<&str> = symbol.descriptor.as_ref()?.module_names()?.collect();
+    Some(names.join("."))
 }
 
 /// Whether a source token names the descriptor's package.

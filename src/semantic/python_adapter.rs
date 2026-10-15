@@ -10,16 +10,22 @@
 //! (interpreter version, path, installed-package fingerprint) ride the produced index as declared
 //! provenance so staleness can compare them.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
-use super::model::{AnalyzerProvenance, EnvironmentFacts, ExtractedIndex, SymbolKind, normalize};
+use super::model::{
+    AnalyzerProvenance, EnvironmentFacts, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, PositionEncoding,
+    SourceRange, SymbolClass, SymbolKind, normalize,
+};
 use super::probe::{PROBE_DEADLINE, ProbeOutcome, run_bounded};
 use super::scip::translate_index;
 use super::{Capabilities, SemanticEngine, SemanticError};
-use crate::identity::SegmentKind;
+use crate::graph::range::{ByteSpan, LineIndex, range_to_span};
+use crate::graph::syntax::{Language, RelativeImport, SyntaxTree};
+use crate::identity::{Descriptor, DescriptorSegment, SegmentKind};
 
 /// The Python indexers the adapter can drive. Both accept the same `index` invocation and emit SCIP;
 /// they differ in executable, recorded analyzer name, install guidance, and how a failed run is read.
@@ -264,38 +270,320 @@ fn rejected_file_remedy(path: &Path, named: &str) -> String {
     }
 }
 
-/// Classify every symbol whose descriptor carries scip-python's module shape as `SymbolKind::Module`.
+/// Rewrite scip-python's descriptors into the canonical Python form.
 ///
-/// scip-python does not report a module kind in `SymbolInformation`, so a module's descriptor arrives
-/// with a meta-suffixed `__init__` terminal segment following the module's own namespace segment —
-/// e.g. `pkg.shapes` (module, `SegmentKind::Module`) followed by `__init__` (`SegmentKind::Meta`). This
-/// enrichment recognizes that shape once, at the adapter boundary, so every downstream consumer (the
-/// join's module-name rule, module-to-document bookkeeping, `get`/`status` display) keys off the one
-/// `module` kind vocabulary instead of re-deriving the shape from the descriptor.
+/// The canonical form has one module segment per dotted component, no `__init__` terminal, and one
+/// segment per module global:
 ///
-/// A second, unrelated module shape needs no enrichment here: a reference occurrence at a bare
-/// `__name__`/`__file__` token resolves to a symbol string ending in a single `Namespace`-suffixed
-/// descriptor segment with no `__init__` — e.g. `` `tests.test_basic`/ `` (one segment, name
-/// `tests.test_basic`, `Suffix::Namespace`), verified against a live scip-python (0.6.6) index. That
-/// shape already classifies as `SymbolKind::Module` through [`super::scip::symbol_kind_from`]'s
-/// existing `Namespace → SegmentKind::Module` mapping, which runs before this function during
-/// translation — so it never reaches this enrichment as anything but a module. The self-name
-/// alignment rule compares such an occurrence's resolved symbol against the containing document's own
-/// module by descriptor identity; no adapter change was needed for it.
+/// - a dotted module segment splits per component;
+/// - a trailing `__init__` meta segment after the module run is dropped;
+/// - two consecutive term segments of equal name directly after the module run collapse to one.
+///
+/// Symbols whose descriptors become equal merge into the first-seen symbol, which keeps its kind,
+/// gains the others' occurrences, and is in-workspace if any of them was. Every other segment (class,
+/// method, attribute) is unchanged. Only scip-python needs this: ty-scip already writes the canonical form.
+pub fn canonicalize_scip_python_descriptors(index: &mut ExtractedIndex) {
+    let mut merged: Vec<ExtractedSymbol> = Vec::with_capacity(index.symbols.len());
+    let mut by_descriptor: HashMap<Descriptor, usize> = HashMap::new();
+    for mut symbol in std::mem::take(&mut index.symbols) {
+        if let Some(descriptor) = &mut symbol.descriptor {
+            descriptor.segments = canonical_segments(std::mem::take(&mut descriptor.segments));
+            if let Some(&first) = by_descriptor.get(descriptor) {
+                let kept = &mut merged[first];
+                kept.occurrences.append(&mut symbol.occurrences);
+                if symbol.class == SymbolClass::InWorkspace {
+                    kept.class = SymbolClass::InWorkspace;
+                }
+                continue;
+            }
+            by_descriptor.insert(descriptor.clone(), merged.len());
+        }
+        merged.push(symbol);
+    }
+    index.symbols = merged;
+}
+
+/// The canonical segments for one scip-python descriptor's segments.
+fn canonical_segments(mut segments: Vec<DescriptorSegment>) -> Vec<DescriptorSegment> {
+    let module_run = segments
+        .iter()
+        .take_while(|seg| seg.kind == SegmentKind::Module)
+        .count();
+    // scip-python writes a module as one namespace segment holding the dotted name (`pkg.shapes`),
+    // writes each module twice (once with an `__init__` meta terminal, once bare), and writes an
+    // annotated module global with its name twice.
+    let mut rest = segments.split_off(module_run);
+    let mut out: Vec<DescriptorSegment> = segments
+        .iter()
+        .flat_map(|seg| seg.name.split('.'))
+        .map(|part| DescriptorSegment::new(part, SegmentKind::Module))
+        .collect();
+    if module_run > 0 {
+        if let [only] = rest.as_slice()
+            && only.name == "__init__"
+            && only.kind == SegmentKind::Meta
+        {
+            rest.clear();
+        } else if let [first, second, ..] = rest.as_slice()
+            && first.kind == SegmentKind::Term
+            && second.kind == SegmentKind::Term
+            && first.name == second.name
+        {
+            rest.remove(1);
+        }
+    }
+    out.extend(rest);
+    out
+}
+
+/// Classify every symbol whose descriptor is made only of module segments as `SymbolKind::Module`.
+///
+/// scip-python does not report a module kind, so this runs after canonicalization.
 pub fn classify_module_kinds(index: &mut ExtractedIndex) {
     for symbol in &mut index.symbols {
-        let Some(descriptor) = &symbol.descriptor else {
-            continue;
-        };
-        let is_module_shape = descriptor.segments.len() >= 2
-            && descriptor
-                .segments
-                .last()
-                .is_some_and(|seg| seg.name == "__init__" && seg.kind == SegmentKind::Meta);
-        if is_module_shape {
+        if symbol
+            .descriptor
+            .as_ref()
+            .is_some_and(|descriptor| descriptor.module_names().is_some())
+        {
             symbol.kind = SymbolKind::Module;
         }
     }
+}
+
+/// The module names of a symbol whose descriptor is made only of module segments, with its package.
+fn module_path(symbol: &ExtractedSymbol) -> Option<(&str, impl Iterator<Item = &str>)> {
+    let descriptor = symbol.descriptor.as_ref()?;
+    Some((descriptor.package.as_str(), descriptor.module_names()?))
+}
+
+/// What one relative import statement says about each module name scip-python can report for it.
+struct StatementTargets {
+    /// The byte span of the statement in its document.
+    span: ByteSpan,
+    /// The in-workspace module each name maps to, `None` when no workspace module sits there.
+    targets: HashMap<Vec<String>, Option<usize>>,
+}
+
+/// One document's relative import statements with the source they were read from.
+struct DocumentImports {
+    source: String,
+    lines: LineIndex,
+    statements: Vec<StatementTargets>,
+}
+
+impl DocumentImports {
+    /// The distinct targets the document's statements give `names`; empty when none names it.
+    fn targets_for(&self, names: &[String]) -> BTreeSet<Option<usize>> {
+        self.statements
+            .iter()
+            .filter_map(|statement| statement.targets.get(names))
+            .copied()
+            .collect()
+    }
+
+    /// The target of the statement holding `range`, when a statement does and it names `names`.
+    fn statement_target(
+        &self,
+        range: SourceRange,
+        encoding: PositionEncoding,
+        names: &[String],
+    ) -> Option<Option<usize>> {
+        let span = range_to_span(&self.source, &self.lines, range, encoding)?;
+        self.statements
+            .iter()
+            .find(|statement| statement.span.contains(&span))?
+            .targets
+            .get(names)
+            .copied()
+    }
+}
+
+/// What a document's relative imports say about each module name scip-python can report for them.
+///
+/// scip-python names a relatively imported module by the text after the dots (`from .shapes import W`
+/// gives `shapes`; `from . import shapes` gives `shapes`; `from .sub import deep` gives `sub` and
+/// `sub::deep`). Each such name maps to the in-workspace module at the document's package, climbed
+/// by the extra dots, plus the name; `None` when no workspace module sits there. A statement whose
+/// dots climb past the top package maps every name to `None`. A name that is only an imported
+/// attribute (not a module) also maps to `None`, so the document never borrows another package's
+/// module for it.
+fn relative_import_targets(
+    imports: &[RelativeImport],
+    own: Option<&[String]>,
+    is_initializer: bool,
+    workspace_modules: &HashMap<Vec<String>, usize>,
+) -> Vec<StatementTargets> {
+    let package = own.map(|own| if is_initializer { own } else { &own[..own.len() - 1] });
+    imports
+        .iter()
+        .map(|import| {
+            let base = package.and_then(|package| {
+                package
+                    .len()
+                    .checked_sub(import.dots.saturating_sub(1))
+                    .filter(|&depth| depth > 0)
+                    .map(|depth| &package[..depth])
+            });
+            let module_at = |tail: &[String]| {
+                let path: Vec<String> = base?.iter().chain(tail).cloned().collect();
+                workspace_modules.get(&path).copied()
+            };
+            let mut targets = HashMap::new();
+            if !import.module.is_empty() {
+                targets.insert(import.module.clone(), module_at(&import.module));
+            }
+            for name in &import.names {
+                let named: Vec<String> = import.module.iter().chain([name]).cloned().collect();
+                let target = module_at(&named);
+                targets.insert(named, target);
+            }
+            StatementTargets {
+                span: import.span,
+                targets,
+            }
+        })
+        .collect()
+}
+
+/// Move scip-python's references to relatively imported modules onto the in-workspace modules they name.
+///
+/// scip-python records `from .shapes import Widget` as a reference to an external module named by the
+/// text after the dots, in the project's package, not to `pkg.shapes`. The absolute path comes from
+/// the document's own module and the dots in its source, read from `project_root`:
+///
+/// - a reference inside a relative import statement that names the external module moves to the
+///   in-workspace module at that statement's path;
+/// - any other reference in a document with relative imports that name the external module moves to
+///   the in-workspace module at their path, when all those imports agree on one;
+/// - in any other readable document, they move only when every relative import in the workspace that
+///   names the external module resolves to the same in-workspace module;
+/// - otherwise they stay on the external module.
+///
+/// A document that cannot be read keeps its references. An external module left with no occurrences
+/// is removed. Run after [`canonicalize_scip_python_descriptors`], before [`classify_module_kinds`];
+/// only scip-python needs it, because ty-scip already resolves relative imports.
+pub fn resolve_scip_python_relative_imports(index: &mut ExtractedIndex, project_root: &Path) {
+    let mut package: Option<String> = None;
+    let mut workspace_modules: HashMap<Vec<String>, usize> = HashMap::new();
+    let mut own_modules: HashMap<String, Vec<String>> = HashMap::new();
+    for (position, symbol) in index.symbols.iter().enumerate() {
+        let Some((symbol_package, names)) = module_path(symbol) else {
+            continue;
+        };
+        if symbol.class != SymbolClass::InWorkspace {
+            continue;
+        }
+        package.get_or_insert_with(|| symbol_package.to_string());
+        let names: Vec<String> = names.map(str::to_string).collect();
+        if let Some(definition) = symbol.definition() {
+            own_modules.insert(definition.document_path.clone(), names.clone());
+        }
+        workspace_modules.insert(names, position);
+    }
+    let Some(package) = package else {
+        return;
+    };
+    let candidates: Vec<(usize, Vec<String>)> = index
+        .symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| symbol.class == SymbolClass::External)
+        .filter_map(|(position, symbol)| {
+            let (symbol_package, names) = module_path(symbol)?;
+            (symbol_package == package.as_str()).then(|| (position, names.map(str::to_string).collect()))
+        })
+        .collect();
+    let documents: BTreeSet<String> = candidates
+        .iter()
+        .flat_map(|(position, _)| &index.symbols[*position].occurrences)
+        .map(|occurrence| occurrence.document_path.clone())
+        .collect();
+
+    let mut imports_by_document: HashMap<String, DocumentImports> = HashMap::new();
+    for document in documents {
+        let Ok(source) = std::fs::read_to_string(project_root.join(&document)) else {
+            continue;
+        };
+        let Some(tree) = SyntaxTree::parse(&source, Language::Python) else {
+            continue;
+        };
+        let own = own_modules.get(&document).map(Vec::as_slice);
+        let is_initializer = Path::new(&document)
+            .file_name()
+            .is_some_and(|name| name == "__init__.py");
+        let statements = relative_import_targets(&tree.relative_imports(), own, is_initializer, &workspace_modules);
+        let lines = LineIndex::new(&source);
+        imports_by_document.insert(
+            document,
+            DocumentImports {
+                source,
+                lines,
+                statements,
+            },
+        );
+    }
+
+    // The distinct targets every statement in the workspace gives each module name.
+    let mut workspace_targets: HashMap<&[String], BTreeSet<Option<usize>>> = HashMap::new();
+    for statement in imports_by_document.values().flat_map(|imports| &imports.statements) {
+        for (names, target) in &statement.targets {
+            workspace_targets.entry(names.as_slice()).or_default().insert(*target);
+        }
+    }
+
+    // Keyed by candidate position and occurrence position within it.
+    let mut moves: HashMap<(usize, usize), usize> = HashMap::new();
+    for (position, names) in &candidates {
+        for (slot, occurrence) in index.symbols[*position].occurrences.iter().enumerate() {
+            let Some(imports) = imports_by_document.get(&occurrence.document_path) else {
+                continue;
+            };
+            let encoding = index
+                .encoding_for(&occurrence.document_path)
+                .unwrap_or(PositionEncoding::Utf8);
+            let settled = match imports.statement_target(occurrence.range, encoding, names) {
+                Some(target) => BTreeSet::from([target]),
+                None => {
+                    let in_document = imports.targets_for(names);
+                    if in_document.is_empty() {
+                        workspace_targets.get(names.as_slice()).cloned().unwrap_or_default()
+                    } else {
+                        in_document
+                    }
+                }
+            };
+            if let Some(Some(target)) = settled.first()
+                && settled.len() == 1
+            {
+                moves.insert((*position, slot), *target);
+            }
+        }
+    }
+
+    let mut arrivals: Vec<(usize, ExtractedOccurrence)> = Vec::new();
+    for (position, _) in &candidates {
+        let symbol = &mut index.symbols[*position];
+        for (slot, occurrence) in std::mem::take(&mut symbol.occurrences).into_iter().enumerate() {
+            match moves.get(&(*position, slot)) {
+                Some(target) => arrivals.push((*target, occurrence)),
+                None => symbol.occurrences.push(occurrence),
+            }
+        }
+    }
+    for (target, occurrence) in arrivals {
+        index.symbols[target].occurrences.push(occurrence);
+    }
+    let emptied: BTreeSet<usize> = candidates
+        .iter()
+        .map(|(position, _)| *position)
+        .filter(|position| index.symbols[*position].occurrences.is_empty())
+        .collect();
+    let mut position = 0;
+    index.symbols.retain(|_| {
+        position += 1;
+        !emptied.contains(&(position - 1))
+    });
 }
 
 impl SemanticEngine for PythonAdapter {
@@ -337,13 +625,26 @@ impl SemanticEngine for PythonAdapter {
                 output_path.display()
             ))
         })?;
-        // library_roots stays empty at launch: Python supplies no package→root map yet, so twin
-        // groups fall back to the refusal path by construction.
+        // Python has no units below the project, so the target inventory stays not-applicable.
         let mut extracted = translate_index(&index, &self.provenance());
         extracted.environment = Some(facts);
-        classify_module_kinds(&mut extracted);
-        Ok(normalize(extracted))
+        Ok(finish_translation(extracted, self.indexer, project_root))
     }
+}
+
+/// Bring a translated Python index to the canonical form: rewrite scip-python's output (ty-scip
+/// already writes the canonical form), classify modules, and normalize.
+pub fn finish_translation(
+    mut extracted: ExtractedIndex,
+    indexer: PythonIndexer,
+    project_root: &Path,
+) -> ExtractedIndex {
+    if indexer == PythonIndexer::ScipPython {
+        canonicalize_scip_python_descriptors(&mut extracted);
+        resolve_scip_python_relative_imports(&mut extracted, project_root);
+    }
+    classify_module_kinds(&mut extracted);
+    normalize(extracted)
 }
 
 /// The child-process PATH with `bin` prepended, preserving the rest of the current PATH.
@@ -529,7 +830,7 @@ pub fn package_fingerprint(site_packages: &Path) -> Result<String, SemanticError
 mod tests {
     use super::*;
     use crate::identity::{Descriptor, DescriptorSegment};
-    use crate::semantic::model::{ExtractedSymbol, SymbolClass};
+    use crate::semantic::model::ExtractedOccurrence;
 
     /// A canonicalized tempdir path (macOS tempdirs live behind a `/private` symlink; comparing
     /// resolved paths keeps the assertions byte-exact).
@@ -539,35 +840,546 @@ mod tests {
         (dir, path)
     }
 
-    // A reference occurrence at a bare `__name__`/`__file__` token resolves to a single-segment
-    // `Namespace`-suffixed descriptor (e.g. `` `tests.test_basic`/ ``, no `__init__` terminal) —
-    // distinct from the `__init__`-terminal shape this module's enrichment recognizes. That shape
-    // already classifies as `SymbolKind::Module` through the translation's own descriptor→kind
-    // mapping before `classify_module_kinds` runs, so the enrichment is a no-op on it — pinning that
-    // here guards against a future translation change silently reclassifying it.
-    #[test]
-    fn namespace_only_descriptor_is_already_module_kind_without_enrichment() {
-        let mut index = ExtractedIndex {
+    fn symbol_with(segments: &[(&str, SegmentKind)], kind: SymbolKind) -> ExtractedSymbol {
+        ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "pkg",
+                segments
+                    .iter()
+                    .map(|(name, kind)| DescriptorSegment::new(*name, *kind))
+                    .collect(),
+            )),
+            kind,
+            class: SymbolClass::InWorkspace,
+            occurrences: Vec::new(),
+        }
+    }
+
+    fn index_of(symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
+        ExtractedIndex {
             provenance: AnalyzerProvenance {
                 analyzer_name: "scip-python".to_string(),
                 analyzer_version: "0.6.6".to_string(),
             },
             documents: Vec::new(),
-            symbols: vec![ExtractedSymbol {
-                descriptor: Some(Descriptor::new(
-                    "flask",
-                    vec![DescriptorSegment::new("tests.test_basic", SegmentKind::Module)],
-                )),
-                kind: SymbolKind::Module,
-                class: SymbolClass::InWorkspace,
-                occurrences: Vec::new(),
-            }],
+            symbols,
             duplicate_groups: Vec::new(),
-            library_roots: Default::default(),
+            targets: Default::default(),
             environment: None,
+        }
+    }
+
+    /// The segment names of the only symbol of `index`, joined by `/`.
+    fn only_path(index: &ExtractedIndex) -> String {
+        assert_eq!(index.symbols.len(), 1);
+        index.symbols[0]
+            .descriptor
+            .as_ref()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|seg| seg.name.as_str())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    fn definition_at(line: u32) -> ExtractedOccurrence {
+        ExtractedOccurrence {
+            document_path: "pkg/shapes.py".to_string(),
+            range: crate::semantic::model::SourceRange::new(line, 0, line, 1),
+            role: crate::semantic::model::OccurrenceRole::Definition,
+        }
+    }
+
+    fn reference_at(line: u32) -> ExtractedOccurrence {
+        ExtractedOccurrence {
+            role: crate::semantic::model::OccurrenceRole::Reference,
+            ..definition_at(line)
+        }
+    }
+
+    // _(Python module path splits per component)_
+    #[test]
+    fn dotted_module_splits_per_component() {
+        let mut index = index_of(vec![symbol_with(
+            &[("pkg.sub.shapes", SegmentKind::Module), ("Widget", SegmentKind::Type)],
+            SymbolKind::Type,
+        )]);
+        canonicalize_scip_python_descriptors(&mut index);
+        assert_eq!(only_path(&index), "pkg/sub/shapes/Widget");
+        let segments = &index.symbols[0].descriptor.as_ref().unwrap().segments;
+        assert!(segments[..3].iter().all(|seg| seg.kind == SegmentKind::Module));
+        assert_eq!(segments[3].kind, SegmentKind::Type);
+    }
+
+    // _(Python module and package have no `__init__` segment)_
+    #[test]
+    fn init_marker_dropped_and_module_symbols_merge() {
+        let bare = ExtractedSymbol {
+            class: SymbolClass::External,
+            occurrences: vec![reference_at(5)],
+            ..symbol_with(&[("pkg.shapes", SegmentKind::Module)], SymbolKind::Module)
         };
+        let marker = ExtractedSymbol {
+            occurrences: vec![definition_at(0)],
+            ..symbol_with(
+                &[("pkg.shapes", SegmentKind::Module), ("__init__", SegmentKind::Meta)],
+                SymbolKind::Other,
+            )
+        };
+        let mut index = index_of(vec![bare, marker]);
+        canonicalize_scip_python_descriptors(&mut index);
+        assert_eq!(only_path(&index), "pkg/shapes");
+        assert_eq!(
+            index.symbols[0].kind,
+            SymbolKind::Module,
+            "first-seen symbol's kind wins"
+        );
+        assert_eq!(
+            index.symbols[0].class,
+            SymbolClass::InWorkspace,
+            "a definition makes the merge in-workspace"
+        );
+        assert_eq!(index.symbols[0].occurrences, vec![reference_at(5), definition_at(0)]);
+    }
+
+    #[test]
+    fn top_level_module_is_one_segment() {
+        let mut index = index_of(vec![symbol_with(
+            &[("shapes", SegmentKind::Module), ("__init__", SegmentKind::Meta)],
+            SymbolKind::Other,
+        )]);
+        canonicalize_scip_python_descriptors(&mut index);
+        assert_eq!(only_path(&index), "shapes");
+    }
+
+    // _(Python method nests in its class)_
+    #[test]
+    fn class_and_method_segments_unchanged() {
+        let mut index = index_of(vec![symbol_with(
+            &[
+                ("pkg.shapes", SegmentKind::Module),
+                ("Widget", SegmentKind::Type),
+                ("area", SegmentKind::Method),
+            ],
+            SymbolKind::Method,
+        )]);
+        canonicalize_scip_python_descriptors(&mut index);
+        assert_eq!(only_path(&index), "pkg/shapes/Widget/area");
+    }
+
+    // _(Python module global is one segment)_
+    #[test]
+    fn doubled_module_global_collapses_to_one_segment() {
+        let mut index = index_of(vec![symbol_with(
+            &[
+                ("flask.globals", SegmentKind::Module),
+                ("current_app", SegmentKind::Term),
+                ("current_app", SegmentKind::Term),
+            ],
+            SymbolKind::Constant,
+        )]);
+        canonicalize_scip_python_descriptors(&mut index);
+        assert_eq!(only_path(&index), "flask/globals/current_app");
+    }
+
+    #[test]
+    fn near_doubled_names_are_unchanged() {
+        let attributes = [("size", SegmentKind::Term), ("_size", SegmentKind::Term)];
+        let mut index = index_of(vec![symbol_with(
+            &[
+                ("pkg", SegmentKind::Module),
+                ("Widget", SegmentKind::Type),
+                attributes[0],
+            ],
+            SymbolKind::Field,
+        )]);
+        canonicalize_scip_python_descriptors(&mut index);
+        assert_eq!(only_path(&index), "pkg/Widget/size");
+
+        let mut index = index_of(vec![symbol_with(
+            &[
+                ("pkg", SegmentKind::Module),
+                ("Widget", SegmentKind::Type),
+                attributes[1],
+            ],
+            SymbolKind::Field,
+        )]);
+        canonicalize_scip_python_descriptors(&mut index);
+        assert_eq!(only_path(&index), "pkg/Widget/_size");
+
+        let mut index = index_of(vec![symbol_with(
+            &[
+                ("pkg", SegmentKind::Module),
+                ("Widget", SegmentKind::Type),
+                ("Widget", SegmentKind::Method),
+            ],
+            SymbolKind::Method,
+        )]);
+        canonicalize_scip_python_descriptors(&mut index);
+        assert_eq!(only_path(&index), "pkg/Widget/Widget");
+    }
+
+    #[test]
+    fn module_only_descriptor_classifies_as_module() {
+        let mut index = index_of(vec![
+            symbol_with(
+                &[("pkg", SegmentKind::Module), ("shapes", SegmentKind::Module)],
+                SymbolKind::Other,
+            ),
+            symbol_with(
+                &[("pkg", SegmentKind::Module), ("Widget", SegmentKind::Type)],
+                SymbolKind::Type,
+            ),
+        ]);
         classify_module_kinds(&mut index);
         assert_eq!(index.symbols[0].kind, SymbolKind::Module);
+        assert_eq!(index.symbols[1].kind, SymbolKind::Type);
+    }
+
+    fn occurrence_at(document: &str, line: u32, role: crate::semantic::model::OccurrenceRole) -> ExtractedOccurrence {
+        ExtractedOccurrence {
+            document_path: document.to_string(),
+            range: crate::semantic::model::SourceRange::new(line, 0, line, 1),
+            role,
+        }
+    }
+
+    /// An in-workspace module defined in `document`.
+    fn workspace_module(path: &[&str], document: &str) -> ExtractedSymbol {
+        let segments: Vec<_> = path.iter().map(|name| (*name, SegmentKind::Module)).collect();
+        ExtractedSymbol {
+            occurrences: vec![occurrence_at(
+                document,
+                0,
+                crate::semantic::model::OccurrenceRole::Definition,
+            )],
+            ..symbol_with(&segments, SymbolKind::Module)
+        }
+    }
+
+    /// An external module named `path`, referenced at each `(document, line)`.
+    fn external_module(path: &[&str], references: &[(&str, u32)]) -> ExtractedSymbol {
+        let segments: Vec<_> = path.iter().map(|name| (*name, SegmentKind::Module)).collect();
+        ExtractedSymbol {
+            class: SymbolClass::External,
+            occurrences: references
+                .iter()
+                .map(|(document, line)| {
+                    occurrence_at(document, *line, crate::semantic::model::OccurrenceRole::Reference)
+                })
+                .collect(),
+            ..symbol_with(&segments, SymbolKind::Module)
+        }
+    }
+
+    /// Run the relative-import step over `symbols` with the project sources `files` written to disk.
+    fn resolve_with_sources(files: &[(&str, &str)], symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
+        let (_guard, root) = canonical_tempdir();
+        for (path, text) in files {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        let mut index = index_of(symbols);
+        resolve_scip_python_relative_imports(&mut index, &root);
+        index
+    }
+
+    /// The `(document, line)` references of the module at `path` with class `class`, or `None` when
+    /// the index holds no such symbol.
+    fn module_references(index: &ExtractedIndex, path: &[&str], class: SymbolClass) -> Option<Vec<(String, u32)>> {
+        index
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.class == class && module_path(symbol).is_some_and(|(_, names)| names.eq(path.iter().copied()))
+            })
+            .map(|symbol| {
+                symbol
+                    .occurrences
+                    .iter()
+                    .filter(|o| o.role == crate::semantic::model::OccurrenceRole::Reference)
+                    .map(|o| (o.document_path.clone(), o.range.start_line))
+                    .collect()
+            })
+    }
+
+    fn at(document: &str, line: u32) -> (String, u32) {
+        (document.to_string(), line)
+    }
+
+    // _(Python import from the same package)_
+    #[test]
+    fn same_package_import_moves_to_the_sibling_module() {
+        let index = resolve_with_sources(
+            &[("pkg/consumer.py", "from .shapes import Widget\n")],
+            vec![
+                workspace_module(&["pkg"], "pkg/__init__.py"),
+                workspace_module(&["pkg", "consumer"], "pkg/consumer.py"),
+                workspace_module(&["pkg", "shapes"], "pkg/shapes.py"),
+                external_module(&["shapes"], &[("pkg/consumer.py", 0)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "shapes"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/consumer.py", 0)])
+        );
+        assert_eq!(module_references(&index, &["shapes"], SymbolClass::External), None);
+    }
+
+    // _(Python import from a parent package)_
+    #[test]
+    fn parent_package_import_climbs_one_package_per_extra_dot() {
+        let index = resolve_with_sources(
+            &[("pkg/sub/deep.py", "from ..shapes import Widget\n")],
+            vec![
+                workspace_module(&["pkg", "sub", "deep"], "pkg/sub/deep.py"),
+                workspace_module(&["pkg", "shapes"], "pkg/shapes.py"),
+                external_module(&["shapes"], &[("pkg/sub/deep.py", 0)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "shapes"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/sub/deep.py", 0)])
+        );
+    }
+
+    // A package initializer is its own package, so one dot stays inside it.
+    #[test]
+    fn initializer_import_resolves_inside_its_own_package() {
+        let index = resolve_with_sources(
+            &[("pkg/sub/__init__.py", "from .app import run\n")],
+            vec![
+                workspace_module(&["pkg", "sub"], "pkg/sub/__init__.py"),
+                workspace_module(&["pkg", "sub", "app"], "pkg/sub/app.py"),
+                external_module(&["app"], &[("pkg/sub/__init__.py", 0)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "sub", "app"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/sub/__init__.py", 0)])
+        );
+    }
+
+    // _(Python name bound by a relative import)_
+    #[test]
+    fn module_bound_by_from_dot_import_moves_with_its_later_use() {
+        let index = resolve_with_sources(
+            &[("pkg/relative.py", "from . import shapes\n\nw = shapes.Widget()\n")],
+            vec![
+                workspace_module(&["pkg", "relative"], "pkg/relative.py"),
+                workspace_module(&["pkg", "shapes"], "pkg/shapes.py"),
+                external_module(&["shapes"], &[("pkg/relative.py", 0), ("pkg/relative.py", 2)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "shapes"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/relative.py", 0), at("pkg/relative.py", 2)])
+        );
+        assert_eq!(module_references(&index, &["shapes"], SymbolClass::External), None);
+    }
+
+    // An imported name that is itself a module resolves to that module; the package it is imported
+    // from resolves too.
+    #[test]
+    fn module_imported_by_name_from_a_subpackage_resolves_with_the_subpackage() {
+        let index = resolve_with_sources(
+            &[("pkg/more.py", "from .sub import deep\n")],
+            vec![
+                workspace_module(&["pkg", "more"], "pkg/more.py"),
+                workspace_module(&["pkg", "sub"], "pkg/sub/__init__.py"),
+                workspace_module(&["pkg", "sub", "deep"], "pkg/sub/deep.py"),
+                external_module(&["sub"], &[("pkg/more.py", 0)]),
+                external_module(&["sub", "deep"], &[("pkg/more.py", 0)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "sub"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/more.py", 0)])
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "sub", "deep"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/more.py", 0)])
+        );
+    }
+
+    // _(Same relative name in two packages)_
+    #[test]
+    fn same_relative_name_resolves_per_package() {
+        let index = resolve_with_sources(
+            &[
+                ("pkg/relative.py", "from .app import run\n"),
+                ("pkg/sub/deep.py", "from .app import run\n"),
+            ],
+            vec![
+                workspace_module(&["pkg", "relative"], "pkg/relative.py"),
+                workspace_module(&["pkg", "sub", "deep"], "pkg/sub/deep.py"),
+                workspace_module(&["pkg", "app"], "pkg/app.py"),
+                workspace_module(&["pkg", "sub", "app"], "pkg/sub/app.py"),
+                external_module(&["app"], &[("pkg/relative.py", 0), ("pkg/sub/deep.py", 0)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "app"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/relative.py", 0)])
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "sub", "app"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/sub/deep.py", 0)])
+        );
+        assert_eq!(module_references(&index, &["app"], SymbolClass::External), None);
+    }
+
+    // A document with no relative import (a re-exporting module's user) follows the workspace only
+    // when every relative import of that name resolves to one module.
+    #[test]
+    fn cross_document_use_moves_only_when_every_import_agrees() {
+        let modules = || {
+            vec![
+                workspace_module(&["pkg", "relative"], "pkg/relative.py"),
+                workspace_module(&["pkg", "other"], "pkg/other.py"),
+                workspace_module(&["pkg", "shapes"], "pkg/shapes.py"),
+                workspace_module(&["pkg", "app"], "pkg/app.py"),
+                workspace_module(&["pkg", "sub", "deep"], "pkg/sub/deep.py"),
+                workspace_module(&["pkg", "sub", "app"], "pkg/sub/app.py"),
+            ]
+        };
+        let files = [
+            ("pkg/relative.py", "from .shapes import W\nfrom .app import run\n"),
+            ("pkg/sub/deep.py", "from .app import run\n"),
+            ("pkg/other.py", "x = 1\n"),
+        ];
+
+        let mut symbols = modules();
+        symbols.push(external_module(
+            &["shapes"],
+            &[("pkg/relative.py", 0), ("pkg/other.py", 0)],
+        ));
+        let index = resolve_with_sources(&files, symbols);
+        assert_eq!(
+            module_references(&index, &["pkg", "shapes"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/relative.py", 0), at("pkg/other.py", 0)]),
+            "one import, one module: the document without an import follows"
+        );
+
+        let mut symbols = modules();
+        symbols.push(external_module(
+            &["app"],
+            &[("pkg/relative.py", 1), ("pkg/sub/deep.py", 0), ("pkg/other.py", 0)],
+        ));
+        let index = resolve_with_sources(&files, symbols);
+        assert_eq!(
+            module_references(&index, &["app"], SymbolClass::External),
+            Some(vec![at("pkg/other.py", 0)]),
+            "two imports, two modules: the document without an import stays external"
+        );
+    }
+
+    // _(a relative import that names no workspace module)_
+    #[test]
+    fn import_naming_no_workspace_module_leaves_the_reference_unchanged() {
+        let index = resolve_with_sources(
+            &[("pkg/consumer.py", "from .missing import thing\n")],
+            vec![
+                workspace_module(&["pkg", "consumer"], "pkg/consumer.py"),
+                external_module(&["missing"], &[("pkg/consumer.py", 0)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["missing"], SymbolClass::External),
+            Some(vec![at("pkg/consumer.py", 0)])
+        );
+    }
+
+    // Each relative import statement settles its own reference, even when the same document imports
+    // the same name from two packages.
+    #[test]
+    fn statements_with_different_dot_counts_each_resolve() {
+        let index = resolve_with_sources(
+            &[(
+                "pkg/sub/consumer.py",
+                "from .app import run as local_run\nfrom ..app import run as parent_run\n",
+            )],
+            vec![
+                workspace_module(&["pkg", "sub", "consumer"], "pkg/sub/consumer.py"),
+                workspace_module(&["pkg", "app"], "pkg/app.py"),
+                workspace_module(&["pkg", "sub", "app"], "pkg/sub/app.py"),
+                external_module(&["app"], &[("pkg/sub/consumer.py", 0), ("pkg/sub/consumer.py", 1)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "sub", "app"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/sub/consumer.py", 0)])
+        );
+        assert_eq!(
+            module_references(&index, &["pkg", "app"], SymbolClass::InWorkspace),
+            Some(vec![at("pkg/sub/consumer.py", 1)])
+        );
+        assert_eq!(module_references(&index, &["app"], SymbolClass::External), None);
+    }
+
+    // Dots that climb past the top package name no module, even when a top-level module has the name.
+    #[test]
+    fn dots_past_the_top_package_resolve_to_nothing() {
+        for (document, own) in [("pkg/consumer.py", "consumer"), ("pkg/__init__.py", "")] {
+            let own_path: Vec<&str> = ["pkg", own].into_iter().filter(|name| !name.is_empty()).collect();
+            let index = resolve_with_sources(
+                &[(document, "from ..app import run\n")],
+                vec![
+                    workspace_module(&own_path, document),
+                    workspace_module(&["app"], "app.py"),
+                    external_module(&["app"], &[(document, 0)]),
+                ],
+            );
+            assert_eq!(
+                module_references(&index, &["app"], SymbolClass::External),
+                Some(vec![at(document, 0)]),
+                "{document}"
+            );
+        }
+    }
+
+    // A `from . import name` that finds no workspace module in its own package does not take the
+    // module another package's import of the same name resolves to.
+    #[test]
+    fn unresolved_imported_name_ignores_other_packages() {
+        let index = resolve_with_sources(
+            &[
+                ("a/consumer.py", "from . import app\n"),
+                ("b/consumer.py", "from . import app\n"),
+            ],
+            vec![
+                workspace_module(&["a", "consumer"], "a/consumer.py"),
+                workspace_module(&["b", "consumer"], "b/consumer.py"),
+                workspace_module(&["b", "app"], "b/app.py"),
+                external_module(&["app"], &[("a/consumer.py", 0), ("b/consumer.py", 0)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["b", "app"], SymbolClass::InWorkspace),
+            Some(vec![at("b/consumer.py", 0)])
+        );
+        assert_eq!(
+            module_references(&index, &["app"], SymbolClass::External),
+            Some(vec![at("a/consumer.py", 0)])
+        );
+    }
+
+    // A source that cannot be read keeps its references where the indexer put them.
+    #[test]
+    fn unreadable_source_leaves_its_references_unchanged() {
+        let index = resolve_with_sources(
+            &[],
+            vec![
+                workspace_module(&["pkg", "consumer"], "pkg/consumer.py"),
+                workspace_module(&["pkg", "shapes"], "pkg/shapes.py"),
+                external_module(&["shapes"], &[("pkg/consumer.py", 0)]),
+            ],
+        );
+        assert_eq!(
+            module_references(&index, &["shapes"], SymbolClass::External),
+            Some(vec![at("pkg/consumer.py", 0)])
+        );
     }
 
     /// An executable shell stub named `name` in `dir` running `body`.

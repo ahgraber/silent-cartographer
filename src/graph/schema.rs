@@ -23,7 +23,13 @@
 /// merely missing a count. The keyed `aligned_counts` column spares that change any DDL and any
 /// per-rule read/write edit — it does not spare it the version bump.
 ///
-/// Migration: version 18 leaves documentation out of the spelled token sequence the clone keys read
+/// Migration: version 19 changes the stored identity form: a Rust declaration outside the package's
+/// library carries a unit marker after the package (`package+bin.tool`, `package+shared`), a
+/// Python module path is one segment per dotted component, and a Python package initializer has no
+/// `__init__` segment (module names read from the segments joined with `.`); the build-target
+/// inventory and the digest of each manifest it was read from are recorded in
+/// `index_metadata.targets`;
+/// version 18 leaves documentation out of the spelled token sequence the clone keys read
 /// (a documented Python leaf's stored keys change) and adds the shared-fragment evidence —
 /// `clone_fingerprints`, `symbols.clone_token_count`, an index on `symbols.clone_substitution_key`,
 /// and the fragment parameters in `index_metadata`;
@@ -43,7 +49,7 @@
 /// columns on `symbols`, and the semantic-index identity in `index_metadata`. The index is derived,
 /// replayable data, so rebuild is the migration — a build replaces an older store of its own
 /// wholesale and a query refuses it with recovery guidance (the replace-or-refuse contract).
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -72,6 +78,9 @@ PRAGMA foreign_keys = ON;
 -- values, so a build compares them when deciding whether stored vectors still describe the
 -- workspace. `fragment_kgram_length` and `fragment_window` are the winnowing parameters the build's
 -- clone fingerprints were derived under; a reader applies the recorded values, not the binary's.
+-- `targets` is JSON: the build-target inventory the build's identities were assigned under and the
+-- digest of each manifest it was read from, which a build compares to decide whether the stored
+-- identities still describe the project.
 CREATE TABLE IF NOT EXISTS index_metadata (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     schema_version      INTEGER NOT NULL,
@@ -86,6 +95,7 @@ CREATE TABLE IF NOT EXISTS index_metadata (
     chunk_overlap             INTEGER NOT NULL,
     fragment_kgram_length     INTEGER NOT NULL,
     fragment_window           INTEGER NOT NULL,
+    targets                   TEXT    NOT NULL,
     content_hash                   TEXT    NOT NULL,
     aligned_counts                 TEXT    NOT NULL DEFAULT '{}',
     text_mismatch_count            INTEGER NOT NULL DEFAULT 0,
@@ -106,6 +116,9 @@ CREATE TABLE IF NOT EXISTS source_files (
 -- `duplicated` marks a true same-descriptor twin: an in-workspace definition whose identical
 -- resolved descriptor is shared by at least one other definition. Distinct descriptors whose
 -- canonical projections merely collide (and so carry a `#<rank>` disambiguator) are NOT duplicated.
+-- `duplicate_key` is the identity of the shared descriptor without unit marker or disambiguator,
+-- identical for every twin of that descriptor (including twins belonging to different units); NULL for a
+-- symbol that is not duplicated.
 -- `start_line`, `start_column`, `end_line`, and `end_column` locate the span in lines and columns
 -- from 1 (lines end at LF, CRLF, or a lone CR; columns count characters; the end is exclusive); they
 -- are NULL exactly when the span is. `occurrences` and `join_discrepancies` carry the same four.
@@ -148,6 +161,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     signature_text   TEXT,
     interface_text   TEXT,
     duplicated       INTEGER NOT NULL DEFAULT 0,
+    duplicate_key    TEXT,
     test_rule        TEXT,
     clone_formatting_key    TEXT,
     clone_substitution_key  TEXT,
@@ -175,8 +189,9 @@ CREATE INDEX IF NOT EXISTS clone_fingerprints_by_hash ON clone_fingerprints(hash
 -- its provenance. Aligned reference occurrences carry
 -- `enclosing_id`, the nearest enclosing persisted declaration (NULL means the module/file itself is
 -- the attribution). `locality` is the locality rule ('defining_document', 'module_chain',
--- 'target_metadata', or 'declaration_scope') that selected this attribution's twin, for an occurrence
--- resolved from a duplicated descriptor's group; NULL for an ordinary (non-duplicated) attribution.
+-- 'target_metadata', 'unit_membership', or 'declaration_scope') that selected this attribution's twin,
+-- for an occurrence resolved from a duplicated descriptor's group; NULL for an ordinary (non-duplicated)
+-- attribution.
 CREATE TABLE IF NOT EXISTS occurrences (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol_id      TEXT    NOT NULL REFERENCES symbols(canonical_id),

@@ -70,6 +70,10 @@ A commit that changed no indexed source returns in a fraction of a second.
 
 Under `--json`, the answer carries `"rebuilt"`: `true` if the workspace was analyzed, `false` if the index was already current.
 
+For Rust, the check also covers the Cargo manifests.
+A change to a `Cargo.toml`, for example a renamed target, makes the next build rebuild.
+A store built while the list of targets was unavailable is rebuilt by the next build.
+
 Anything the check cannot confirm causes a build rather than a skip — an absent index, an older schema version, a store recorded for a different workspace, or unreadable metadata.
 Use `--force` when you distrust the check itself.
 
@@ -107,6 +111,57 @@ added during build: src/f.rs
 
 The list is not paged.
 An edit that is reverted before the second pass is not reported, and the index then matches the files again.
+
+## Undetermined units
+
+A Rust identity names the package unit that a declaration belongs to; see [the canonical identity](common.md#the-canonical-identity).
+When `build` cannot determine a unit, it labels the code as library code and reports why.
+Under `--json`, the answer always carries `"undetermined_units"`, an object with two lists.
+Both lists are empty when every unit was determined.
+A build that finds the index already current repeats the lists of the build that wrote it, and the human answer repeats its warnings.
+
+```json
+{
+  "undetermined_units": {
+    "packages": [
+      {
+        "package": "libbin",
+        "reason": "metadata_timeout"
+      }
+    ],
+    "documents": [
+      {
+        "document_path": "src/old.rs",
+        "reason": "no_target_loads_it"
+      }
+    ]
+  }
+}
+```
+
+A `packages` entry means the list of Cargo targets was unavailable for that package.
+Its `reason` is one of:
+
+| Reason             | Cause                                                                          |
+| ------------------ | ------------------------------------------------------------------------------ |
+| `metadata_timeout` | `cargo metadata` did not finish within the probe bound                         |
+| `no_manifest`      | The workspace has no `Cargo.toml`; the build was forced with `--language rust` |
+| `metadata_failed`  | `cargo metadata` failed; `detail` holds the first line of Cargo's error output |
+
+A `documents` entry means no `mod` declaration in any Cargo target loads the file.
+Its `reason` is always `no_target_loads_it`.
+
+In both cases, the affected code is labeled as library code.
+A reference between same-named items in different targets may point to the wrong one.
+Run the build again, or fix the cause, to label each target's code.
+
+The human answer prints one warning per entry after the accounting line:
+
+```text
+warning: could not determine the Cargo targets of package libbin, because `cargo metadata` did not finish within 10 s.
+  Code in its binaries, tests, and examples is labeled as library code, so a reference between same-named items in different targets may point to the wrong one.
+  Run `c10r build` again; if this repeats, run `cargo metadata --no-deps` in the workspace to see what is slow.
+```
 
 ## Chunk parameters
 

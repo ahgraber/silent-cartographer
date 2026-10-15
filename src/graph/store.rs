@@ -4,15 +4,16 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::identity::{CanonicalId, WorkspaceId};
-use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
+use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts, TargetInventory};
 
 use super::chunk::ChunkParams;
 use super::join::{AlignmentRule, JoinAccounting};
 use super::range::{LineColumn, LineColumnSpan};
 use super::schema::{SCHEMA_SQL, SCHEMA_VERSION};
+use super::units::UndeterminedUnits;
 
 /// An edge kind in the graph. All four kinds are contracted: `Contains` is enclosure; the three
 /// dependency kinds — `Uses`, `Imports`, `TypeHierarchy` — are read by the dependents traversal.
@@ -246,7 +247,7 @@ pub struct OccurrenceRow {
     pub rule: String,
     /// The nearest enclosing persisted declaration, if attributed.
     pub enclosing_id: Option<CanonicalId>,
-    /// The locality rule (`defining_document`, `module_chain`, `target_metadata`, or
+    /// The locality rule (`defining_document`, `module_chain`, `target_metadata`, `unit_membership`, or
     /// `declaration_scope`) that selected this attribution's twin, for an occurrence resolved from a
     /// duplicated descriptor's group; `None` for an ordinary (non-duplicated) attribution.
     pub locality: Option<String>,
@@ -356,20 +357,31 @@ impl DiscrepancySummary {
     }
 }
 
-/// A duplicated-descriptor group: the shared descriptor's canonical base and the persisted
+/// A duplicated-descriptor group: the shared descriptor's unit-free identity and the persisted
 /// definitions that share it.
 ///
-/// Derived at query time from the persisted symbols table (design.md: "derived, not separately
-/// persisted"): members are the symbols marked `duplicated` at ingest — true same-descriptor twins,
-/// never canonical-projection collisions of distinct descriptors — grouped by their identity with
-/// the `#<rank>` disambiguator stripped.
+/// Derived at query time from the persisted symbols table: members are the symbols marked `duplicated`
+/// at ingest — true same-descriptor twins, never canonical-projection collisions of distinct
+/// descriptors — grouped by the key recorded for them at ingest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicatedGroup {
-    /// The shared descriptor's canonical base (the identity with its `#<rank>` suffix stripped).
+    /// The shared descriptor's identity without any unit marker or `#<rank>` suffix.
     pub descriptor_base: String,
-    /// The definitions that share the descriptor, ordered by canonical identity (their disambiguator
-    /// rank).
+    /// The definitions that share the descriptor, ordered by canonical identity.
     pub definitions: Vec<SymbolRow>,
+}
+
+/// What a build recorded about the project's build targets: the inventory it used, with the digest of
+/// each manifest it was read from. A later build compares these to the project as it
+/// stands to decide whether the stored identities still describe it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedTargets {
+    /// The inventory the build used.
+    pub inventory: TargetInventory,
+    /// The declarations whose unit the build could not determine, so a build that finds the index
+    /// current reports them again.
+    #[serde(default)]
+    pub undetermined_units: UndeterminedUnits,
 }
 
 /// The recorded index metadata.
@@ -395,6 +407,8 @@ pub struct IndexMetadata {
     pub environment: Option<EnvironmentFacts>,
     /// The chunk parameters the build ran under, recorded as part of the semantic-index identity.
     pub chunk_params: ChunkParams,
+    /// The build targets the build used and the digest of each manifest they were read from.
+    pub targets: RecordedTargets,
 }
 
 /// The semantic-index identity recorded with a build: the embedding model, the corpus/render
@@ -899,14 +913,15 @@ impl GraphStore {
             .map(|(rule, count)| (rule.tag().to_string(), serde_json::json!(count)))
             .collect();
         let aligned_counts = serde_json::Value::Object(aligned_counts).to_string();
+        let targets = serde_json::to_string(&meta.targets).expect("recorded targets serialize");
         self.conn.execute(
             "INSERT OR REPLACE INTO index_metadata
                 (id, schema_version, workspace_id, workspace_root, analyzer_name, analyzer_version, environment,
                  content_hash, aligned_counts,
                  text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count,
                  semantic_model_identity, corpus_definition_version, chunk_size, chunk_overlap,
-                 fragment_kgram_length, fragment_window)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                 fragment_kgram_length, fragment_window, targets)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 SCHEMA_VERSION,
                 meta.workspace_id.as_str(),
@@ -926,6 +941,7 @@ impl GraphStore {
                 meta.chunk_params.overlap as i64,
                 crate::graph::clone::FRAGMENT_KGRAM_LENGTH as i64,
                 crate::graph::clone::FRAGMENT_WINDOW as i64,
+                targets,
             ],
         )?;
         Ok(())
@@ -938,7 +954,7 @@ impl GraphStore {
                 "SELECT workspace_id, analyzer_name, analyzer_version, environment, content_hash,
                         aligned_counts,
                         text_mismatch_count, semantic_only_count, duplicate_ambiguous_count, syntax_only_count,
-                        workspace_root, chunk_size, chunk_overlap
+                        workspace_root, chunk_size, chunk_overlap, targets
                  FROM index_metadata WHERE id = 1",
                 [],
                 |r| {
@@ -960,8 +976,12 @@ impl GraphStore {
                         r.get::<_, i64>(8)? as u64,
                         r.get::<_, i64>(9)? as u64,
                     )?;
+                    let targets = serde_json::from_str::<RecordedTargets>(&r.get::<_, String>(13)?).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(e))
+                    })?;
                     Ok(IndexMetadata {
                         workspace_id: WorkspaceId::new(r.get::<_, String>(0)?),
+                        targets,
                         workspace_root: r.get(10)?,
                         chunk_params: ChunkParams {
                             chunk_size: r.get::<_, i64>(11)? as usize,
@@ -1315,6 +1335,18 @@ impl GraphStore {
             .optional()
     }
 
+    /// Record, for each already-inserted duplicated symbol, the key shared by every twin of its
+    /// descriptor: the unit-free identity of the descriptor.
+    pub fn record_duplicate_keys(&self, keys: &[(CanonicalId, String)]) -> rusqlite::Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE symbols SET duplicate_key = ?2 WHERE canonical_id = ?1")?;
+        for (id, key) in keys {
+            stmt.execute(params![id.as_str(), key])?;
+        }
+        Ok(())
+    }
+
     /// Insert a symbol row.
     pub fn insert_symbol(&self, row: &SymbolRow) -> rusqlite::Result<()> {
         // Refused at the boundary rather than stored: a persisted external symbol carrying a span
@@ -1617,7 +1649,22 @@ impl GraphStore {
 
     /// All symbols whose canonical identity ends with the qualified-name suffix `::<qualified>`, or
     /// equals it exactly. Used to resolve a qualified name that omits the workspace prefix.
+    ///
+    /// When some identity is exactly the recorded workspace followed by `::<qualified>`, only those
+    /// identities are returned: a name that starts at the package denotes the package's own
+    /// declarations, not a same-named nested module elsewhere that merely ends the same way.
     pub fn symbols_by_qualified_suffix(&self, qualified: &str) -> rusqlite::Result<Vec<SymbolRow>> {
+        let mut rows = self.symbols_ending_with(qualified)?;
+        if let Some(metadata) = self.read_metadata()? {
+            let direct = format!("{}::{qualified}", metadata.workspace_id.as_str());
+            if rows.iter().any(|row| row.canonical_id.as_str() == direct) {
+                rows.retain(|row| row.canonical_id.as_str() == direct);
+            }
+        }
+        Ok(rows)
+    }
+
+    fn symbols_ending_with(&self, qualified: &str) -> rusqlite::Result<Vec<SymbolRow>> {
         let suffix = format!("::{qualified}");
         let mut stmt = self.conn.prepare(
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
@@ -1634,8 +1681,9 @@ impl GraphStore {
     }
 
     /// The duplicated-descriptor groups the build encountered: symbols marked `duplicated` at ingest
-    /// (true same-descriptor twins, under the two-definition quorum), grouped by their canonical
-    /// identity with the `#<rank>` disambiguator stripped (the shared descriptor's base).
+    /// (true same-descriptor twins, under the two-definition quorum), grouped by the unit-free
+    /// identity of their shared descriptor. Twins belonging to different units differ in identity yet
+    /// share that key.
     ///
     /// The `duplicated` mark is what distinguishes real twins from canonical-projection collisions:
     /// two DISTINCT descriptors whose base projections happen to collide also carry `#<rank>`
@@ -1649,16 +1697,18 @@ impl GraphStore {
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
                     signature_text, interface_text, duplicated, test_rule,
                     start_line, start_column, end_line, end_column,
-                    header_end, header_end_line, header_end_column
-             FROM symbols WHERE class = 'in_workspace' AND duplicated = 1 ORDER BY canonical_id",
+                    header_end, header_end_line, header_end_column, duplicate_key
+             FROM symbols
+             WHERE class = 'in_workspace' AND duplicated = 1 AND duplicate_key IS NOT NULL
+             ORDER BY canonical_id",
         )?;
-        let rows: Vec<SymbolRow> = stmt.query_map([], Self::map_symbol)?.collect::<rusqlite::Result<_>>()?;
+        let rows: Vec<(String, SymbolRow)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(19)?, Self::map_symbol(r)?)))?
+            .collect::<rusqlite::Result<_>>()?;
 
         let mut by_base: std::collections::BTreeMap<String, Vec<SymbolRow>> = std::collections::BTreeMap::new();
-        for row in rows {
-            if let Some(base) = disambiguator_base(row.canonical_id.as_str()) {
-                by_base.entry(base).or_default().push(row);
-            }
+        for (key, row) in rows {
+            by_base.entry(key).or_default().push(row);
         }
 
         Ok(by_base
@@ -2273,21 +2323,6 @@ fn remove_store_files(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The descriptor base of a canonical identity: the identity with a trailing `#<digits>`
-/// disambiguator stripped, or `None` when the identity carries no disambiguator.
-///
-/// [`project_all`](crate::identity::project_all) appends `#<rank>` only to members of an observed
-/// collision group, so this recovers exactly the shared base a duplicated-descriptor group formed
-/// under.
-fn disambiguator_base(canonical_id: &str) -> Option<String> {
-    let (base, rank) = canonical_id.rsplit_once('#')?;
-    if !rank.is_empty() && rank.bytes().all(|b| b.is_ascii_digit()) {
-        Some(base.to_string())
-    } else {
-        None
-    }
-}
-
 /// A span's line and column as the four nullable columns `start_line, start_column, end_line,
 /// end_column`; all NULL for an absent span.
 fn line_column_values(line_column: Option<LineColumnSpan>) -> [Option<i64>; 4] {
@@ -2850,6 +2885,7 @@ mod tests {
                 accounting: JoinAccounting::default(),
                 environment: None,
                 chunk_params: Default::default(),
+                targets: Default::default(),
             })
             .unwrap();
 
@@ -2897,6 +2933,7 @@ mod tests {
             accounting: JoinAccounting::default(),
             environment: None,
             chunk_params: params,
+            targets: Default::default(),
         };
         let params = ChunkParams {
             chunk_size: 256,
@@ -3020,6 +3057,7 @@ mod tests {
             accounting: JoinAccounting::default(),
             environment: None,
             chunk_params: ChunkParams::default(),
+            targets: Default::default(),
         }
     }
 
