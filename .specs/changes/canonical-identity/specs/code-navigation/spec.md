@@ -7,7 +7,7 @@
 > Previously: the requirement did not say how a qualified name resolves when two units of one package declare the same path.
 
 The system SHALL resolve a symbol reference supplied as a short name, a qualified name, or a canonical identity to the symbol it denotes, and SHALL return a typed candidate set when a reference denotes more than one symbol rather than selecting one arbitrarily.
-A qualified name that begins with a package's name SHALL denote only declarations the package's default unit owns.
+A qualified name that begins with a package's name SHALL denote only declarations in that package's default unit.
 
 Serves: identity-reads-as-qualified-name, blast-radius-crosses-crate-targets
 
@@ -47,7 +47,7 @@ Serves: identity-reads-as-qualified-name, blast-radius-crosses-crate-targets
 - **WHEN** `util::Config` is supplied as a reference
 - **THEN** a typed candidate set holding the library's `Config` and the binary's `Config` is returned
 
-#### Scenario: Owner-marked identity round-trips
+#### Scenario: Identity with a marker round-trips
 
 - **GIVEN** the canonical identity `<workspace>::libbin+bin.tool::util::Config` of an indexed binary declaration
 - **WHEN** it is supplied as a reference

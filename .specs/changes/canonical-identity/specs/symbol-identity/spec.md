@@ -1,12 +1,45 @@
 # Delta for Symbol Identity
 
+## Terms
+
+These terms name the parts a canonical identity is built from.
+The example is the Cargo package `libbin` in the workspace `ws`, with a library and a binary named `tool`:
+
+```text
+workspace  ws
+└ package  libbin
+  ├ unit   the library (default unit)
+  │ └ module  util
+  │   └ declaration  struct Config     identity: ws::libbin::util::Config
+  └ unit   the binary tool (marker +bin.tool)
+    └ module  util
+      └ declaration  struct Config     identity: ws::libbin+bin.tool::util::Config
+```
+
+| Term           | Meaning                                                                                                                                                                                                                                                                                                          | Example                                                  |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Workspace      | The directory c10r indexes. Every identity starts with its name.                                                                                                                                                                                                                                                 | `ws`                                                     |
+| Package        | What a developer names, publishes, and depends on: one Cargo package, or one Python project.                                                                                                                                                                                                                     | `libbin`, `python-conformance`                           |
+| Unit           | A part of a package that the build tool compiles on its own. Two units of one package can each declare the same qualified name. In Rust, the library, each binary, each integration test, each example, each benchmark, and the build script are units; Cargo calls them targets. A Python project has one unit. | the library; the binary `tool`                           |
+| Kind           | The type of a unit, as the build tool names it.                                                                                                                                                                                                                                                                  | `lib`, `bin`, `test`, `example`, `bench`, `custom-build` |
+| Default unit   | The unit that other packages use. In Rust, the library. In Python, the project.                                                                                                                                                                                                                                  | the library                                              |
+| Marker         | The text after `+` in an identity. It names the unit when the unit is not the default unit. Declarations in the default unit have no marker. `+shared` marks source that more than one unit compiles.                                                                                                            | `+bin.tool`, `+test.a`, `+shared`                        |
+| Module         | A namespace inside a unit. A Rust module is a file or a `mod` block. A Python module is a file; a Python package directory, such as `pkg`, is also a module here, because c10r's package is the whole project.                                                                                                   | `util`, `pkg.shapes`                                     |
+| Declaration    | One named item in the code that receives an identity: a module, type, function, method, field, or module global.                                                                                                                                                                                                 | `struct Config`                                          |
+| Document       | One source file. A document holds declarations. An identity never depends on which document holds a declaration.                                                                                                                                                                                                 | `src/util.rs`                                            |
+| Qualified name | A declaration's name with every module and type that encloses it, as the language writes it.                                                                                                                                                                                                                     | `util::Config`, `pkg.shapes.Widget`                      |
+| Segment        | One level of a qualified name. An identity writes segments separated by `::`.                                                                                                                                                                                                                                    | `util`, `Config`                                         |
+| Descriptor     | The name an indexer records for a declaration. Declarations in different units can have the same descriptor.                                                                                                                                                                                                     | `util/Config#`                                           |
+| Disambiguator  | The `#n` suffix that separates two distinct declarations whose identities would otherwise be equal.                                                                                                                                                                                                              | `#0`, `#1`                                               |
+
 ## MODIFIED Requirements
 
 ### Requirement: Deterministic canonical identity
 
-> Previously: the identity was a pure function of the symbol's resolved semantic descriptor.
+> Previously: the identity was computed from the indexer's descriptor alone.
 
-The system SHALL assign each indexed symbol a canonical identity that is a pure function of the workspace identity, the symbol's owner, and the symbol's qualified name as the language declares it, such that re-indexing unchanged sources yields the identical identity for every symbol.
+The system SHALL give each indexed symbol a canonical identity computed only from the workspace, the symbol's package and unit, and the symbol's qualified name.
+Indexing unchanged sources again SHALL give every symbol the same identity, byte for byte.
 
 Serves: saved-identity-stays-valid
 
@@ -24,12 +57,14 @@ Serves: saved-identity-stays-valid
 
 ### Requirement: Identity uniqueness within a workspace
 
-> Previously: a disambiguator was introduced wherever the resolved descriptor collided, so same-descriptor declarations in two units of one package received numbered twin identities.
+> Previously: a disambiguator was added wherever two descriptors were equal, so the same qualified name in two units of one package received numbered identities.
 
-The system SHALL guarantee that within one workspace no two distinct symbols share a canonical identity.
-Symbols with different owners SHALL differ by owner alone and carry no disambiguator.
-Only distinct symbols with the same owner and the same qualified name SHALL carry a disambiguator.
-A disambiguated identity SHALL stay the same on every run over unchanged sources, whatever order the files and symbols are read in.
+Within one workspace, no two distinct symbols SHALL share a canonical identity.
+Two symbols in different units differ by their unit, so neither SHALL carry a disambiguator.
+Only distinct symbols in the same unit with the same qualified name SHALL carry a disambiguator.
+A disambiguator SHALL be the same on every run over unchanged sources, whatever order the files and symbols are read in.
+
+<!-- modified-removes: True duplicates keep definition-anchored identities -->
 
 Serves: saved-identity-stays-valid
 
@@ -47,7 +82,7 @@ Serves: saved-identity-stays-valid
 
 #### Scenario: True duplicates receive distinct identities
 
-- **GIVEN** two distinct definitions with one owner that the semantic backend describes with an identical resolved descriptor
+- **GIVEN** two distinct definitions in one unit that the indexer records with the same descriptor
 - **WHEN** canonical identities are assigned
 - **THEN** each definition receives a distinct identity
 
@@ -61,15 +96,15 @@ Serves: saved-identity-stays-valid
 
 - **GIVEN** a Cargo package `libbin` whose library and binary `tool` each declare `mod util { pub struct Config; }`
 - **WHEN** canonical identities are assigned
-- **THEN** the library's `Config` and the binary's `Config` have distinct identities that differ in their owner, and neither carries a disambiguator suffix
+- **THEN** the library's `Config` and the binary's `Config` have identities that differ only in their unit, and neither has a disambiguator
 
 ## ADDED Requirements
 
 ### Requirement: Segments follow the language's declared nesting
 
-After the workspace and owner, a canonical identity SHALL consist of one segment per namespace unit the language places the declaration in, from the outermost unit inward, followed by one segment for the declaration itself.
-The identity SHALL NOT contain a segment for a nesting level the language does not define, and SHALL NOT join two nesting levels the language defines into one segment.
-A module or package SHALL be identified by the segments of its qualified name alone, with no segment that marks it as a module.
+After the workspace, package, and unit, a canonical identity SHALL have one segment for each nesting level the language places the declaration in, outermost first, then one segment for the declaration itself.
+The identity SHALL NOT add a segment for a level the language does not have, and SHALL NOT merge two of the language's levels into one segment.
+A module's identity SHALL be its qualified name alone, with no extra segment that marks it as a module.
 
 Serves: identity-reads-as-qualified-name, saved-identity-stays-valid
 
@@ -79,11 +114,11 @@ Serves: identity-reads-as-qualified-name, saved-identity-stays-valid
 - **WHEN** canonical identities are assigned
 - **THEN** the identity of `Widget` ends in the segments `pkg`, `shapes`, `Widget`, and no segment holds the dotted name `pkg.shapes`
 
-#### Scenario: Python module and package carry no marker
+#### Scenario: Python module and package have no `__init__` segment
 
-- **GIVEN** a Python project with the package `pkg` and the module `pkg.shapes`
+- **GIVEN** a Python project with the package directory `pkg` and the module `pkg.shapes`
 - **WHEN** canonical identities are assigned
-- **THEN** the module's identity ends in the segments `pkg`, `shapes`, the package's identity ends in the segment `pkg`, and neither identity contains an `__init__` segment
+- **THEN** the module's identity ends in the segments `pkg`, `shapes`, the package directory's identity ends in the segment `pkg`, and neither identity has an `__init__` segment
 
 #### Scenario: Python declaration in a package initializer belongs to the package
 
@@ -105,24 +140,28 @@ Serves: identity-reads-as-qualified-name, saved-identity-stays-valid
 
 #### Scenario: Rust inline modules nest without a directory
 
-- **GIVEN** a Rust crate whose file `src/lib.rs` declares `mod a { mod b { pub struct S; } }`
+- **GIVEN** a Rust library whose file `src/lib.rs` declares `mod a { mod b { pub struct S; } }`
 - **WHEN** canonical identities are assigned
 - **THEN** the identity of `S` ends in the segments `a`, `b`, `S`
 
 #### Scenario: Rust module loaded through a path attribute keeps its declared name
 
-- **GIVEN** a Rust crate that declares `#[path = "generated/schema.rs"] mod model;` and the file defines `pub struct Record;`
+- **GIVEN** a Rust library that declares `#[path = "generated/schema.rs"] mod model;`, and that file defines `pub struct Record;`
 - **WHEN** canonical identities are assigned
 - **THEN** the identity of `Record` ends in the segments `model`, `Record`, and no segment is named `generated` or `schema`
 
-### Requirement: Identity names the declaration's owner
+### Requirement: Identity names the declaration's package and unit
 
-Every canonical identity SHALL name the declaration's owner between the workspace and the segments, in the text form `workspace::package[+unit]::segments`.
-The owner SHALL name the package that supplies the declaration.
-For a language in which two units of one package may declare the same qualified name, the owner SHALL also name the unit, as follows: the package's default unit carries no marker; any other unit is marked `+kind.name`, where kind and name are the unit's kind and name as the build tool declares them; a declaration whose source is compiled into more than one unit of its package has one identity, marked `+shared`.
-For a language with no such units, the owner is the package alone.
-Whether a unit carries a marker, and the marker's text, SHALL depend only on that unit's own kind and name, never on which other units the package has.
-When the system cannot determine which unit owns a declaration, the build SHALL succeed, the declaration SHALL carry the package-only owner, and the build answer SHALL disclose that the owner's unit could not be determined, naming the package, or the document, whose units are unknown, and the reason they could not be determined.
+Every canonical identity SHALL name the declaration's package and unit, in the form `workspace::package[+marker]::segments`, where the marker is:
+
+- none, for a declaration in the package's default unit;
+- `+kind.name`, for a declaration in any other unit, with the kind and name the build tool gives that unit, such as `+bin.tool`;
+- `+shared`, for a declaration whose source file is compiled into more than one unit of its package; it has one identity, not one per unit.
+
+A language whose packages have a single unit, such as Python, never uses a marker.
+A unit's marker SHALL depend only on that unit's own kind and name, never on which other units the package has.
+When the system cannot determine a declaration's unit, the build SHALL still succeed, and the declaration SHALL have no marker.
+The build answer SHALL then name the affected package or document and say why its unit could not be determined.
 
 Serves: saved-identity-stays-valid, identity-reads-as-qualified-name
 
@@ -134,7 +173,7 @@ Serves: saved-identity-stays-valid, identity-reads-as-qualified-name
 
 #### Scenario: Rust binary declarations are marked by kind and name
 
-- **GIVEN** a Cargo package `libbin` whose binary target `tool` at `src/bin/tool.rs` declares `mod util { pub struct Config; }`
+- **GIVEN** a Cargo package `libbin` whose binary `tool` at `src/bin/tool.rs` declares `mod util { pub struct Config; }`
 - **WHEN** canonical identities are assigned
 - **THEN** the identity of the binary's `Config` is `<workspace>::libbin+bin.tool::util::Config`
 
@@ -146,80 +185,118 @@ Serves: saved-identity-stays-valid, identity-reads-as-qualified-name
 
 #### Scenario: Source compiled into two units has one shared identity
 
-- **GIVEN** a Cargo package `libbin` whose integration tests `tests/a.rs` and `tests/b.rs` each declare `mod common;` loading `tests/common/mod.rs`, which defines `pub fn fixture()`, and each call `common::fixture()`
+- **GIVEN** a Cargo package `libbin` whose integration tests `tests/a.rs` and `tests/b.rs` each declare `mod common;`, which loads `tests/common/mod.rs`, and each call `common::fixture()`, which that file defines
 - **WHEN** canonical identities are assigned
 - **THEN** `fixture` has the one identity `<workspace>::libbin+shared::common::fixture`
 
-#### Scenario: Adding a target changes no other unit's identities
+#### Scenario: Adding a binary changes no other unit's identities
 
 - **GIVEN** a Cargo package `libbin` indexed with a library and a binary `tool`
 - **WHEN** a second binary `src/bin/second.rs` declaring `mod util { pub struct Config; }` is added and the package is indexed again
-- **THEN** every identity of the library and of `tool` is identical to its prior identity, and the new binary's `Config` is `<workspace>::libbin+bin.second::util::Config`
+- **THEN** every identity in the library and in `tool` is unchanged, and the new binary's `Config` is `<workspace>::libbin+bin.second::util::Config`
 
-#### Scenario: Python owner is the project with no marker
+#### Scenario: Python identity names the project with no marker
 
 - **GIVEN** the shared Python conformance project, whose project name is `python-conformance`, with the class `Widget` in the module `pkg.shapes`
 - **WHEN** canonical identities are assigned
 - **THEN** the identity of `Widget` is `<workspace>::python-conformance::pkg::shapes::Widget`
 
-#### Scenario: Unavailable list of targets degrades to package-only owners with disclosure
+#### Scenario: Package whose units cannot be listed has no markers
 
-- **GIVEN** a Cargo package `libbin` with a library and a binary `tool`, on a host where the build tool does not return the package's list of targets within the probe bound
+- **GIVEN** a Cargo package `libbin` with a library and a binary `tool`, and the build tool does not list the package's units within the time limit
 - **WHEN** the workspace is built
-- **THEN** the build succeeds, every declaration of the package carries the owner `libbin` with no unit marker, and the build answer discloses that the crate targets of `libbin` could not be determined and why
+- **THEN** the build succeeds, no declaration in `libbin` has a marker, and the build answer says that the units of `libbin` could not be determined, and why
 
-#### Scenario: Document reached from no target root degrades to the package-only owner with disclosure
+#### Scenario: File that no unit loads has no marker
 
-- **GIVEN** a Cargo package `libbin` whose file `src/orphan.rs` declares `pub fn stray()` and is loaded by no `mod` declaration of any target
+- **GIVEN** a Cargo package `libbin` whose file `src/orphan.rs` declares `pub fn stray()`, and no `mod` declaration in any unit loads that file
 - **WHEN** the workspace is built
-- **THEN** the build succeeds, `stray` carries the owner `libbin` with no unit marker, every other declaration carries its unit's owner, and the build answer discloses that `src/orphan.rs` belongs to no known unit because no target loads it
+- **THEN** the build succeeds, `stray` has no marker, every other declaration has its unit's marker, and the build answer says that `src/orphan.rs` belongs to no known unit because no unit loads it
 
 ### Requirement: Identity does not depend on the indexer
 
-For any declaration that two conforming indexers for a language both report as one declaration with the same qualified name, the canonical identity SHALL be the same whichever of them produced the index.
-This guarantee does not cover a declaration that one indexer reports and another does not, and does not cover a name for which the indexers report different numbers of definitions; the identities of such definitions are governed by `Identity uniqueness within a workspace`.
+When two conforming indexers for a language both report a declaration with the same qualified name, its canonical identity SHALL be the same whichever indexer built the index.
+This does not cover a declaration that only one indexer reports, or a name for which the indexers report different numbers of definitions; `Identity uniqueness within a workspace` governs those identities.
 
 Serves: saved-identity-stays-valid
 
 #### Scenario: scip-python yields the Python reference identities
 
-- **GIVEN** the shared Python conformance project and its reference list of canonical identities, written from the identity form this spec defines
-- **WHEN** the project is indexed through scip-python and canonical identities are projected
+- **GIVEN** the shared Python conformance project and its reference list of canonical identities, written by hand from this spec
+- **WHEN** the project is indexed through scip-python and canonical identities are assigned
 - **THEN** every module, class, function, method, and module global the index reports has the identity the reference list gives it
 
 #### Scenario: rust-analyzer yields the Rust reference identities
 
-- **GIVEN** the shared Rust conformance project and its reference list of canonical identities, written from the identity form this spec defines
-- **WHEN** the project is indexed through rust-analyzer and canonical identities are projected
+- **GIVEN** the shared Rust conformance project and its reference list of canonical identities, written by hand from this spec
+- **WHEN** the project is indexed through rust-analyzer and canonical identities are assigned
 - **THEN** every module, struct, function, and method the index reports, in the library and in the binary, has the identity the reference list gives it
+
+### Requirement: Relative imports resolve to their absolute path
+
+A relative import SHALL resolve to the same symbol as its absolute import path.
+For example, `from .shapes import Widget` in `pkg/consumer.py` refers to the module `pkg.shapes`, and `super::load()` in Rust refers to `load` in the parent module.
+If the absolute path cannot be worked out, the reference is not attributed to any workspace symbol.
+
+Serves: relative-imports-resolve, saved-identity-stays-valid
+
+#### Scenario: Python import from the same package
+
+- **GIVEN** `pkg/consumer.py` contains `from .shapes import Widget`
+- **WHEN** the workspace is built
+- **THEN** the reference is a reference to `pkg.shapes`, and `pkg.consumer` is one of its importers
+
+#### Scenario: Python import from a parent package
+
+- **GIVEN** `pkg/sub/deep.py` contains `from ..shapes import Widget`
+- **WHEN** the workspace is built
+- **THEN** the reference is a reference to `pkg.shapes`
+
+#### Scenario: Python name bound by a relative import
+
+- **GIVEN** a module contains `from . import shapes` and later `shapes.Widget()`
+- **WHEN** the workspace is built
+- **THEN** both references are references to `pkg.shapes`
+
+#### Scenario: Same relative name in two packages
+
+- **GIVEN** packages `a` and `a.sub` each contain a module `app`, and each package imports it with `from .app import run`
+- **WHEN** the workspace is built
+- **THEN** each import refers to the `app` module of its own package
+
+#### Scenario: Rust `super` path
+
+- **GIVEN** `src/lib.rs` declares `mod a { pub fn load() {} mod b { fn f() { super::load(); } } }`
+- **WHEN** the workspace is built
+- **THEN** the call `super::load()` is a reference to `a::load`
 
 ### Requirement: Identity does not depend on source location
 
-For any declaration, the canonical identity SHALL be unchanged by a change of the file or directory that holds the declaration, while the declaration's qualified name and owner are unchanged.
-A change to the declaration's qualified name SHALL change its canonical identity.
+Moving a declaration to another file or directory SHALL NOT change its canonical identity, as long as its qualified name, package, and unit stay the same.
+Changing a declaration's qualified name SHALL change its identity.
 
 Serves: saved-identity-stays-valid
 
 #### Scenario: Rust inline module moved to its own file
 
-- **GIVEN** a Rust crate indexed with `mod util { pub fn load() {} }` inline in `src/lib.rs`
-- **WHEN** the module is changed to `mod util;` with the body in `src/util.rs` and the crate is indexed again
-- **THEN** the identity of `load` is identical to its prior identity
+- **GIVEN** a Rust library indexed with `mod util { pub fn load() {} }` inline in `src/lib.rs`
+- **WHEN** the module is changed to `mod util;` with the body in `src/util.rs` and the library is indexed again
+- **THEN** the identity of `load` is unchanged
 
 #### Scenario: Rust module file renamed to a directory module
 
-- **GIVEN** a Rust crate indexed with the module `util` in `src/util.rs`
-- **WHEN** the file is moved to `src/util/mod.rs` and the crate is indexed again
-- **THEN** every identity under `util` is identical to its prior identity
+- **GIVEN** a Rust library indexed with the module `util` in `src/util.rs`
+- **WHEN** the file is moved to `src/util/mod.rs` and the library is indexed again
+- **THEN** every identity under `util` is unchanged
 
 #### Scenario: Python package moved between source roots
 
 - **GIVEN** a Python project indexed with the module `acme.tools` at `src/acme/tools.py`
-- **WHEN** the package is moved to `acme/tools.py` at the project root, the project configuration is updated so the import name stays `acme.tools`, and the project is indexed again
-- **THEN** every identity under `acme.tools` is identical to its prior identity
+- **WHEN** the directory is moved to `acme/tools.py` at the project root, the project configuration is updated so the import name stays `acme.tools`, and the project is indexed again
+- **THEN** every identity under `acme.tools` is unchanged
 
 #### Scenario: A module rename changes identity
 
-- **GIVEN** a Rust crate indexed with the module `util`
-- **WHEN** the module is renamed to `helpers` and the crate is indexed again
+- **GIVEN** a Rust library indexed with the module `util`
+- **WHEN** the module is renamed to `helpers` and the library is indexed again
 - **THEN** the declarations in the module have identities ending in `helpers`, and the prior identities under `util` resolve to no symbol
