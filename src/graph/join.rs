@@ -1053,20 +1053,12 @@ fn select_twin<'a>(
     twins: &[(&'a ExtractedSymbol, &'a CanonicalId, &'a str)],
     parent_of: &HashMap<String, String>,
 ) -> Option<(&'a ExtractedSymbol, &'a CanonicalId, LocalityRule)> {
-    // Defining-document: the occurrence's document is the definition document of exactly one twin.
-    let direct: Vec<_> = twins.iter().filter(|(_, _, doc)| *doc == document_path).collect();
-    if direct.len() == 1 {
-        let (symbol, identity, _) = direct[0];
-        return Some((symbol, identity, LocalityRule::DefiningDocument));
-    }
-    if direct.len() > 1 {
-        return None;
-    }
-
-    // Module-chain: walk the occurrence's document up through the parent-of-document map (each hop
-    // moving from a module's definition document to the document declaring it) until a document that
-    // is a twin's own definition document is reached, or the chain runs out. A cycle terminates the
-    // walk (via the visited set) rather than looping forever on malformed input.
+    // Walk the occurrence's document up through the parent-of-document map (each hop moving from a
+    // module's definition document to the document declaring it) until a document that is a twin's
+    // own definition document is reached, or the chain runs out. The occurrence's own document is
+    // the first step: a twin defined there is the defining-document hit, any later step the
+    // module-chain hit. A cycle terminates the walk (via the visited set) rather than looping
+    // forever on malformed input.
     let mut current = document_path.to_string();
     let mut visited: HashSet<String> = HashSet::new();
     loop {
@@ -1076,7 +1068,12 @@ fn select_twin<'a>(
         let reached: Vec<_> = twins.iter().filter(|(_, _, doc)| *doc == current).collect();
         if reached.len() == 1 {
             let (symbol, identity, _) = reached[0];
-            return Some((symbol, identity, LocalityRule::ModuleChain));
+            let rule = if current == document_path {
+                LocalityRule::DefiningDocument
+            } else {
+                LocalityRule::ModuleChain
+            };
+            return Some((symbol, identity, rule));
         }
         if reached.len() > 1 {
             return None;
@@ -1219,7 +1216,7 @@ fn evaluate_rules_at(
     // The kind-scoped rules are language-gated: each evaluates only for the language whose
     // constructs it reconciles. Ungated, the Rust module-span rule accepted zero-width Python
     // module markers on empty documents (a zero-width span vacuously spans an empty document) —
-    // the cross-language leak the gate closes (design.md, 2026-07-09 dogfood amendment).
+    // the cross-language leak the gate closes.
     if language == Language::Rust {
         // Crate-root rule: a descriptor whose terminal segment is `crate` (a keyword, so it can never
         // name a user symbol) is a crate root; its source token is the crate's own package name at
@@ -1367,10 +1364,10 @@ fn evaluate_rules_at(
 
     // Module-name rule (Python only): an occurrence resolving to a module-kind symbol whose span
     // text — after stripping any leading relative-import dots — equals a trailing component-run of
-    // the module's dotted namespace name at a component boundary (design.md, 2026-07-09 dogfood
-    // amendment). The bare terminal (`shapes`), the full dotted name (`pkg.shapes`), and relative
-    // forms (`.shapes`) are all instances of the one condition; a token spelling only leading
-    // components is not evidence for the module and stays refused.
+    // the module's dotted namespace name at a component boundary. The bare terminal (`shapes`), the
+    // full dotted name (`pkg.shapes`), and relative forms (`.shapes`) are all instances of the one
+    // condition; a token spelling only leading components is not evidence for the module and stays
+    // refused.
     //
     // Structural gates: a span inside an identifier name node uses the identifier's text (the bare-
     // terminal case, same gate as the default rule); any other span uses its raw source bytes, which
@@ -1488,7 +1485,7 @@ fn base_type_name(name: &str) -> &str {
 }
 
 /// The `std::ops` range type name a range operator's shape corresponds to, under the closed
-/// range-literal correspondence (design.md). Any other combination of ends/inclusivity has no
+/// range-literal correspondence. Any other combination of ends/inclusivity has no
 /// corresponding type and yields `None` — refusal, not a guess.
 fn range_type_name(shape: RangeShape) -> Option<&'static str> {
     Some(match (shape.has_start, shape.has_end, shape.inclusive) {
@@ -1606,7 +1603,7 @@ impl DesugarExpectation {
     }
 }
 
-/// The closed method-to-construct correspondence for the operator-desugar rule (design.md).
+/// The closed method-to-construct correspondence for the operator-desugar rule.
 ///
 /// Extending this table is a design amendment plus tests, never an implementation convenience.
 /// Autoderef at `.` is deliberately excluded: `deref`/`deref_mut` accept only the explicit unary
