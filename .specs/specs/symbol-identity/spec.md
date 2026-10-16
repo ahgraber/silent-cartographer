@@ -245,6 +245,18 @@ This does not cover a declaration that only one indexer reports, or a name for w
 - **WHEN** the project is indexed through scip-python and canonical identities are assigned
 - **THEN** every module, class, function, method, and module global the index reports has the identity the reference list gives it
 
+#### Scenario: ty-scip yields the Python reference identities
+
+- **GIVEN** the shared Python conformance project and its reference list of canonical identities
+- **WHEN** the project is indexed through ty-scip and canonical identities are assigned
+- **THEN** every module, class, function, method, and module global that the index reports with one definition has the identity the reference list gives it
+
+#### Scenario: A name defined twice has one identity per definition under ty-scip
+
+- **GIVEN** the class `Widget` in the module `pkg.shapes` of the shared Python conformance project, whose property `size` is defined twice, once as the getter and once as the setter
+- **WHEN** the project is indexed through scip-python, and again through ty-scip
+- **THEN** the scip-python index gives `size` the one identity `<workspace>::python-conformance::pkg::shapes::Widget::size`, and the ty-scip index gives each of the two definitions its own distinct identity
+
 #### Scenario: rust-analyzer yields the Rust reference identities
 
 - **GIVEN** the shared Rust conformance project and its reference list of canonical identities, written by hand from this spec
