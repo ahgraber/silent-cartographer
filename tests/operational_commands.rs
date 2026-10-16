@@ -242,7 +242,15 @@ fn doctor_succeeds_with_ty_scip_unresponsive() {
         String::from_utf8_lossy(&out.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("the --json report parses");
-    assert_eq!(indexer_entry(&report, "ty-scip")["presence"], "unresponsive");
+    let ty_scip = indexer_entry(&report, "ty-scip");
+    assert_eq!(ty_scip["presence"], "unresponsive");
+    let hint = ty_scip["hint"]
+        .as_str()
+        .expect("an unresponsive indexer carries a hint");
+    assert!(
+        hint.contains("did not respond") && hint.contains("stuck"),
+        "the investigation hint points at a stuck process, distinct from an install hint: {hint}"
+    );
 }
 
 // _(Indexer readiness report — human rendering)_ — the default human report is a fixed-width line per

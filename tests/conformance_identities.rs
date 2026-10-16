@@ -87,6 +87,56 @@ fn scip_python_yields_python_reference_identities() {
     );
 }
 
+/// The property `Widget.size`, which the project defines twice (getter and setter).
+const TWICE_DEFINED: &str = "python-conformance::pkg::shapes::Widget::size";
+
+/// The instance attribute `Widget._size`, which only scip-python reports.
+const SCIP_PYTHON_ONLY: &str = "python-conformance::pkg::shapes::Widget::_size";
+
+// _(ty-scip yields the Python reference identities)_ — every identity the committed ty-scip index reports
+// with one definition is listed, and every listed identity is reported, except the twice-defined property
+// and the attribute only scip-python reports, which the requirement does not cover. The reference to
+// `Widget` from `consumer.py` resolves to the listed one.
+#[test]
+fn ty_scip_yields_python_reference_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, reported) = python_identities_of("ty-scip.scip", dir.path());
+    let single_definitions: BTreeSet<String> = reported
+        .into_iter()
+        .filter(|id| !id.starts_with(TWICE_DEFINED))
+        .collect();
+    let mut expected = reference_list(&support::python_fixture_root());
+    expected.remove(TWICE_DEFINED);
+    expected.remove(SCIP_PYTHON_ONLY);
+    assert_eq!(single_definitions, expected);
+
+    let widget = CanonicalId::from_raw("test-ws::python-conformance::pkg::shapes::Widget");
+    let references = store.references_of(&widget).unwrap();
+    assert!(
+        references.iter().any(|r| r.document_path == "pkg/consumer.py"),
+        "the reference from consumer.py resolves to the listed Widget: {references:?}"
+    );
+}
+
+// _(A name defined twice has one identity per definition under ty-scip)_ — scip-python reports the getter
+// and setter of `Widget.size` as one definition and ty-scip as two, so the property has one identity in
+// the scip-python store and two distinct identities in the ty-scip store.
+#[test]
+fn name_defined_twice_has_one_identity_per_definition_under_ty_scip() {
+    let size_identities = |file: &str| -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, reported) = python_identities_of(file, dir.path());
+        reported
+            .into_iter()
+            .filter(|id| id.starts_with(TWICE_DEFINED))
+            .collect()
+    };
+    assert_eq!(size_identities("index.scip"), [TWICE_DEFINED]);
+    let ty_scip = size_identities("ty-scip.scip");
+    assert_eq!(ty_scip.len(), 2, "one identity per definition: {ty_scip:?}");
+    assert!(!ty_scip.contains(&TWICE_DEFINED.to_string()), "{ty_scip:?}");
+}
+
 // _(rust-analyzer yields the Rust reference identities)_ — every module, struct, function, and method
 // the committed rust-analyzer index reports, in the library, the binary, and the tests, has exactly its
 // listed identity, every listed identity is reported, and `libbin::util::load()` resolves to the

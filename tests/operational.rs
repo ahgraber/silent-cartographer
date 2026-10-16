@@ -3022,6 +3022,37 @@ fn an_explicit_python_indexer_builds_the_store() {
     assert_eq!(ws.recorded_analyzer().as_deref(), Some("ty-scip"));
 }
 
+// _(Scenario: An explicit selection names the indexer — through the binary)_ — the `--python-indexer`
+// flag reaches the build: with both stub indexers on `PATH`, the built `c10r` records ty-scip.
+#[test]
+fn the_python_indexer_flag_selects_the_indexer_through_the_binary() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::TyScip, "0.1.0");
+    ws.install(PythonIndexer::ScipPython, "0.6.0");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+        .arg("--db")
+        .arg(ws.db())
+        .args([
+            "build",
+            "--language",
+            "python",
+            "--python-indexer",
+            "ty-scip",
+            "--environment",
+        ])
+        .arg(&ws.venv)
+        .arg(ws.dir.path())
+        .current_dir(ws.dir.path())
+        .env("PATH", support::prepend_path(&[&ws.stub_bin()]))
+        .env_remove("VIRTUAL_ENV")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ws.recorded_analyzer().as_deref(), Some("ty-scip"));
+}
+
 // _(Scenario: A new store defaults to scip-python)_
 #[test]
 fn a_new_python_store_defaults_to_scip_python() {
@@ -3149,6 +3180,7 @@ fn an_absent_recorded_indexer_refuses_and_leaves_the_store_untouched() {
         message.contains("ty-scip") && message.contains("uv tool install"),
         "the refusal names the recorded indexer and how to install it: {message}"
     );
+    assert_eq!(classify(&err), ExitCode::IndexerSetup);
     assert_eq!(std::fs::read(ws.db()).unwrap(), before, "the store is byte-identical");
 }
 
