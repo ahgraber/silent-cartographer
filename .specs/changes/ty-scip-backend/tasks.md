@@ -21,7 +21,7 @@
 
 - [x] Map the analyzer name `ty-scip` to `Language::Python` in `backend_language` ([src/graph/mod.rs](../../../src/graph/mod.rs)).
 - [x] Unit test: `backend_language` returns Python for `ty-scip` and `scip-python`, Rust for `rust-analyzer`, and refuses an unknown name.
-- [x] Change `module_dotted_name` in [src/graph/join.rs](../../../src/graph/join.rs) to return `Option<Cow<str>>` and read both descriptor shapes per `design.md` § ModuleNameReadsBothShapes.
+- [x] Change `module_dotted_name` in [src/graph/join.rs](../../../src/graph/join.rs) to return `Option<Cow<str>>` and read both descriptor shapes as the module rule required before `canonical-identity`; `design.md` § ModuleNameReadsTheCanonicalForm records the current form.
 - [x] Unit test the module-name rule on the namespace-segment shape: a reference at the terminal component is accepted, a reference at the full dotted name is accepted, a relative-import token is accepted, and a token spelling only a leading component is refused.
 - [x] Unit test the self-name rule when the document's module has the namespace-segment shape: a `__name__` occurrence resolving to that module is accepted, and one resolving to another module is refused.
 
@@ -60,27 +60,40 @@
 
 ## After `canonical-identity` lands
 
-- [ ] After `canonical-identity` lands, resolve the join's module-name rule in favor of the canonical module form.
-- [ ] Add a test that ty-scip's index of `tests/fixtures/python-conformance/` yields exactly the Python reference identities that `canonical-identity` defines.
-- [ ] Add the repeated-assignment boundary scenario for `Identity does not depend on the indexer` (a name assigned twice: one identity under scip-python, one per assignment under ty-scip), with its test.
-- [ ] Rebuild the gate stores with both indexers and re-run identity overlap, edge retention, answer identity, and the wrong-target review, because both indexers' identities change.
+- [x] After `canonical-identity` lands, resolve the join's module-name rule in favor of the canonical module form.
+  `canonical-identity` already did this: the join reads only the canonical form, so the change records the decision and adds no code.
+- [x] Add a test that ty-scip's index of `tests/fixtures/python-conformance/` yields the Python reference identities that `canonical-identity` defines, for every declaration the requirement covers (`ty-scip yields the Python reference identities`).
+- [x] Add the repeated-definition boundary scenario for `Identity does not depend on the indexer` (`A name defined twice has one identity per definition under ty-scip`, on the property `Widget.size`), with its test.
+- [x] Rebuild the gate stores with both indexers and re-run identity overlap, edge retention, answer identity, and the wrong-target review, because both indexers' identities change.
 
 ## Comparison gate (runs before merge)
 
-- [ ] Write the comparison scripts in `._scratch/research/scip-python/gate/`: build a repository once per indexer with an explicit `--python-indexer` and separate `--db`, then report edge retention, join acceptance, answer identity, and every residual that changes an in-workspace `dependents` or `impact` answer.
-- [ ] Run the gate on Flask, httpx2, and Faker from copies of the clones in `~/.cache/silent-cartographer`, run ty-scip twice per repository, and compare the two indexes byte for byte.
-- [ ] Review a sample of 100 accepted ty-scip edges per repository, and every answer-changing residual, for wrong targets.
-- [ ] Run Flask for time and peak memory; run sympy with its documented exclude list; run sphinx with only `exclude-scripts = true` added.
-- [ ] Record all results, thresholds, and pass or fail per target in `gate.md`, and present them to the user before merge.
+- [x] Write the comparison scripts in `._scratch/research/scip-python/gate/`: build a repository once per indexer with an explicit `--python-indexer` and separate `--db`, then report edge retention, join acceptance, answer identity, and every residual that changes an in-workspace `dependents` or `impact` answer.
+- [x] Run the gate on Flask, httpx2, and Faker from copies of the clones in `~/.cache/silent-cartographer`, run ty-scip twice per repository, and compare the two indexes byte for byte.
+  Flask, httpx2, and Faker needed no configuration change, so their builds read the persistent clones directly, and each clone's `git status --porcelain --ignored` was the same before and after; sympy and sphinx ran from copies.
+- [x] Review a sample of 100 accepted ty-scip edges per repository, and every answer-changing residual, for wrong targets.
+- [x] Run Flask for time and peak memory; run sympy with its documented exclude list; run sphinx with only `exclude-scripts = true` added.
+- [x] Record all results, thresholds, and pass or fail per target in `gate.md`, and present them to the user before merge.
 
 ## Upstream reports (drafts only)
 
-- [ ] Draft a ty-scip issue asking to skip files with no importable module name, with a warning, instead of refusing the index; include the sphinx and sympy cases.
+- [x] Draft a ty-scip issue asking to skip files with no importable module name, with a warning, instead of refusing the index; include the sphinx and sympy cases.
+  Draft: `._scratch/research/scip-python/upstream/ty-scip-skip-unmapped-files.md`.
   The user files it.
-- [ ] Draft a ty-scip issue on one definition per reassignment of the same name, with the Flask counts.
+- [x] Draft a ty-scip issue on one definition per reassignment of the same name, with the Flask counts.
+  Draft: `._scratch/research/scip-python/upstream/ty-scip-one-symbol-per-name.md`.
   The user files it.
 
 ## Checks
 
-- [ ] Run the full Rust test suite and the MCP test suite.
-- [ ] Run the pre-commit hooks on every changed and new file, and fix any failure.
+- [x] Run the full Rust test suite and the MCP test suite.
+- [x] Run the pre-commit hooks on every changed and new file, and fix any failure.
+
+## Verification remediation
+
+- [x] Add the Resolved Questions lines for indexer selection, the optional readiness entry, and the non-blocking gate.
+- [x] Correct the design risk that claimed a pinned install hint, and name the measured ty-scip version in the README.
+- [x] Integration test: the built `c10r` with `--python-indexer ty-scip` and both indexers on `PATH` records ty-scip.
+- [x] Assert the investigation hint for an unresponsive ty-scip in `doctor`, and the indexer/setup exit code when the recorded indexer is absent.
+- [x] Pass each line of ty-scip's standard error through as it arrives instead of after the run, keeping the copy that classifies a failed run; unit test that a line is forwarded before the stream closes.
+- [x] Run the full Rust test suite, the MCP test suite, and the pre-commit hooks.

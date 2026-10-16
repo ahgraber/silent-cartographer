@@ -1,8 +1,7 @@
 # Comparison Gate: ty-scip against scip-python
 
-The results below were measured on 2026-10-11 with ty-scip descriptors converted to scip-python's form.
-`canonical-identity` replaces that form, so every identity-dependent result here (identity overlap, edge retention, answer identity, the wrong-target review) must be re-run after this change is rebased onto it.
-Determinism, speed, sympy, and sphinx do not depend on the identity form.
+The identity-dependent results (identity overlap, edge retention, answer identity, and the wrong-target review) were measured on 2026-10-15, after this change was rebased onto `canonical-identity`.
+Determinism, speed, sympy, and sphinx do not depend on the identity form, and were measured on 2026-10-11 with the same ty-scip version.
 
 ## Indexer versions
 
@@ -14,7 +13,6 @@ These definitions were fixed on 2026-10-11, before any gate run.
 
 - **Binary.**
   Every build uses the branch binary, run with an explicit `--python-indexer` and a separate `--db` per indexer.
-  The ty-scip stores are built with the descriptor conversion that gives both indexers one identity form (added 2026-10-11, after the first run found the two Flask stores shared no in-workspace identity).
 - **Identity overlap.**
   The share of scip-python's in-workspace identities that the ty-scip store also holds.
   Reported, with no threshold.
@@ -77,46 +75,52 @@ Faker has no `pyproject.toml`, so both Faker builds pass `--language python`.
 
 ## Results
 
-Measured 2026-10-11.
-Raw outputs and scripts are in `._scratch/research/scip-python/gate/` (`results.md`, `metrics-<repo>.md`, `edges_compare.py`).
+The identity-dependent measures were run on 2026-10-15 from commit `46360fd`, with raw outputs and scripts in `._scratch/research/scip-python/gate/rerun-2026-10-15/` (`metrics-<repo>.md`, `build-<repo>-<indexer>.out`, `edges_compare.py`, `reuse_verdicts.py`).
+The 2026-10-11 outputs are in `._scratch/research/scip-python/gate/`.
+The clones were at the commits listed above, and `git status --porcelain --ignored` was the same before and after the builds.
 
 | Measure                         | Flask       | httpx2      | Faker       | Threshold        |
 | ------------------------------- | ----------- | ----------- | ----------- | ---------------- |
-| Identity overlap                | 95.3%       | 95.8%       | 98.0%       | reported         |
-| Edges, scip-python / ty-scip    | 2268 / 2509 | 7913 / 8156 | 8354 / 8329 | reported         |
-| Edge retention                  | 88.0%       | 91.5%       | 94.9%       | at least 95%     |
-| Lost edges                      | 273         | 676         | 429         | each has a cause |
-| Gained edges                    | 514         | 919         | 404         | reviewed         |
-| Answer identity                 | 84.0%       | 85.2%       | 90.9%       | reported         |
+| Identity overlap                | 95.6%       | 95.9%       | 98.1%       | reported         |
+| Edges, scip-python / ty-scip    | 2379 / 2509 | 8205 / 8156 | 8473 / 8329 | reported         |
+| Edge retention                  | 94.1%       | 91.2%       | 94.9%       | at least 95%     |
+| Lost edges                      | 140         | 723         | 428         | each has a cause |
+| Gained edges                    | 270         | 674         | 284         | reviewed         |
+| Answer identity                 | 84.1%       | 86.5%       | 91.6%       | reported         |
 | Join acceptance, ty-scip        | 98.0%       | 95.8%       | 92.8%       | at least 97%     |
 | Join acceptance, scip-python    | 99.3%       | 97.0%       | 93.1%       | reference        |
 | Two ty-scip runs byte-identical | yes         | yes         | yes         | yes              |
 
-Lost-edge causes (target absent from ty-scip / source absent / no occurrence in ty-scip): Flask 202 / 35 / 36, httpx2 383 / 8 / 285, Faker 49 / 2 / 378.
+Lost-edge causes (target absent from ty-scip / source absent / no occurrence in ty-scip): Flask 51 / 40 / 49, httpx2 382 / 8 / 333, Faker 47 / 2 / 379.
 No lost edge sat at a ty-scip join discrepancy, and no lost edge fell in "other".
 
-- Flask speed: 0.71 s / 120 MB, 0.72 s / 120 MB, 0.72 s / 120 MB.
+Most identities that only one store holds come from names with several definitions. ty-scip gives a separate definition to each assignment of a name, so a name that scip-python reports once has several identities in the ty-scip store: Flask 61 such names, httpx2 211, Faker 143.
+An edge to such a name in the scip-python store is lost, and its counterpart in the ty-scip store points at one of the several identities, or at none when the join cannot choose (duplicate-ambiguous: Flask 303, httpx2 1366, Faker 1295 under ty-scip, against 6, 0, and 671 under scip-python).
+
+- Flask speed: 0.71 s / 120 MB, 0.72 s / 120 MB, 0.72 s / 120 MB (2026-10-11).
   Passes.
-- sympy: ty-scip indexed in 45.5 s with 2459 MB peak and refused no file.
+- sympy: ty-scip indexed in 45.5 s with 2459 MB peak and refused no file (2026-10-11).
   `c10r build` completed in 213 s, and `find` answered.
   Passes.
-- sphinx: the clone already has a `ty.toml` with `[src]`, so `exclude-scripts = true` went into that table.
+- sphinx: the clone already has a `ty.toml` with `[src]`, so `exclude-scripts = true` went into that table (2026-10-11).
   `c10r build` completed in 28 s, and `find` answered.
   Passes.
-- The sympy and sphinx stores were built before the descriptor conversion.
-  The conversion changes identities, not whether a build completes.
 
-Wrong-target review: all 2,088 packet entries (Flask 588, httpx2 1,003, Faker 497: each repository's 100-edge sample plus every gained edge) were judged by Haiku reviewers against `review-rubric.md`, with verdicts in `verdicts-<repo>-<range>.tsv`.
+Wrong-target review: all 1,504 packet entries (Flask 359, httpx2 767, Faker 378: each repository's 100-edge sample plus every gained edge) have a verdict against `review-rubric.md`.
+A verdict judges whether the tokens at an entry's occurrence sites denote the declaration at its target's definition site, and identity renaming does not change that judgment.
+So an entry with the same kind, target definition site, and occurrence sites as a 2026-10-11 entry keeps that entry's verdict (Flask 304, httpx2 697, Faker 295; `reused-<repo>.tsv`).
+Haiku reviewers judged the other 208 entries (`verdicts-<repo>-new.tsv`, and `verdicts-httpx2-a.tsv` and `verdicts-httpx2-b.tsv`).
 
 | Repository | Correct | Wrong | Unclear |
 | ---------- | ------- | ----- | ------- |
-| Flask      | 588     | 0     | 0       |
-| httpx2     | 1,002   | 1     | 0       |
-| Faker      | 497     | 0     | 0       |
+| Flask      | 359     | 0     | 0       |
+| httpx2     | 766     | 1     | 0       |
+| Faker      | 378     | 0     | 0       |
 
-The one wrong target is httpx2 entry 531, confirmed by reading the source: `exc_info.value.request` reads the property `HTTPError.request` (`_exceptions.py:108`), and ty-scip points it at the subclass assignment `self.request = request` (`_exceptions.py:278`), which only calls the inherited setter. ty-scip treats an assignment through an inherited property as a new attribute of the subclass.
+The one wrong target is a reused verdict, confirmed on 2026-10-11 by reading the source: `exc_info.value.request` reads the property `HTTPError.request` (`_exceptions.py:108`), and ty-scip points it at the subclass assignment `self.request = request` (`_exceptions.py:278`), which only calls the inherited setter. ty-scip treats an assignment through an inherited property as a new attribute of the subclass.
 
-No reviewer returned UNCLEAR, which the rubric expected for receivers with no visible type.
-Six verdicts were rechecked by hand from the source, chosen at random among attribute accesses on a receiver that is neither `self` nor a module (Flask 31 and 312, httpx2 41, Faker 73, 356, and 407); all six agree.
+Eleven new Faker entries have a target with no definition site in the store; the reviewer judged them against the `Faker` class declarations in `faker/proxy.pyi`.
+Five new verdicts were rechecked by hand from the source (Flask 9 and 18, httpx2 30 and 64, Faker 2); all five agree.
 
-Outcome: edge retention fails on all three repositories, ty-scip join acceptance fails on httpx2 and Faker, and the wrong-target threshold fails on httpx2 with one wrong target.
+Outcome: edge retention fails on all three repositories (Flask and Faker by less than one point), ty-scip join acceptance fails on httpx2 and Faker, and the wrong-target threshold fails on httpx2 with one wrong target.
+Under the gate's rules, ty-scip stays opt-in, and `ty-scip-default` cannot proceed on these results.

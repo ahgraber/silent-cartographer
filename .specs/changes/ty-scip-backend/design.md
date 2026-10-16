@@ -10,8 +10,8 @@
   `backend_language` maps a recorded analyzer name to a language and refuses unknown names (`src/graph/mod.rs:198`).
   `doctor` probes rust-analyzer and scip-python and treats both as required (`src/commands.rs:2473`).
 
-- The join's module-name rule reads a module's dotted name only from scip-python's shape: a dotted namespace segment followed by an `__init__` meta terminal (`module_dotted_name`, `src/graph/join.rs:1580`). ty-scip emits a module as a sequence of namespace segments (`flask/app/`).
-  On Flask, the rule accepted 919 occurrences under scip-python and 0 under ty-scip.
+- The join's module-name rule reads a module's dotted name from a descriptor made only of module segments (`module_dotted_name`, `src/graph/join.rs`).
+  `canonical-identity` gives both indexers that module form: ty-scip emits it directly, and translation rewrites scip-python's namespace-plus-`__init__` form into it.
 
 - The store already persists analyzer name and version as provenance, and currency already compares them (`A build over unchanged inputs does no work`, `Staleness reflects underlying change`).
 
@@ -59,7 +59,8 @@ The two indexers differ only in the four enum-supplied values, so a second adapt
 
 ### Decision: RejectedFileIsATypedRefusal
 
-**Chosen:** for ty-scip, capture standard error, then replay it to c10r's standard error after the run.
+**Chosen:** for ty-scip, pass each line of standard error through to c10r's standard error as it arrives, and keep a copy for classifying a failed run.
+Printing the output only after the run would leave a long run (sympy indexes for about 45 s) silent, and a run interrupted with Ctrl-C would lose its output.
 A nonzero exit whose output holds `project file has no importable module name: <path>` becomes a new `SemanticError::RejectedFile { path, remedy }`.
 The remedy depends on the named file:
 
@@ -120,24 +121,29 @@ Keeping the recorded indexer makes an explicit choice last until another explici
 - Autodetection with ty-scip preferred: makes ty-scip the effective default wherever it is installed, before the gate results exist.
   That decision belongs to `ty-scip-default`.
 
-### Decision: ModuleNameReadsBothShapes
+### Decision: ModuleNameReadsTheCanonicalForm
 
-**Chosen:** `module_dotted_name` returns `Option<Cow<str>>`.
+**Chosen:** `module_dotted_name` reads only the canonical module form: a descriptor whose segments are all module segments, joined with `.`.
+This change adds no module-name code of its own.
 
-- For scip-python's shape, it returns the namespace segment as today.
-- For a descriptor whose segments are all module segments, it returns the segment names joined with `.`.
-  This shape includes scip-python's single-segment symbol that a `__name__` token resolves to, so the self-name rule reads module identity through the same function.
-  On Flask and httpx2 under scip-python, the stored occurrences, symbols, edges, and join accounting match `main` (checked 2026-10-10).
-
-`classify_module_kinds` is unchanged: ty-scip's terminal namespace segment already classifies as `SymbolKind::Module` through `symbol_kind_from`.
-Both callers (`src/graph/join.rs:1387`, `:1463`) are Python-only rule arms, so Rust module descriptors are not affected.
-
-**Rationale:** the baseline rule is written in terms of "the module's dotted namespace name" and names no descriptor shape.
-This is an implementation fix under the existing requirement, and needs no spec delta.
+**Rationale:** `canonical-identity` rewrites scip-python's module descriptors into the canonical form during translation, and ty-scip already emits that form.
+One input form needs one reading in the join.
+The baseline rule is written in terms of "the module's dotted namespace name" and names no descriptor shape, so no spec delta is needed.
 
 **Alternatives considered:**
 
-- Rewrite ty-scip symbols into scip-python's `__init__:` shape during translation: hides the real descriptor and couples identity to one indexer's quirk.
+- Read each indexer's raw module form in the join: the implementation before `canonical-identity`, which ties the join to each indexer's descriptor form.
+
+### Decision: TyScipIsHeldToTheReferenceListWithinTheRequirement
+
+**Chosen:** ty-scip's index of the conformance project is held to the hand-written reference list, except for the two declarations that `Identity does not depend on the indexer` does not cover:
+
+- `Widget.size`, a property with a getter and a setter: scip-python reports one definition, ty-scip reports two, so the ty-scip store holds two distinct identities.
+- `Widget._size`, an instance attribute assigned only through `self` in the setter: scip-python reports it, and ty-scip reports no symbol for it.
+
+**Rationale:** the requirement excludes a declaration that only one indexer reports and a name with different numbers of definitions.
+An exact-match test would fail on behavior the requirement permits.
+The twice-defined property is the conformance project's instance of the repeated-definition boundary, so it needs no fixture change, and the committed indexes of both indexers stay as they are.
 
 ### Decision: BuildOptionAndLanguageMapping
 
@@ -218,7 +224,7 @@ status (no option) ──────┤        │
                                                                   ▼
                                                    SCIP → translate_index → classify_module_kinds
                                                                   ▼
-                                               join (module_dotted_name reads both shapes)
+                                               join (module_dotted_name reads the canonical module form)
                                                                   ▼
                                     store: provenance {analyzer name, version, environment}
                                                                   ▲
@@ -231,7 +237,8 @@ status (no option) ──────┤        │
   Two stores of the same code can hold indexes from different indexers.
   Mitigation: provenance names the indexer, and a harness that needs a fixed indexer passes `--python-indexer`.
 - **ty-scip scheme or output changes between versions.**
-  Mitigation: the version is part of the staleness identity, the install hint pins a version, and the gate is re-run on each bump.
+  The install hint does not pin a version, so a new install can get a version the gate never measured; the gate measured ty-scip 0.1.0, and the README names that version.
+  Mitigation: the version is part of the staleness identity, so a version change makes an existing store stale, and the gate is re-run before any decision that depends on ty-scip's results.
 - **Reassigned names become duplicate-ambiguous.** ty-scip emits a definition per reassignment (303 refused references on Flask, against 4).
   Mitigation: measured in the gate, and reported upstream, not patched in the join.
 - **Third-party references are lost under ty-scip.**
@@ -240,3 +247,10 @@ status (no option) ──────┤        │
   Mitigation: a typed error with a cause-specific remedy, and an upstream request for skip-with-warning.
 - **Single upstream maintainer.**
   Mitigation: forking ty-scip is the named contingency, and scip-python remains the default.
+
+## Spec Changes
+
+- **Change:** symbol-identity: add scenario `ty-scip yields the Python reference identities` to `Identity does not depend on the indexer` **Source:** upstream: proposal § Approach, which makes this change carry the ty-scip evidence for that requirement **Rationale:** the requirement covers every conforming indexer, and its scenarios held only scip-python and rust-analyzer to their reference lists.
+  **Approved by user:** 2026-10-16
+- **Change:** symbol-identity: add scenario `A name defined twice has one identity per definition under ty-scip` to `Identity does not depend on the indexer` **Source:** upstream: the requirement's own exclusion of a name for which the indexers report different numbers of definitions **Rationale:** the exclusion had no scenario; the conformance project's property with a getter and a setter is a name that scip-python reports once and ty-scip twice.
+  **Approved by user:** 2026-10-16

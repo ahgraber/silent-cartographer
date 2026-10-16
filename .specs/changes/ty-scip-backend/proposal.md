@@ -66,3 +66,12 @@ The mechanism, the refusal causes, and the gate thresholds are in `design.md`.
 This change depends on `canonical-identity`, which defines the identity form every Python indexer must produce.
 It is paused until that change lands, and is then rebased onto it.
 After the rebase, ty-scip's output needs no descriptor conversion, and this change carries the ty-scip evidence for `canonical-identity`'s requirement `Identity does not depend on the indexer`.
+
+## Resolved Questions
+
+- 2026-10-10 Indexer selection: ty-scip is opt-in and scip-python is the default for a new store; a build without `--python-indexer` uses the indexer recorded in the existing store, so refresh hooks and MCP builds never replace a ty-scip store; the indexer and its version are part of the staleness identity.
+  Decided with the user.
+- 2026-10-10 Readiness report: ty-scip is reported as an optional indexer, and its absence or a probe timeout does not signal the indexer/setup failure.
+  Decided with the user.
+- 2026-10-10 Comparison gate: the gate runs before merge and its results are recorded, but a failed gate does not block the merge; `ty-scip-default` requires a passed gate.
+  Decided with the user.
