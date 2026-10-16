@@ -69,6 +69,7 @@ uv tool install ty-scip
 You only need the one for the languages you index.
 Python builds use scip-python by default.
 `c10r build --python-indexer ty-scip` opts in to ty-scip, and the store keeps that indexer on later builds until you pass the option again.
+The ty-scip version measured with c10r is 0.1.0 (`uv tool install ty-scip==0.1.0`), and a later version may index differently.
 See [build](docs/commands/build.md#python-indexer) for the selection rule and the limits of ty-scip.
 `c10r doctor` reports which are present and which are missing.
 
