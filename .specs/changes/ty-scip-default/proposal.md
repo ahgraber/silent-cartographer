@@ -46,5 +46,9 @@ As an agent working in a large Python repository, I want a build without options
   `ty-scip-backend` never uses the other indexer in place of an unavailable one.
 - Does scip-python become an optional indexer in the readiness report?
 - Does `c10r-settings` land first, so that a project can fix its indexer before any store exists?
+- Does the default wait for ty-scip to emit one definition per name ([ty-scip#19](https://github.com/brendan-m-murphy/ty-scip/issues/19)) and for a gate run that passes after it?
+  The 2026-10-16 gate failed edge retention on Flask, httpx2, and Faker, and join acceptance on httpx2 and Faker.
+  References that the join refuses because their target has several definitions rose from 6, 0, and 671 under scip-python to 303, 1366, and 1295 under ty-scip.
+- If ty-scip skips a file with no importable module name instead of refusing the index ([ty-scip#18](https://github.com/brendan-m-murphy/ty-scip/issues/18)), how does a build keep the guarantee that it never persists a partial index: by keeping the strict behavior, or by naming the skipped files in the build answer?
 - How does the change handle the third-party references that ty-scip does not record?
   A probe on Flask on 2026-10-10 found 497 calls to third-party targets with no occurrence under ty-scip.
