@@ -55,7 +55,8 @@ The build then fails, names the file, and gives the remedy.
 No partial index is stored, and c10r never excludes files on your behalf.
 
 - For a file that starts with PEP 723 inline script metadata (`# /// script`), set `exclude-scripts = true` under `[src]` in `ty.toml`, or under `[tool.ty.src]` in `pyproject.toml`.
-- For any other such file, for example one under a directory whose name is not a Python identifier such as `test-examples/`, add its path to `exclude` in the same section.
+- For any other such file, for example one under a directory whose name is not a Python identifier such as `test-examples/`, add its path, relative to the project root, to `exclude` in the same section.
+  The refusal prints that relative path.
 
 ty-scip records no references into third-party packages.
 Answers built with ty-scip contain no edges to third-party targets.
