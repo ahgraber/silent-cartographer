@@ -262,8 +262,16 @@ fn rejected_file(stderr: &str, project_root: &Path) -> Option<SemanticError> {
         .lines()
         .find_map(|line| line.split_once(REJECTED_FILE_PREFIX).map(|(_, path)| path.trim()))?;
     let path = project_root.join(named);
-    let remedy = rejected_file_remedy(&path, named);
+    let remedy = rejected_file_remedy(&path, &relative_to_root(&path, project_root));
     Some(SemanticError::RejectedFile { path, remedy })
+}
+
+/// `path` relative to `project_root`, comparing symlink-resolved forms (ty-scip reports resolved
+/// paths); `path` unchanged when it lies outside the root.
+fn relative_to_root(path: &Path, project_root: &Path) -> String {
+    let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (path, root) = (resolve(path), resolve(project_root));
+    path.strip_prefix(&root).unwrap_or(&path).display().to_string()
 }
 
 /// The configuration change that stops ty-scip refusing `path`: a file whose leading comment lines
@@ -1819,6 +1827,25 @@ mod tests {
         }
 
         assert!(rejected_file("ty-scip: Failed to discover local Python environment\n", &root).is_none());
+    }
+
+    // ty-scip names a refused file by its absolute, symlink-resolved path; the remedy names it relative
+    // to the project root, so it can be pasted into the project's configuration as printed.
+    #[test]
+    fn rejected_file_remedy_names_the_path_relative_to_the_project_root() {
+        let (_guard, real_root) = canonical_tempdir();
+        std::fs::create_dir(real_root.join("test-examples")).unwrap();
+        std::fs::write(real_root.join("test-examples").join("case.py"), "x = 1\n").unwrap();
+        let (_link_guard, link_dir) = canonical_tempdir();
+        let linked_root = link_dir.join("project");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+
+        let absolute = real_root.join("test-examples").join("case.py");
+        let stderr = format!("project file has no importable module name: {}\n", absolute.display());
+        let Some(SemanticError::RejectedFile { remedy, .. }) = rejected_file(&stderr, &linked_root) else {
+            panic!("typed");
+        };
+        assert!(remedy.contains("add `test-examples/case.py` to `exclude`"), "{remedy}");
     }
 
     // A nonzero ty-scip run becomes a typed refusal only when its standard error names a refused
