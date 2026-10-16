@@ -218,21 +218,38 @@ impl PythonAdapter {
             }
             return Ok(());
         }
-        // ty-scip: a refusal is read from standard error, which is replayed afterwards so the user
-        // still sees the indexer's own diagnostics.
-        let run = command.stdout(Stdio::inherit()).output().map_err(unavailable)?;
-        let stderr = String::from_utf8_lossy(&run.stderr);
-        eprint!("{stderr}");
-        if !run.status.success() {
+        // ty-scip: a refusal is read from standard error, so each line is passed through to the user
+        // as it arrives and kept for classifying a failed run.
+        let mut child = command.stderr(Stdio::piped()).spawn().map_err(unavailable)?;
+        let child_stderr = child.stderr.take().expect("standard error is piped");
+        let forwarder = std::thread::spawn(move || forward_lines(child_stderr, std::io::stderr()));
+        let status = child.wait().map_err(unavailable)?;
+        let stderr = forwarder.join().unwrap_or_default();
+        if !status.success() {
             return Err(rejected_file(&stderr, project_root).unwrap_or_else(|| {
                 SemanticError::Analysis(format!(
-                    "`{} index` failed ({}). Its own error output is printed above.",
-                    self.executable, run.status
+                    "`{} index` failed ({status}). Its own error output is printed above.",
+                    self.executable
                 ))
             }));
         }
         Ok(())
     }
+}
+
+/// Copy `source` to `sink` one line at a time as each line arrives, and return everything read.
+fn forward_lines(source: impl std::io::Read, mut sink: impl std::io::Write) -> String {
+    use std::io::BufRead;
+
+    let mut reader = std::io::BufReader::new(source);
+    let mut captured = Vec::new();
+    let mut line = Vec::new();
+    while matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+        // A closed terminal must not stop the capture that classifies the run.
+        let _ = sink.write_all(&line).and_then(|()| sink.flush());
+        captured.append(&mut line);
+    }
+    String::from_utf8_lossy(&captured).into_owned()
 }
 
 /// The line prefix ty-scip prints when it refuses a file that has no module name in the project.
@@ -1837,6 +1854,45 @@ mod tests {
         assert!(matches!(run(), Err(SemanticError::Analysis(_))));
         script("exit 0");
         assert!(run().is_ok());
+    }
+
+    // Each line of the indexer's error output reaches the user while the indexer still runs, and the
+    // whole output is returned once the stream closes.
+    #[test]
+    fn indexer_error_output_is_forwarded_as_it_arrives() {
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct ChannelSink(mpsc::Sender<Vec<u8>>);
+        impl Write for ChannelSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.send(buf.to_vec()).unwrap();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let forwarder = std::thread::spawn(move || forward_lines(reader, ChannelSink(tx)));
+
+        writer.write_all(b"ty-scip: indexing\n").unwrap();
+        let first = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("forwarded before the stream closes");
+        assert_eq!(first, b"ty-scip: indexing\n");
+
+        writer
+            .write_all(b"project file has no importable module name: a.py")
+            .unwrap();
+        drop(writer);
+        assert_eq!(
+            forwarder.join().unwrap(),
+            "ty-scip: indexing\nproject file has no importable module name: a.py"
+        );
     }
 
     // A missing indexer tool refuses with guidance naming the tool and how to install it. The tool
