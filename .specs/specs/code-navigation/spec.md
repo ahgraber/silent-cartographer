@@ -231,6 +231,7 @@ For a dependents query, the system SHALL return detailed results only up to a de
 ### Requirement: Symbol reference resolution
 
 The system SHALL resolve a symbol reference supplied as a short name, a qualified name, or a canonical identity to the symbol it denotes, and SHALL return a typed candidate set when a reference denotes more than one symbol rather than selecting one arbitrarily.
+A qualified name that begins with a package's name SHALL denote only declarations in that package's default unit.
 
 #### Scenario: Qualified name resolves uniquely
 
@@ -253,6 +254,24 @@ The system SHALL resolve a symbol reference supplied as a short name, a qualifie
 #### Scenario: Canonical identity round-trips
 
 - **GIVEN** the canonical identity of an indexed symbol
+- **WHEN** it is supplied as a reference
+- **THEN** exactly that symbol is resolved
+
+#### Scenario: Package-qualified name resolves to the library's declaration
+
+- **GIVEN** a Cargo package `libbin` whose library and binary `tool` each declare `util::Config`
+- **WHEN** `libbin::util::Config` is supplied as a reference
+- **THEN** exactly the library's `Config` is resolved
+
+#### Scenario: Path declared in two units returns candidates
+
+- **GIVEN** a Cargo package `libbin` whose library and binary `tool` each declare `util::Config`
+- **WHEN** `util::Config` is supplied as a reference
+- **THEN** a typed candidate set holding the library's `Config` and the binary's `Config` is returned
+
+#### Scenario: Identity with a marker round-trips
+
+- **GIVEN** the canonical identity `<workspace>::libbin+bin.tool::util::Config` of an indexed binary declaration
 - **WHEN** it is supplied as a reference
 - **THEN** exactly that symbol is resolved
 

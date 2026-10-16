@@ -446,73 +446,90 @@ The system SHALL record, for every build, the number of semantic occurrences acc
 
 ### Requirement: Occurrences of duplicated descriptors are never arbitrarily attributed
 
-When more than one distinct definition shares an identical resolved descriptor, the system SHALL attribute each definition occurrence to the definition at its own location; SHALL attribute a non-definition occurrence of that descriptor to one of the duplicates only when the occurrence's containing document is associated with exactly that one duplicate and the occurrence also satisfies the guarded join's alignment rules, except that an occurrence whose source token spells the package's own name rather than the descriptor's name — a token that denotes the package's library target regardless of where it sits — SHALL be attributed to the duplicate whose definition document the build system's authoritative target description names as the library target's root, and SHALL be recorded duplicate-ambiguous when no authoritative target description is available or it names no persisted duplicate; SHALL, when the occurrence's containing document is associated with more than one duplicate, attribute the occurrence to a duplicate by declaration scope — the innermost declaration enclosing the occurrence that contains at least one of the duplicates' definitions decides, and the occurrence is attributed to the single duplicate defined within it — only when exactly one duplicate's definition lies within that deciding declaration and the occurrence also satisfies the guarded join's alignment rules; every attribution SHALL carry its locality evidence as provenance; and SHALL record a non-definition occurrence for which no locality evidence discriminates a single duplicate — a containing document associated with no duplicate, or shared territory whose deciding declaration contains more than one duplicate or does not exist — as a typed duplicate-ambiguous outcome, never attributing it to any single duplicate arbitrarily.
+When two or more distinct definitions share one resolved descriptor, they are duplicates, and the system SHALL NOT guess which duplicate a reference to them points to.
+This requirement covers references that an alignment rule accepts; a reference that no alignment rule accepts SHALL be attributed to no duplicate.
+Each duplicate SHALL keep its own definition location, and no duplicate SHALL be given another duplicate's location.
+A reference written with the package's name SHALL be attributed to the library's duplicate, in whatever file the reference appears.
+This covers a reference that is the package's name itself, and the last name in a path that starts with the package's name, such as `load` in `libbin::util::load()`.
+If the package's unit list is unavailable, or none of the duplicates belongs to the library, such a reference SHALL be recorded duplicate-ambiguous.
+Any other reference SHALL be attributed to a duplicate only in one of these cases:
 
-#### Scenario: Definition occurrences attach to their own duplicate
+- the file that holds the reference belongs to the unit (for Rust, the library, a binary, a test, or an example) of exactly one duplicate;
+- the file belongs to the units of several duplicates, and, moving outward from the reference, the first declaration that holds any duplicate holds exactly one.
 
-- **GIVEN** two distinct definitions sharing an identical resolved descriptor
-- **WHEN** the join runs
-- **THEN** each definition occurrence is attributed to the definition at its own location
+Every other reference SHALL be recorded duplicate-ambiguous and attributed to no duplicate.
 
-#### Scenario: Reference in one duplicate's territory is attributed to it
+#### Scenario: Two duplicates keep separate definition locations
 
-- **GIVEN** a non-definition occurrence of a duplicated descriptor whose containing document is associated with exactly one of the duplicates
-- **WHEN** the join runs
-- **THEN** the occurrence is attributed to that duplicate and the attribution carries its locality evidence as provenance
+- **GIVEN** a library file `src/lib.rs` and a binary file `src/bin/tool.rs` that each define `fn load()` in one package
+- **WHEN** the workspace is built
+- **THEN** the library's `load` is defined at its line in `src/lib.rs`, the binary's `load` at its line in `src/bin/tool.rs`, and neither is given the other's location
 
-#### Scenario: Locality does not bypass the guarded join
+#### Scenario: A reference in one duplicate's unit is attributed to it
 
-- **GIVEN** a non-definition occurrence in a document associated with exactly one duplicate, whose source text satisfies no alignment rule's expectation
-- **WHEN** the join runs
-- **THEN** the occurrence is refused by the guarded join and is not attributed to the duplicate
+- **GIVEN** a reference to duplicates, in a file that belongs to the unit of exactly one of them
+- **WHEN** the workspace is built
+- **THEN** the reference is attributed to that duplicate
 
-#### Scenario: Package-name reference resolves to the library target
+#### Scenario: A reference in one duplicate's unit is not attributed if no alignment rule accepts it
 
-- **GIVEN** several crate-root definitions sharing an identical resolved descriptor, and an authoritative target description naming the library target's root document
-- **WHEN** the join processes a reference occurrence of that descriptor whose source token spells the package name rather than the descriptor's name
-- **THEN** the occurrence is attributed to the duplicate defined at the library target's root — never to the containing document's own crate root — and the attribution carries the target-description evidence as provenance
+- **GIVEN** a reference to duplicates, in a file that belongs to the unit of exactly one of them, and no alignment rule accepts the reference
+- **WHEN** the workspace is built
+- **THEN** the reference is not attributed to that duplicate
 
-#### Scenario: Package-name reference without target metadata is typed ambiguous
+#### Scenario: A reference by package name is attributed to the library
 
-- **GIVEN** several crate-root definitions sharing an identical resolved descriptor, and no authoritative target description available
-- **WHEN** the join processes a reference occurrence of that descriptor whose source token spells the package name
-- **THEN** the occurrence is recorded as a duplicate-ambiguous outcome, not attributed to the containing document's own crate root
+- **GIVEN** a package whose library and binary each have a root module, whose unit list is available, and a reference that is the package's name
+- **WHEN** the workspace is built
+- **THEN** the reference is attributed to the library's root module, never to the root module of the unit that holds the reference
 
-#### Scenario: Reference outside every duplicate's territory is typed ambiguous
+#### Scenario: A path that starts with the package name is attributed to the library
 
-- **GIVEN** a non-definition occurrence of a duplicated descriptor whose containing document is associated with none of the duplicates
-- **WHEN** the join runs
-- **THEN** the occurrence is recorded as a duplicate-ambiguous outcome and is attributed to no single duplicate
+- **GIVEN** a Cargo package `libbin` with a library and a binary `tool`, which each declare `mod util { pub fn load() {} }`, and the binary's `main` calls `util::load()` and `libbin::util::load()`, and the package's unit list is available
+- **WHEN** the workspace is built
+- **THEN** the call `libbin::util::load()` is attributed to the library's `load`, the call `util::load()` is attributed to the binary's `load`, and the references of the library's `load` include the call at `libbin::util::load()`
 
-#### Scenario: Same-document reference inside exactly one twin's scope is attributed to it
+#### Scenario: A reference by package name with no unit list is ambiguous
 
-- **GIVEN** several definitions sharing an identical resolved descriptor within one document, and a non-definition occurrence of that descriptor whose innermost enclosing declaration containing any of the definitions contains exactly one of them
-- **WHEN** the join runs
-- **THEN** the occurrence is attributed to that single duplicate and the attribution carries the declaration-scope evidence as locality provenance
+- **GIVEN** a package whose library and binary each have a root module, whose unit list is unavailable, and a reference that is the package's name
+- **WHEN** the workspace is built
+- **THEN** the reference is recorded duplicate-ambiguous, not attributed to the root module of the unit that holds the reference
 
-#### Scenario: Same-document reference whose deciding scope holds several twins stays ambiguous
+#### Scenario: A reference outside every duplicate's unit is ambiguous
 
-- **GIVEN** several definitions sharing an identical resolved descriptor within one document, and a non-definition occurrence whose innermost enclosing declaration containing any of the definitions contains more than one of them
-- **WHEN** the join runs
-- **THEN** the occurrence is recorded as a duplicate-ambiguous outcome and is attributed to no single duplicate
+- **GIVEN** a reference to duplicates, in a file that belongs to the unit of none of them
+- **WHEN** the workspace is built
+- **THEN** the reference is recorded duplicate-ambiguous and attributed to no duplicate
 
-#### Scenario: Same-document reference enclosed by no twin-bearing declaration stays ambiguous
+#### Scenario: A reference in a declaration that holds exactly one duplicate is attributed to it
 
-- **GIVEN** several definitions sharing an identical resolved descriptor at the top level of one document, and a non-definition occurrence elsewhere in that document none of whose enclosing declarations contains any of the definitions
-- **WHEN** the join runs
-- **THEN** the occurrence is recorded as a duplicate-ambiguous outcome and is attributed to no single duplicate
+- **GIVEN** duplicates defined in one file, and a reference in that file where, moving outward from the reference, the first declaration that holds any duplicate holds exactly one
+- **WHEN** the workspace is built
+- **THEN** the reference is attributed to that duplicate
 
-#### Scenario: Scope locality does not bypass the guarded join
+#### Scenario: A reference in a declaration that holds several duplicates is ambiguous
 
-- **GIVEN** a non-definition occurrence inside exactly one twin's scope whose source text satisfies no alignment rule's expectation
-- **WHEN** the join runs
-- **THEN** the occurrence is refused by the guarded join and is not attributed to the duplicate
+- **GIVEN** duplicates defined in one file, and a reference in that file where, moving outward from the reference, the first declaration that holds any duplicate holds more than one
+- **WHEN** the workspace is built
+- **THEN** the reference is recorded duplicate-ambiguous and attributed to no duplicate
 
-#### Scenario: Unduplicated descriptors are unaffected
+#### Scenario: A reference outside every declaration that holds a duplicate is ambiguous
+
+- **GIVEN** duplicates defined at the top level of one file, and a reference elsewhere in that file that no declaration holding a duplicate encloses
+- **WHEN** the workspace is built
+- **THEN** the reference is recorded duplicate-ambiguous and attributed to no duplicate
+
+#### Scenario: A reference in a declaration that holds one duplicate is not attributed if no alignment rule accepts it
+
+- **GIVEN** a reference inside a declaration that holds exactly one duplicate, and no alignment rule accepts the reference
+- **WHEN** the workspace is built
+- **THEN** the reference is not attributed to that duplicate
+
+#### Scenario: A descriptor with one definition has no ambiguous references
 
 - **GIVEN** a descriptor with exactly one definition
-- **WHEN** the join runs
-- **THEN** its non-definition occurrences are attributed through the ordinary guarded join, never marked duplicate-ambiguous
+- **WHEN** the workspace is built
+- **THEN** no reference to it is recorded duplicate-ambiguous
 
 ### Requirement: Builds wholly supersede prior derived state
 
@@ -1274,8 +1291,8 @@ The system SHALL record, with every build it persists, the semantic-index identi
 
 ### Requirement: A build over unchanged inputs does no work
 
-Before analyzing a workspace, the system SHALL determine whether the stored index already describes that workspace: the same workspace identity and root, and the workspace's current sources, analyzer, declared environment, and chunk parameters.
-When it does, the system SHALL analyze nothing, leave the store unchanged, report the index as already current, and succeed.
+The system SHALL treat the stored index as current when everything it recorded still matches the workspace: the workspace identity and root, the sources, the declared packages and units, the analyzer, the declared environment, and the chunk parameters.
+When the index is current, a build SHALL analyze nothing, leave the store unchanged, report the index as already current, and succeed.
 When any of those inputs differs, or no compatible store exists, the system SHALL build.
 The system SHALL offer an explicit way to build even when the stored index is already current.
 
@@ -1290,6 +1307,12 @@ The system SHALL offer an explicit way to build even when the stored index is al
 - **GIVEN** a workspace whose index was just built
 - **WHEN** one source file is edited and the workspace is built again
 - **THEN** the workspace is analyzed and the store is rebuilt
+
+#### Scenario: A renamed binary rebuilds
+
+- **GIVEN** a Rust workspace whose index was just built, with a binary `tool`
+- **WHEN** the binary is renamed to `cli` in `Cargo.toml` with no other change, and the workspace is built again
+- **THEN** the workspace is analyzed, the store is rebuilt, and the binary's declarations have the marker `+bin.cli`
 
 #### Scenario: A changed analyzer rebuilds
 
