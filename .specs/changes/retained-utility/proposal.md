@@ -56,3 +56,5 @@ The initial design should use the existing Rust and Python syntax support to pro
 - Which existing query commands remain available in structural mode, and should unavailable relations be reported as a query result or as a distinct command error?
 - How should a structural declaration identity be rendered so that it cannot be confused with the stable semantic identity used by resolved indexes?
 - Should the first implementation add a Bash/sh syntax profile, or first prove retained utility with the Rust and Python grammars already in c10r?
+- Does structural mode add a query that lists the calls with a given name and pages through them?
+  `unresolved-calls` left that query to this change, because in structural mode every call is unresolved.

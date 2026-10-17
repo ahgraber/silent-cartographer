@@ -44,3 +44,6 @@ As a developer, I want `build` to report the receivers that leave the most calls
 - Whether the report appears in every `build` answer, behind a flag, or in `doctor`.
 - How many groups the report names before it summarizes the rest.
 - Whether `status` also reports the count of unresolved calls.
+- Whether the report, or `status`, names the unresolved share only when it exceeds a threshold, and which threshold.
+  Candidates raised on 2026-10-16 were 2%, 5%, and 10% of calls.
+  The measured shares were 2.4% to 34.6% of attribute calls in four Python repositories, and 0% to 3.4% of calls in three Rust repositories.
