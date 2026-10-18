@@ -41,4 +41,4 @@ As an agent auditing a method with a common name, I want to list only the unreso
 - Does the filter take a literal receiver text, a pattern, or the subject's class name with its common spellings (`cache`, `self.cache`)?
 - Does the filter also apply to the unconfirmed-use group?
 - Is the filter a flag on `trace`, which changes the command surface and the MCP tool schema, or a separate query?
-- Does `retained-utility`'s listing of calls by name make this change unnecessary?
+- Does a query that lists calls by name, which `multi-language-builds` asks about, make this change unnecessary?
