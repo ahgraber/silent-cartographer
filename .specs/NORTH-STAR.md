@@ -20,6 +20,7 @@ Coding agents (Claude Code and peers) and the humans beside them fail on non-tri
 
 A **persistent codebase knowledge graph** that answers precise, type-aware navigation cheaply.
 It unifies a **syntax tree** (structure, always fresh) with a **semantic index** (cross-file identity, resolution, and types) into one graph keyed on stable symbol identities.
+Where no semantic index is available, c10r builds a structural index from the syntax tree alone and labels every answer from it as structural.
 Users and agents query it — over a CLI and an MCP interface — to find code by symbol, trace the blast radius of a change, and understand structure, at higher precision and far lower token cost than grep.
 
 The single measure of success: **an agent trusts c10r enough to stop grepping.**
@@ -72,7 +73,9 @@ Neither is a second-class path.
 - Not a code generator or refactoring executor — c10r _informs_ changes; it does not mutate code.
 - Not a replacement for live language servers — it _consumes_ them; it does not replace the editor loop.
 - Not a cross-repository or global code search engine — the focus is one codebase.
-- A language is supported only when its syntax and semantic layers unify into precise, type-aware results — breadth never comes at the cost of silent imprecision.
+- A language is supported at the semantic tier only when its syntax and semantic layers unify into precise, type-aware results.
+  A language without a semantic indexer is supported at the structural tier only: answers the syntax tree proves, each labeled with its tier, and every relation that needs resolution reported as unavailable.
+  Breadth never comes at the cost of silent imprecision.
 
 ## Current horizon
 
