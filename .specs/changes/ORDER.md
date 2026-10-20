@@ -4,21 +4,22 @@ This file records the recommended order in which the active changes are fleshed 
 Remove an entry when its change is archived.
 
 `unresolved-calls`, `method-overrides`, and `retained-utility` are fully proposed.
-The other six active changes are placeholders: each has a proposal and no delta specs, `design.md`, or `tasks.md`.
+The other seven active changes are placeholders: each has a proposal and no delta specs, `design.md`, or `tasks.md`.
 The order puts dependencies first, then severity.
 Severity ranks a wrong answer above a loud failure, and a loud failure above a missing feature.
 
 ## Sequence
 
-1. `unresolved-calls`
-2. `method-overrides`
-3. `retained-utility`
-4. `multi-language-builds`
-5. `unresolved-call-hints`
-6. `unresolved-call-filter` (conditional; see its section)
-7. `unreadable-sources`
-8. `c10r-settings`
-9. `ty-scip-default` (blocked; see Blocked)
+01. `unresolved-calls`
+02. `method-overrides`
+03. `retained-utility`
+04. `multi-language-builds`
+05. `unresolved-call-hints`
+06. `unresolved-call-filter` (conditional; see its section)
+07. `scip-range-encodings`
+08. `unreadable-sources`
+09. `c10r-settings`
+10. `ty-scip-default` (blocked; see Blocked)
 
 ### 1. `unresolved-calls`
 
@@ -55,7 +56,17 @@ It narrows the unresolved-call group of a `references` answer by receiver.
 It is built only if dogfood use of `unresolved-calls` shows that the group is too noisy, or too large for an MCP tool result, for common names.
 A query that lists calls by name, which `multi-language-builds` asks about, may make it unnecessary.
 
-### 7. `unreadable-sources`
+### 7. `scip-range-encodings`
+
+It makes c10r read the newer SCIP position encoding, `typed_range`, as well as the deprecated `range` that it reads today.
+No indexer c10r uses emits only the newer encoding yet, so no answer is wrong today.
+If one does, the build drops almost every occurrence without an error, and every answer is empty or partial without notice.
+That is a wrong answer, so it ranks above `unreadable-sources`, which fails loudly.
+It ranks below the earlier changes because their wrong answers happen today.
+It should land before `ty-scip-default` and before any change that adopts a SCIP indexer for a new language.
+ty-scip is at 0.1.0 and changing quickly, so it is the indexer most likely to switch encodings; this is a guess, not a measurement.
+
+### 8. `unreadable-sources`
 
 It depends on no other change, and no other change depends on it.
 It fails loudly instead of giving a wrong answer, so it ranks below `unresolved-calls`.
@@ -68,7 +79,7 @@ Its size depends on its first open question.
 
 A persistent list of excluded paths, which this change leaves out of scope, belongs to `c10r-settings`.
 
-### 8. `c10r-settings`
+### 9. `c10r-settings`
 
 It depends on no other change, so its place depends on how urgent it is.
 The chunk parameters are the case that motivates it: a build that omits the chunk flags rebuilds the whole index at the defaults without a report.
@@ -78,7 +89,7 @@ Since `ty-scip-backend`, a build without `--python-indexer` uses the indexer rec
 The indexer reverts to the default only for a new store.
 That gap matters when `ty-scip-default` changes the default, so `c10r-settings` comes before `ty-scip-default`.
 
-### 9. `ty-scip-default`
+### 10. `ty-scip-default`
 
 It decides whether ty-scip becomes the indexer for a new Python store.
 It cannot be decided until the conditions in Blocked are met.
@@ -97,6 +108,7 @@ These pairs are expected to modify the same requirement:
 
 ## Independent
 
+- `scip-range-encodings`
 - `unreadable-sources`
 - `c10r-settings`
 
