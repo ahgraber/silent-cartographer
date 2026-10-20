@@ -4935,6 +4935,86 @@ fn a_use_ambiguous_between_duplicates_is_disclosed_on_each_duplicate() {
     }
 }
 
+// A use ambiguous between the duplicates of one descriptor is linked to those duplicates only, not
+// to the duplicates of a distinct descriptor that shares its segment names but not its terminal kind.
+#[test]
+fn a_duplicate_use_is_linked_only_to_its_own_descriptor_group() {
+    use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind};
+    use silent_cartographer::semantic::model::DuplicateGroup;
+
+    let descriptor = |kind| Descriptor::new("dupcrate", vec![DescriptorSegment::new("f", kind)]);
+    let definitions: Vec<(String, SegmentKind)> = vec![
+        ("t0.rs".into(), SegmentKind::Term),
+        ("t1.rs".into(), SegmentKind::Term),
+        ("m0.rs".into(), SegmentKind::Method),
+        ("m1.rs".into(), SegmentKind::Method),
+    ];
+    let mut sources: Vec<(String, String)> = definitions
+        .iter()
+        .map(|(doc, _)| (doc.clone(), "fn f() {}\n".to_string()))
+        .collect();
+    sources.push(("ref.rs".to_string(), "fn use_it() { f(); }\n".to_string()));
+    let at = sources.last().unwrap().1.find("f()").unwrap() as u32;
+    let symbols = definitions
+        .iter()
+        .map(|(doc, kind)| ExtractedSymbol {
+            descriptor: Some(descriptor(*kind)),
+            kind: SymbolKind::Function,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![ExtractedOccurrence {
+                document_path: doc.clone(),
+                range: SourceRange::new(0, 3, 0, 4),
+                role: OccurrenceRole::Definition,
+            }],
+        })
+        .collect();
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: sources
+            .iter()
+            .map(|(path, _)| SourceDocument {
+                path: path.clone(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols,
+        duplicate_groups: vec![DuplicateGroup {
+            descriptor: descriptor(SegmentKind::Term),
+            occurrences: vec![ExtractedOccurrence {
+                document_path: "ref.rs".to_string(),
+                range: SourceRange::new(0, at, 0, at + 1),
+                role: OccurrenceRole::Reference,
+            }],
+        }],
+        targets: Default::default(),
+        environment: None,
+        local_occurrence_ranges: Default::default(),
+    };
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+    let twins = store.symbols_by_shortname("f").unwrap();
+    assert_eq!(twins.len(), 4);
+
+    let hash = silent_cartographer::graph::content_hash(&sources);
+    let engine = QueryEngine::new(&store, index.provenance.clone(), hash, None);
+    for twin in &twins {
+        let answer = engine
+            .trace(twin.canonical_id.as_str(), TraceRelation::References, None, None)
+            .unwrap();
+        let answer: serde_json::Value = serde_json::from_str(&answer.to_json()).unwrap();
+        let is_term = twin.document_path.as_deref().is_some_and(|d| d.starts_with('t'));
+        let uses = &answer["unconfirmed_uses"];
+        if is_term {
+            assert_eq!(uses["total"], 1, "{}", twin.canonical_id);
+            let refused = &uses["uses"][0];
+            assert_eq!(refused["reason"], "duplicate_ambiguous");
+            assert_eq!(refused["candidates_total"], 2, "{}: {refused}", twin.canonical_id);
+        } else {
+            assert_eq!(uses["total"], 0, "{}: {uses}", twin.canonical_id);
+        }
+    }
+}
+
 // _(A use ambiguous among many duplicates lists a bounded candidate set)_
 #[test]
 fn a_use_ambiguous_among_many_duplicates_lists_a_bounded_candidate_set() {

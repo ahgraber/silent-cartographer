@@ -223,6 +223,9 @@ pub struct UnalignedOccurrence {
     pub expected_name: String,
     /// The source bytes actually found at the location, if any syntax was there.
     pub found_text: Option<String>,
+    /// For a duplicate-ambiguous refusal, the descriptor of the duplicate group it belongs to; `None` for
+    /// every other refusal.
+    pub duplicate_group: Option<Descriptor>,
 }
 
 /// Per-build counts of join outcomes: one acceptance bucket per alignment rule, plus the refusal
@@ -486,6 +489,7 @@ pub fn join(
                     span,
                     expected_name: expected_name.clone(),
                     found_text: None,
+                    duplicate_group: symbol.descriptor.clone(),
                 });
                 continue;
             }
@@ -500,6 +504,7 @@ pub fn join(
                     span: None,
                     expected_name: expected_name.clone(),
                     found_text: None,
+                    duplicate_group: None,
                 });
                 continue;
             };
@@ -518,6 +523,7 @@ pub fn join(
                     span: None,
                     expected_name: expected_name.clone(),
                     found_text: None,
+                    duplicate_group: None,
                 });
                 continue;
             };
@@ -559,6 +565,7 @@ pub fn join(
                             span: Some(name_span),
                             expected_name: expected_name.clone(),
                             found_text: doc.tree.text_at(name_span).map(str::to_string),
+                            duplicate_group: None,
                         });
                     }
                     None if doc.tree.has_construct_at(span) => {
@@ -571,6 +578,7 @@ pub fn join(
                             span: Some(span),
                             expected_name: expected_name.clone(),
                             found_text: doc.tree.text_at(span).map(str::to_string),
+                            duplicate_group: None,
                         });
                     }
                     None => {
@@ -583,6 +591,7 @@ pub fn join(
                             span: Some(span),
                             expected_name: expected_name.clone(),
                             found_text: None,
+                            duplicate_group: None,
                         });
                     }
                 },
@@ -731,6 +740,7 @@ pub fn join(
                     span: None,
                     expected_name: expected_name.to_string(),
                     found_text: None,
+                    duplicate_group: None,
                 });
                 continue;
             };
@@ -914,6 +924,7 @@ fn join_group_occurrence(
                     span: Some(name_span),
                     expected_name: expected_name.to_string(),
                     found_text: doc.tree.text_at(name_span).map(str::to_string),
+                    duplicate_group: None,
                 });
             }
             None if doc.tree.has_construct_at(span) => {
@@ -926,6 +937,7 @@ fn join_group_occurrence(
                     span: Some(span),
                     expected_name: expected_name.to_string(),
                     found_text: doc.tree.text_at(span).map(str::to_string),
+                    duplicate_group: None,
                 });
             }
             None => {
@@ -938,6 +950,7 @@ fn join_group_occurrence(
                     span: Some(span),
                     expected_name: expected_name.to_string(),
                     found_text: None,
+                    duplicate_group: None,
                 });
             }
         },
@@ -964,7 +977,8 @@ fn record_group_ambiguous(
         range_to_span(doc.tree.source(), &doc.line_index, occ.range, encoding)
     });
     // No single twin owns the occurrence, so the discrepancy is surfaced under the group's shared
-    // identity base — which descriptor group the ambiguity belongs to stays inspectable.
+    // identity base. Groups whose descriptors differ only in segment kind share that base, so the
+    // descriptor itself is recorded to tell them apart.
     unaligned.push(UnalignedOccurrence {
         symbol: group_identity.clone(),
         document_path: occ.document_path.clone(),
@@ -973,6 +987,7 @@ fn record_group_ambiguous(
         span,
         expected_name: group.descriptor.terminal_name().unwrap_or_default().to_string(),
         found_text: None,
+        duplicate_group: Some(group.descriptor.clone()),
     });
 }
 
@@ -1006,7 +1021,7 @@ fn group_base_identity(
 
 /// An identity with a trailing `#<digits>` collision disambiguator stripped; an identity carrying no
 /// disambiguator is returned unchanged.
-pub(super) fn strip_disambiguator(identity: &CanonicalId) -> CanonicalId {
+fn strip_disambiguator(identity: &CanonicalId) -> CanonicalId {
     match identity.as_str().rsplit_once('#') {
         Some((base, rank)) if !rank.is_empty() && rank.bytes().all(|b| b.is_ascii_digit()) => {
             CanonicalId::from_raw(base.to_string())

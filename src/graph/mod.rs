@@ -433,6 +433,9 @@ pub fn ingest_with_params(
     // The unit-free identity of each duplicated symbol's descriptor, so twins belonging to different
     // units still group together.
     let mut duplicate_keys: Vec<(CanonicalId, String)> = Vec::new();
+    // The persisted members of each duplicated descriptor. Unlike the unit-free key, the full
+    // descriptor keeps segment kinds, so descriptors differing only in a kind stay separate groups.
+    let mut duplicate_members: HashMap<&crate::identity::Descriptor, Vec<CanonicalId>> = HashMap::new();
     for (idx, sym) in index.symbols.iter().enumerate() {
         let Some(Some(id)) = identities.get(idx) else {
             continue;
@@ -474,6 +477,7 @@ pub fn ingest_with_params(
         if duplicated && let Some(descriptor) = &sym.descriptor {
             let key = project_one(workspace, descriptor);
             duplicate_keys.push((id.clone(), key.as_str().to_string()));
+            duplicate_members.entry(descriptor).or_default().push(id.clone());
         }
         let content = definition_content(sym, id, &def_name_span, &prepared);
         let symbol_line_column = match (&content.document_path, content.span) {
@@ -688,7 +692,7 @@ pub fn ingest_with_params(
         &join_result.unaligned,
         &discrepancy_ids,
         &persisted_symbols,
-        &duplicate_keys,
+        &duplicate_members,
     ))?;
 
     store.insert_unresolved_calls(&unresolved_calls(
@@ -1046,33 +1050,25 @@ fn enclosing_symbol(
 /// The symbols each refused reference occurrence may denote, as `(discrepancy id, symbol)` links.
 ///
 /// `discrepancy_ids` is parallel to `unaligned`. A duplicate-ambiguous occurrence links every
-/// persisted member of the duplicate group its symbol belongs to; any other refused reference links
-/// its own symbol when that is persisted. A refused definition links nothing.
+/// persisted member of the duplicate group recorded on it, found by full descriptor equality; any
+/// other refused reference, or one whose descriptor has no group, links its own symbol when that is
+/// persisted. A refused definition links nothing.
 fn discrepancy_links(
     unaligned: &[UnalignedOccurrence],
     discrepancy_ids: &[i64],
     persisted: &std::collections::HashSet<&CanonicalId>,
-    duplicate_keys: &[(CanonicalId, String)],
+    duplicate_members: &HashMap<&crate::identity::Descriptor, Vec<CanonicalId>>,
 ) -> Vec<(i64, CanonicalId)> {
-    // A duplicate-ambiguous occurrence names either a twin or the group's shared base (the twins'
-    // identity without its `#<rank>` disambiguator), so both resolve to the group.
-    let mut group_of: HashMap<CanonicalId, &str> = HashMap::new();
-    let mut members: HashMap<&str, Vec<&CanonicalId>> = HashMap::new();
-    for (id, key) in duplicate_keys {
-        group_of.insert(id.clone(), key);
-        group_of.insert(join::strip_disambiguator(id), key);
-        members.entry(key).or_default().push(id);
-    }
     let mut links = Vec::new();
     for (occ, &discrepancy_id) in unaligned.iter().zip(discrepancy_ids) {
         if occ.role != OccurrenceRole::Reference {
             continue;
         }
         let group = (occ.outcome == JoinOutcome::DuplicateAmbiguous)
-            .then(|| group_of.get(&occ.symbol))
+            .then(|| occ.duplicate_group.as_ref().and_then(|d| duplicate_members.get(d)))
             .flatten();
         match group {
-            Some(key) => links.extend(members[key].iter().map(|&id| (discrepancy_id, id.clone()))),
+            Some(members) => links.extend(members.iter().map(|id| (discrepancy_id, id.clone()))),
             None if persisted.contains(&occ.symbol) => links.push((discrepancy_id, occ.symbol.clone())),
             None => {}
         }
