@@ -581,6 +581,51 @@ fn comment_only_change_exits_success_with_typed_empty_answer() {
     );
 }
 
+// _(An impact answer that touches no indexed symbol stays definite)_ — a comment-only diff renders the
+// definite none line and does not claim to have looked for dependents.
+#[test]
+fn a_comment_only_diff_renders_the_definite_none_line() {
+    let (repo, db, _ws) = setup_repo_with_index();
+    let mut lines: Vec<&str> = support::SOURCE.lines().collect();
+    lines.insert(6, "    // just a comment");
+    let mut edited = lines.join("\n");
+    edited.push('\n');
+    repo.write(support::DOC, &edited);
+
+    let text = run_impact_human(&repo, &db, &[]);
+    assert!(
+        text.contains("none: the change touches nothing the graph tracks (a definite none)"),
+        "{text}"
+    );
+    assert!(!text.contains("no resolved dependent recorded"), "{text}");
+}
+
+// _(An impact answer with no dependents states what it cannot see)_ — `disconnect` has no caller, so
+// the rendering lists it as a seed and then scopes the empty dependents; the answer carries neither
+// reference group.
+#[test]
+fn an_impact_answer_with_no_dependents_states_what_it_cannot_see() {
+    let (repo, db, _ws) = setup_repo_with_index();
+    let edited = edit_line(support::SOURCE, 5, "        pub fn disconnect(&self, extra: bool) {}");
+    repo.write(support::DOC, &edited);
+
+    let text = run_impact_human(&repo, &db, &[]);
+    let seeds_at = text.find("1 seeds").expect("a seed list");
+    let seed_at = text.find("disconnect").expect("the seed");
+    let scoped_at = text
+        .find(
+            "no resolved dependent recorded (calls by frameworks, implicit calls such as constructors and operators, \
+             and lookups by string are not seen)",
+        )
+        .unwrap_or_else(|| panic!("no scoped line: {text}"));
+    assert!(seeds_at < seed_at && seed_at < scoped_at, "{text}");
+    assert!(!text.contains("definite"), "{text}");
+
+    let answer = run_impact_json(&repo, &db, &[]);
+    assert!(answer.get("unresolved_calls").is_none(), "{answer}");
+    assert!(answer.get("unconfirmed_uses").is_none(), "{answer}");
+}
+
 // _(A change touching no indexed symbol is typed absence — files the graph does not track)_ — a
 // change confined to files source discovery would never collect (a README, a JSON fixture) reaches
 // the definite-none answer, and those files are not disclosed as regions the index cannot resolve:
@@ -1042,6 +1087,7 @@ fn python_located_repo() -> LocatedRepo {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
 
     let repo = TestRepo::new();
@@ -1673,6 +1719,7 @@ fn diff_larger_than_64kib_seeds_every_touched_symbol() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     index.symbols.push(ExtractedSymbol {
         descriptor: Some(Descriptor::new(

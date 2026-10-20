@@ -141,6 +141,17 @@ pub struct ClassBases {
     pub base_name_spans: Vec<ByteSpan>,
 }
 
+/// One call expression whose callee names a function or method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Call {
+    /// The byte span of the called name.
+    pub name_span: ByteSpan,
+    /// The called name's text.
+    pub name: String,
+    /// The byte span of the receiver expression or path, when the callee has one.
+    pub receiver_span: Option<ByteSpan>,
+}
+
 /// One declared alias binding: a document-local name bound to a target token, from an
 /// `import ... as ...`-shaped construct.
 ///
@@ -266,6 +277,27 @@ fn name_node_kinds(language: Language) -> &'static [&'static str] {
             "shorthand_field_identifier",
         ],
         Language::Python => &["identifier"],
+    }
+}
+
+/// The called-name node and optional receiver node of a call's `function` field, or `None` when the
+/// callee is not a shape that names a function.
+fn callee_name(callee: Node, language: Language) -> Option<(Node, Option<Node>)> {
+    match (language, callee.kind()) {
+        (_, "identifier") => Some((callee, None)),
+        (Language::Python, "attribute") => Some((
+            callee.child_by_field_name("attribute")?,
+            callee.child_by_field_name("object"),
+        )),
+        (Language::Rust, "field_expression") => Some((
+            callee.child_by_field_name("field")?,
+            callee.child_by_field_name("value"),
+        )),
+        (Language::Rust, "scoped_identifier") => {
+            Some((callee.child_by_field_name("name")?, callee.child_by_field_name("path")))
+        }
+        (Language::Rust, "generic_function") => callee_name(callee.child_by_field_name("function")?, language),
+        _ => None,
     }
 }
 
@@ -446,6 +478,39 @@ impl SyntaxTree {
                 out.push(ClassBases {
                     class_name_span: span_of(name),
                     base_name_spans,
+                });
+            }
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// Every call in the file, at any nesting depth, in no guaranteed order.
+    ///
+    /// The callee is the `function` field of a Python `call` or a Rust `call_expression`. Only a
+    /// callee that is a plain name, an attribute / field access, or a path (looking through a
+    /// turbofish) yields a call; any other callee, such as a subscript or a parenthesized closure,
+    /// yields none. A Rust macro's arguments are an unparsed token tree and hold no call nodes.
+    pub fn calls(&self) -> Vec<Call> {
+        let call_kind = match self.language {
+            Language::Python => "call",
+            Language::Rust => "call_expression",
+        };
+        let root = self.tree.root_node();
+        let mut out = Vec::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == call_kind
+                && let Some(function) = node.child_by_field_name("function")
+                && let Some((name, receiver)) = callee_name(function, self.language)
+            {
+                out.push(Call {
+                    name_span: span_of(name),
+                    name: self.source[name.start_byte()..name.end_byte()].to_string(),
+                    receiver_span: receiver.map(span_of),
                 });
             }
             for child in node.children(&mut cursor) {
@@ -2551,6 +2616,61 @@ TOP_LEVEL = 1
         assert_eq!(
             module_tree.module_documentation().as_deref(),
             Some("\"mod one \" \"mod two\"")
+        );
+    }
+
+    /// `(name, receiver text)` of every call in `source`, sorted by position.
+    fn call_pairs(source: &str, language: Language) -> Vec<(String, Option<String>)> {
+        let tree = SyntaxTree::parse(source, language).unwrap();
+        let mut calls = tree.calls();
+        calls.sort_by_key(|call| call.name_span.start);
+        calls
+            .into_iter()
+            .map(|call| {
+                assert_eq!(tree.text_at(call.name_span), Some(call.name.as_str()));
+                (
+                    call.name,
+                    call.receiver_span.map(|s| tree.text_at(s).unwrap().to_string()),
+                )
+            })
+            .collect()
+    }
+
+    fn pair(name: &str, receiver: Option<&str>) -> (String, Option<String>) {
+        (name.to_string(), receiver.map(str::to_string))
+    }
+
+    #[test]
+    fn python_calls_name_the_callee_and_its_receiver() {
+        let src = "@app.route('/')\ndef f():\n    plain()\n    obj.method()\n    make().chained()\n    table[0]()\n    (f)()\n";
+        assert_eq!(
+            call_pairs(src, Language::Python),
+            vec![
+                pair("route", Some("app")),
+                pair("plain", None),
+                pair("method", Some("obj")),
+                pair("make", None),
+                pair("chained", Some("make()")),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_calls_name_the_callee_and_its_receiver() {
+        let src = "fn f() {\n    plain();\n    obj.method();\n    util::load();\n    Vec::<u8>::new();\n    \
+                   parse::<u8>();\n    items.iter().collect::<Vec<u8>>();\n    ::root();\n    println!(\"{}\", inner());\n    (|| 1)();\n}\n";
+        assert_eq!(
+            call_pairs(src, Language::Rust),
+            vec![
+                pair("plain", None),
+                pair("method", Some("obj")),
+                pair("load", Some("util")),
+                pair("new", Some("Vec::<u8>")),
+                pair("parse", None),
+                pair("iter", Some("items")),
+                pair("collect", Some("items.iter()")),
+                pair("root", None),
+            ]
         );
     }
 }

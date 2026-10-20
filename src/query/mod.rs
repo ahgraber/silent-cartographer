@@ -12,12 +12,15 @@ pub mod search;
 use crate::graph::rank;
 use crate::graph::store::{
     DEPENDENTS_HORIZON, DependencyKind, DependentRow, EdgeKind, Freshness, GraphStore, OccurrenceRow, PersistedClass,
-    SymbolRow,
+    SymbolRow, UnconfirmedUseRow,
 };
 use crate::identity::CanonicalId;
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
 
-use output::{Answer, ContentLines, Location, Provenance, SymbolView};
+use output::{
+    Answer, ContentLines, EmptyScope, Location, Provenance, SymbolView, UNCONFIRMED_CANDIDATES_MAX, UnconfirmedUse,
+    UnconfirmedUses, UnresolvedCallView, UnresolvedCalls,
+};
 use resolve::{Resolution, SourcePosition, resolve, resolve_position};
 
 /// The detail level at which `get` retrieves a symbol.
@@ -374,6 +377,16 @@ impl<'a> QueryEngine<'a> {
         } else {
             Answer::found(items, provenance, freshness)
         };
+        let answer = match relation {
+            TraceRelation::References => {
+                let (calls, uses) = self.reference_groups(&subject)?;
+                answer
+                    .with_reference_groups(calls, uses)
+                    .with_empty_scope(EmptyScope::References)
+            }
+            TraceRelation::Importers => answer.with_empty_scope(EmptyScope::Importers),
+            _ => answer,
+        };
         // Every `tests` answer — found and empty alike — carries the structural heuristic-grade
         // marker: an empty answer asserts only that no convention-classified site was found, never
         // that nothing tests the subject.
@@ -413,12 +426,12 @@ impl<'a> QueryEngine<'a> {
 
         let mut rows = self.store.dependents(&subject.canonical_id, DEPENDENTS_HORIZON)?;
         if rows.is_empty() {
-            return Ok(Answer::empty(provenance, freshness));
+            return Ok(Answer::empty(provenance, freshness).with_empty_scope(EmptyScope::Dependents));
         }
         self.order_dependent_rows(&mut rows, order)?;
 
         let report = self.dependents_report(&rows, depth, detail, max_lines)?;
-        Ok(Answer::found(vec![report], provenance, freshness))
+        Ok(Answer::found(vec![report], provenance, freshness).with_empty_scope(EmptyScope::Dependents))
     }
 
     /// `find`: return every symbol whose name contains `fragment`, matched case-insensitively,
@@ -484,6 +497,52 @@ impl<'a> QueryEngine<'a> {
             None => self.store.module_of_document(&occ.document_path)?,
         };
         Ok(row.and_then(|r| r.test_rule))
+    }
+
+    /// The two groups a `references` answer carries beside its results: the unresolved calls named like
+    /// the subject (its display name's last component, after the final `::` or `.`) and the refused
+    /// uses linked to it. Both are whole here; the shared pagination step caps them.
+    fn reference_groups(&self, subject: &SymbolRow) -> Result<(UnresolvedCalls, UnconfirmedUses), QueryError> {
+        let name = subject
+            .display_name
+            .rsplit(['.', ':'])
+            .next()
+            .unwrap_or(&subject.display_name);
+        let calls: Vec<UnresolvedCallView> = self
+            .store
+            .unresolved_calls_named(name)?
+            .into_iter()
+            .map(|call| UnresolvedCallView {
+                receiver_shortened: call.receiver.as_ref().map(|_| call.receiver_shortened),
+                receiver: call.receiver,
+                location: Location {
+                    document_path: call.document_path,
+                    span_start: call.span.0,
+                    span_end: call.span.1,
+                    line_column: call.line_column.into(),
+                },
+                enclosing: call.enclosing_id,
+            })
+            .collect();
+        let uses: Vec<UnconfirmedUse> = self
+            .store
+            .unconfirmed_uses_of(&subject.canonical_id)?
+            .into_iter()
+            .map(unconfirmed_use)
+            .collect();
+        Ok((
+            UnresolvedCalls {
+                name: name.to_string(),
+                total: calls.len(),
+                truncated: false,
+                calls,
+            },
+            UnconfirmedUses {
+                total: uses.len(),
+                truncated: false,
+                uses,
+            },
+        ))
     }
 
     /// The content for a `references` row at `detail`, capped at `max_lines`: the content of the
@@ -824,6 +883,49 @@ fn symbol_view(row: &SymbolRow) -> SymbolView {
         name: row.display_name.clone(),
         kind: row.kind.clone(),
         external: row.class == PersistedClass::External,
+    }
+}
+
+/// The answer view of a refused use: candidates for a duplicate-ambiguous one, found text for any
+/// other kind.
+fn unconfirmed_use(row: UnconfirmedUseRow) -> UnconfirmedUse {
+    let UnconfirmedUseRow {
+        discrepancy,
+        mut candidates,
+    } = row;
+    let location = discrepancy.span.map(|(span_start, span_end)| Location {
+        document_path: discrepancy.document_path.clone(),
+        span_start,
+        span_end,
+        line_column: discrepancy.line_column.into(),
+    });
+    if discrepancy.outcome == "duplicate_ambiguous" {
+        let total = candidates.len();
+        candidates.truncate(UNCONFIRMED_CANDIDATES_MAX);
+        UnconfirmedUse {
+            document_path: discrepancy.document_path,
+            location,
+            candidates_shortened: Some(candidates.len() < total),
+            candidates_total: Some(total),
+            candidates: Some(candidates),
+            found_text: None,
+            found_text_shortened: None,
+            reason: discrepancy.outcome,
+        }
+    } else {
+        UnconfirmedUse {
+            document_path: discrepancy.document_path,
+            location,
+            candidates: None,
+            candidates_total: None,
+            candidates_shortened: None,
+            found_text_shortened: discrepancy
+                .found_text
+                .as_ref()
+                .map(|_| discrepancy.found_text_shortened),
+            found_text: discrepancy.found_text,
+            reason: discrepancy.outcome,
+        }
     }
 }
 

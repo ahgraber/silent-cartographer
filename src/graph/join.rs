@@ -1006,7 +1006,7 @@ fn group_base_identity(
 
 /// An identity with a trailing `#<digits>` collision disambiguator stripped; an identity carrying no
 /// disambiguator is returned unchanged.
-fn strip_disambiguator(identity: &CanonicalId) -> CanonicalId {
+pub(super) fn strip_disambiguator(identity: &CanonicalId) -> CanonicalId {
     match identity.as_str().rsplit_once('#') {
         Some((base, rank)) if !rank.is_empty() && rank.bytes().all(|b| b.is_ascii_digit()) => {
             CanonicalId::from_raw(base.to_string())

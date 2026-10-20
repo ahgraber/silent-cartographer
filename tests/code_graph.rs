@@ -302,6 +302,7 @@ use thing::Thing;
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -400,6 +401,7 @@ fn shared_module_symbol_maps_to_every_document_it_defines() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![
@@ -1172,6 +1174,7 @@ fn text_mismatch_is_refused_and_surfaced() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1204,6 +1207,7 @@ fn text_mismatch_is_refused_and_surfaced() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store2 = GraphStore::open_in_memory().unwrap();
     let src2 = vec![("n.rs".to_string(), nonascii.to_string())];
@@ -1243,6 +1247,7 @@ fn semantic_only_occurrence_is_unaligned() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1643,6 +1648,7 @@ impl Client {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1744,6 +1750,7 @@ use thing::Thing;
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1838,6 +1845,7 @@ fn external_symbol_persists_without_definition_span() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -1897,6 +1905,7 @@ fn external_symbol_persists_null_tiers() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -2267,6 +2276,7 @@ fn duplicate_index() -> ExtractedIndex {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     }
 }
 
@@ -2453,6 +2463,7 @@ fn text_mismatch_detail_is_persisted() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -2502,6 +2513,7 @@ fn discrepancies_are_superseded_per_build() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     ingest(
         &mut store,
@@ -2582,22 +2594,22 @@ fn unnormalizable_span_is_typed_absence_and_ambiguous_span_is_real() {
 }
 
 // _(Join discrepancies are inspectable — truncation bound)_ — a mismatch whose found text exceeds
-// the persistence bound is classified on the full bytes and truncated on a UTF-8 char boundary.
+// the persistence bound is classified on the full text and cut at the character bound.
 #[test]
-fn oversized_found_text_is_classified_on_full_bytes_and_truncated_on_a_boundary() {
-    use silent_cartographer::graph::store::FOUND_TEXT_MAX_BYTES;
+fn oversized_found_text_is_classified_on_the_full_text_and_cut_at_the_character_bound() {
+    use silent_cartographer::graph::store::QUOTED_TEXT_MAX_CHARS;
 
-    // An identifier of 1 ASCII byte + 60 two-byte `é`s = 121 bytes: one past the bound, with the
-    // 60th `é` straddling the boundary byte. The expected name is exactly the first 119 bytes — so
-    // if classification ran on the truncated text the two would compare equal and the occurrence
-    // would silently align; classification on the full bytes keeps it a mismatch.
-    let found_ident = format!("a{}", "é".repeat(60));
+    // An identifier of 1 ASCII character + 200 two-byte `é`s: one character past the bound, so a
+    // byte-counted cut would split an `é`. The expected name is exactly the first 200 characters — so
+    // if classification ran on the cut text the two would compare equal and the occurrence would
+    // silently align; classification on the full text keeps it a mismatch.
+    let found_ident = format!("a{}", "é".repeat(QUOTED_TEXT_MAX_CHARS));
     assert_eq!(
-        found_ident.len(),
-        FOUND_TEXT_MAX_BYTES + 1,
-        "test setup: one byte past the bound"
+        found_ident.chars().count(),
+        QUOTED_TEXT_MAX_CHARS + 1,
+        "test setup: one character past the bound"
     );
-    let expected_name = format!("a{}", "é".repeat(59));
+    let expected_name = format!("a{}", "é".repeat(QUOTED_TEXT_MAX_CHARS - 1));
     let source = format!("let {found_ident} = 1;\n");
 
     let index = ExtractedIndex {
@@ -2623,15 +2635,16 @@ fn oversized_found_text_is_classified_on_full_bytes_and_truncated_on_a_boundary(
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source)];
     let acc = ingest(&mut store, &ws(), Some(WS_ROOT), &index, &src).unwrap();
 
-    // Classified on the full bytes: a mismatch, not a silent alignment against the truncated text.
+    // Classified on the full text: a mismatch, not a silent alignment against the cut text.
     assert_eq!(
         acc.text_mismatch, 1,
-        "the equality check runs on full bytes before truncation"
+        "the equality check runs on the full text before the cut"
     );
     assert_eq!(acc.aligned_total(), 0);
 
@@ -2641,17 +2654,13 @@ fn oversized_found_text_is_classified_on_full_bytes_and_truncated_on_a_boundary(
         .find(|r| r.expected_name == expected_name)
         .expect("the mismatch is persisted");
     let found = row.found_text.as_deref().expect("found text persisted");
-    // Truncated to the bound on a UTF-8 boundary: the straddling `é` is dropped whole, leaving the
-    // 119-byte prefix, and the persisted text is valid UTF-8 by construction (it is a `str`).
-    assert!(
-        found.len() <= FOUND_TEXT_MAX_BYTES,
-        "found text is bounded: {} bytes",
-        found.len()
-    );
+    // Cut to the bound in whole characters: the 201st character is dropped, and the persisted text
+    // is valid UTF-8 by construction (it is a `str`).
     assert_eq!(
         found, expected_name,
-        "truncation cut on the char boundary before the straddling char"
+        "the cut keeps exactly the first {QUOTED_TEXT_MAX_CHARS} characters"
     );
+    assert!(row.found_text_shortened, "the cut is marked");
 }
 
 // _(Content-hash gate)_ — ingest refuses a source tree whose content hash does not match the
@@ -4793,6 +4802,7 @@ fn duplicate_group_index(
         }],
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     }
 }
 
@@ -5000,6 +5010,7 @@ fn reference_reachable_only_through_one_twins_module_chain_attributes_via_module
         }],
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
 
     let src = vec![
@@ -5122,6 +5133,7 @@ fn use_style_module_references_derive_no_parent_and_group_reference_stays_ambigu
         }],
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
 
     let src = vec![
@@ -5312,6 +5324,7 @@ fn package_name_reference_resolves_to_the_library_twin_via_target_metadata() {
             manifests: Default::default(),
         },
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let src = vec![
         ("root_a.rs".to_string(), root_a_source.to_string()),
@@ -5876,6 +5889,7 @@ fn conservation_holds_with_locality_attributed_and_ambiguous_group_references() 
         }],
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let total_occurrences = 2 /* definitions */ + 2 /* group references */;
 
@@ -5970,6 +5984,7 @@ fn twin_crate_roots_produce_per_target_imports_edges_after_normalization() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     // The normalization pass every backend flows through: splits the merged crate root into two
     // distinct twin symbols, one per definition document.
@@ -6620,6 +6635,7 @@ fn py_synthetic_index(symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     }
 }
 
@@ -7388,6 +7404,7 @@ fn alias_binding_outside_document_is_not_evidence() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![
@@ -7483,6 +7500,7 @@ fn rust_use_alias_accepted_under_document_binding() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     let src = vec![("m.rs".to_string(), source.to_string())];
@@ -7531,6 +7549,7 @@ fn docs_index(paths: &[&str], symbols: Vec<ExtractedSymbol>) -> ExtractedIndex {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     }
 }
 
@@ -7806,6 +7825,7 @@ fn py_docs_index(paths: &[&str], symbols: Vec<ExtractedSymbol>) -> ExtractedInde
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     }
 }
 
@@ -9500,4 +9520,446 @@ fn package_qualified_name_resolves_to_the_library_over_a_binary_nested_module() 
         Resolution::Ambiguous(rows) => assert_eq!(rows.len(), 2, "{rows:?}"),
         other => panic!("a name that is no package path stays ambiguous: {other:?}"),
     }
+}
+
+/// Every row of the tables the join persists, as sorted debug strings per table.
+fn persisted_rows(store: &GraphStore) -> Vec<(&'static str, Vec<String>)> {
+    let snapshot = store.read_snapshot().unwrap();
+    ["symbols", "occurrences", "edges", "join_discrepancies"]
+        .into_iter()
+        .map(|table| {
+            let mut statement = snapshot.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|cells| cells.join("|"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
+// _(Local occurrence ranges do not reach the join or the store)_ — ingesting an index that carries
+// local occurrence ranges persists the same symbols, occurrences, and edges as ingesting it with the
+// list emptied.
+#[test]
+fn local_occurrence_ranges_do_not_change_what_is_persisted() {
+    let mut cases: Vec<_> = PYTHON_FIXTURE_INDEXES
+        .into_iter()
+        .map(|file| {
+            (
+                support::unresolved_calls_python_index_from(file),
+                support::unresolved_calls_python_sources(),
+            )
+        })
+        .collect();
+    cases.push((
+        support::unresolved_calls_rust_index(),
+        support::unresolved_calls_rust_sources(),
+    ));
+    for (index, sources) in cases {
+        assert!(
+            !index.local_occurrence_ranges.is_empty(),
+            "the fixture index carries local ranges"
+        );
+        let mut emptied = index.clone();
+        emptied.local_occurrence_ranges.clear();
+
+        let ingest_rows = |index: &ExtractedIndex| {
+            let mut store = GraphStore::open_in_memory().unwrap();
+            ingest(&mut store, &ws(), Some(WS_ROOT), index, &sources).unwrap();
+            persisted_rows(&store)
+        };
+        assert_eq!(ingest_rows(&index), ingest_rows(&emptied));
+    }
+}
+
+/// Ingest `index` over `sources` into a fresh in-memory store.
+fn ingest_into_new_store(index: &ExtractedIndex, sources: &[(String, String)]) -> GraphStore {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), index, sources).unwrap();
+    store
+}
+
+/// The Python unresolved-calls fixture stores, one per committed index.
+fn unresolved_calls_python_stores() -> Vec<(&'static str, GraphStore)> {
+    PYTHON_FIXTURE_INDEXES
+        .into_iter()
+        .map(|file| {
+            let index = support::unresolved_calls_python_index_from(file);
+            (
+                file,
+                ingest_into_new_store(&index, &support::unresolved_calls_python_sources()),
+            )
+        })
+        .collect()
+}
+
+fn unresolved_calls_rust_store() -> GraphStore {
+    ingest_into_new_store(
+        &support::unresolved_calls_rust_index(),
+        &support::unresolved_calls_rust_sources(),
+    )
+}
+
+/// The number of rows in `table`.
+fn row_count(store: &GraphStore, table: &str) -> i64 {
+    store
+        .read_snapshot()
+        .unwrap()
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+        .unwrap()
+}
+
+/// A one-document Python index with no symbols, over `source` at `m.py`.
+fn bare_python_index_and_sources(source: &str) -> (ExtractedIndex, Vec<(String, String)>) {
+    let mut index = one_doc_index("m.py", Vec::new());
+    index.provenance = support::backend_provenance(silent_cartographer::graph::syntax::Language::Python);
+    (index, vec![("m.py".to_string(), source.to_string())])
+}
+
+// _(A Python attribute call the indexer cannot resolve is recorded)_ — under each indexer, the
+// `client.fetch()` call through an unannotated parameter has no occurrence at its name.
+#[test]
+fn python_attribute_call_the_indexer_cannot_resolve_is_recorded() {
+    for (file, store) in unresolved_calls_python_stores() {
+        let calls = store.unresolved_calls_named("fetch").unwrap();
+        assert_eq!(calls.len(), 1, "{file}: {calls:?}");
+        let call = &calls[0];
+        let source = &support::unresolved_calls_python_sources()
+            .into_iter()
+            .find(|(path, _)| *path == call.document_path)
+            .unwrap()
+            .1;
+        assert_eq!(call.document_path, "tests/test_client.py", "{file}");
+        assert_eq!(&source[call.span.0..call.span.1], "fetch", "{file}");
+        assert_eq!(call.receiver.as_deref(), Some("client"), "{file}");
+        assert!(!call.receiver_shortened, "{file}");
+        let at = call.line_column.expect("the call has a line and column");
+        assert_eq!((at.start.line, at.start.column), (2, 19), "{file}");
+        assert_eq!((at.end.line, at.end.column), (2, 24), "{file}");
+        assert_eq!(
+            call.enclosing_id.as_ref().map(CanonicalId::as_str),
+            Some("test-ws::unresolved-calls::tests::test_client::test_fetch"),
+            "{file}"
+        );
+    }
+}
+
+// _(A Python plain call with no occurrence is recorded without a receiver)_
+#[test]
+fn python_plain_call_with_no_occurrence_is_recorded_without_a_receiver() {
+    let (index, sources) = bare_python_index_and_sources("def f():\n    g()\n");
+    let store = ingest_into_new_store(&index, &sources);
+
+    let calls = store.unresolved_calls_named("g").unwrap();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].receiver, None);
+    assert!(!calls[0].receiver_shortened);
+}
+
+// A source the analyzer left out of its index has none of its calls resolved, so every call in it is
+// recorded.
+#[test]
+fn calls_in_a_source_missing_from_the_index_are_recorded() {
+    let (index, mut sources) = bare_python_index_and_sources("def f():\n    pass\n");
+    sources.push(("left_out.py".to_string(), "def g():\n    h()\n".to_string()));
+    let store = ingest_into_new_store(&index, &sources);
+
+    let calls = store.unresolved_calls_named("h").unwrap();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].document_path, "left_out.py");
+}
+
+// _(A Rust call in code the analyzer does not analyze is recorded)_,
+// _(A Rust path call carries its path as receiver)_ — the `#[cfg(any())]` function is never
+// analyzed, so its method call and its path call have no occurrence.
+#[test]
+fn rust_calls_in_unanalyzed_code_are_recorded_with_their_receivers() {
+    let store = unresolved_calls_rust_store();
+
+    let render = store.unresolved_calls_named("render").unwrap();
+    assert_eq!(render.len(), 1, "{render:?}");
+    assert_eq!(render[0].receiver.as_deref(), Some("value"));
+    assert_eq!(render[0].line_column.unwrap().start.line, 25);
+
+    let build = store.unresolved_calls_named("build").unwrap();
+    assert_eq!(build.len(), 1, "{build:?}");
+    assert_eq!(build[0].receiver.as_deref(), Some("Widget"));
+    assert_eq!(build[0].line_column.unwrap().start.line, 24);
+}
+
+// _(A resolved call is not recorded)_ — the annotated `.fetch()` call and every call the indexers
+// resolved are absent; only the calls without an occurrence are recorded.
+#[test]
+fn resolved_calls_are_not_recorded() {
+    for (file, store) in unresolved_calls_python_stores() {
+        let fetch = store.unresolved_calls_named("fetch").unwrap();
+        assert!(
+            fetch.iter().all(|call| call.document_path != "pkg/use.py"),
+            "{file}: the annotated call in pkg/use.py is resolved: {fetch:?}"
+        );
+        for resolved in ["loads", "wrap", "make_helper"] {
+            assert!(
+                store.unresolved_calls_named(resolved).unwrap().is_empty(),
+                "{file}: {resolved}"
+            );
+        }
+        assert_eq!(store.unresolved_calls_named("drain").unwrap().len(), 1, "{file}");
+    }
+
+    let store = unresolved_calls_rust_store();
+    // `use_widget` calls `Widget::build()` and `widget.render()`, both resolved; only the gated copies
+    // (lines 24 and 25) are recorded.
+    for name in ["build", "render"] {
+        assert_eq!(store.unresolved_calls_named(name).unwrap().len(), 1, "{name}");
+    }
+}
+
+// _(A call resolved to a local binding is not recorded)_ — the Python parameter is covered by its
+// own symbol and the Python local variable and the Rust parameter by local-occurrence ranges.
+#[test]
+fn calls_resolved_to_local_bindings_are_not_recorded() {
+    for (file, store) in unresolved_calls_python_stores() {
+        for name in ["callback", "helper"] {
+            assert!(store.unresolved_calls_named(name).unwrap().is_empty(), "{file}: {name}");
+        }
+    }
+    assert!(
+        unresolved_calls_rust_store()
+            .unresolved_calls_named("callback")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// An occurrence the join refuses still shows the indexer resolved the call, so the call is not
+// recorded.
+#[test]
+fn call_whose_name_holds_a_refused_occurrence_is_not_recorded() {
+    let source = "fn f() { g(); }\n";
+    // A symbol `other` with a reference at the `g` token: the join refuses it as a text mismatch.
+    let other = one_occ_symbol(
+        "c",
+        &[("other", SegmentKind::Term)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 9, 0, 10),
+        OccurrenceRole::Reference,
+    );
+    let src = vec![("m.rs".to_string(), source.to_string())];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    let accounting = ingest(
+        &mut store,
+        &ws(),
+        Some(WS_ROOT),
+        &one_doc_index("m.rs", vec![other]),
+        &src,
+    )
+    .unwrap();
+
+    assert_eq!(accounting.text_mismatch, 1, "the occurrence is refused");
+    assert!(store.unresolved_calls_named("g").unwrap().is_empty());
+}
+
+// _(A module-level call attributes to the module)_
+#[test]
+fn module_level_call_attributes_to_the_module() {
+    for (file, store) in unresolved_calls_python_stores() {
+        let calls = store.unresolved_calls_named("append").unwrap();
+        assert_eq!(calls.len(), 1, "{file}: {calls:?}");
+        assert_eq!(
+            calls[0].enclosing_id.as_ref().map(CanonicalId::as_str),
+            Some("test-ws::unresolved-calls::pkg::use"),
+            "{file}"
+        );
+    }
+}
+
+// _(A long receiver is shortened with a marker)_
+#[test]
+fn long_receiver_is_shortened_and_a_short_one_is_not() {
+    let source = support::unresolved_calls_python_sources()
+        .into_iter()
+        .find(|(path, _)| path == "pkg/use.py")
+        .unwrap()
+        .1;
+    let receiver_start = source.find("wrap(\n").unwrap();
+    let expected: String = source[receiver_start..].chars().take(200).collect();
+
+    for (file, store) in unresolved_calls_python_stores() {
+        let long = store.unresolved_calls_named("strip").unwrap();
+        assert_eq!(long.len(), 1, "{file}");
+        assert_eq!(long[0].receiver.as_deref(), Some(expected.as_str()), "{file}");
+        assert!(long[0].receiver_shortened, "{file}");
+
+        let short = store.unresolved_calls_named("drain").unwrap();
+        assert!(!short[0].receiver_shortened, "{file}");
+    }
+}
+
+// _(An unresolved call carries line and column)_ — two two-byte characters precede the call on its
+// line, so the column counts characters and the byte offsets count bytes.
+#[test]
+fn unresolved_call_location_counts_characters_in_its_column_and_bytes_in_its_span() {
+    let source = "x = \"éé\"; g()\n";
+    let (index, sources) = bare_python_index_and_sources(source);
+    let store = ingest_into_new_store(&index, &sources);
+
+    let calls = store.unresolved_calls_named("g").unwrap();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let call = &calls[0];
+    assert_eq!(&source[call.span.0..call.span.1], "g");
+    assert_eq!(call.span.0, "x = \"éé\"; ".len());
+    let at = call.line_column.unwrap();
+    assert_eq!((at.start.line, at.start.column), (1, 11));
+    assert_eq!((at.end.line, at.end.column), (1, 12));
+}
+
+/// Three `Widget` definitions sharing one descriptor in `a.rs`, `b.rs`, and `d.rs`, and a reference
+/// in `c.rs` that no locality rule settles, so the join records it duplicate-ambiguous.
+fn three_way_duplicate_store() -> GraphStore {
+    let definition = "struct Widget;\n";
+    let reference_source = "fn use_it(_w: Widget) {}\n";
+    let twins = ["a.rs", "b.rs", "d.rs"].map(|doc| {
+        twin(
+            widget_descriptor(),
+            SymbolKind::Type,
+            doc,
+            SourceRange::new(0, 7, 0, 13),
+        )
+    });
+    let at = reference_source.find("Widget").unwrap() as u32;
+    let index = duplicate_group_index(
+        &["a.rs", "b.rs", "c.rs", "d.rs"],
+        twins.to_vec(),
+        widget_descriptor(),
+        vec![group_ref("c.rs", SourceRange::new(0, at, 0, at + 6))],
+    );
+    let src = vec![
+        ("a.rs".to_string(), definition.to_string()),
+        ("b.rs".to_string(), definition.to_string()),
+        ("c.rs".to_string(), reference_source.to_string()),
+        ("d.rs".to_string(), definition.to_string()),
+    ];
+    let store = ingest_into_new_store(&index, &src);
+    assert_eq!(store.discrepancy_summary().unwrap().total_discrepancies, 1);
+    store
+}
+
+// _(A duplicate-ambiguous reference records every duplicate)_
+#[test]
+fn duplicate_ambiguous_reference_links_every_duplicate() {
+    let store = three_way_duplicate_store();
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    assert_eq!(twins.len(), 3);
+    let mut expected: Vec<CanonicalId> = twins.iter().map(|t| t.canonical_id.clone()).collect();
+    expected.sort();
+
+    for twin in &twins {
+        let uses = store.unconfirmed_uses_of(&twin.canonical_id).unwrap();
+        assert_eq!(uses.len(), 1, "{uses:?}");
+        assert_eq!(uses[0].discrepancy.outcome, "duplicate_ambiguous");
+        assert_eq!(uses[0].discrepancy.document_path, "c.rs");
+        assert_eq!(uses[0].candidates, expected);
+    }
+    assert_eq!(row_count(&store, "discrepancy_symbols"), 3);
+}
+
+/// An index over `m.rs` whose symbol `alpha` has one `role` occurrence at the `beta` token of
+/// `fn f() { beta(); }`, which the join refuses as a text mismatch.
+fn mismatched_alpha(role: OccurrenceRole) -> (ExtractedIndex, Vec<(String, String)>) {
+    let alpha = one_occ_symbol(
+        "c",
+        &[("alpha", SegmentKind::Term)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 9, 0, 13),
+        role,
+    );
+    (
+        one_doc_index("m.rs", vec![alpha]),
+        vec![("m.rs".to_string(), "fn f() { beta(); }\n".to_string())],
+    )
+}
+
+// _(A text-mismatch reference records the symbol it names)_
+#[test]
+fn text_mismatch_reference_links_the_symbol_it_names() {
+    let (index, sources) = mismatched_alpha(OccurrenceRole::Reference);
+    let store = ingest_into_new_store(&index, &sources);
+
+    let alpha = store.symbols_by_shortname("alpha").unwrap();
+    let uses = store.unconfirmed_uses_of(&alpha[0].canonical_id).unwrap();
+    assert_eq!(uses.len(), 1, "{uses:?}");
+    let refused = &uses[0].discrepancy;
+    assert_eq!(refused.outcome, "text_mismatch");
+    assert_eq!(refused.expected_name, "alpha");
+    assert_eq!(refused.found_text.as_deref(), Some("beta"));
+    assert!(uses[0].candidates.is_empty());
+}
+
+// _(A refused occurrence of no persisted symbol records none)_ — the only document the symbol
+// occurs in was never supplied, so the symbol is not persisted.
+#[test]
+fn refused_reference_of_an_unpersisted_symbol_links_nothing() {
+    let ghost = one_occ_symbol(
+        "c",
+        &[("ghost", SegmentKind::Term)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "gone.rs",
+        SourceRange::new(0, 0, 0, 5),
+        OccurrenceRole::Reference,
+    );
+    let mut index = one_doc_index("m.rs", vec![ghost]);
+    index.documents.push(SourceDocument {
+        path: "gone.rs".to_string(),
+        encoding: PositionEncoding::Utf8,
+    });
+    let sources = vec![("m.rs".to_string(), "fn f() {}\n".to_string())];
+    let store = ingest_into_new_store(&index, &sources);
+
+    assert!(store.symbols_by_shortname("ghost").unwrap().is_empty());
+    assert_eq!(row_count(&store, "join_discrepancies"), 1);
+    assert_eq!(row_count(&store, "discrepancy_symbols"), 0);
+}
+
+#[test]
+fn refused_definition_links_no_symbol() {
+    let (index, sources) = mismatched_alpha(OccurrenceRole::Definition);
+    let store = ingest_into_new_store(&index, &sources);
+
+    let alpha = store.symbols_by_shortname("alpha").unwrap();
+    assert!(store.unconfirmed_uses_of(&alpha[0].canonical_id).unwrap().is_empty());
+    assert_eq!(row_count(&store, "join_discrepancies"), 1);
+    assert_eq!(row_count(&store, "discrepancy_symbols"), 0);
+}
+
+// _(Builds wholly supersede prior derived state)_ — a rebuild after the unresolved call and the
+// refused reference are gone leaves neither a recorded call nor a link.
+#[test]
+fn rebuild_supersedes_unresolved_calls_and_discrepancy_links() {
+    let (mut index, mut sources) = mismatched_alpha(OccurrenceRole::Reference);
+    sources[0].1 = "fn f() { beta(); g(); }\n".to_string();
+    let mut store = ingest_into_new_store(&index, &sources);
+    assert_eq!(store.unresolved_calls_named("g").unwrap().len(), 1);
+    assert_eq!(row_count(&store, "discrepancy_symbols"), 1);
+
+    index.symbols.clear();
+    sources[0].1 = "fn f() {}\n".to_string();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+
+    assert!(store.unresolved_calls_named("g").unwrap().is_empty());
+    assert_eq!(row_count(&store, "unresolved_calls"), 0);
+    assert_eq!(row_count(&store, "discrepancy_symbols"), 0);
 }

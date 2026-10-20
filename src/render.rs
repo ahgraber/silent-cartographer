@@ -14,7 +14,8 @@ use crate::cli::{ColorArg, PositionUnit};
 use crate::query::clones::{CloneGroup, CloneItem, CloneKind};
 use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
 use crate::query::output::{
-    Answer, Classification, ContentLines, Location, Outcome, PageInfo, SymbolView, WorkspaceRelation,
+    Answer, Classification, ContentLines, EmptyScope, Location, Outcome, PageInfo, SymbolView, UnconfirmedUse,
+    WorkspaceRelation,
 };
 use crate::query::search::{CloneCertainty, MutualMember, MutualPair, RelationView, SearchItem, SimilarItem};
 use crate::query::{DependentsReport, FindItem, HorizonDisclosure, OrderMode, SymbolDetail, TraceItem};
@@ -205,13 +206,13 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool, unit: Position
             (Some(Classification::Estimation { .. }), None) => {
                 "empty: the semantic corpus offered no candidates (not proof that no relevant code exists)".to_string()
             }
-            (Some(Classification::Convention), None) => {
-                "empty: no convention-classified test reference found (not proof that nothing tests the subject)"
-                    .to_string()
-            }
-            (None, None) => "empty: the relation holds no instances (a definite empty set)".to_string(),
+            (Some(Classification::Convention), None) => format!(
+                "empty: no convention-classified test reference found (not proof that nothing tests the subject; {UNSEEN_CASES})"
+            ),
+            (None, None) => plain_empty_line(answer),
         }),
     }
+    push_reference_groups(&mut lines, answer, unit);
     if let Some(page) = &answer.page {
         push_page(&mut lines, page, styled);
     }
@@ -234,6 +235,176 @@ fn push_page(lines: &mut Vec<String>, page: &PageInfo, styled: bool) {
     ));
     if let Some(cursor) = &page.cursor {
         lines.push(format!("  resume with --cursor {cursor}"));
+    }
+}
+
+/// What an empty answer of a reference-derived relation cannot see; shared by every scoped empty
+/// line and the impact line.
+const UNSEEN_CASES: &str =
+    "calls by frameworks, implicit calls such as constructors and operators, and lookups by string are not seen";
+
+/// The `Outcome::Empty` line of an answer with no classification or token-equivalence marker: scoped
+/// to resolved instances for `references`, `dependents`, and `importers`, a definite none otherwise.
+fn plain_empty_line<T>(answer: &Answer<T>) -> String {
+    match answer.empty_scope {
+        Some(EmptyScope::References) => match (&answer.unresolved_calls, &answer.unconfirmed_uses) {
+            (Some(calls), Some(uses)) => format!(
+                "empty: no resolved reference recorded; {} {} named {} {} no resolved target and {} {} unconfirmed ({UNSEEN_CASES})",
+                calls.total,
+                agree(calls.total, "call", "calls"),
+                sanitize(&calls.name),
+                agree(calls.total, "has", "have"),
+                uses.total,
+                agree(uses.total, "use is", "uses are")
+            ),
+            _ => format!("empty: no resolved reference recorded ({UNSEEN_CASES})"),
+        },
+        Some(EmptyScope::Dependents) => format!("empty: no resolved dependent recorded ({UNSEEN_CASES})"),
+        Some(EmptyScope::Importers) => format!("empty: no resolved importer recorded ({UNSEEN_CASES})"),
+        None => "empty: the relation holds no instances (a definite empty set)".to_string(),
+    }
+}
+
+/// `singular` when `count` is 1, else `plural`.
+fn agree(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
+}
+
+/// Append the unresolved-call group and then the unconfirmed-use group of a `references` answer,
+/// each only when it lists something.
+fn push_reference_groups<T>(lines: &mut Vec<String>, answer: &Answer<T>, unit: PositionUnit) {
+    if let Some(group) = &answer.unresolved_calls
+        && group.total > 0
+    {
+        let count = group_count(group.calls.len(), group.total, group.truncated);
+        let name = sanitize(&group.name);
+        lines.push(format!(
+            "unresolved: {count} {} named {name} {} no resolved target (each may or may not call this symbol)",
+            agree(group.total, "call", "calls"),
+            agree(group.total, "has", "have")
+        ));
+        for call in &group.calls {
+            let called = match &call.receiver {
+                Some(receiver) => {
+                    let shortened = if call.receiver_shortened == Some(true) {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    format!("{}{shortened}.{name}", sanitize(&collapse_whitespace(receiver)))
+                }
+                None => name.clone(),
+            };
+            let enclosing = call
+                .enclosing
+                .as_ref()
+                .map_or(String::new(), |id| format!(" in {}", sanitize(id.as_str())));
+            lines.push(format!(
+                "  {called}  at {}{enclosing}",
+                location_text(&call.location, unit)
+            ));
+        }
+        if group.truncated {
+            lines.push(format!("  list all {} with --limit 0", group.total));
+        }
+    }
+    if let Some(group) = &answer.unconfirmed_uses
+        && group.total > 0
+    {
+        let count = group_count(group.uses.len(), group.total, group.truncated);
+        lines.push(format!(
+            "unconfirmed: {count} {} may refer to this symbol but {} not counted above",
+            agree(group.total, "use", "uses"),
+            agree(group.total, "is", "are")
+        ));
+        let name = answer.unresolved_calls.as_ref().map_or("", |calls| calls.name.as_str());
+        for unconfirmed in &group.uses {
+            let at = match &unconfirmed.location {
+                Some(location) => format!("at {}", location_text(location, unit)),
+                None => format!("at {} (position unknown)", sanitize(&unconfirmed.document_path)),
+            };
+            lines.push(format!("  {at}  {}", describe_unconfirmed_use(unconfirmed, name)));
+        }
+        if group.truncated {
+            lines.push(format!("  list all {} with --limit 0", group.total));
+        }
+    }
+}
+
+/// `N of M` for a group the cap shortened, else `M`.
+fn group_count(listed: usize, total: usize, truncated: bool) -> String {
+    if truncated {
+        format!("{listed} of {total}")
+    } else {
+        total.to_string()
+    }
+}
+
+/// Collapse each run of whitespace to one space, so a multi-line receiver reads on one line.
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !in_run {
+                out.push(' ');
+            }
+            in_run = true;
+        } else {
+            out.push(c);
+            in_run = false;
+        }
+    }
+    out
+}
+
+/// The sentence saying why a refused use is unconfirmed.
+fn describe_unconfirmed_use(unconfirmed: &UnconfirmedUse, name: &str) -> String {
+    let found = unconfirmed.found_text.as_ref().map(|text| {
+        let shortened = if unconfirmed.found_text_shortened == Some(true) {
+            "…"
+        } else {
+            ""
+        };
+        format!("`{}{shortened}`", sanitize(text))
+    });
+    match (unconfirmed.reason.as_str(), &unconfirmed.candidates, found) {
+        (_, Some(candidates), _) => {
+            let total = unconfirmed.candidates_total.unwrap_or(candidates.len());
+            let mut tags: Vec<String> = candidates.iter().map(|id| candidate_tag(id.as_str())).collect();
+            if unconfirmed.candidates_shortened == Some(true) {
+                tags.push(format!("…and {} more", total.saturating_sub(candidates.len())));
+            }
+            format!(
+                "could mean any of {total} definitions of {} ({})",
+                sanitize(name),
+                tags.join(", ")
+            )
+        }
+        ("text_mismatch", _, Some(found)) => {
+            format!("the indexer placed a use of this symbol here, but the source text is {found}")
+        }
+        ("text_mismatch", _, None) => {
+            "the indexer placed a use of this symbol here, but no source text was found there".to_string()
+        }
+        (reason, _, Some(found)) => format!(
+            "the indexer recorded a use of this symbol here that was refused ({}), source text {found}",
+            sanitize(reason)
+        ),
+        (reason, _, None) => format!(
+            "the indexer recorded a use of this symbol here that was refused ({})",
+            sanitize(reason)
+        ),
+    }
+}
+
+/// A duplicate candidate's disambiguating `#k` suffix, or its whole identity when it has none.
+fn candidate_tag(identity: &str) -> String {
+    match identity.rsplit_once('#') {
+        Some((_, suffix)) if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("#{suffix}")
+        }
+        _ => sanitize(identity),
     }
 }
 
@@ -601,6 +772,12 @@ impl HumanRender for ImpactReport {
             // header.
             if report.seed_outcome != SeedOutcome::NoIndexedSymbolTouched {
                 DependentsReport::render_found(std::slice::from_ref(&report.dependents), lines, styled, unit);
+            }
+            if report.seed_outcome == SeedOutcome::Seeded
+                && report.dependents.detail.is_empty()
+                && report.dependents.beyond_bound.is_empty()
+            {
+                lines.push(format!("no resolved dependent recorded ({UNSEEN_CASES})"));
             }
             if let Exactness::Approximate { recovery } = &report.exactness {
                 lines.push(bold("approximate: run these steps to produce an exact answer", styled));

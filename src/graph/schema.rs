@@ -23,7 +23,9 @@
 /// merely missing a count. The keyed `aligned_counts` column spares that change any DDL and any
 /// per-rule read/write edit — it does not spare it the version bump.
 ///
-/// Migration: version 19 changes the stored identity form: a Rust declaration outside the package's
+/// Migration: version 20 adds `unresolved_calls` (calls whose called name no semantic occurrence
+/// covers) and `discrepancy_symbols` (the symbols a refused reference occurrence may denote);
+/// version 19 changes the stored identity form: a Rust declaration outside the package's
 /// library carries a unit marker after the package (`package+bin.tool`, `package+shared`), a
 /// Python module path is one segment per dotted component, and a Python package initializer has no
 /// `__init__` segment (module names read from the segments joined with `.`); the build-target
@@ -49,7 +51,7 @@
 /// columns on `symbols`, and the semantic-index identity in `index_metadata`. The index is derived,
 /// replayable data, so rebuild is the migration — a build replaces an older store of its own
 /// wholesale and a query refuses it with recovery guidance (the replace-or-refuse contract).
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -228,10 +230,10 @@ CREATE INDEX IF NOT EXISTS edges_by_dst ON edges(kind, dst_id);
 -- One row per non-aligned semantic occurrence, the inspectable detail behind the aggregate join
 -- counts. `outcome` is 'text_mismatch', 'semantic_only', or 'duplicate_ambiguous'. `expected_name`
 -- is the occurrence's expected name token; `found_text` is the source text at the location, truncated
--- to a bounded length. The span columns are NULL when the occurrence's coordinates could not be
--- normalized onto the source — typed absence, never a fabricated location. Wholly rewritten in the
--- same transaction as each build (every prior row is deleted first), so the table reflects only the
--- most recent build.
+-- to a bounded length, with `found_text_shortened` set when it was cut. The span columns are NULL when
+-- the occurrence's coordinates could not be normalized onto the source — typed absence, never a
+-- fabricated location. Wholly rewritten in the same transaction as each build (every prior row is
+-- deleted first), so the table reflects only the most recent build.
 CREATE TABLE IF NOT EXISTS join_discrepancies (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     document_path  TEXT    NOT NULL,
@@ -243,9 +245,43 @@ CREATE TABLE IF NOT EXISTS join_discrepancies (
     end_column     INTEGER,
     outcome        TEXT    NOT NULL,
     expected_name  TEXT    NOT NULL,
-    found_text     TEXT
+    found_text     TEXT,
+    found_text_shortened INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS join_discrepancies_by_group ON join_discrepancies(outcome, expected_name);
+
+-- The persisted symbols a refused reference occurrence may denote, one row per link. A
+-- duplicate-ambiguous occurrence links every member of its descriptor's duplicate group; any other
+-- refused reference links its own symbol, when that symbol is persisted. A refused definition links
+-- nothing. Rewritten with `join_discrepancies` on each build.
+CREATE TABLE IF NOT EXISTS discrepancy_symbols (
+    discrepancy_id  INTEGER NOT NULL REFERENCES join_discrepancies(id),
+    symbol_id       TEXT    NOT NULL REFERENCES symbols(canonical_id),
+    PRIMARY KEY (discrepancy_id, symbol_id)
+);
+CREATE INDEX IF NOT EXISTS discrepancy_symbols_by_symbol ON discrepancy_symbols(symbol_id);
+
+-- One row per call whose called name no semantic occurrence covers: the indexer recorded nothing at
+-- the name, whatever the call resolves to. `name` is the called name; the span and its line and
+-- column locate it. `receiver` is the source text of the receiver expression or path as written,
+-- cut to a bounded length, with `receiver_shortened` set when it was cut; NULL for a call with no
+-- receiver. `enclosing_id` is the nearest enclosing persisted declaration, else the document's own
+-- module; NULL only for a document with no persisted module. Wholly rewritten with each build.
+CREATE TABLE IF NOT EXISTS unresolved_calls (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_path       TEXT    NOT NULL,
+    name                TEXT    NOT NULL,
+    span_start          INTEGER NOT NULL,
+    span_end            INTEGER NOT NULL,
+    start_line          INTEGER,
+    start_column        INTEGER,
+    end_line            INTEGER,
+    end_column          INTEGER,
+    receiver            TEXT,
+    receiver_shortened  INTEGER NOT NULL DEFAULT 0,
+    enclosing_id        TEXT    REFERENCES symbols(canonical_id)
+);
+CREATE INDEX IF NOT EXISTS unresolved_calls_by_name ON unresolved_calls(name);
 
 -- The semantic corpus: one row per corpus-contributing symbol — one passage — holding the
 -- deterministic render its representations derive from. A leaf's render carries its own source

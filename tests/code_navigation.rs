@@ -144,6 +144,7 @@ fn py_synthetic_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedInd
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     }
 }
 
@@ -1427,6 +1428,7 @@ fn stale_after_a_changed_environment_is_fresh_once_the_refresh_command_runs() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: Some(facts),
+        local_occurrence_ranges: Default::default(),
     };
     let db = dir.path().join("index.db");
     silent_cartographer::commands::build_from_index(&db, "refresh-ws", dir.path(), &index, &collected).unwrap();
@@ -3282,6 +3284,7 @@ fn tr_store() -> GraphStore {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let mut store = GraphStore::open_in_memory().unwrap();
     ingest(&mut store, &ws(), Some(WS_ROOT), &index, &tr_sources()).unwrap();
@@ -3464,6 +3467,7 @@ fn trace_tests_python_site_returned() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let sources = vec![
         ("pkg/api.py".to_string(), api_source.to_string()),
@@ -4762,4 +4766,401 @@ fn similar_at_a_line_on_a_rust_method_header_takes_the_method() {
         "the method has neighbors"
     );
     assert_eq!(by_line.outcome, by_name.outcome);
+}
+
+/// The committed unresolved-calls Python indexes, one per indexer.
+const UNRESOLVED_CALLS_PYTHON_INDEXES: [&str; 2] = ["index.scip", "ty-scip.scip"];
+
+/// The `references` answer for `subject` over `index` and `sources`, as JSON.
+fn references_json(index: &ExtractedIndex, sources: &[(String, String)], subject: &str) -> serde_json::Value {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), index, sources).unwrap();
+    let hash = silent_cartographer::graph::content_hash(sources);
+    let engine = QueryEngine::new(&store, index.provenance.clone(), hash, None);
+    let answer = engine.trace(subject, TraceRelation::References, None, None).unwrap();
+    serde_json::from_str(&answer.to_json()).unwrap()
+}
+
+/// The `references` JSON for `subject` in a one-document Rust source `m.rs` whose symbol `alpha` has
+/// one `role` occurrence over `range`.
+fn alpha_references_json(source: &str, range: SourceRange, subject: &str) -> serde_json::Value {
+    let alpha = one_occ_symbol(
+        "c",
+        &[("alpha", SegmentKind::Term)],
+        SymbolKind::Function,
+        silent_cartographer::semantic::model::SymbolClass::InWorkspace,
+        "m.rs",
+        range,
+        OccurrenceRole::Reference,
+    );
+    references_json(
+        &one_doc_index("m.rs", vec![alpha]),
+        &[("m.rs".to_string(), source.to_string())],
+        subject,
+    )
+}
+
+// _(Resolved references and unresolved calls appear side by side)_ — the annotated call is a result
+// and the call through an unannotated parameter is in the group, under each indexer.
+#[test]
+fn resolved_references_and_unresolved_calls_appear_side_by_side() {
+    for file in UNRESOLVED_CALLS_PYTHON_INDEXES {
+        let answer = references_json(
+            &support::unresolved_calls_python_index_from(file),
+            &support::unresolved_calls_python_sources(),
+            "fetch",
+        );
+
+        let results = answer["outcome"]["results"].as_array().expect("found results");
+        let result_docs: Vec<&str> = results
+            .iter()
+            .map(|r| r["location"]["document_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(result_docs, ["pkg/use.py"], "{file}");
+
+        let group = &answer["unresolved_calls"];
+        assert_eq!(group["name"], "fetch", "{file}");
+        assert_eq!(group["total"], 1, "{file}");
+        assert_eq!(group["truncated"], false, "{file}");
+        let call = &group["calls"][0];
+        assert_eq!(call["receiver"], "client", "{file}");
+        assert_eq!(call["receiver_shortened"], false, "{file}");
+        assert_eq!(call["location"]["document_path"], "tests/test_client.py", "{file}");
+        assert_eq!(call["location"]["start_line"], 2, "{file}");
+        assert_eq!(
+            call["enclosing"], "test-ws::unresolved-calls::tests::test_client::test_fetch",
+            "{file}"
+        );
+    }
+}
+
+// _(A subject with no matching call carries an empty group)_,
+// _(A subject with no refused use carries an empty group)_
+#[test]
+fn a_subject_with_no_call_and_no_refused_use_carries_both_groups_at_zero() {
+    let lonely = one_occ_symbol(
+        "c",
+        &[("lonely", SegmentKind::Term)],
+        SymbolKind::Function,
+        silent_cartographer::semantic::model::SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 3, 0, 9),
+        OccurrenceRole::Definition,
+    );
+    let answer = references_json(
+        &one_doc_index("m.rs", vec![lonely]),
+        &[("m.rs".to_string(), "fn lonely() {}\n".to_string())],
+        "lonely",
+    );
+
+    assert_eq!(answer["outcome"]["outcome"], "empty");
+    assert_eq!(answer["unresolved_calls"]["name"], "lonely");
+    assert_eq!(answer["unresolved_calls"]["total"], 0);
+    assert_eq!(answer["unresolved_calls"]["calls"], serde_json::json!([]));
+    assert_eq!(answer["unconfirmed_uses"]["total"], 0);
+    assert_eq!(answer["unconfirmed_uses"]["uses"], serde_json::json!([]));
+}
+
+// _(A module-level call names its module)_ — the fixture's module-scope `shared.append(1)` call is
+// enclosed by the `pkg.use` module symbol. The fixture has no symbol named `append`, so one is added.
+#[test]
+fn a_module_level_call_names_its_module() {
+    use silent_cartographer::semantic::model::{ExtractedSymbol, SymbolClass};
+
+    for file in UNRESOLVED_CALLS_PYTHON_INDEXES {
+        let mut index = support::unresolved_calls_python_index_from(file);
+        index.symbols.push(ExtractedSymbol {
+            descriptor: Some(Descriptor::new(
+                "builtins",
+                vec![DescriptorSegment::new("append", SegmentKind::Method)],
+            )),
+            kind: SymbolKind::Method,
+            class: SymbolClass::External,
+            occurrences: Vec::new(),
+        });
+        let answer = references_json(&index, &support::unresolved_calls_python_sources(), "append");
+
+        let calls = answer["unresolved_calls"]["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{file}: {calls:?}");
+        assert_eq!(calls[0]["enclosing"], "test-ws::unresolved-calls::pkg::use", "{file}");
+    }
+}
+
+// _(A Rust subject carries the group)_ — the `value.render()` call inside the `#[cfg(any())]`
+// function is listed for `Widget::render`.
+#[test]
+fn a_rust_subject_carries_the_group() {
+    let answer = references_json(
+        &support::unresolved_calls_rust_index(),
+        &support::unresolved_calls_rust_sources(),
+        "Widget::render",
+    );
+
+    let group = &answer["unresolved_calls"];
+    assert_eq!(group["name"], "render");
+    assert_eq!(group["total"], 1);
+    assert_eq!(group["calls"][0]["receiver"], "value");
+    assert_eq!(group["calls"][0]["location"]["start_line"], 25);
+}
+
+// _(A use ambiguous between duplicates is disclosed on each duplicate)_
+#[test]
+fn a_use_ambiguous_between_duplicates_is_disclosed_on_each_duplicate() {
+    let (index, sources) = support::duplicate_widgets(3);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+    let twins = store.symbols_by_shortname("Widget").unwrap();
+    assert_eq!(twins.len(), 3);
+    let mut expected: Vec<String> = twins.iter().map(|t| t.canonical_id.to_string()).collect();
+    expected.sort();
+
+    let hash = silent_cartographer::graph::content_hash(&sources);
+    let engine = QueryEngine::new(&store, index.provenance.clone(), hash, None);
+    for twin in &twins {
+        let answer = engine
+            .trace(twin.canonical_id.as_str(), TraceRelation::References, None, None)
+            .unwrap();
+        let answer: serde_json::Value = serde_json::from_str(&answer.to_json()).unwrap();
+
+        let uses = &answer["unconfirmed_uses"];
+        assert_eq!(uses["total"], 1, "{}", twin.canonical_id);
+        let refused = &uses["uses"][0];
+        assert_eq!(refused["reason"], "duplicate_ambiguous");
+        assert_eq!(refused["document_path"], "ref.rs");
+        assert_eq!(refused["location"]["document_path"], "ref.rs");
+        assert_eq!(refused["candidates"], serde_json::json!(expected));
+        assert_eq!(refused["candidates_total"], 3);
+        assert_eq!(refused["candidates_shortened"], false);
+        assert!(refused.get("found_text").is_none());
+    }
+}
+
+// _(A use ambiguous among many duplicates lists a bounded candidate set)_
+#[test]
+fn a_use_ambiguous_among_many_duplicates_lists_a_bounded_candidate_set() {
+    let (index, sources) = support::duplicate_widgets(12);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+    let subject = store.symbols_by_shortname("Widget").unwrap().remove(0).canonical_id;
+
+    let hash = silent_cartographer::graph::content_hash(&sources);
+    let engine = QueryEngine::new(&store, index.provenance.clone(), hash, None);
+    let answer = engine
+        .trace(subject.as_str(), TraceRelation::References, None, None)
+        .unwrap();
+    let answer: serde_json::Value = serde_json::from_str(&answer.to_json()).unwrap();
+
+    let refused = &answer["unconfirmed_uses"]["uses"][0];
+    assert_eq!(refused["candidates"].as_array().unwrap().len(), 10);
+    assert_eq!(refused["candidates_total"], 12);
+    assert_eq!(refused["candidates_shortened"], true);
+}
+
+// _(A use refused for mismatched text is disclosed with the text found)_
+#[test]
+fn a_use_refused_for_mismatched_text_is_disclosed_with_the_text_found() {
+    let answer = alpha_references_json("fn f() { beta(); }\n", SourceRange::new(0, 9, 0, 13), "alpha");
+
+    let refused = &answer["unconfirmed_uses"]["uses"][0];
+    assert_eq!(answer["unconfirmed_uses"]["total"], 1);
+    assert_eq!(refused["reason"], "text_mismatch");
+    assert_eq!(refused["document_path"], "m.rs");
+    assert_eq!(refused["location"]["start_line"], 1);
+    assert_eq!(refused["found_text"], "beta");
+    assert_eq!(refused["found_text_shortened"], false);
+    assert!(refused.get("candidates").is_none());
+}
+
+// _(A refused use with no location is listed with typed absence)_ — JSON half: the occurrence's
+// range lies beyond its document, so the use keeps its document and refusal kind and carries neither
+// a location nor found text.
+#[test]
+fn a_refused_use_with_no_location_keeps_its_document_and_reason() {
+    let answer = alpha_references_json("fn f() {}\n", SourceRange::new(7, 0, 7, 5), "alpha");
+
+    let refused = &answer["unconfirmed_uses"]["uses"][0];
+    assert_eq!(refused["document_path"], "m.rs");
+    assert_eq!(refused["reason"], "semantic_only");
+    assert!(refused.get("location").is_none(), "{refused}");
+    assert!(refused.get("found_text").is_none(), "{refused}");
+    assert!(refused.get("found_text_shortened").is_none(), "{refused}");
+}
+
+// A use refused for mismatched text whose found text exceeds 200 characters carries its first 200
+// characters marked shortened.
+#[test]
+fn found_text_over_the_character_bound_is_carried_shortened() {
+    use silent_cartographer::graph::store::QUOTED_TEXT_MAX_CHARS;
+
+    // `a` plus two hundred two-byte `é`: one character past the bound.
+    let found = format!("a{}", "é".repeat(QUOTED_TEXT_MAX_CHARS));
+    let source = format!("let {found} = 1;\n");
+    let answer = alpha_references_json(&source, SourceRange::new(0, 4, 0, 4 + found.len() as u32), "alpha");
+
+    let refused = &answer["unconfirmed_uses"]["uses"][0];
+    let stored = format!("a{}", "é".repeat(QUOTED_TEXT_MAX_CHARS - 1));
+    assert_eq!(refused["found_text"], stored.as_str());
+    assert_eq!(refused["found_text_shortened"], true);
+}
+
+// _(An ambiguous subject carries no group)_ — a name shared by several symbols returns the candidate
+// set and an unresolved name returns typed absence, each without either group.
+#[test]
+fn an_ambiguous_or_unresolved_subject_carries_no_group() {
+    use silent_cartographer::semantic::model::{ExtractedSymbol, SymbolClass};
+
+    let mut index = support::fixture_index();
+    index.symbols.push(ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "mycrate",
+            vec![
+                DescriptorSegment::new("net", SegmentKind::Module),
+                DescriptorSegment::new("Server", SegmentKind::Type),
+                DescriptorSegment::new("connect", SegmentKind::Method),
+            ],
+        )),
+        kind: SymbolKind::Method,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![ExtractedOccurrence {
+            document_path: support::DOC.to_string(),
+            range: SourceRange::new(3, 15, 3, 22),
+            role: OccurrenceRole::Definition,
+        }],
+    });
+
+    let ambiguous = references_json(&index, &sources(), "connect");
+    assert_eq!(ambiguous["outcome"]["outcome"], "ambiguous");
+    assert!(ambiguous.get("unresolved_calls").is_none());
+    assert!(ambiguous.get("unconfirmed_uses").is_none());
+
+    let absent = references_json(&index, &sources(), "no_such_symbol");
+    assert_eq!(absent["outcome"]["outcome"], "absent");
+    assert!(absent.get("unresolved_calls").is_none());
+    assert!(absent.get("unconfirmed_uses").is_none());
+}
+
+// _(The group carries no heuristic-grade marker)_ — neither group nor the answer carries a
+// classification, and the groups name no grade.
+#[test]
+fn the_groups_carry_no_heuristic_grade_marker() {
+    let (index, sources) = support::grouped_references(2);
+    let answer = references_json(&index, &sources, "target");
+
+    assert_eq!(answer["unresolved_calls"]["total"], 3);
+    assert_eq!(answer["unconfirmed_uses"]["total"], 3);
+    assert!(answer.get("classification").is_none());
+    for group in ["unresolved_calls", "unconfirmed_uses"] {
+        let text = answer[group].to_string();
+        for marker in ["classification", "grade", "heuristic"] {
+            assert!(!text.contains(marker), "{group} names {marker}: {text}");
+        }
+    }
+}
+
+// Other relations carry neither group.
+#[test]
+fn only_references_carries_the_groups() {
+    let (index, sources) = support::grouped_references(2);
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+    let hash = silent_cartographer::graph::content_hash(&sources);
+    let engine = QueryEngine::new(&store, index.provenance.clone(), hash, None);
+
+    for relation in [
+        TraceRelation::Tests,
+        TraceRelation::Contains,
+        TraceRelation::Containers,
+        TraceRelation::Importers,
+        TraceRelation::Implementers,
+    ] {
+        let answer = engine.trace("target", relation, None, None).unwrap();
+        assert!(answer.unresolved_calls.is_none(), "{relation:?}");
+        assert!(answer.unconfirmed_uses.is_none(), "{relation:?}");
+    }
+
+    let dependents = engine.dependents("target", 1, None, None, OrderMode::Unranked).unwrap();
+    assert!(dependents.unresolved_calls.is_none());
+    assert!(dependents.unconfirmed_uses.is_none());
+}
+
+/// A store over the Python unresolved-calls fixture under `file`'s index, and its engine inputs.
+fn unresolved_calls_python_store(file: &str) -> (GraphStore, AnalyzerProvenance, String) {
+    let index = support::unresolved_calls_python_index_from(file);
+    let sources = support::unresolved_calls_python_sources();
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+    (
+        store,
+        index.provenance.clone(),
+        silent_cartographer::graph::content_hash(&sources),
+    )
+}
+
+// _(Dependents ignore unresolved calls)_ — `drain` is called only through an unresolved call, so no
+// symbol depends on it and its answer carries neither group.
+#[test]
+fn dependents_ignore_unresolved_calls() {
+    for file in UNRESOLVED_CALLS_PYTHON_INDEXES {
+        let (store, provenance, hash) = unresolved_calls_python_store(file);
+        let engine = QueryEngine::new(&store, provenance, hash, None);
+
+        let references = engine.trace("drain", TraceRelation::References, None, None).unwrap();
+        assert_eq!(references.unresolved_calls.as_ref().unwrap().total, 1, "{file}");
+
+        let dependents = engine.dependents("drain", 1, None, None, OrderMode::Unranked).unwrap();
+        assert_eq!(dependents.outcome, Outcome::Empty, "{file}");
+        assert!(dependents.unresolved_calls.is_none(), "{file}");
+        assert!(dependents.unconfirmed_uses.is_none(), "{file}");
+    }
+}
+
+// _(Tests ignore unresolved calls)_ — the call inside `test_fetch` is unresolved, so it is not a
+// test site for `fetch`, and the answer carries neither group.
+#[test]
+fn tests_ignore_unresolved_calls() {
+    for file in UNRESOLVED_CALLS_PYTHON_INDEXES {
+        let (store, provenance, hash) = unresolved_calls_python_store(file);
+        let engine = QueryEngine::new(&store, provenance, hash, None);
+
+        let references = engine.trace("fetch", TraceRelation::References, None, None).unwrap();
+        let calls = &references.unresolved_calls.as_ref().unwrap().calls;
+        let enclosing = calls[0].enclosing.as_ref().unwrap();
+        assert!(enclosing.as_str().ends_with("::test_fetch"), "{file}");
+        assert!(
+            store.symbol(enclosing).unwrap().unwrap().test_rule.is_some(),
+            "{file}: the unresolved call sits in a test-classified function"
+        );
+
+        let tests = engine.trace("fetch", TraceRelation::Tests, None, None).unwrap();
+        assert_eq!(tests.outcome, Outcome::Empty, "{file}");
+        assert!(tests.unresolved_calls.is_none(), "{file}");
+        assert!(tests.unconfirmed_uses.is_none(), "{file}");
+    }
+}
+
+// _(Dependents ignore refused uses)_ — the only use of `alpha` is refused for mismatched text, so
+// nothing depends on it.
+#[test]
+fn dependents_ignore_refused_uses() {
+    let alpha = one_occ_symbol(
+        "c",
+        &[("alpha", SegmentKind::Term)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        SourceRange::new(0, 9, 0, 13),
+        OccurrenceRole::Reference,
+    );
+    let index = one_doc_index("m.rs", vec![alpha]);
+    let sources = vec![("m.rs".to_string(), "fn f() { beta(); }\n".to_string())];
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+    let hash = silent_cartographer::graph::content_hash(&sources);
+    let engine = QueryEngine::new(&store, index.provenance.clone(), hash, None);
+
+    let references = engine.trace("alpha", TraceRelation::References, None, None).unwrap();
+    assert_eq!(references.unconfirmed_uses.as_ref().unwrap().total, 1);
+
+    let dependents = engine.dependents("alpha", 1, None, None, OrderMode::Unranked).unwrap();
+    assert_eq!(dependents.outcome, Outcome::Empty);
 }

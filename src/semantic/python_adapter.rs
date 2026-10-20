@@ -891,6 +891,7 @@ mod tests {
             duplicate_groups: Vec::new(),
             targets: Default::default(),
             environment: None,
+            local_occurrence_ranges: Default::default(),
         }
     }
 

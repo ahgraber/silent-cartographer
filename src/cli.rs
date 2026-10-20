@@ -112,6 +112,9 @@ pub enum Command {
     Clones(ClonesArgs),
     /// Assess what a change could affect: the dependents of every symbol the change touched, seeded
     /// from a git diff rather than from a symbol the caller names.
+    ///
+    /// An answer that lists seeds and no dependents means no resolved dependent was recorded, not
+    /// that none exists: calls by frameworks, implicit calls, and lookups by string are not seen.
     Impact(ImpactArgs),
     /// Build or refresh the index for the workspace.
     Build(BuildArgs),
@@ -297,7 +300,10 @@ pub struct TraceArgs {
     /// The subject symbol reference.
     pub reference: String,
 
-    /// The relation to trace.
+    /// The relation to trace. An empty answer of `references`, `dependents`, `importers`, or `tests` means no
+    /// resolved instance was recorded, not that none exists: calls by frameworks, implicit calls, and
+    /// lookups by string are not seen. Structural relations (`containers`, `contains`, `implementers`)
+    /// answer a definite none.
     #[arg(long, value_enum)]
     pub relation: RelationArg,
 

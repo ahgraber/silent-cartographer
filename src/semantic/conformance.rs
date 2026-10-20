@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use super::model::{ExtractedIndex, OccurrenceRole, SymbolClass};
+use super::model::{ExtractedIndex, OccurrenceRole, SourceRange, SymbolClass};
 use super::{SemanticEngine, SemanticError};
 
 /// A single contract clause a backend either satisfies or violates.
@@ -40,9 +40,9 @@ impl ConformanceReport {
 /// Check an already-produced index against the mandatory extraction contract.
 ///
 /// The contract floor requires: every non-local symbol carries a resolved descriptor; every
-/// occurrence is role-classified and carries a well-formed, mappable range; the index carries
-/// analyzer provenance; and at least one definition-role and one reference-role occurrence are
-/// producible (evidence the backend classifies both roles).
+/// occurrence is role-classified and carries a well-formed, mappable range, as does every local
+/// occurrence range; the index carries analyzer provenance; and at least one definition-role and
+/// one reference-role occurrence are producible (evidence the backend classifies both roles).
 pub fn check_index(index: &ExtractedIndex) -> ConformanceReport {
     let mut violations = Vec::new();
 
@@ -79,25 +79,13 @@ pub fn check_index(index: &ExtractedIndex) -> ConformanceReport {
                 OccurrenceRole::Definition => saw_definition = true,
                 OccurrenceRole::Reference => saw_reference = true,
             }
-            // A range must map unambiguously to a file position: it must be well-formed (end not
-            // before start) and its document must declare an encoding.
-            if index.encoding_for(&occ.document_path).is_none() {
-                violations.push(Violation {
-                    clause: "range-mappable",
-                    detail: format!(
-                        "occurrence document {} declares no position encoding",
-                        occ.document_path
-                    ),
-                });
-            }
-            let r = occ.range;
-            let well_formed = (r.end_line, r.end_char) >= (r.start_line, r.start_char) || r.end_line > r.start_line;
-            if !well_formed {
-                violations.push(Violation {
-                    clause: "range-well-formed",
-                    detail: format!("occurrence range {r:?} is not well-formed"),
-                });
-            }
+            check_range(index, &occ.document_path, occ.range, "occurrence", &mut violations);
+        }
+    }
+
+    for (path, ranges) in &index.local_occurrence_ranges {
+        for range in ranges {
+            check_range(index, path, *range, "local occurrence", &mut violations);
         }
     }
 
@@ -115,6 +103,30 @@ pub fn check_index(index: &ExtractedIndex) -> ConformanceReport {
     }
 
     ConformanceReport { violations }
+}
+
+/// A range must map unambiguously to a file position: it must be well-formed (end not before start)
+/// and its document must declare an encoding.
+fn check_range(
+    index: &ExtractedIndex,
+    document_path: &str,
+    r: SourceRange,
+    what: &str,
+    violations: &mut Vec<Violation>,
+) {
+    if index.encoding_for(document_path).is_none() {
+        violations.push(Violation {
+            clause: "range-mappable",
+            detail: format!("{what} document {document_path} declares no position encoding"),
+        });
+    }
+    let well_formed = (r.end_line, r.end_char) >= (r.start_line, r.start_char) || r.end_line > r.start_line;
+    if !well_formed {
+        violations.push(Violation {
+            clause: "range-well-formed",
+            detail: format!("{what} range {r:?} is not well-formed"),
+        });
+    }
 }
 
 /// Run the same contract clauses against several backends, one project root per backend, reporting

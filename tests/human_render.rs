@@ -867,6 +867,29 @@ fn empty_tests_render_states_scoped_absence() {
     );
 }
 
+// _(Scenario: An empty tests answer states what it cannot see)_ — the empty `tests` line names the
+// cases the convention cannot see and makes no definite claim.
+#[test]
+fn empty_tests_render_names_the_unseen_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_tests_render_db(dir.path());
+
+    let out = c10r(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .args(["trace", "uncovered", "--relation", "tests"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "calls by frameworks, implicit calls such as constructors and operators, and lookups by string are not seen"
+        ),
+        "the empty line names the unseen cases: {stdout}"
+    );
+    assert!(!stdout.contains("definite"), "no definite claim: {stdout}");
+}
+
 /// A store at `dir/index.db` holding a subject and one dependent whose `display_name` and
 /// `document_path` carry terminal-control bytes, connected by a `uses` edge, so a `dependents`
 /// impact answer's detail row and summary project the hostile fields.
@@ -992,4 +1015,282 @@ fn ranked_note_renders_for_ranked_answers_only() {
         json.find(note).is_none(),
         "the note is a render line, not a machine field: {json}"
     );
+}
+
+/// Build `index` and `sources` into `dir/index.db` under a workspace named `ws`.
+fn build_db(
+    dir: &Path,
+    ws: &str,
+    index: &silent_cartographer::semantic::model::ExtractedIndex,
+    sources: &[(String, String)],
+) -> PathBuf {
+    let db = dir.join("index.db");
+    silent_cartographer::commands::build_from_index(&db, ws, dir, index, sources).unwrap();
+    db
+}
+
+/// A one-document Rust index whose only symbol is a function `name` with the given occurrence.
+fn function_index(
+    name: &str,
+    range: silent_cartographer::semantic::model::SourceRange,
+    role: silent_cartographer::semantic::model::OccurrenceRole,
+) -> silent_cartographer::semantic::model::ExtractedIndex {
+    use silent_cartographer::identity::SegmentKind;
+    use silent_cartographer::semantic::model::{SymbolClass, SymbolKind};
+
+    let symbol = support::one_occ_symbol(
+        "c",
+        &[(name, SegmentKind::Term)],
+        SymbolKind::Function,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        range,
+        role,
+    );
+    support::one_doc_index("m.rs", vec![symbol])
+}
+
+/// A store holding one function, `lonely`, that nothing references, depends on, or imports.
+fn build_lonely_db(dir: &Path) -> PathBuf {
+    use silent_cartographer::semantic::model::{OccurrenceRole, SourceRange};
+
+    build_db(
+        dir,
+        "lonely-ws",
+        &function_index("lonely", SourceRange::new(0, 3, 0, 9), OccurrenceRole::Definition),
+        &[("m.rs".to_string(), "fn lonely() {}\n".to_string())],
+    )
+}
+
+/// The human rendering of `trace <subject> --relation <relation>` over `db`, asserting success.
+fn human_trace(dir: &Path, db: &Path, subject: &str, relation: &str, extra: &[&str]) -> String {
+    let out = c10r(dir)
+        .arg("--db")
+        .arg(db)
+        .args(["--color", "never", "trace", subject, "--relation", relation])
+        .args(extra)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("the human render is UTF-8")
+}
+
+/// The Python unresolved-calls fixture under scip-python, built into `dir`.
+fn build_unresolved_calls_python_db(dir: &Path) -> PathBuf {
+    build_db(
+        dir,
+        "ucalls-ws",
+        &support::unresolved_calls_python_index_from("index.scip"),
+        &support::unresolved_calls_python_sources(),
+    )
+}
+
+/// The line of `text` starting with `prefix`, panicking when there is none.
+fn line_starting<'a>(text: &'a str, prefix: &str) -> &'a str {
+    text.lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no line starts with {prefix:?}: {text}"))
+}
+
+// _(An empty references answer states what it cannot see)_ and _(Empty relation is typed absence)_ —
+// both group totals are zero, the rendering names them and the unseen cases, and the JSON outcome
+// stays `empty`.
+#[test]
+fn an_empty_references_answer_states_what_it_cannot_see() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_lonely_db(dir.path());
+
+    let stdout = human_trace(dir.path(), &db, "lonely", "references", &[]);
+    assert!(
+        stdout.contains(
+            "empty: no resolved reference recorded; 0 calls named lonely have no resolved target and 0 uses are \
+             unconfirmed (calls by frameworks, implicit calls such as constructors and operators, and lookups by \
+             string are not seen)"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("definite"), "{stdout}");
+    assert!(
+        !stdout.contains("unresolved:"),
+        "a zero group prints nothing more: {stdout}"
+    );
+
+    let json = c10r(dir.path())
+        .arg("--db")
+        .arg(&db)
+        .arg("--json")
+        .args(["trace", "lonely", "--relation", "references"])
+        .output()
+        .unwrap();
+    let answer: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(answer["outcome"]["outcome"], "empty");
+}
+
+// _(An empty references answer with unresolved calls gives their total)_ — `drain` has no resolved
+// reference and one call that names it through an unannotated parameter.
+#[test]
+fn an_empty_references_answer_with_unresolved_calls_gives_their_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_unresolved_calls_python_db(dir.path());
+
+    let stdout = human_trace(dir.path(), &db, "drain", "references", &[]);
+    assert!(
+        stdout.contains("empty: no resolved reference recorded; 1 call named drain has no resolved target"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("definite"), "{stdout}");
+}
+
+// _(An empty dependents answer states what it cannot see)_,
+// _(An empty importers answer states what it cannot see)_ and
+// _(Structural relations keep the definite wording)_ — through the built binary.
+#[test]
+fn empty_dependents_and_importers_state_what_they_cannot_see_and_contains_stays_definite() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_lonely_db(dir.path());
+    let unseen =
+        "(calls by frameworks, implicit calls such as constructors and operators, and lookups by string are not seen)";
+
+    for (relation, noun) in [("dependents", "dependent"), ("importers", "importer")] {
+        let stdout = human_trace(dir.path(), &db, "lonely", relation, &[]);
+        assert!(
+            stdout.contains(&format!("empty: no resolved {noun} recorded {unseen}")),
+            "{relation}: {stdout}"
+        );
+        assert!(!stdout.contains("definite"), "{relation}: {stdout}");
+    }
+
+    let stdout = human_trace(dir.path(), &db, "lonely", "contains", &[]);
+    assert!(
+        stdout.contains("empty: the relation holds no instances (a definite empty set)"),
+        "{stdout}"
+    );
+}
+
+// _(The group renders after the results with its label)_ — `fetch` has a resolved reference and one
+// unresolved call; the group follows the result rows and labels its call.
+#[test]
+fn the_unresolved_group_renders_after_the_results_with_its_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_unresolved_calls_python_db(dir.path());
+
+    let stdout = human_trace(dir.path(), &db, "fetch", "references", &[]);
+    let results_at = stdout.find("1 result").expect("a results header");
+    let group_at = stdout.find("unresolved:").expect("the group");
+    assert!(results_at < group_at, "{stdout}");
+    assert_eq!(
+        line_starting(&stdout, "unresolved:"),
+        "unresolved: 1 call named fetch has no resolved target (each may or may not call this symbol)"
+    );
+    assert!(
+        line_starting(&stdout, "  client.fetch  at tests/test_client.py:2:").contains(" in "),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("list all"),
+        "a whole group has no list-all line: {stdout}"
+    );
+}
+
+// A group the limit cut states the cut and how to list every entry, once per cut group.
+#[test]
+fn a_truncated_group_names_the_cut_and_how_to_list_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, sources) = support::grouped_references(1);
+    let db = build_db(dir.path(), "group-ws", &index, &sources);
+
+    let stdout = human_trace(dir.path(), &db, "target", "references", &["--limit", "2"]);
+    assert_eq!(
+        line_starting(&stdout, "unresolved:"),
+        "unresolved: 2 of 3 calls named target have no resolved target (each may or may not call this symbol)"
+    );
+    assert_eq!(
+        line_starting(&stdout, "unconfirmed:"),
+        "unconfirmed: 2 of 3 uses may refer to this symbol but are not counted above"
+    );
+    assert_eq!(stdout.matches("  list all 3 with --limit 0").count(), 2, "{stdout}");
+}
+
+// _(The unconfirmed-use group renders with its reasons)_ — a duplicate-ambiguous use names the
+// definitions it could mean, a mismatched use names the source text found, and the group follows the
+// unresolved-call group.
+#[test]
+fn the_unconfirmed_group_renders_each_use_with_its_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, sources) = support::duplicate_widgets(3);
+    let db = build_db(dir.path(), "dup-ws", &index, &sources);
+    let subject = {
+        let store = GraphStore::open_or_replace(&db).unwrap();
+        store.symbols_by_shortname("Widget").unwrap().remove(0).canonical_id
+    };
+    let stdout = human_trace(dir.path(), &db, subject.as_str(), "references", &[]);
+    assert!(
+        line_starting(&stdout, "  at ref.rs:").ends_with("could mean any of 3 definitions of Widget (#0, #1, #2)"),
+        "{stdout}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (index, sources) = support::grouped_references(0);
+    let db = build_db(dir.path(), "group-ws", &index, &sources);
+    let stdout = human_trace(dir.path(), &db, "target", "references", &[]);
+    assert!(
+        stdout.find("unresolved:").unwrap() < stdout.find("unconfirmed:").unwrap(),
+        "{stdout}"
+    );
+    assert!(
+        line_starting(&stdout, "  at m.rs:")
+            .ends_with("the indexer placed a use of this symbol here, but the source text is `other`"),
+        "{stdout}"
+    );
+}
+
+// _(A refused use with no location is listed with typed absence)_ — human half: the rendering states
+// that the use's position is unknown.
+#[test]
+fn a_refused_use_with_no_location_renders_its_position_as_unknown() {
+    use silent_cartographer::semantic::model::{OccurrenceRole, SourceRange};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_db(
+        dir.path(),
+        "absent-ws",
+        &function_index("alpha", SourceRange::new(7, 0, 7, 5), OccurrenceRole::Reference),
+        &[("m.rs".to_string(), "fn f() {}\n".to_string())],
+    );
+
+    let stdout = human_trace(dir.path(), &db, "alpha", "references", &[]);
+    assert!(stdout.contains("  at m.rs (position unknown)  "), "{stdout}");
+}
+
+// A shortened multi-line receiver holding a terminal-control character renders on one line, with the
+// character replaced and `…` appended.
+#[test]
+fn a_shortened_receiver_with_a_control_character_renders_on_one_line() {
+    use silent_cartographer::semantic::model::{OccurrenceRole, SourceRange};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!(
+        "fn target() {{}}\nfn f() {{ make(\n    \"\u{1b}{}\"\n).target(); }}\n",
+        "a".repeat(250)
+    );
+    let db = build_db(
+        dir.path(),
+        "ctl-ws",
+        &function_index("target", SourceRange::new(0, 3, 0, 9), OccurrenceRole::Definition),
+        &[("m.rs".to_string(), source)],
+    );
+
+    let stdout = human_trace(dir.path(), &db, "target", "references", &[]);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "the control character is replaced: {stdout:?}"
+    );
+    let call = line_starting(&stdout, "  make(");
+    assert!(call.starts_with("  make( \"\u{fffd}aaa"), "{call:?}");
+    assert!(call.contains("….target  at m.rs:"), "{call:?}");
 }

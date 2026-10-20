@@ -1135,3 +1135,43 @@ fn an_unreadable_stored_class_names_the_value_and_the_forced_build() {
         "names the forced build: {stderr}"
     );
 }
+
+/// The `--help` text of `args` from the built binary, with line wrapping collapsed to single spaces.
+fn help_text(args: &[&str]) -> String {
+    let out = c10r().args(args).arg("--help").output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// `trace --help` and `impact --help` scope an empty reference-derived answer to resolved instances
+// and make no definite claim for those relations.
+#[test]
+fn help_scopes_an_empty_answer_to_resolved_instances() {
+    let trace = help_text(&["trace"]);
+    let (reference_derived, structural) = trace
+        .split_once("Structural relations")
+        .expect("trace help separates the structural relations");
+    assert!(
+        reference_derived.contains("`tests` means no resolved instance was recorded"),
+        "trace help: {reference_derived}"
+    );
+    for word in ["definite", "complete"] {
+        assert!(
+            !reference_derived.contains(word),
+            "trace help makes no {word} claim for the reference-derived relations: {reference_derived}"
+        );
+    }
+    assert!(structural.contains("definite none"), "trace help: {structural}");
+
+    let impact = help_text(&["impact"]);
+    assert!(
+        impact.contains("no resolved dependent was recorded"),
+        "impact help: {impact}"
+    );
+    for word in ["definite", "complete"] {
+        assert!(!impact.contains(word), "impact help makes no {word} claim: {impact}");
+    }
+}

@@ -19,16 +19,18 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
 use crate::identity::{CanonicalId, DefinitionSite, ProjectionInput, WorkspaceId, project_all, project_one};
-use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SymbolClass, SymbolKind};
+use crate::semantic::model::{ExtractedIndex, ExtractedSymbol, OccurrenceRole, SourceRange, SymbolClass, SymbolKind};
 use crate::semantic::python_adapter::PythonIndexer;
 use crate::semantic::rust_adapter::RustAdapter;
 
-use join::{AlignedOccurrence, JoinAccounting, SourceCorpus, join, module_by_document};
+use join::{
+    AlignedOccurrence, JoinAccounting, JoinOutcome, SourceCorpus, UnalignedOccurrence, join, module_by_document,
+};
 use prepared::PreparedCorpus;
-use range::{ByteSpan, LineColumnSpan, PositionIndex};
+use range::{ByteSpan, LineColumnSpan, PositionIndex, range_to_span};
 use store::{
     DiscrepancyRow, EdgeKind, Freshness, GraphStore, IndexMetadata, OccurrenceRow, PersistedClass, RecordedTargets,
-    SymbolRow,
+    SymbolRow, UnresolvedCallRow, shorten_quoted_text,
 };
 use syntax::Language;
 use units::{UndeterminedUnits, Unit, assign_units, declared_from, document_units, single_parent_map};
@@ -666,16 +668,37 @@ pub fn ingest_with_params(
     let discrepancies: Vec<DiscrepancyRow> = join_result
         .unaligned
         .iter()
-        .map(|occ| DiscrepancyRow {
-            document_path: occ.document_path.clone(),
-            span: occ.span.map(|s| (s.start, s.end)),
-            line_column: occ.span.and_then(|s| line_column(&occ.document_path, s.start, s.end)),
-            outcome: occ.outcome.tag().to_string(),
-            expected_name: occ.expected_name.clone(),
-            found_text: occ.found_text.clone(),
+        .map(|occ| {
+            let found = occ.found_text.as_deref().map(shorten_quoted_text);
+            DiscrepancyRow {
+                document_path: occ.document_path.clone(),
+                span: occ.span.map(|s| (s.start, s.end)),
+                line_column: occ.span.and_then(|s| line_column(&occ.document_path, s.start, s.end)),
+                outcome: occ.outcome.tag().to_string(),
+                expected_name: occ.expected_name.clone(),
+                found_text_shortened: found.as_ref().is_some_and(|(_, shortened)| *shortened),
+                found_text: found.map(|(text, _)| text),
+            }
         })
         .collect();
-    store.insert_discrepancies(&discrepancies)?;
+    let discrepancy_ids = store.insert_discrepancies(&discrepancies)?;
+    let persisted_symbols: std::collections::HashSet<&CanonicalId> =
+        symbol_rows.iter().map(|row| &row.canonical_id).collect();
+    store.insert_discrepancy_symbols(&discrepancy_links(
+        &join_result.unaligned,
+        &discrepancy_ids,
+        &persisted_symbols,
+        &duplicate_keys,
+    ))?;
+
+    store.insert_unresolved_calls(&unresolved_calls(
+        index,
+        &prepared,
+        &definitions_at,
+        &type_by_name,
+        &module_by_doc,
+        &line_column,
+    ))?;
 
     // The semantic corpus and its representations. Containment for corpus purposes is the union of
     // two signals: the `contains`-edge parents (which catch a type whose methods live in `impl`
@@ -1020,6 +1043,109 @@ fn enclosing_symbol(
     None
 }
 
+/// The symbols each refused reference occurrence may denote, as `(discrepancy id, symbol)` links.
+///
+/// `discrepancy_ids` is parallel to `unaligned`. A duplicate-ambiguous occurrence links every
+/// persisted member of the duplicate group its symbol belongs to; any other refused reference links
+/// its own symbol when that is persisted. A refused definition links nothing.
+fn discrepancy_links(
+    unaligned: &[UnalignedOccurrence],
+    discrepancy_ids: &[i64],
+    persisted: &std::collections::HashSet<&CanonicalId>,
+    duplicate_keys: &[(CanonicalId, String)],
+) -> Vec<(i64, CanonicalId)> {
+    // A duplicate-ambiguous occurrence names either a twin or the group's shared base (the twins'
+    // identity without its `#<rank>` disambiguator), so both resolve to the group.
+    let mut group_of: HashMap<CanonicalId, &str> = HashMap::new();
+    let mut members: HashMap<&str, Vec<&CanonicalId>> = HashMap::new();
+    for (id, key) in duplicate_keys {
+        group_of.insert(id.clone(), key);
+        group_of.insert(join::strip_disambiguator(id), key);
+        members.entry(key).or_default().push(id);
+    }
+    let mut links = Vec::new();
+    for (occ, &discrepancy_id) in unaligned.iter().zip(discrepancy_ids) {
+        if occ.role != OccurrenceRole::Reference {
+            continue;
+        }
+        let group = (occ.outcome == JoinOutcome::DuplicateAmbiguous)
+            .then(|| group_of.get(&occ.symbol))
+            .flatten();
+        match group {
+            Some(key) => links.extend(members[key].iter().map(|&id| (discrepancy_id, id.clone()))),
+            None if persisted.contains(&occ.symbol) => links.push((discrepancy_id, occ.symbol.clone())),
+            None => {}
+        }
+    }
+    links
+}
+
+/// The calls whose called name no semantic occurrence covers.
+///
+/// A name is covered when its byte span equals the normalized span of any occurrence the index holds
+/// for the document — aligned or refused by the join, definition or reference, local or not. An
+/// occurrence whose range cannot be normalized covers nothing. A call attributes to its nearest
+/// enclosing persisted declaration, else to its document's module.
+fn unresolved_calls(
+    index: &ExtractedIndex,
+    prepared: &PreparedCorpus,
+    definitions_at: &HashMap<(&str, ByteSpan), Option<&CanonicalId>>,
+    type_by_name: &HashMap<String, CanonicalId>,
+    module_by_doc: &HashMap<String, CanonicalId>,
+    line_column: &dyn Fn(&str, usize, usize) -> Option<LineColumnSpan>,
+) -> Vec<UnresolvedCallRow> {
+    let mut ranges: HashMap<&str, Vec<SourceRange>> = HashMap::new();
+    let occurrences = index
+        .symbols
+        .iter()
+        .flat_map(|symbol| &symbol.occurrences)
+        .chain(index.duplicate_groups.iter().flat_map(|group| &group.occurrences));
+    for occ in occurrences {
+        ranges.entry(occ.document_path.as_str()).or_default().push(occ.range);
+    }
+    for (path, local) in &index.local_occurrence_ranges {
+        ranges.entry(path.as_str()).or_default().extend(local);
+    }
+
+    let mut rows = Vec::new();
+    for (path, doc) in prepared.iter() {
+        let covered: std::collections::HashSet<ByteSpan> = index
+            .encoding_for(path)
+            .into_iter()
+            .flat_map(|encoding| {
+                ranges
+                    .get(path)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(move |&range| range_to_span(doc.tree.source(), &doc.line_index, range, encoding))
+            })
+            .collect();
+        let source = doc.tree.source();
+        for call in doc.tree.calls() {
+            if covered.contains(&call.name_span) {
+                continue;
+            }
+            let chain = doc.tree.enclosing_declarations(call.name_span.start);
+            let enclosing_id = enclosing_symbol(&chain, path, source, definitions_at, type_by_name)
+                .or_else(|| module_by_doc.get(path).cloned());
+            let receiver = call
+                .receiver_span
+                .and_then(|span| doc.tree.text_at(span))
+                .map(shorten_quoted_text);
+            rows.push(UnresolvedCallRow {
+                document_path: path.to_string(),
+                name: call.name,
+                span: (call.name_span.start, call.name_span.end),
+                line_column: line_column(path, call.name_span.start, call.name_span.end),
+                receiver_shortened: receiver.as_ref().is_some_and(|(_, shortened)| *shortened),
+                receiver: receiver.map(|(text, _)| text),
+                enclosing_id,
+            });
+        }
+    }
+    rows
+}
+
 /// The parent declaration of a definition: the nearest enclosing persisted declaration other than
 /// the definition itself.
 fn parent_of_definition(
@@ -1273,6 +1399,7 @@ pub(crate) mod work_bound_fixture {
             duplicate_groups: Vec::new(),
             targets: Default::default(),
             environment: None,
+            local_occurrence_ranges: Default::default(),
         }
     }
 }

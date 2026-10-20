@@ -38,9 +38,9 @@ Serves: references-name-what-they-cannot-see
 
 #### Scenario: Local occurrence ranges extracted
 
-- **GIVEN** a Python function that calls its parameter as `callback()`, and a Rust function that calls its closure parameter as `callback()`
+- **GIVEN** a Python function that assigns a function to a local variable and calls it as `helper()`, and a Rust function that calls its closure parameter as `callback()`
 - **WHEN** each project is indexed through the backend contract, the Python project once through each Python adapter
-- **THEN** the range of each `callback` token is reported as a local occurrence range of its document, and no persisted symbol or occurrence is created for it
+- **THEN** the range of the `helper` token and of the `callback` token is reported as a local occurrence range of its document, and no persisted symbol or occurrence is created for it
 
 #### Scenario: Each Python adapter passes the conformance suite
 

@@ -5,6 +5,8 @@
 //! `rust-analyzer`, Python via `scip-python`) translates through the same code, so the translation's
 //! bug-fix surface is not duplicated per language.
 
+use std::collections::BTreeMap;
+
 use scip::symbol::parse_symbol;
 use scip::types as scip_types;
 
@@ -114,11 +116,11 @@ pub(super) fn symbol_kind_from(descriptor: &Descriptor) -> SymbolKind {
 ///
 /// Symbols with a definition occurrence in the index are classified in-workspace; symbols that only
 /// appear as references (no definition) are classified external — a first-class reference target
-/// with no definition span. Local symbols are dropped (they have no global descriptor).
+/// with no definition span. Occurrences with no usable symbol identity (local symbols and symbol
+/// strings that do not parse) have no global descriptor, so only their ranges are kept, per document.
 pub fn translate_index(index: &scip_types::Index, provenance: &AnalyzerProvenance) -> ExtractedIndex {
-    use std::collections::BTreeMap;
-
     let mut documents = Vec::new();
+    let mut local_occurrence_ranges: BTreeMap<String, Vec<SourceRange>> = BTreeMap::new();
     // Accumulate occurrences per SCIP symbol string, preserving whether a definition was seen.
     struct Acc {
         descriptor: Option<Descriptor>,
@@ -138,6 +140,8 @@ pub fn translate_index(index: &scip_types::Index, provenance: &AnalyzerProvenanc
             encoding,
         });
         for occ in &doc.occurrences {
+            // An occurrence with no symbol names nothing, such as one emitted only for highlighting,
+            // so it neither persists nor counts as resolving a call.
             if occ.symbol.is_empty() {
                 continue;
             }
@@ -145,8 +149,11 @@ pub fn translate_index(index: &scip_types::Index, provenance: &AnalyzerProvenanc
                 continue;
             };
             let parsed = parse_scip_symbol(&occ.symbol);
-            // Local symbols (no descriptor) are excluded from the persisted base.
             if parsed.descriptor.is_none() {
+                local_occurrence_ranges
+                    .entry(doc.relative_path.clone())
+                    .or_default()
+                    .push(range);
                 continue;
             }
             let is_definition = occ.symbol_roles & DEFINITION_ROLE_BIT != 0;
@@ -195,6 +202,7 @@ pub fn translate_index(index: &scip_types::Index, provenance: &AnalyzerProvenanc
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges,
     }
 }
 
@@ -286,5 +294,39 @@ mod tests {
             translated.encoding_for("m.rs"),
             Some(crate::semantic::model::PositionEncoding::Utf8)
         );
+    }
+
+    #[test]
+    fn occurrences_without_a_usable_symbol_keep_only_their_range() {
+        use scip::types::{Document, Index, Occurrence};
+
+        let occurrence = |symbol: &str, range: Vec<i32>| {
+            let mut occ = Occurrence::new();
+            occ.symbol = symbol.to_string();
+            occ.range = range;
+            occ
+        };
+        let mut doc = Document::new();
+        doc.relative_path = "m.py".to_string();
+        doc.occurrences = vec![
+            occurrence("local 7", vec![0, 0, 1]),
+            occurrence("not a scip symbol", vec![1, 0, 1]),
+            occurrence("scip-python python p 0 f().", vec![2, 0, 1]),
+            occurrence("", vec![3, 0, 1]),
+        ];
+        let mut index = Index::new();
+        index.documents = vec![doc];
+
+        let provenance = AnalyzerProvenance {
+            analyzer_name: "scip-python".to_string(),
+            analyzer_version: "test".to_string(),
+        };
+        let translated = translate_index(&index, &provenance);
+
+        assert_eq!(
+            translated.local_occurrence_ranges["m.py"],
+            [SourceRange::new(0, 0, 0, 1), SourceRange::new(1, 0, 1, 1)]
+        );
+        assert_eq!(translated.symbols.len(), 1, "only the parsable symbol is persisted");
     }
 }

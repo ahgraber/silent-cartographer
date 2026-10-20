@@ -79,6 +79,7 @@ fn non_conformant_backend_is_rejected() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let engine = FixtureEngine::new(broken);
     let report = conformance::run(&engine, Path::new("."));
@@ -185,6 +186,7 @@ fn merged_twins_are_split_through_the_backend_contract() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
 
     // Take the index through the backend contract surface, exactly as ingestion does.
@@ -442,6 +444,62 @@ fn generate_rust_conformance_scip_fixture() {
     std::fs::write(root.join("RUST-ANALYZER-VERSION"), format!("{version}\n")).expect("record tool version");
 }
 
+/// One-off generator for the unresolved-calls Python fixture indexes. Run explicitly to (re)create them:
+/// `cargo test --test semantic_engine -- --ignored generate_unresolved_calls_python_fixture`
+///
+/// Generates THROUGH the adapter for both indexers, like the python-conformance generators. Needs
+/// `uv`, `scip-python`, and `ty-scip` on PATH.
+#[test]
+#[ignore = "fixture generator; needs uv + scip-python + ty-scip; run explicitly to regenerate the unresolved-calls Python indexes"]
+fn generate_unresolved_calls_python_fixture() {
+    use silent_cartographer::semantic::python_adapter::{PythonAdapter, PythonIndexer};
+
+    let root = support::unresolved_calls_python_root();
+    let venv = root.join(".venv");
+    if !venv.is_dir() {
+        let status = std::process::Command::new("uv")
+            .args(["venv", "--no-project"])
+            .arg(&venv)
+            .status()
+            .expect("uv is required to create the fixture venv");
+        assert!(status.success(), "uv venv failed");
+    }
+
+    for (indexer, index_file, version_file) in [
+        (PythonIndexer::ScipPython, "index.scip", "SCIP-PYTHON-VERSION"),
+        (PythonIndexer::TyScip, "ty-scip.scip", "TY-SCIP-VERSION"),
+    ] {
+        let adapter = PythonAdapter::new(indexer, indexer.executable(), venv.clone(), "unresolved-calls").expect(
+            "scip-python (npm install -g @sourcegraph/scip-python) and ty-scip (uv tool install ty-scip) are required",
+        );
+        let output = root.join(index_file);
+        adapter.write_scip_index(&root, &output).expect("indexer runs");
+        assert!(output.exists());
+        let version = adapter.provenance().analyzer_version;
+        std::fs::write(root.join(version_file), format!("{version}\n")).expect("record tool version");
+    }
+}
+
+/// One-off generator for the unresolved-calls Rust fixture index. Run explicitly to (re)create it:
+/// `cargo test --release --test semantic_engine generate_unresolved_calls_rust_fixture -- --ignored --exact`
+///
+/// Generates THROUGH the adapter. Needs `rust-analyzer` on PATH.
+#[test]
+#[ignore = "fixture generator; needs rust-analyzer; run explicitly to regenerate tests/fixtures/unresolved-calls/rust/index.scip"]
+fn generate_unresolved_calls_rust_fixture() {
+    use silent_cartographer::semantic::SemanticEngine;
+    use silent_cartographer::semantic::rust_adapter::RustAdapter;
+
+    let root = support::unresolved_calls_rust_root();
+    let adapter =
+        RustAdapter::new("rust-analyzer").expect("rust-analyzer is required: rustup component add rust-analyzer");
+    adapter.analyze(&root).expect("rust-analyzer scip runs");
+    assert!(root.join("index.scip").exists());
+
+    let version = adapter.provenance().analyzer_version;
+    std::fs::write(root.join("RUST-ANALYZER-VERSION"), format!("{version}\n")).expect("record tool version");
+}
+
 /// The committed Python fixture indexes, one per Python indexer.
 const PYTHON_FIXTURE_INDEXES: [&str; 2] = ["index.scip", "ty-scip.scip"];
 
@@ -531,6 +589,7 @@ fn nonconformant_backend_does_not_affect_the_other() {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let broken = FixtureEngine::new(broken_index);
 
@@ -542,6 +601,29 @@ fn nonconformant_backend_does_not_affect_the_other() {
         reports.iter().map(|(l, r)| (*l, r.is_conformant())).collect();
     assert!(by_label["python"], "the conforming backend stays usable");
     assert!(!by_label["broken"], "the broken backend is gated out");
+}
+
+// A local occurrence range is held to the same range clauses as a symbol occurrence: its document
+// declares an encoding and the range is well formed.
+#[test]
+fn local_occurrence_ranges_are_checked_like_occurrence_ranges() {
+    let clauses_for = |path: &str, range: SourceRange| {
+        let mut index = support::python_fixture_index();
+        let declared = index.documents[0].path.clone();
+        let path = if path.is_empty() { declared } else { path.to_string() };
+        index.local_occurrence_ranges.insert(path, vec![range]);
+        conformance::check_index(&index)
+            .violations()
+            .iter()
+            .map(|v| v.clause)
+            .collect::<Vec<_>>()
+    };
+    assert!(clauses_for("", SourceRange::new(1, 0, 1, 4)).is_empty());
+    assert_eq!(clauses_for("", SourceRange::new(2, 5, 1, 0)), ["range-well-formed"]);
+    assert_eq!(
+        clauses_for("undeclared.py", SourceRange::new(1, 0, 1, 4)),
+        ["range-mappable"]
+    );
 }
 
 // _(Live backend conformance)_ — the real scip-python over the fixture project must match the
@@ -612,4 +694,135 @@ fn python_live_tool_matches_committed_fixture_shape() {
         "live output conforms: {:?}",
         report.violations()
     );
+}
+
+/// The symbols of the single-line occurrences in the raw SCIP document `path` whose range covers the
+/// `name` token found inside the first occurrence of `needle` in `source`. Multi-line occurrences
+/// (a Rust crate's whole-file module definition) are skipped.
+fn symbols_covering(index: &scip::types::Index, path: &str, source: &str, needle: &str, name: &str) -> Vec<String> {
+    let at = source.find(needle).unwrap_or_else(|| panic!("{needle:?} in {path}")) + needle.find(name).unwrap();
+    let (line, col) = support::line_col(source, at);
+    let (line, col, end) = (line as i32, col as i32, col as i32 + name.len() as i32);
+    let doc = index
+        .documents
+        .iter()
+        .find(|d| d.relative_path == path)
+        .unwrap_or_else(|| panic!("{path} in the index"));
+    doc.occurrences
+        .iter()
+        .filter(|o| matches!(o.range.as_slice(), [l, s, e] if *l == line && *s < end && col < *e))
+        .map(|o| o.symbol.clone())
+        .collect()
+}
+
+fn read_committed_index(root: &Path, file: &str) -> scip::types::Index {
+    let bytes = std::fs::read(root.join(file)).expect("committed fixture index present");
+    protobuf::Message::parse_from_bytes(&bytes).expect("valid SCIP protobuf")
+}
+
+// _(Fixture premise)_ — under each Python indexer, the unannotated-receiver calls have no occurrence
+// at the called name and the annotated call has one. The `callback` token's coverage is reported.
+#[test]
+fn unresolved_calls_python_fixture_premise_holds() {
+    let root = support::unresolved_calls_python_root();
+    for file in PYTHON_FIXTURE_INDEXES {
+        let index = read_committed_index(&root, file);
+        let cover = |path: &str, needle: &str, name: &str| {
+            let source = std::fs::read_to_string(root.join(path)).unwrap();
+            symbols_covering(&index, path, &source, needle, name)
+        };
+        assert!(
+            cover("tests/test_client.py", "client.fetch()", "fetch").is_empty(),
+            "{file}: client.fetch() in the test"
+        );
+        assert!(
+            cover("pkg/use.py", "client.drain()", "drain").is_empty(),
+            "{file}: client.drain()"
+        );
+        assert!(
+            cover("pkg/use.py", "shared.append(1)", "append").is_empty(),
+            "{file}: shared.append(1)"
+        );
+        assert!(
+            cover("pkg/use.py", ").strip()", "strip").is_empty(),
+            "{file}: .strip() on a call with a long multi-line argument"
+        );
+        assert!(
+            !cover("pkg/use.py", "return client.fetch()", "fetch").is_empty(),
+            "{file}: annotated client.fetch()"
+        );
+        eprintln!(
+            "{file}: callback() covered by {:?}",
+            cover("pkg/use.py", "return callback()", "callback")
+        );
+    }
+}
+
+// _(Fixture premise)_ — in the Rust fixture, the calls under `#[cfg(any())]` have no occurrence at the
+// called name, and the live calls do.
+#[test]
+fn unresolved_calls_rust_fixture_premise_holds() {
+    let root = support::unresolved_calls_rust_root();
+    let index = read_committed_index(&root, "index.scip");
+    let source = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    let cover = |needle: &str, name: &str| symbols_covering(&index, "src/lib.rs", &source, needle, name);
+    assert!(cover("value.render()", "render").is_empty());
+    assert!(cover("_built = Widget::build()", "build").is_empty());
+    assert!(!cover("widget.render()", "render").is_empty());
+    assert!(!cover("widget = Widget::build()", "build").is_empty());
+    eprintln!("rust callback() covered by {:?}", cover("    callback()", "callback"));
+}
+
+/// Assert that `index` lists the range of the `name` token inside the first occurrence of `needle` in
+/// `path`'s `source` as a local occurrence range of that document, and that no persisted symbol
+/// carries an occurrence there.
+fn assert_local_range_extracted(
+    label: &str,
+    index: &ExtractedIndex,
+    path: &str,
+    source: &str,
+    needle: &str,
+    name: &str,
+) {
+    let at = source.find(needle).unwrap_or_else(|| panic!("{needle:?} in {path}")) + needle.find(name).unwrap();
+    let (line, col) = support::line_col(source, at);
+    let range = SourceRange {
+        start_line: line,
+        start_char: col,
+        end_line: line,
+        end_char: col + name.len() as u32,
+    };
+    assert!(
+        index
+            .local_occurrence_ranges
+            .get(path)
+            .is_some_and(|ranges| ranges.contains(&range)),
+        "{label}: {name} at {range:?} is a local occurrence range of {path}"
+    );
+    assert!(
+        index
+            .symbols
+            .iter()
+            .flat_map(|s| &s.occurrences)
+            .all(|o| o.document_path != path || o.range != range),
+        "{label}: no symbol occurrence is created at {range:?}"
+    );
+}
+
+// _(Scenario: Local occurrence ranges extracted)_ — a variable assigned inside a Python function and
+// called as `helper()`, under each Python indexer, and a Rust closure parameter called as
+// `callback()` are reported as local occurrence ranges of their documents.
+#[test]
+fn local_occurrence_ranges_extracted() {
+    let root = support::unresolved_calls_python_root();
+    let source = std::fs::read_to_string(root.join("pkg/use.py")).unwrap();
+    for file in PYTHON_FIXTURE_INDEXES {
+        let index = support::unresolved_calls_python_index_from(file);
+        assert_local_range_extracted(file, &index, "pkg/use.py", &source, "return helper()", "helper");
+    }
+
+    let root = support::unresolved_calls_rust_root();
+    let source = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    let index = support::unresolved_calls_rust_index();
+    assert_local_range_extracted("rust", &index, "src/lib.rs", &source, "    callback()", "callback");
 }

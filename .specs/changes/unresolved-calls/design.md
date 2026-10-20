@@ -21,14 +21,20 @@ Constraints from the baseline and from earlier decisions:
 
 ### Decision: Carry local occurrence ranges across the extraction boundary
 
-**Chosen:** `translate_index` in [src/semantic/scip.rs](../../../src/semantic/scip.rs) drops every occurrence of a local symbol today.
-It keeps them as a per-document list of source ranges in `ExtractedIndex`, with no symbol identity and no role, and both adapters return that list.
+**Chosen:** `translate_index` in [src/semantic/scip.rs](../../../src/semantic/scip.rs) does not persist an occurrence whose symbol has no global descriptor: a local symbol, or a symbol string that does not parse.
+It keeps the range of each such occurrence in a per-document list in `ExtractedIndex`, with no symbol identity and no role, and both adapters return that list.
+An occurrence with an empty symbol string names nothing, so its range is not kept.
 The join and every persisting step ignore the list; only the unresolved-call pass reads it.
-The conformance suite checks, for each adapter, that a call through a parameter has its range in the list.
+The conformance suite checks each listed range as it checks occurrence ranges: its document declares a position encoding, and the range is well formed.
+A fixture test checks, for each shipped adapter, that the range of a call through a local binding is in the list: the Python `helper` token and the Rust `callback` token.
 
-**Rationale:** A call through a parameter or a local closure, such as `callback()`, is resolved by every indexer to a local symbol.
+**Rationale:** A call through a local binding is resolved by every indexer to a local symbol: in Rust a parameter or closure binding such as `callback()`, and in Python a variable assigned inside a function such as `helper()`.
+Both Python indexers give a function parameter its own global symbol instead, so a Python `callback()` through a parameter is covered by that symbol's occurrence.
 Without these ranges the pass would see no occurrence and record the call as unresolved, contrary to the requirement.
 The 2026-10-16 Rust measurement counted 257 such calls in c10r alone.
+The list also keeps the ranges of symbol strings that do not parse, because the requirement counts an occurrence at a called name as resolving the call, whatever symbol it names.
+The suite does not require a backend to report any local range, because a project with no local bindings has none; the Rust conformance fixture is one such project.
+The field keeps the name `local_occurrence_ranges`, because renaming it would touch every place an index is built, for a naming gain only.
 
 **Alternatives considered:**
 
@@ -40,6 +46,7 @@ The 2026-10-16 Rust measurement counted 257 such calls in c10r alone.
 A call is unresolved when the byte span of its called name equals none of those spans.
 Occurrence ranges are converted to byte spans with the same normalization the join uses (`range_to_span` with the document's position encoding).
 An occurrence whose range cannot be normalized covers no call.
+An occurrence with an empty symbol string covers no call: the SCIP format allows an occurrence with no symbol, such as one that carries only highlighting information, and it says nothing about what the name refers to.
 
 **Rationale:** The spec says a call is recorded when its called name has no semantic occurrence, whatever symbol the occurrence names.
 An occurrence the join refused, for example because two definitions share its descriptor, is still evidence that the indexer resolved the call.
@@ -51,6 +58,22 @@ On Flask it agreed with ty-scip for 1,000 of 1,004 attribute calls.
 
 - Compare against aligned occurrences only: a call the indexer resolved but the join refused would appear as unresolved, which is false.
 - Accept an occurrence that overlaps the name: no measured indexer emits a partial range at a call's name, and overlap admits occurrences of the receiver in edge cases such as `a.a()`.
+
+### Decision: Calls in a source the analyzer did not index are recorded
+
+**Chosen:** The pass walks every source the build parsed, whether or not the semantic index has a document for it.
+A source the analyzer left out of its index has no occurrences, so every call in it is recorded.
+`docs/commands/trace.md` states this.
+
+**Rationale:** The analyzer resolved none of those calls, so each is a call with no resolved target, like a call in code under a `#[cfg(...)]` condition that is false for the build host.
+On 2026-10-19, rust-analyzer left ripgrep's `crates/globset/src/serde_impl.rs` out of its index, and the build recorded its 28 calls.
+A function called only from such a source would otherwise look unused.
+The baseline uses "indexed source" for a source the build discovered, which matches this reading of "indexed document".
+Decided by the user on 2026-10-19.
+
+**Alternatives considered:**
+
+- Skip sources absent from the semantic index: the lists get shorter, but a function called only from such a source looks unused again.
 
 ### Decision: Identify calls and called names from the syntax tree
 
@@ -153,6 +176,8 @@ The shared pagination step caps `uses` at the effective limit exactly as it caps
 
 **Rationale:** The same shape as the unresolved-call group lets a caller read both groups the same way.
 The reason tells the reader what to check: which definition a call means, or whether the indexer placed a use at the wrong position.
+The build stores found text already cut, with a flag that records the cut, so the discrepancy listing and this group show the same text.
+One bound for all quoted source text replaces the earlier 120-byte bound on stored found text; on 2026-10-19 none of 2,506 found texts in the Flask, ai-vfs, and ripgrep dogfood stores was longer than 28 characters, so no listed text changes.
 
 ### Decision: The group is a new answer field beside the outcome
 
@@ -243,6 +268,20 @@ Structural relations come from declarations the syntax tree proves, so their emp
 
 - Keep the definite message when both group totals are zero: it would still be false for the Flask cases above.
 
+### Decision: An empty tests answer follows the same rule
+
+**Chosen:** "Empty answers of reference-derived relations claim no proof" covers `tests`.
+An empty `tests` answer keeps its convention marker and its line `empty: no convention-classified test reference found (not proof that nothing tests the subject; …)`, and the parenthesis gains the same list of unseen cases as the other relations.
+It carries neither group, because unresolved calls and refused uses stay out of `tests`.
+
+**Rationale:** `tests` is built from the same resolved references, so it has the same blind spots.
+On ai-vfs, the 33 calls to `MetadataStore.touch_blob` go through untyped pytest fixtures and none resolves, so its `tests` answer is empty for the reason the other relations' empty lines name.
+One rule for every reference-derived relation also removes a conflict: "Relationship trace" sent every reference-derived empty answer to this requirement, which named only three of the four relations.
+
+**Alternatives considered:**
+
+- Let the baseline requirement "Heuristic-grade answers are structurally labeled" govern empty `tests` answers alone: the conflict goes away, but the empty line says "not proof" without saying what is not seen.
+
 ## Architecture
 
 ```text
@@ -283,5 +322,17 @@ trace --relation references
   Mitigation: the pass uses the join's normalization, and a dogfood check compares the count on Flask under scip-python with the 1,004 attribute calls the 2026-10-03 measurement found.
 - **Rust results depend on the build host**: code under a `#[cfg(...)]` condition that is false on the host has no occurrences, so its calls appear in the group, and the group differs between hosts.
   This is the intended disclosure, and `docs/commands/trace.md` states it.
+- **ty-scip leaves calls through a comprehension variable unresolved**: in `[g() for g in handlers]`, ty-scip records the variable's definition but no occurrence at the call, while scip-python records a local occurrence there.
+  Under ty-scip such a call is listed in the group of any symbol named `g`.
 - **ty-scip adds third-party calls to the group**: ty-scip records no third-party references, so a workspace symbol that shares a name with a third-party function lists calls to that function.
   Each such call is labeled as unresolved, never counted as a reference.
+
+## Spec Changes
+
+- semantic-engine, scenario `Local occurrence ranges extracted`: the Python case calls a local variable as `helper()` instead of a parameter as `callback()`.
+  Source: the requirement's clause on symbols local to a document.
+  A 2026-10-19 probe showed that scip-python 0.6.6 and ty-scip 0.1.0 give a function parameter a global symbol, such as `run().(callback)`, and give a variable assigned inside a function a `local` symbol.
+  The scenario's Python premise was false under both indexers; the revised case is one that both indexers report as local.
+  Approved by the user on 2026-10-19.
+- code-navigation, requirement `Empty answers of reference-derived relations claim no proof`: covers `tests`, with its rendering stating that no convention-classified test reference was found; new scenario `An empty tests answer states what it cannot see`.
+  Source: user decision on 2026-10-19, after verification found that the requirement named three of the four reference-derived relations.

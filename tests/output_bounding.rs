@@ -1535,3 +1535,103 @@ fn cli_rejects_explicit_order_on_references_but_not_the_default() {
         String::from_utf8_lossy(&default.stderr)
     );
 }
+
+/// Build [`support::grouped_references`] with `resolved` resolved references into `dir/index.db`.
+fn build_grouped_db(dir: &Path, resolved: usize) -> PathBuf {
+    let db = dir.join("index.db");
+    let (index, sources) = support::grouped_references(resolved);
+    silent_cartographer::commands::build_from_index(&db, "group-ws", dir, &index, &sources).unwrap();
+    db
+}
+
+/// `trace target --relation references --limit <limit>` over `db`, plus any `extra` arguments.
+fn grouped_references(dir: &Path, db: &Path, limit: &str, extra: &[&str]) -> serde_json::Value {
+    json_answer(
+        &c10r(dir)
+            .arg("--db")
+            .arg(db)
+            .arg("--json")
+            .args(["trace", "target", "--relation", "references", "--limit", limit])
+            .args(extra)
+            .output()
+            .unwrap(),
+    )
+}
+
+// _(The group is capped at the result limit)_,
+// _(The unconfirmed-use group is capped at the result limit)_ — on an answer with resolved references
+// and on one with none, each group lists the limit's number, carries the full total, is marked
+// truncated, and issues no continuation token.
+#[test]
+fn both_groups_are_capped_at_the_limit_without_a_token() {
+    for resolved in [2, 0] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = build_grouped_db(dir.path(), resolved);
+
+        let answer = grouped_references(dir.path(), &db, "2", &[]);
+
+        for (group, list) in [("unresolved_calls", "calls"), ("unconfirmed_uses", "uses")] {
+            assert_eq!(answer[group][list].as_array().unwrap().len(), 2, "{resolved}: {group}");
+            assert_eq!(answer[group]["total"], 3, "{resolved}: {group}");
+            assert_eq!(answer[group]["truncated"], true, "{resolved}: {group}");
+            assert!(answer[group].get("cursor").is_none(), "{resolved}: {group}");
+        }
+        assert!(
+            answer.get("page").is_none(),
+            "{resolved}: only the groups were cut, so the answer issues no token: {answer}"
+        );
+    }
+}
+
+// _(An unbounded answer lists every unresolved call)_
+#[test]
+fn an_unbounded_answer_lists_every_group_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    // Three unresolved calls from the fixture plus enough more to exceed the default limit of 25.
+    let (index, mut sources) = support::grouped_references(2);
+    for i in 0..30 {
+        sources[0].1.push_str(&format!("fn extra{i}() {{ x.target(); }}\n"));
+    }
+    silent_cartographer::commands::build_from_index(&db, "group-ws", dir.path(), &index, &sources).unwrap();
+
+    let default = json_answer(
+        &c10r(dir.path())
+            .arg("--db")
+            .arg(&db)
+            .arg("--json")
+            .args(["trace", "target", "--relation", "references"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(default["unresolved_calls"]["calls"].as_array().unwrap().len(), 25);
+    assert_eq!(default["unresolved_calls"]["total"], 33);
+    assert_eq!(default["unresolved_calls"]["truncated"], true);
+
+    let answer = grouped_references(dir.path(), &db, "0", &[]);
+    assert_eq!(answer["unresolved_calls"]["calls"].as_array().unwrap().len(), 33);
+    assert_eq!(answer["unresolved_calls"]["truncated"], false);
+    assert_eq!(answer["unconfirmed_uses"]["uses"].as_array().unwrap().len(), 3);
+    assert_eq!(answer["unconfirmed_uses"]["truncated"], false);
+}
+
+// _(Every page carries the same group)_ and _(The group does not change the paging counts)_ — the
+// page a continuation token resumes carries the same groups as the first, and the paging counts are
+// those of the resolved references alone.
+#[test]
+fn every_page_carries_the_same_groups_and_the_counts_ignore_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_grouped_db(dir.path(), 4);
+
+    let first = grouped_references(dir.path(), &db, "2", &[]);
+    let token = first["page"]["cursor"].as_str().expect("results remain").to_string();
+    let second = grouped_references(dir.path(), &db, "2", &["--cursor", &token]);
+
+    assert_eq!(first["unresolved_calls"], second["unresolved_calls"]);
+    assert_eq!(first["unconfirmed_uses"], second["unconfirmed_uses"]);
+    assert_eq!(first["unresolved_calls"]["truncated"], true);
+    for page in [&first["page"], &second["page"]] {
+        assert_eq!(page["returned"], 2);
+        assert_eq!(page["total"], 4);
+    }
+}

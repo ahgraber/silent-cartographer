@@ -30,12 +30,16 @@ See [common flags](common.md#shared-flags) for `--db`, `--workspace`, `--json`, 
 
 Returns the declarations the diff touched, then their dependents to the depth bound, with deeper reach aggregated rather than dropped.
 
+A change that touches declarations with no dependents reads `no resolved dependent recorded`.
+That is not proof that nothing depends on them; see [empty answers](trace.md#empty-answers).
+A change that touches no indexed declaration reads as a definite none.
+
 Each answer carries an `exactness` grade:
 
-| Grade         | Means                                                                                 |
-| ------------- | ------------------------------------------------------------------------------------- |
-| `exact`       | The index matches the change's pre-change state, so the reach shown is the real reach |
-| `approximate` | Something drifted since the index was built                                           |
+| Grade         | Means                                                                                                   |
+| ------------- | ------------------------------------------------------------------------------------------------------- |
+| `exact`       | The index matches the pre-change code, so the dependents shown are the resolved dependents of that code |
+| `approximate` | Something drifted since the index was built                                                             |
 
 An `approximate` answer carries a runnable recovery recipe: shell commands that rebuild the index at the change's base revision in a throwaway worktree and re-run the same query, with every value filled in.
 

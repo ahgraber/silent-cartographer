@@ -439,6 +439,7 @@ mod tests {
             duplicate_groups: Vec::new(),
             targets,
             environment: None,
+            local_occurrence_ranges: Default::default(),
         }
     }
 

@@ -191,6 +191,91 @@ pub struct ContentLines {
     pub total: usize,
 }
 
+/// The most candidate identities an unconfirmed use lists.
+pub const UNCONFIRMED_CANDIDATES_MAX: usize = 10;
+
+/// One call named like a `references` subject that no semantic occurrence covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnresolvedCallView {
+    /// The receiver's source text; absent for a call with no receiver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
+    /// Whether `receiver` was cut; absent exactly when `receiver` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_shortened: Option<bool>,
+    /// The called name's position.
+    pub location: Location,
+    /// The declaration, else the module, the call sits in; absent when the document has no persisted
+    /// module symbol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing: Option<CanonicalId>,
+}
+
+/// The calls named like the subject that the indexer left unresolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnresolvedCalls {
+    /// The called name matched: the last component of the subject's name.
+    pub name: String,
+    /// How many matching calls exist, before any cap.
+    pub total: usize,
+    /// Whether the cap dropped calls.
+    pub truncated: bool,
+    /// The calls, by document path then position.
+    pub calls: Vec<UnresolvedCallView>,
+}
+
+/// One reference occurrence the join refused that may denote the subject.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnconfirmedUse {
+    /// The document the occurrence sits in; present even when `location` is absent.
+    pub document_path: String,
+    /// The occurrence's position; absent when the discrepancy recorded no span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
+    /// The discrepancy's outcome kind.
+    pub reason: String,
+    /// Up to [`UNCONFIRMED_CANDIDATES_MAX`] symbols a duplicate-ambiguous use may denote, in
+    /// canonical-identity order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<CanonicalId>>,
+    /// How many symbols the use may denote; present exactly when `candidates` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates_total: Option<usize>,
+    /// Whether `candidates` lists fewer than `candidates_total`; present exactly when `candidates` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates_shortened: Option<bool>,
+    /// The source text found at the position, as the discrepancy stored it; absent for a
+    /// duplicate-ambiguous use and when no text was found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found_text: Option<String>,
+    /// Whether `found_text` was cut; present exactly when `found_text` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found_text_shortened: Option<bool>,
+}
+
+/// The refused reference occurrences that may denote the subject.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnconfirmedUses {
+    /// How many such uses exist, before any cap.
+    pub total: usize,
+    /// Whether the cap dropped uses.
+    pub truncated: bool,
+    /// The uses, by document path then position.
+    pub uses: Vec<UnconfirmedUse>,
+}
+
+/// The relation an empty answer came from, for the three whose empty answer is scoped to resolved
+/// instances. Read only by the human rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyScope {
+    /// `references`: no resolved reference was recorded.
+    References,
+    /// `dependents`: no resolved dependent was recorded.
+    Dependents,
+    /// `importers`: no resolved importer was recorded.
+    Importers,
+}
+
 /// The outcome of a query: a found result set, a typed candidate set on ambiguity, or typed absence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -214,7 +299,9 @@ pub enum Outcome<T> {
     /// The subject carries no comparable content, so no comparison was possible — distinct from
     /// `Empty`, where the comparison ran and found no instance. Produced only by `clones`.
     NotComparable,
-    /// The relation exists but the subject stands in no instance of it — a definite empty set.
+    /// The relation exists but the index recorded no instance of it for the subject. For a structural
+    /// relation this is a definite empty set; for `references`, `dependents`, `importers`, and
+    /// `impact` it means only that no resolved instance was recorded.
     Empty,
 }
 
@@ -290,6 +377,18 @@ pub struct Answer<T> {
     /// so every other answer's shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_compared_completely: Option<Vec<SymbolView>>,
+    /// The calls named like a `references` subject that no semantic occurrence covers: present on every
+    /// `references` answer whose subject resolves to one symbol, absent on every other answer. It sits
+    /// beside the outcome, never among its results, so results and paging counts are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unresolved_calls: Option<UnresolvedCalls>,
+    /// The refused reference occurrences that may denote the subject: present exactly when
+    /// `unresolved_calls` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unconfirmed_uses: Option<UnconfirmedUses>,
+    /// Which scoped empty message the human rendering prints for an empty outcome; never serialized.
+    #[serde(skip)]
+    pub empty_scope: Option<EmptyScope>,
     /// The outcome.
     pub outcome: Outcome<T>,
     /// The result-set paging disclosure, present only when a result limit was applied.
@@ -321,7 +420,7 @@ impl<T> Answer<T> {
         Self::wrap(Outcome::Absent, provenance, freshness)
     }
 
-    /// An answer carrying a definite empty relation.
+    /// An answer whose relation holds no recorded instance.
     pub fn empty(provenance: Provenance, freshness: Freshness) -> Self {
         Self::wrap(Outcome::Empty, provenance, freshness)
     }
@@ -343,6 +442,9 @@ impl<T> Answer<T> {
             ordering: None,
             excluded_relations: None,
             not_compared_completely: None,
+            unresolved_calls: None,
+            unconfirmed_uses: None,
+            empty_scope: None,
             outcome,
             page: None,
         }
@@ -400,6 +502,19 @@ impl<T> Answer<T> {
     /// Name the symbols a `clones` query did not compare completely; no field at all when none.
     pub fn with_not_compared_completely(mut self, symbols: Vec<SymbolView>) -> Self {
         self.not_compared_completely = (!symbols.is_empty()).then_some(symbols);
+        self
+    }
+
+    /// Attach the unresolved-call and unconfirmed-use groups of a `references` answer.
+    pub fn with_reference_groups(mut self, calls: UnresolvedCalls, uses: UnconfirmedUses) -> Self {
+        self.unresolved_calls = Some(calls);
+        self.unconfirmed_uses = Some(uses);
+        self
+    }
+
+    /// Scope the human rendering of an empty outcome to the relation it came from.
+    pub fn with_empty_scope(mut self, scope: EmptyScope) -> Self {
+        self.empty_scope = Some(scope);
         self
     }
 

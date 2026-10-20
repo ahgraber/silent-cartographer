@@ -167,6 +167,7 @@ chrome-profile
 !tests/fixtures/*.scip
 !tests/fixtures/python-conformance/*.scip
 !tests/fixtures/rust-conformance/*.scip
+!tests/fixtures/unresolved-calls/*/*.scip
 # The Rust conformance project's binary targets live under `src/bin/`.
 !tests/fixtures/rust-conformance/src/bin/
 

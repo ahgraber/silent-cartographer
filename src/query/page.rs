@@ -154,13 +154,14 @@ pub fn precheck_cursor(cursor: Option<&str>, limit: Option<usize>) -> anyhow::Re
 /// decoded and its identity hash recomputed and compared, a mismatch or an out-of-range page is a
 /// usage error naming the recovery.
 pub fn apply_pagination<T>(
-    answer: Answer<T>,
+    mut answer: Answer<T>,
     limit: Option<usize>,
     cursor: Option<&str>,
     identity: &PageIdentity,
 ) -> anyhow::Result<Answer<T>> {
     let param_hash = identity.hash();
     let page_index = resolve_page_index(cursor, limit, &param_hash)?;
+    cap_reference_groups(&mut answer, limit);
 
     let Answer {
         provenance,
@@ -173,6 +174,9 @@ pub fn apply_pagination<T>(
         ordering,
         excluded_relations,
         not_compared_completely,
+        unresolved_calls,
+        unconfirmed_uses,
+        empty_scope,
         outcome,
         page: _,
     } = answer;
@@ -203,6 +207,9 @@ pub fn apply_pagination<T>(
             ordering,
             excluded_relations,
             not_compared_completely,
+            unresolved_calls,
+            unconfirmed_uses,
+            empty_scope,
             outcome: Outcome::Ambiguous {
                 candidates,
                 candidates_total,
@@ -228,6 +235,9 @@ pub fn apply_pagination<T>(
             ordering,
             excluded_relations,
             not_compared_completely,
+            unresolved_calls,
+            unconfirmed_uses,
+            empty_scope,
             outcome,
             page: None,
         });
@@ -246,6 +256,9 @@ pub fn apply_pagination<T>(
             ordering,
             excluded_relations,
             not_compared_completely,
+            unresolved_calls,
+            unconfirmed_uses,
+            empty_scope,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -264,9 +277,27 @@ pub fn apply_pagination<T>(
         ordering,
         excluded_relations,
         not_compared_completely,
+        unresolved_calls,
+        unconfirmed_uses,
+        empty_scope,
         outcome: Outcome::Found { results: page_results },
         page,
     })
+}
+
+/// Cap the unresolved-call and unconfirmed-use groups at `limit`. The groups are not a paged result
+/// set: the cap ignores the page index, so every page carries the same groups, and it issues no
+/// token.
+fn cap_reference_groups<T>(answer: &mut Answer<T>, limit: Option<usize>) {
+    let Some(cap) = limit else { return };
+    if let Some(group) = &mut answer.unresolved_calls {
+        group.truncated = group.calls.len() > cap;
+        group.calls.truncate(cap);
+    }
+    if let Some(group) = &mut answer.unconfirmed_uses {
+        group.truncated = group.uses.len() > cap;
+        group.uses.truncate(cap);
+    }
 }
 
 /// Apply the result-set bound to a report-shaped answer, paging the detail rows `detail` selects out
@@ -304,6 +335,9 @@ pub fn apply_report_pagination<T>(
         ordering,
         excluded_relations,
         not_compared_completely,
+        unresolved_calls,
+        unconfirmed_uses,
+        empty_scope,
         outcome,
         page: _,
     } = answer;
@@ -324,6 +358,9 @@ pub fn apply_report_pagination<T>(
             ordering,
             excluded_relations,
             not_compared_completely,
+            unresolved_calls,
+            unconfirmed_uses,
+            empty_scope,
             outcome: Outcome::Found { results },
             page: None,
         });
@@ -349,6 +386,9 @@ pub fn apply_report_pagination<T>(
         ordering,
         excluded_relations,
         not_compared_completely,
+        unresolved_calls,
+        unconfirmed_uses,
+        empty_scope,
         outcome: Outcome::Found { results: vec![report] },
         page,
     })

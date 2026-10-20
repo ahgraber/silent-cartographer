@@ -187,6 +187,7 @@ pub fn fixture_index() -> ExtractedIndex {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     }
 }
 
@@ -226,6 +227,7 @@ pub fn one_doc_index(path: &str, symbols: Vec<ExtractedSymbol>) -> ExtractedInde
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     }
 }
 
@@ -282,10 +284,15 @@ pub const RUST_FIXTURE_FILES: [&str; 5] = [
 /// Panics if `index.scip` is missing from the fixture directory or fails to parse as a SCIP
 /// protobuf.
 pub fn rust_fixture_index() -> ExtractedIndex {
+    rust_index_at(&rust_fixture_root())
+}
+
+/// The committed `index.scip` under the Rust fixture directory `root`, translated as
+/// [`rust_fixture_index`] does.
+fn rust_index_at(root: &std::path::Path) -> ExtractedIndex {
     use silent_cartographer::semantic::model::normalize;
     use silent_cartographer::semantic::rust_adapter::{cargo_targets, translate_index};
 
-    let root = rust_fixture_root();
     let bytes = std::fs::read(root.join("index.scip")).expect("checked-in rust-conformance index present");
     let index: scip::types::Index = protobuf::Message::parse_from_bytes(&bytes).expect("valid SCIP protobuf");
     let provenance = AnalyzerProvenance {
@@ -293,7 +300,7 @@ pub fn rust_fixture_index() -> ExtractedIndex {
         analyzer_version: index.metadata.tool_info.version.clone(),
     };
     let mut extracted = translate_index(&index, &provenance);
-    extracted.targets = cargo_targets(&root);
+    extracted.targets = cargo_targets(root);
     normalize(extracted)
 }
 
@@ -303,8 +310,12 @@ pub fn rust_fixture_index() -> ExtractedIndex {
 ///
 /// Panics if any of the fixture's source files is missing.
 pub fn rust_fixture_sources() -> Vec<(String, String)> {
-    let root = rust_fixture_root();
-    RUST_FIXTURE_FILES
+    read_sources(&rust_fixture_root(), &RUST_FIXTURE_FILES)
+}
+
+/// `(relative path, text)` for each of `files` under `root`.
+fn read_sources(root: &std::path::Path, files: &[&str]) -> Vec<(String, String)> {
+    files
         .iter()
         .map(|rel| {
             let text = std::fs::read_to_string(root.join(rel)).expect("fixture source present");
@@ -336,11 +347,17 @@ pub fn python_fixture_index() -> ExtractedIndex {
 ///
 /// Panics if `file` is missing from the fixture directory or fails to parse as a SCIP protobuf.
 pub fn python_fixture_index_from(file: &str) -> ExtractedIndex {
+    python_index_at(&python_fixture_root(), file)
+}
+
+/// The committed Python index `file` under the fixture directory `root`, translated as
+/// [`python_fixture_index_from`] does.
+fn python_index_at(root: &std::path::Path, file: &str) -> ExtractedIndex {
     use silent_cartographer::semantic::python_adapter::{PythonIndexer, finish_translation};
     use silent_cartographer::semantic::scip::translate_index;
 
-    let path = python_fixture_root().join(file);
-    let bytes = std::fs::read(&path).expect("checked-in python-conformance index present");
+    let path = root.join(file);
+    let bytes = std::fs::read(&path).expect("checked-in Python fixture index present");
     let index: scip::types::Index = protobuf::Message::parse_from_bytes(&bytes).expect("valid SCIP protobuf");
     let provenance = AnalyzerProvenance {
         analyzer_name: index.metadata.tool_info.name.clone(),
@@ -348,7 +365,7 @@ pub fn python_fixture_index_from(file: &str) -> ExtractedIndex {
     };
     let indexer =
         PythonIndexer::from_analyzer_name(&provenance.analyzer_name).expect("committed fixture from a known indexer");
-    finish_translation(translate_index(&index, &provenance), indexer, &python_fixture_root())
+    finish_translation(translate_index(&index, &provenance), indexer, root)
 }
 
 /// The Python fixture's sources, `(scip_document_path, text)`, read from the committed project.
@@ -357,23 +374,52 @@ pub fn python_fixture_index_from(file: &str) -> ExtractedIndex {
 ///
 /// Panics if any of the fixture's source files is missing.
 pub fn python_fixture_sources() -> Vec<(String, String)> {
-    let root = python_fixture_root();
-    [
-        "pkg/__init__.py",
-        "pkg/app.py",
-        "pkg/consumer.py",
-        "pkg/relative.py",
-        "pkg/shapes.py",
-        "pkg/sub/__init__.py",
-        "pkg/sub/app.py",
-        "pkg/sub/deep.py",
-    ]
-    .iter()
-    .map(|rel| {
-        let text = std::fs::read_to_string(root.join(rel)).expect("fixture source present");
-        (rel.to_string(), text)
-    })
-    .collect()
+    read_sources(
+        &python_fixture_root(),
+        &[
+            "pkg/__init__.py",
+            "pkg/app.py",
+            "pkg/consumer.py",
+            "pkg/relative.py",
+            "pkg/shapes.py",
+            "pkg/sub/__init__.py",
+            "pkg/sub/app.py",
+            "pkg/sub/deep.py",
+        ],
+    )
+}
+
+/// The committed unresolved-calls Python fixture directory (`tests/fixtures/unresolved-calls/python`).
+pub fn unresolved_calls_python_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unresolved-calls/python")
+}
+
+/// The unresolved-calls Python fixture index named `file` (`index.scip` or `ty-scip.scip`).
+pub fn unresolved_calls_python_index_from(file: &str) -> ExtractedIndex {
+    python_index_at(&unresolved_calls_python_root(), file)
+}
+
+/// The unresolved-calls Python fixture's sources, `(scip_document_path, text)`.
+pub fn unresolved_calls_python_sources() -> Vec<(String, String)> {
+    read_sources(
+        &unresolved_calls_python_root(),
+        &["pkg/__init__.py", "pkg/client.py", "pkg/use.py", "tests/test_client.py"],
+    )
+}
+
+/// The committed unresolved-calls Rust fixture directory (`tests/fixtures/unresolved-calls/rust`).
+pub fn unresolved_calls_rust_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unresolved-calls/rust")
+}
+
+/// The unresolved-calls Rust fixture index.
+pub fn unresolved_calls_rust_index() -> ExtractedIndex {
+    rust_index_at(&unresolved_calls_rust_root())
+}
+
+/// The unresolved-calls Rust fixture's sources, `(scip_document_path, text)`.
+pub fn unresolved_calls_rust_sources() -> Vec<(String, String)> {
+    read_sources(&unresolved_calls_rust_root(), &["src/lib.rs"])
 }
 
 /// Write an executable stub tool that answers `--version` with `version`, and — for any other
@@ -848,4 +894,96 @@ pub fn header_fixture(language: silent_cartographer::graph::syntax::Language) ->
             ],
         },
     }
+}
+
+/// A one-document Rust index and sources in which the function `target` has `resolved` resolved
+/// references, three method calls named `target` that no occurrence covers, and three references
+/// the join refuses as text mismatches.
+pub fn grouped_references(resolved: usize) -> (ExtractedIndex, Vec<(String, String)>) {
+    let mut source = String::from("fn target() {}\n");
+    let mut occurrences = vec![ExtractedOccurrence {
+        document_path: "m.rs".to_string(),
+        range: SourceRange::new(0, 3, 0, 9),
+        role: OccurrenceRole::Definition,
+    }];
+    let mut reference_on_new_line = |source: &mut String, line: String, token: &str| {
+        let row = source.matches('\n').count() as u32;
+        let col = line.find(token).unwrap() as u32;
+        source.push_str(&line);
+        source.push('\n');
+        occurrences.push(ExtractedOccurrence {
+            document_path: "m.rs".to_string(),
+            range: SourceRange::new(row, col, row, col + token.len() as u32),
+            role: OccurrenceRole::Reference,
+        });
+    };
+    for i in 0..resolved {
+        reference_on_new_line(&mut source, format!("fn r{i}() {{ target(); }}"), "target");
+    }
+    for i in 0..3 {
+        reference_on_new_line(&mut source, format!("fn m{i}() {{ other(); }}"), "other");
+    }
+    for i in 0..3 {
+        source.push_str(&format!("fn u{i}() {{ x.target(); }}\n"));
+    }
+    let target = ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "c",
+            vec![DescriptorSegment::new("target", SegmentKind::Term)],
+        )),
+        kind: SymbolKind::Function,
+        class: SymbolClass::InWorkspace,
+        occurrences,
+    };
+    (one_doc_index("m.rs", vec![target]), vec![("m.rs".to_string(), source)])
+}
+
+/// An index and sources in which `copies` documents each define `struct Widget;` under one shared
+/// descriptor and a further document `ref.rs` holds a reference that no locality rule settles, so
+/// the join records it duplicate-ambiguous.
+pub fn duplicate_widgets(copies: usize) -> (ExtractedIndex, Vec<(String, String)>) {
+    let descriptor = || Descriptor::new("dupcrate", vec![DescriptorSegment::new("Widget", SegmentKind::Type)]);
+    let documents: Vec<String> = (0..copies).map(|i| format!("d{i}.rs")).collect();
+    let mut sources: Vec<(String, String)> = documents
+        .iter()
+        .map(|doc| (doc.clone(), "struct Widget;\n".to_string()))
+        .collect();
+    sources.push(("ref.rs".to_string(), "fn use_it(_w: Widget) {}\n".to_string()));
+    let at = sources.last().unwrap().1.find("Widget").unwrap() as u32;
+    let symbols = documents
+        .iter()
+        .map(|doc| ExtractedSymbol {
+            descriptor: Some(descriptor()),
+            kind: SymbolKind::Type,
+            class: SymbolClass::InWorkspace,
+            occurrences: vec![ExtractedOccurrence {
+                document_path: doc.clone(),
+                range: SourceRange::new(0, 7, 0, 13),
+                role: OccurrenceRole::Definition,
+            }],
+        })
+        .collect();
+    let index = ExtractedIndex {
+        provenance: provenance(),
+        documents: sources
+            .iter()
+            .map(|(path, _)| SourceDocument {
+                path: path.clone(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols,
+        duplicate_groups: vec![silent_cartographer::semantic::model::DuplicateGroup {
+            descriptor: descriptor(),
+            occurrences: vec![ExtractedOccurrence {
+                document_path: "ref.rs".to_string(),
+                range: SourceRange::new(0, at, 0, at + 6),
+                role: OccurrenceRole::Reference,
+            }],
+        }],
+        targets: Default::default(),
+        environment: None,
+        local_occurrence_ranges: Default::default(),
+    };
+    (index, sources)
 }

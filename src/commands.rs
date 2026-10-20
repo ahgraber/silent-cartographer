@@ -3914,6 +3914,7 @@ mod tests {
                 manifests: BTreeMap::from([("Cargo.toml".to_string(), text_hash(manifest))]),
             },
             environment: None,
+            local_occurrence_ranges: Default::default(),
         };
         let db = root.join("index.db");
         let workspace = WorkspaceId::new("ws");

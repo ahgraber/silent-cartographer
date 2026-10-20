@@ -140,9 +140,9 @@ Serves: references-name-what-they-cannot-see
 
 ### Requirement: Empty answers of reference-derived relations claim no proof
 
-An empty answer of `references`, `dependents`, or `importers`, and an `impact` answer whose seeds have no resolved dependent, assert only that the index recorded no resolved instance of the relation.
+An empty answer of `references`, `dependents`, `importers`, or `tests`, and an `impact` answer whose seeds have no resolved dependent, assert only that the index recorded no resolved instance of the relation.
 Such an answer SHALL keep its typed outcome, distinct from an unavailable or failed answer, and SHALL NOT be described, in its human rendering, in the command's self-description, or in the MCP tool description, as a definite or complete empty set.
-Its human rendering SHALL state that no resolved instance was recorded; for a `references` answer, SHALL state the totals of its unresolved-call and unconfirmed-use groups; and SHALL state that calls made by frameworks, implicit calls such as constructors and operators, and lookups by string are not seen.
+Its human rendering SHALL state that no resolved instance was recorded, or for a `tests` answer that no convention-classified test reference was found; for a `references` answer, SHALL state the totals of its unresolved-call and unconfirmed-use groups; and SHALL state that calls made by frameworks, implicit calls such as constructors and operators, and lookups by string are not seen.
 The empty answers of `containers`, `contains`, and `implementers`, and an `impact` answer whose change touches no indexed symbol, are outside this requirement: each states a fact the syntax tree establishes.
 
 Serves: empty-answers-claim-no-proof
@@ -170,6 +170,12 @@ Serves: empty-answers-claim-no-proof
 - **GIVEN** an indexed module that no indexed module imports
 - **WHEN** `trace` is invoked for it over the `importers` relation and the answer is rendered for a human
 - **THEN** the rendering states that no resolved importer was recorded and does not call the result definite
+
+#### Scenario: An empty tests answer states what it cannot see
+
+- **GIVEN** an indexed function referenced only from production code
+- **WHEN** `trace` is invoked for it over the `tests` relation and the answer is rendered for a human
+- **THEN** the rendering states that no convention-classified test reference was found and that calls by frameworks, implicit calls, and lookups by string are not seen, and does not call the result definite
 
 #### Scenario: An impact answer with no dependents states what it cannot see
 

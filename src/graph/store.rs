@@ -253,12 +253,20 @@ pub struct OccurrenceRow {
     pub locality: Option<String>,
 }
 
-/// The maximum number of `found_text` bytes persisted per discrepancy row.
+/// The maximum number of characters stored of a quoted source text: a call's receiver and a refused
+/// occurrence's found text.
 ///
-/// A provisional design constant: name tokens are far shorter than this, and the equality check that
-/// classifies the outcome runs on the full bytes before truncation, so classification is unaffected.
-/// Superseded when the interface-layer pagination change defines the real bounded-output model.
-pub const FOUND_TEXT_MAX_BYTES: usize = 120;
+/// The join classifies an occurrence on the full text before it is cut, so the bound never changes
+/// an outcome.
+pub const QUOTED_TEXT_MAX_CHARS: usize = 200;
+
+/// Cut `text` to its first [`QUOTED_TEXT_MAX_CHARS`] characters; the flag is set when it was cut.
+pub fn shorten_quoted_text(text: &str) -> (String, bool) {
+    match text.char_indices().nth(QUOTED_TEXT_MAX_CHARS) {
+        Some((end, _)) => (text[..end].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
 
 /// The maximum number of groups the default discrepancy summary displays.
 ///
@@ -319,8 +327,41 @@ pub struct DiscrepancyRow {
     pub outcome: String,
     /// The expected name token.
     pub expected_name: String,
-    /// The source text found at the location, truncated to [`FOUND_TEXT_MAX_BYTES`], if any.
+    /// The source text found at the location, cut to [`QUOTED_TEXT_MAX_CHARS`], if any.
     pub found_text: Option<String>,
+    /// Whether `found_text` was cut at [`QUOTED_TEXT_MAX_CHARS`].
+    pub found_text_shortened: bool,
+}
+
+/// A call whose called name no semantic occurrence covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedCallRow {
+    /// The document the call sits in.
+    pub document_path: String,
+    /// The called name.
+    pub name: String,
+    /// The byte span of the called name.
+    pub span: (usize, usize),
+    /// The line and column of `span`.
+    pub line_column: Option<LineColumnSpan>,
+    /// The receiver's source text as written, cut to [`QUOTED_TEXT_MAX_CHARS`]; `None` for a call
+    /// with no receiver.
+    pub receiver: Option<String>,
+    /// Whether `receiver` was cut.
+    pub receiver_shortened: bool,
+    /// The nearest enclosing persisted declaration, else the document's module.
+    pub enclosing_id: Option<CanonicalId>,
+}
+
+/// A refused reference occurrence that may denote a symbol: its discrepancy detail plus, for a
+/// duplicate-ambiguous one, every symbol it may denote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnconfirmedUseRow {
+    /// The refused occurrence's discrepancy detail.
+    pub discrepancy: DiscrepancyRow,
+    /// Every symbol a duplicate-ambiguous occurrence may denote, in canonical-identity order; empty
+    /// for any other outcome.
+    pub candidates: Vec<CanonicalId>,
 }
 
 /// One group in the bounded discrepancy summary: an `(outcome, expected_name)` key with its count,
@@ -850,15 +891,17 @@ impl GraphStore {
         self.conn.unchecked_transaction()
     }
 
-    /// Delete every derived row — occurrences, edges, discrepancies, then symbols — so the running
-    /// build wholly supersedes the prior one.
+    /// Delete every derived row — occurrences, edges, unresolved calls, discrepancies and their symbol
+    /// links, then symbols — so the running build wholly supersedes the prior one.
     ///
-    /// Children first: `occurrences` and `edges` carry foreign keys into `symbols`. Meant to run
-    /// inside [`Self::begin_build`]'s transaction; `index_metadata` is not touched (its single row is
-    /// replaced by [`Self::write_metadata`]).
+    /// Children first: `occurrences`, `edges`, `unresolved_calls`, and `discrepancy_symbols` carry
+    /// foreign keys into `symbols`. Meant to run inside [`Self::begin_build`]'s transaction;
+    /// `index_metadata` is not touched (its single row is replaced by [`Self::write_metadata`]).
     pub fn clear_derived(&self) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM occurrences", [])?;
         self.conn.execute("DELETE FROM edges", [])?;
+        self.conn.execute("DELETE FROM unresolved_calls", [])?;
+        self.conn.execute("DELETE FROM discrepancy_symbols", [])?;
         self.conn.execute("DELETE FROM join_discrepancies", [])?;
         self.conn.execute("DELETE FROM semantic_lexical", [])?;
         self.conn.execute("DELETE FROM semantic_vectors", [])?;
@@ -1435,17 +1478,17 @@ impl GraphStore {
     ///
     /// The prior build's rows are removed by [`Self::clear_derived`], and atomicity — a reader sees
     /// either the old build's set or the new one, never a mix — comes from the surrounding
-    /// [`Self::begin_build`] transaction. Each `found_text` is truncated to
-    /// [`FOUND_TEXT_MAX_BYTES`] on a UTF-8 boundary before persistence.
-    pub fn insert_discrepancies(&self, rows: &[DiscrepancyRow]) -> rusqlite::Result<()> {
+    /// [`Self::begin_build`] transaction. Each `found_text` must already be cut to its bound. Returns
+    /// each row's id, in the order of `rows`, for [`Self::insert_discrepancy_symbols`].
+    pub fn insert_discrepancies(&self, rows: &[DiscrepancyRow]) -> rusqlite::Result<Vec<i64>> {
         let mut stmt = self.conn.prepare(
             "INSERT INTO join_discrepancies
-                (document_path, span_start, span_end, outcome, expected_name, found_text,
+                (document_path, span_start, span_end, outcome, expected_name, found_text, found_text_shortened,
                  start_line, start_column, end_line, end_column)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
+        let mut ids = Vec::with_capacity(rows.len());
         for row in rows {
-            let found = row.found_text.as_deref().map(truncate_on_boundary);
             let [start_line, start_column, end_line, end_column] = line_column_values(row.line_column);
             stmt.execute(params![
                 row.document_path,
@@ -1453,7 +1496,48 @@ impl GraphStore {
                 row.span.map(|s| s.1 as i64),
                 row.outcome,
                 row.expected_name,
-                found,
+                row.found_text,
+                row.found_text_shortened,
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+            ])?;
+            ids.push(self.conn.last_insert_rowid());
+        }
+        Ok(ids)
+    }
+
+    /// Link discrepancy rows (by the ids [`Self::insert_discrepancies`] returned) to the symbols
+    /// their refused occurrences may denote.
+    pub fn insert_discrepancy_symbols(&self, links: &[(i64, CanonicalId)]) -> rusqlite::Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("INSERT INTO discrepancy_symbols (discrepancy_id, symbol_id) VALUES (?1, ?2)")?;
+        for (discrepancy_id, symbol) in links {
+            stmt.execute(params![discrepancy_id, symbol.as_str()])?;
+        }
+        Ok(())
+    }
+
+    /// Insert the build's unresolved-call rows. The receiver text must already be cut to its bound.
+    pub fn insert_unresolved_calls(&self, rows: &[UnresolvedCallRow]) -> rusqlite::Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO unresolved_calls
+                (document_path, name, span_start, span_end, receiver, receiver_shortened, enclosing_id,
+                 start_line, start_column, end_line, end_column)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
+        for row in rows {
+            let [start_line, start_column, end_line, end_column] = line_column_values(row.line_column);
+            stmt.execute(params![
+                row.document_path,
+                row.name,
+                row.span.0 as i64,
+                row.span.1 as i64,
+                row.receiver,
+                row.receiver_shortened,
+                row.enclosing_id.as_ref().map(CanonicalId::as_str),
                 start_line,
                 start_column,
                 end_line,
@@ -1461,6 +1545,66 @@ impl GraphStore {
             ])?;
         }
         Ok(())
+    }
+
+    /// Every unresolved call to `name`, ordered by document path, then start offset.
+    pub fn unresolved_calls_named(&self, name: &str) -> rusqlite::Result<Vec<UnresolvedCallRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT document_path, name, span_start, span_end, receiver, receiver_shortened, enclosing_id,
+                    start_line, start_column, end_line, end_column
+             FROM unresolved_calls WHERE name = ?1
+             ORDER BY document_path, span_start, span_end, id",
+        )?;
+        let rows = stmt.query_map(params![name], |r| {
+            Ok(UnresolvedCallRow {
+                document_path: r.get(0)?,
+                name: r.get(1)?,
+                span: (r.get::<_, i64>(2)? as usize, r.get::<_, i64>(3)? as usize),
+                line_column: read_line_column(r, 7)?,
+                receiver: r.get(4)?,
+                receiver_shortened: r.get(5)?,
+                enclosing_id: r.get::<_, Option<String>>(6)?.map(CanonicalId::from_raw),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Every refused reference occurrence that may denote `symbol`, ordered by document path, then
+    /// start offset, with location-less ones last within their document, ordered by outcome kind and
+    /// expected name.
+    pub fn unconfirmed_uses_of(&self, symbol: &CanonicalId) -> rusqlite::Result<Vec<UnconfirmedUseRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.document_path, d.span_start, d.span_end, d.outcome, d.expected_name, d.found_text,
+                    d.start_line, d.start_column, d.end_line, d.end_column, d.found_text_shortened, d.id
+             FROM discrepancy_symbols s JOIN join_discrepancies d ON d.id = s.discrepancy_id
+             WHERE s.symbol_id = ?1
+             ORDER BY d.document_path, d.span_start IS NULL, d.span_start, d.span_end,
+                      d.outcome, d.expected_name, d.id",
+        )?;
+        let mut candidates_stmt = self
+            .conn
+            .prepare("SELECT symbol_id FROM discrepancy_symbols WHERE discrepancy_id = ?1 ORDER BY symbol_id")?;
+        let found: Vec<(DiscrepancyRow, i64)> = stmt
+            .query_map(params![symbol.as_str()], |r| {
+                Ok((Self::map_discrepancy(r)?, r.get(11)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        found
+            .into_iter()
+            .map(|(discrepancy, id)| {
+                let candidates = if discrepancy.outcome == "duplicate_ambiguous" {
+                    candidates_stmt
+                        .query_map(params![id], |r| Ok(CanonicalId::from_raw(r.get::<_, String>(0)?)))?
+                        .collect::<rusqlite::Result<_>>()?
+                } else {
+                    Vec::new()
+                };
+                Ok(UnconfirmedUseRow {
+                    discrepancy,
+                    candidates,
+                })
+            })
+            .collect()
     }
 
     /// The bounded discrepancy summary: groups by `(outcome, expected_name)` ordered by descending
@@ -1489,7 +1633,7 @@ impl GraphStore {
         // typed-absence span appears only when the whole group lacks locations.
         let mut exemplar_stmt = self.conn.prepare(
             "SELECT document_path, span_start, span_end, outcome, expected_name, found_text,
-                    start_line, start_column, end_line, end_column
+                    start_line, start_column, end_line, end_column, found_text_shortened
              FROM join_discrepancies
              WHERE outcome = ?1 AND expected_name = ?2
              ORDER BY span_start IS NULL, document_path, span_start, span_end
@@ -1528,7 +1672,7 @@ impl GraphStore {
     pub fn all_discrepancies(&self) -> rusqlite::Result<Vec<DiscrepancyRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT document_path, span_start, span_end, outcome, expected_name, found_text,
-                    start_line, start_column, end_line, end_column
+                    start_line, start_column, end_line, end_column, found_text_shortened
              FROM join_discrepancies
              ORDER BY document_path, span_start, span_end, outcome, expected_name",
         )?;
@@ -1550,6 +1694,7 @@ impl GraphStore {
             outcome: r.get(3)?,
             expected_name: r.get(4)?,
             found_text: r.get(5)?,
+            found_text_shortened: r.get(10)?,
         })
     }
 
@@ -2362,19 +2507,6 @@ fn read_line_column(r: &rusqlite::Row, first: usize) -> rusqlite::Result<Option<
         }),
         _ => None,
     })
-}
-
-/// Truncate `s` to at most [`FOUND_TEXT_MAX_BYTES`] bytes, cutting on a UTF-8 character boundary so
-/// the persisted text is always valid UTF-8.
-fn truncate_on_boundary(s: &str) -> String {
-    if s.len() <= FOUND_TEXT_MAX_BYTES {
-        return s.to_string();
-    }
-    let mut end = FOUND_TEXT_MAX_BYTES;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
 }
 
 /// Up to two distinct walk roots (seed indices) a traversal node carries, in arrival order.

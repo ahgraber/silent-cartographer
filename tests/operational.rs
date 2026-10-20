@@ -231,6 +231,7 @@ fn build_n_discrepancy_groups_in(language: Language, n: usize) -> (tempfile::Tem
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     };
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
@@ -901,6 +902,7 @@ fn duplicated_group_index() -> ExtractedIndex {
         duplicate_groups: Vec::new(),
         targets: Default::default(),
         environment: None,
+        local_occurrence_ranges: Default::default(),
     }
 }
 
@@ -1925,6 +1927,7 @@ fn a_changed_declared_environment_rebuilds() {
         duplicate_groups: vec![],
         targets: Default::default(),
         environment: Some(environment_facts(&canonical_venv).unwrap()),
+        local_occurrence_ranges: Default::default(),
     };
     let db = dir.path().join("index.db");
     let collected = collect_python_sources(dir.path()).unwrap();

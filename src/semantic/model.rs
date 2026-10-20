@@ -4,6 +4,8 @@
 //! non-SCIP backend produces comparable data. The Rust adapter translates `rust-analyzer`'s SCIP
 //! output into this model.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{Descriptor, SegmentKind};
@@ -270,6 +272,11 @@ pub struct ExtractedIndex {
     /// Declared by the Python adapter; `None` for backends without an environment dependency (Rust).
     #[serde(default)]
     pub environment: Option<EnvironmentFacts>,
+    /// Source ranges of occurrences with no usable symbol identity (local symbols and symbol strings
+    /// that do not parse), keyed by document path. They carry no identity or role and are never
+    /// joined or persisted.
+    #[serde(default)]
+    pub local_occurrence_ranges: BTreeMap<String, Vec<SourceRange>>,
 }
 
 impl ExtractedIndex {
@@ -348,6 +355,7 @@ pub fn normalize(index: ExtractedIndex) -> ExtractedIndex {
         duplicate_groups,
         targets: index.targets,
         environment: index.environment,
+        local_occurrence_ranges: index.local_occurrence_ranges,
     }
 }
 
@@ -408,6 +416,7 @@ mod tests {
             duplicate_groups: Vec::new(),
             targets: Default::default(),
             environment: None,
+            local_occurrence_ranges: Default::default(),
         }
     }
 

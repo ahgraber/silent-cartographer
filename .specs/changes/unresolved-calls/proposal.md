@@ -36,7 +36,7 @@ As an agent or developer auditing a method, I want the `references` answer to li
 
 ### Story: empty-answers-claim-no-proof
 
-As an agent auditing a symbol for removal, I want an empty `references`, `dependents`, `importers`, or `impact` answer to state what c10r cannot see, so that I do not delete a function that a framework or the language calls without naming it.
+As an agent auditing a symbol for removal, I want an empty `references`, `dependents`, `importers`, `tests`, or `impact` answer to state what c10r cannot see, so that I do not delete a function that a framework or the language calls without naming it.
 
 > Ladders to north-star outcome 5 (**Calibrated trust**) and to the principle **Calibration over coverage**.
 > On 2026-10-17, `references` of the Flask view function `blog.index`, registered with `@bp.route("/")`, and of `flask.config.Config.__init__`, which runs whenever an app is created, each reported `a definite empty set`.
@@ -58,7 +58,7 @@ As an agent auditing a symbol for removal, I want an empty `references`, `depend
 - code-navigation: each group lists at most the result limit's number of entries and carries its total, as an ambiguous-reference answer does with its candidates.
   A group is not a paged result set and has no continuation token; a larger `--limit`, or `--limit 0`, lists more.
   Every page of a paged answer carries the same groups, and their entries are not counted in the paging disclosure.
-- code-navigation: no empty answer of `references`, `dependents`, or `importers`, and no `impact` answer whose seeds have no resolved dependent, claims to be a definite empty set.
+- code-navigation: no empty answer of `references`, `dependents`, `importers`, or `tests`, and no `impact` answer whose seeds have no resolved dependent, claims to be a definite empty set.
   An `impact` answer whose change touches no indexed symbol keeps its definite wording, because the syntax tree establishes it.
   Its human rendering states that no resolved instance was recorded, gives the counts of the two groups where the answer has them, and states that calls made by frameworks, implicit calls such as constructors and operators, and lookups by string are not seen.
   The documented meaning of the JSON `empty` outcome for these relations, and the MCP tool descriptions, say the same.
@@ -92,3 +92,9 @@ A query for the references of a symbol reads the recorded calls whose name equal
 
 The store schema version changes, because the build records new data.
 The command-surface version does not change, because no command or flag changes.
+
+## Resolved Questions
+
+- 2026-10-19: An empty `tests` answer follows "Empty answers of reference-derived relations claim no proof", like the other relations built from resolved references.
+  Its human rendering keeps the convention wording and adds what c10r cannot see.
+  Decided by the user after verification found that the rule named three of the four reference-derived relations.
