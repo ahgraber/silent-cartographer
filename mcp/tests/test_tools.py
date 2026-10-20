@@ -153,3 +153,29 @@ async def test_every_tool_carries_a_description(server: FastMCP, tool: str) -> N
         described = {t.name: t.description for t in await connected.list_tools()}
 
     assert described[tool], f"{tool} advertises no description"
+
+
+async def _description(server: FastMCP, tool: str) -> str:
+    async with client(server) as connected:
+        described = {t.name: t.description for t in await connected.list_tools()}
+    return " ".join((described[tool] or "").split())
+
+
+async def test_trace_description_scopes_an_empty_answer_to_resolved_instances(server: FastMCP) -> None:
+    """The reference-derived relations never advertise a definite none."""
+    description = await _description(server, "trace")
+
+    start = description.index("An empty answer of `references`")
+    claim = description[start : description.index("are not seen", start)]
+    assert "no resolved instance was recorded" in claim, claim
+    assert "`tests`" in claim, claim
+    assert "definite" not in claim, claim
+    assert "complete" not in claim, claim
+
+
+async def test_impact_description_scopes_an_empty_answer_to_resolved_instances(server: FastMCP) -> None:
+    description = await _description(server, "impact")
+
+    assert "no resolved dependent was recorded" in description, description
+    assert "definite" not in description, description
+    assert "complete" not in description, description

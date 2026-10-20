@@ -309,8 +309,12 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
         The structural question tool. Use `dependents` before changing a symbol to
         see what could break, `references` to find every mention, `containers` and
         `contains` to orient in unfamiliar code, and `tests` to find what exercises
-        it. A relation the subject stands in no instance of returns typed absence,
-        which is a definite none rather than a failure.
+        it. An empty answer of `containers`, `contains`, or `implementers` is a
+        definite none. An empty answer of `references`, `dependents`, `importers`,
+        or `tests` means only that no resolved instance was recorded: calls by
+        frameworks, implicit calls such as constructors and operators, and lookups
+        by string are not seen. A `references` answer also lists calls with the subject's name
+        that have no resolved target, and uses it could not confirm.
         """
         args = [
             "trace",
@@ -623,7 +627,10 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
         Use this before or during an edit, when you want the blast radius of work
         already in progress rather than of one symbol you name. It reads the diff
         itself and traces the dependents of everything the diff touched. Requires a
-        git worktree; outside one it reports a setup failure.
+        git worktree; outside one it reports a setup failure. Seeds with no dependents
+        mean only that no resolved dependent was recorded: calls by frameworks,
+        implicit calls such as constructors and operators, and lookups by string
+        are not seen.
         """
         args = [
             "impact",
