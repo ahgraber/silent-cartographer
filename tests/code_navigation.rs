@@ -4935,10 +4935,17 @@ fn a_use_ambiguous_between_duplicates_is_disclosed_on_each_duplicate() {
     }
 }
 
-// A use ambiguous between the duplicates of one descriptor is linked to those duplicates only, not
-// to the duplicates of a distinct descriptor that shares its segment names but not its terminal kind.
-#[test]
-fn a_duplicate_use_is_linked_only_to_its_own_descriptor_group() {
+// Where the refused use of the duplicated `f` is recorded in the extracted index.
+enum DuplicateUseHome {
+    // On the duplicate group itself.
+    Group,
+    // On one of the duplicated symbols.
+    Twin,
+}
+
+// Two Term-kind and two Method-kind `f` definitions in separate documents (`t*.rs`, `m*.rs`) plus
+// one Reference occurrence of the Term descriptor in `ref.rs`.
+fn duplicate_f_with_one_use(home: DuplicateUseHome) -> (ExtractedIndex, Vec<(String, String)>) {
     use silent_cartographer::identity::{Descriptor, DescriptorSegment, SegmentKind};
     use silent_cartographer::semantic::model::DuplicateGroup;
 
@@ -4955,7 +4962,12 @@ fn a_duplicate_use_is_linked_only_to_its_own_descriptor_group() {
         .collect();
     sources.push(("ref.rs".to_string(), "fn use_it() { f(); }\n".to_string()));
     let at = sources.last().unwrap().1.find("f()").unwrap() as u32;
-    let symbols = definitions
+    let reference = ExtractedOccurrence {
+        document_path: "ref.rs".to_string(),
+        range: SourceRange::new(0, at, 0, at + 1),
+        role: OccurrenceRole::Reference,
+    };
+    let mut symbols: Vec<ExtractedSymbol> = definitions
         .iter()
         .map(|(doc, kind)| ExtractedSymbol {
             descriptor: Some(descriptor(*kind)),
@@ -4968,6 +4980,16 @@ fn a_duplicate_use_is_linked_only_to_its_own_descriptor_group() {
             }],
         })
         .collect();
+    let duplicate_groups = match home {
+        DuplicateUseHome::Group => vec![DuplicateGroup {
+            descriptor: descriptor(SegmentKind::Term),
+            occurrences: vec![reference],
+        }],
+        DuplicateUseHome::Twin => {
+            symbols[0].occurrences.push(reference);
+            Vec::new()
+        }
+    };
     let index = ExtractedIndex {
         provenance: support::provenance(),
         documents: sources
@@ -4978,41 +5000,71 @@ fn a_duplicate_use_is_linked_only_to_its_own_descriptor_group() {
             })
             .collect(),
         symbols,
-        duplicate_groups: vec![DuplicateGroup {
-            descriptor: descriptor(SegmentKind::Term),
-            occurrences: vec![ExtractedOccurrence {
-                document_path: "ref.rs".to_string(),
-                range: SourceRange::new(0, at, 0, at + 1),
-                role: OccurrenceRole::Reference,
-            }],
-        }],
+        duplicate_groups,
         targets: Default::default(),
         environment: None,
         local_occurrence_ranges: Default::default(),
     };
+    (index, sources)
+}
+
+// Ingests the index and asserts the one refused use is disclosed on each Term definition, with
+// exactly the two Term definitions as candidates, and on no Method definition.
+fn assert_duplicate_use_linked_only_to_term_group(index: &ExtractedIndex, sources: &[(String, String)]) {
     let mut store = GraphStore::open_in_memory().unwrap();
-    ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), index, sources).unwrap();
     let twins = store.symbols_by_shortname("f").unwrap();
     assert_eq!(twins.len(), 4);
+    let is_term = |document_path: &Option<String>| document_path.as_deref().is_some_and(|d| d.starts_with('t'));
+    let mut term_identities: Vec<String> = twins
+        .iter()
+        .filter(|t| is_term(&t.document_path))
+        .map(|t| t.canonical_id.to_string())
+        .collect();
+    term_identities.sort();
+    assert_eq!(term_identities.len(), 2);
 
-    let hash = silent_cartographer::graph::content_hash(&sources);
+    let hash = silent_cartographer::graph::content_hash(sources);
     let engine = QueryEngine::new(&store, index.provenance.clone(), hash, None);
     for twin in &twins {
         let answer = engine
             .trace(twin.canonical_id.as_str(), TraceRelation::References, None, None)
             .unwrap();
         let answer: serde_json::Value = serde_json::from_str(&answer.to_json()).unwrap();
-        let is_term = twin.document_path.as_deref().is_some_and(|d| d.starts_with('t'));
         let uses = &answer["unconfirmed_uses"];
-        if is_term {
+        if is_term(&twin.document_path) {
             assert_eq!(uses["total"], 1, "{}", twin.canonical_id);
             let refused = &uses["uses"][0];
             assert_eq!(refused["reason"], "duplicate_ambiguous");
             assert_eq!(refused["candidates_total"], 2, "{}: {refused}", twin.canonical_id);
+            assert_eq!(
+                refused["candidates"],
+                serde_json::json!(term_identities),
+                "{}: {refused}",
+                twin.canonical_id
+            );
         } else {
             assert_eq!(uses["total"], 0, "{}: {uses}", twin.canonical_id);
         }
     }
+}
+
+// A use ambiguous between the duplicates of one descriptor is linked to those duplicates only, not
+// to the duplicates of a distinct descriptor that shares its segment names but not its terminal kind.
+#[test]
+fn a_duplicate_use_is_linked_only_to_its_own_descriptor_group() {
+    let (index, sources) = duplicate_f_with_one_use(DuplicateUseHome::Group);
+    assert_eq!(index.duplicate_groups.len(), 1);
+    assert_duplicate_use_linked_only_to_term_group(&index, &sources);
+}
+
+// The same linkage holds when the refused use is recorded on one of the duplicated symbols rather
+// than on a duplicate group.
+#[test]
+fn a_duplicate_use_stored_on_a_twin_is_linked_only_to_its_own_descriptor_group() {
+    let (index, sources) = duplicate_f_with_one_use(DuplicateUseHome::Twin);
+    assert!(index.duplicate_groups.is_empty());
+    assert_duplicate_use_linked_only_to_term_group(&index, &sources);
 }
 
 // _(A use ambiguous among many duplicates lists a bounded candidate set)_
