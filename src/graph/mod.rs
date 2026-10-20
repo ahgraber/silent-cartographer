@@ -431,8 +431,9 @@ pub fn ingest_with_params(
     // content and containment to assemble the corpus.
     let mut symbol_rows: Vec<SymbolRow> = Vec::new();
     // The unit-free identity of each duplicated symbol's descriptor, so twins belonging to different
-    // units still group together.
-    let mut duplicate_keys: Vec<(CanonicalId, String)> = Vec::new();
+    // units still group together, with the kind-aware descriptor that keeps descriptors differing only
+    // in a segment kind apart.
+    let mut duplicate_keys: Vec<(CanonicalId, String, String)> = Vec::new();
     // The persisted members of each duplicated descriptor. Unlike the unit-free key, the full
     // descriptor keeps segment kinds, so descriptors differing only in a kind stay separate groups.
     let mut duplicate_members: HashMap<&crate::identity::Descriptor, Vec<CanonicalId>> = HashMap::new();
@@ -476,7 +477,8 @@ pub fn ingest_with_params(
                 .is_some_and(|d| definition_count_by_descriptor.get(d).copied().unwrap_or(0) > 1);
         if duplicated && let Some(descriptor) = &sym.descriptor {
             let key = project_one(workspace, descriptor);
-            duplicate_keys.push((id.clone(), key.as_str().to_string()));
+            let kinded = serde_json::to_string(descriptor).expect("descriptor serializes");
+            duplicate_keys.push((id.clone(), key.as_str().to_string(), kinded));
             duplicate_members.entry(descriptor).or_default().push(id.clone());
         }
         let content = definition_content(sym, id, &def_name_span, &prepared);

@@ -966,6 +966,91 @@ fn duplicated_groups_are_retrievable_with_descriptor_and_definitions() {
     );
 }
 
+// Descriptors that share segment names but differ in a segment kind are distinct descriptors, so
+// their duplicates form separate groups and the group count counts them separately.
+#[test]
+fn descriptors_differing_only_in_segment_kind_are_separate_duplicated_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let definitions = [
+        ("t0.rs", SegmentKind::Term),
+        ("t1.rs", SegmentKind::Term),
+        ("m0.rs", SegmentKind::Method),
+        ("m1.rs", SegmentKind::Method),
+    ];
+    let index = ExtractedIndex {
+        provenance: support::provenance(),
+        documents: definitions
+            .iter()
+            .map(|(path, _)| SourceDocument {
+                path: path.to_string(),
+                encoding: PositionEncoding::Utf8,
+            })
+            .collect(),
+        symbols: definitions
+            .iter()
+            .map(|(path, kind)| ExtractedSymbol {
+                descriptor: Some(Descriptor::new("dupcrate", vec![DescriptorSegment::new("f", *kind)])),
+                kind: SymbolKind::Function,
+                class: SymbolClass::InWorkspace,
+                occurrences: vec![ExtractedOccurrence {
+                    document_path: path.to_string(),
+                    range: SourceRange::new(0, 3, 0, 4),
+                    role: OccurrenceRole::Definition,
+                }],
+            })
+            .collect(),
+        duplicate_groups: Vec::new(),
+        targets: Default::default(),
+        environment: None,
+        local_occurrence_ranges: Default::default(),
+    };
+    let sources: Vec<(String, String)> = definitions
+        .iter()
+        .map(|(path, _)| (path.to_string(), "fn f() {}\n".to_string()))
+        .collect();
+    build_from_index(&db, "op-ws", dir.path(), &index, &sources).unwrap();
+
+    let report = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        &PythonExecutables::default(),
+        true,
+        false,
+        false,
+        true,
+        silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+    assert_eq!(v["duplicated_descriptors"]["group_count"].as_u64(), Some(2), "{report}");
+    let groups = v["duplicated_descriptors"]["groups"].as_array().unwrap();
+    let mut documents: Vec<Vec<&str>> = groups
+        .iter()
+        .map(|g| {
+            let mut docs: Vec<&str> = g["definitions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["document_path"].as_str().unwrap())
+                .collect();
+            docs.sort();
+            docs
+        })
+        .collect();
+    documents.sort();
+    assert_eq!(
+        documents,
+        vec![vec!["m0.rs", "m1.rs"], vec!["t0.rs", "t1.rs"]],
+        "{report}"
+    );
+}
+
 // _(Duplicated descriptors are disclosed — no-duplicates branch)_ — a build with no duplicated
 // descriptor discloses a definite zero group count, distinct from an unavailable answer.
 #[test]

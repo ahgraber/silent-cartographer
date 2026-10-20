@@ -1379,13 +1379,14 @@ impl GraphStore {
     }
 
     /// Record, for each already-inserted duplicated symbol, the key shared by every twin of its
-    /// descriptor: the unit-free identity of the descriptor.
-    pub fn record_duplicate_keys(&self, keys: &[(CanonicalId, String)]) -> rusqlite::Result<()> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("UPDATE symbols SET duplicate_key = ?2 WHERE canonical_id = ?1")?;
-        for (id, key) in keys {
-            stmt.execute(params![id.as_str(), key])?;
+    /// descriptor (the unit-free identity of the descriptor) and the kind-aware serialization of the
+    /// descriptor itself.
+    pub fn record_duplicate_keys(&self, keys: &[(CanonicalId, String, String)]) -> rusqlite::Result<()> {
+        let mut stmt = self.conn.prepare_cached(
+            "UPDATE symbols SET duplicate_key = ?2, duplicate_descriptor = ?3 WHERE canonical_id = ?1",
+        )?;
+        for (id, key, descriptor) in keys {
+            stmt.execute(params![id.as_str(), key, descriptor])?;
         }
         Ok(())
     }
@@ -1828,7 +1829,8 @@ impl GraphStore {
     /// The duplicated-descriptor groups the build encountered: symbols marked `duplicated` at ingest
     /// (true same-descriptor twins, under the two-definition quorum), grouped by the unit-free
     /// identity of their shared descriptor. Twins belonging to different units differ in identity yet
-    /// share that key.
+    /// share that key. Descriptors whose segment names match but whose segment kinds differ share the
+    /// printed key yet form separate groups, ordered by key and then by their kind-aware form.
     ///
     /// The `duplicated` mark is what distinguishes real twins from canonical-projection collisions:
     /// two DISTINCT descriptors whose base projections happen to collide also carry `#<rank>`
@@ -1842,24 +1844,28 @@ impl GraphStore {
             "SELECT canonical_id, display_name, kind, class, document_path, span_start, span_end, span_text,
                     signature_text, interface_text, duplicated, test_rule,
                     start_line, start_column, end_line, end_column,
-                    header_end, header_end_line, header_end_column, duplicate_key
+                    header_end, header_end_line, header_end_column, duplicate_key, duplicate_descriptor
              FROM symbols
              WHERE class = 'in_workspace' AND duplicated = 1 AND duplicate_key IS NOT NULL
+               AND duplicate_descriptor IS NOT NULL
              ORDER BY canonical_id",
         )?;
-        let rows: Vec<(String, SymbolRow)> = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(19)?, Self::map_symbol(r)?)))?
+        let rows: Vec<((String, String), SymbolRow)> = stmt
+            .query_map([], |r| {
+                Ok(((r.get::<_, String>(19)?, r.get::<_, String>(20)?), Self::map_symbol(r)?))
+            })?
             .collect::<rusqlite::Result<_>>()?;
 
-        let mut by_base: std::collections::BTreeMap<String, Vec<SymbolRow>> = std::collections::BTreeMap::new();
+        let mut by_descriptor: std::collections::BTreeMap<(String, String), Vec<SymbolRow>> =
+            std::collections::BTreeMap::new();
         for (key, row) in rows {
-            by_base.entry(key).or_default().push(row);
+            by_descriptor.entry(key).or_default().push(row);
         }
 
-        Ok(by_base
+        Ok(by_descriptor
             .into_iter()
             .filter(|(_, members)| members.len() > 1)
-            .map(|(descriptor_base, definitions)| DuplicatedGroup {
+            .map(|((descriptor_base, _), definitions)| DuplicatedGroup {
                 descriptor_base,
                 definitions,
             })

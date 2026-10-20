@@ -24,7 +24,8 @@
 /// per-rule read/write edit — it does not spare it the version bump.
 ///
 /// Migration: version 20 adds `unresolved_calls` (calls whose called name no semantic occurrence
-/// covers) and `discrepancy_symbols` (the symbols a refused reference occurrence may denote);
+/// covers), `discrepancy_symbols` (the symbols a refused reference occurrence may denote), and
+/// `symbols.duplicate_descriptor` (the kind-aware descriptor duplicated twins group on);
 /// version 19 changes the stored identity form: a Rust declaration outside the package's
 /// library carries a unit marker after the package (`package+bin.tool`, `package+shared`), a
 /// Python module path is one segment per dotted component, and a Python package initializer has no
@@ -121,6 +122,8 @@ CREATE TABLE IF NOT EXISTS source_files (
 -- `duplicate_key` is the identity of the shared descriptor without unit marker or disambiguator,
 -- identical for every twin of that descriptor (including twins belonging to different units); NULL for a
 -- symbol that is not duplicated.
+-- `duplicate_descriptor` is the JSON serialization of that descriptor with its segment kinds, which
+-- `duplicate_key` omits; twins group on it so descriptors differing only in a kind stay separate.
 -- `start_line`, `start_column`, `end_line`, and `end_column` locate the span in lines and columns
 -- from 1 (lines end at LF, CRLF, or a lone CR; columns count characters; the end is exclusive); they
 -- are NULL exactly when the span is. `occurrences` and `join_discrepancies` carry the same four.
@@ -164,7 +167,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     interface_text   TEXT,
     duplicated       INTEGER NOT NULL DEFAULT 0,
     duplicate_key    TEXT,
-    test_rule        TEXT,
+    duplicate_descriptor TEXT,
+    test_rule       TEXT,
     clone_formatting_key    TEXT,
     clone_substitution_key  TEXT,
     clone_token_count       INTEGER

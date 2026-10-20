@@ -127,3 +127,10 @@
 - [x] Update the `Answer::empty` docstring in [src/query/output.rs](../../../src/query/output.rs), and the `exact` row in [docs/commands/impact.md](../../../docs/commands/impact.md) so it does not read as a completeness claim.
 - [x] Add `tests` to the empty-answer section of `docs/commands/trace.md`, and to the `trace` help text and MCP `trace` description if they list the relations whose empty answer means no resolved instance recorded.
 - [x] Run the full Rust suite, the MCP suite, and the hooks.
+
+## Review remediation
+
+- [x] Link a duplicate-ambiguous refusal only to the definitions of its own full descriptor, and test it with two duplicated descriptors that differ only in segment kind, for a use stored on the duplicate group and for a use stored on one of the twins.
+- [x] Group the duplicated-descriptor disclosure of `status` by the full descriptor, and test that two such descriptors are reported as two groups.
+- [x] Describe `references` in the MCP `trace` description and the README as resolved reference sites plus unresolved calls, not every mention.
+- [x] Run the full Rust suite, the MCP suite, and the hooks.

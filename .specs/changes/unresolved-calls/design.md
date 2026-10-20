@@ -143,6 +143,18 @@ An index on the symbol column serves the query.
 **Rationale:** The join already holds each refused occurrence's symbol and role in `UnalignedOccurrence`, and the build already knows each duplicate group, so the rows cost one insert per link.
 A separate link table keeps `join_discrepancies` unchanged for its existing readers.
 
+### Decision: Duplicate groups are keyed by the full descriptor
+
+**Chosen:** A duplicate group is the set of definitions that share one full descriptor, segment kinds included.
+The join records that descriptor on each duplicate-ambiguous refusal, and the links of the previous decision go to the persisted definitions of exactly that descriptor.
+The build also stores, for each duplicated symbol, a kind-aware serialization of its descriptor in `symbols.duplicate_descriptor`, and the duplicated-descriptor disclosure of `status` groups by it.
+The printed `descriptor_base` is unchanged, so two groups whose descriptors differ only in a segment kind print the same base and list their definitions separately.
+
+**Rationale:** The unit-free key that grouped duplicates before is built from segment names only.
+Two descriptors such as a term `f` and a method `f`, each defined twice, shared one key, so a refused use of one was disclosed on the other's definitions, and `status` reported one group of four instead of two groups of two.
+An external review found the first case on 2026-10-20; the user decided on 2026-10-20 to fix both in this change.
+The new column is part of schema version 20, which this change introduces.
+
 ### Decision: The unconfirmed-use group is a second answer field
 
 **Chosen:** `Answer` gains a field `unconfirmed_uses`, present exactly when `unresolved_calls` is present:
