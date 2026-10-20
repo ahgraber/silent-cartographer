@@ -125,22 +125,22 @@ See [naming a symbol](docs/commands/common.md#naming-a-symbol) for the grammar a
 
 ## Commands
 
-| Command                                       | Question it answers                                                                                             |
-| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| [`get`](docs/commands/get.md)                 | What is this symbol — its location, signature, interface, or body?                                              |
-| [`trace`](docs/commands/trace.md)             | What stands in a relation to it — containers, contents, references, importers, implementers, dependents, tests? |
-| [`find`](docs/commands/find.md)               | Which symbols have this fragment in their name?                                                                 |
-| [`search`](docs/commands/search.md)           | Which code matches this natural-language description?                                                           |
-| [`similar`](docs/commands/similar.md)         | Which code is most similar to this symbol, and is any of it a clone?                                            |
-| [`clones`](docs/commands/clones.md)           | Which symbols are token-for-token copies of one another, corpus-wide or of this symbol?                         |
-| [`impact`](docs/commands/impact.md)           | What could this git diff break?                                                                                 |
-| [`build`](docs/commands/build.md)             | (Re)index the workspace.                                                                                        |
-| [`status`](docs/commands/status.md)           | What does the index know, and how well did indexing align?                                                      |
-| [`doctor`](docs/commands/doctor.md)           | Are the language indexers installed and responsive?                                                             |
-| [`cache`](docs/commands/cache.md)             | Where is the stored index, how much disk does it use, and remove it.                                            |
-| [`hooks`](docs/commands/hooks.md)             | Install the repository hooks that keep the index tracking the checked-out commit.                               |
-| [`manifest`](docs/commands/manifest.md)       | Print the machine-readable command surface and index state.                                                     |
-| [`completions`](docs/commands/completions.md) | Print a shell completion script.                                                                                |
+| Command                                       | Question it answers                                                                                                                                          |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`get`](docs/commands/get.md)                 | What is this symbol — its location, signature, interface, or body?                                                                                           |
+| [`trace`](docs/commands/trace.md)             | What stands in a relation to it — containers, contents, references (with unresolved calls and unconfirmed uses), importers, implementers, dependents, tests? |
+| [`find`](docs/commands/find.md)               | Which symbols have this fragment in their name?                                                                                                              |
+| [`search`](docs/commands/search.md)           | Which code matches this natural-language description?                                                                                                        |
+| [`similar`](docs/commands/similar.md)         | Which code is most similar to this symbol, and is any of it a clone?                                                                                         |
+| [`clones`](docs/commands/clones.md)           | Which symbols are token-for-token copies of one another, corpus-wide or of this symbol?                                                                      |
+| [`impact`](docs/commands/impact.md)           | What could this git diff break?                                                                                                                              |
+| [`build`](docs/commands/build.md)             | (Re)index the workspace.                                                                                                                                     |
+| [`status`](docs/commands/status.md)           | What does the index know, and how well did indexing align?                                                                                                   |
+| [`doctor`](docs/commands/doctor.md)           | Are the language indexers installed and responsive?                                                                                                          |
+| [`cache`](docs/commands/cache.md)             | Where is the stored index, how much disk does it use, and remove it.                                                                                         |
+| [`hooks`](docs/commands/hooks.md)             | Install the repository hooks that keep the index tracking the checked-out commit.                                                                            |
+| [`manifest`](docs/commands/manifest.md)       | Print the machine-readable command surface and index state.                                                                                                  |
+| [`completions`](docs/commands/completions.md) | Print a shell completion script.                                                                                                                             |
 
 The shared flags, the symbol reference forms, and the index store are documented in [common](docs/commands/common.md).
 
