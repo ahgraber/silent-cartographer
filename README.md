@@ -94,7 +94,7 @@ c10r hooks install
 c10r find retry
 # a symbol's source
 c10r get with_backoff --detail body
-# every reference site
+# resolved reference sites, plus unresolved calls with the same name
 c10r trace with_backoff --relation references
 # what could break if it changes
 c10r trace with_backoff --relation dependents

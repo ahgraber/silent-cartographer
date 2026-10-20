@@ -307,9 +307,9 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
         """Return the symbols standing in a named relation to a subject.
 
         The structural question tool. Use `dependents` before changing a symbol to
-        see what could break, `references` to find every mention, `containers` and
-        `contains` to orient in unfamiliar code, and `tests` to find what exercises
-        it. An empty answer of `containers`, `contains`, or `implementers` is a
+        see what could break, `references` to find resolved references and the
+        unresolved calls that share the name, `containers` and `contains` to orient
+        in unfamiliar code, and `tests` to find what exercises it. An empty answer of `containers`, `contains`, or `implementers` is a
         definite none. An empty answer of `references`, `dependents`, `importers`,
         or `tests` means only that no resolved instance was recorded: calls by
         frameworks, implicit calls such as constructors and operators, and lookups
