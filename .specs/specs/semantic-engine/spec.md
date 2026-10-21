@@ -10,6 +10,7 @@ The contract is the intersection every backend must satisfy; capabilities only s
 ### Requirement: Mandatory extraction contract
 
 The system SHALL define a backend contract — the intersection every semantic backend must satisfy — under which a backend, given a project, produces the project's symbols with their resolved canonical descriptors and the occurrences of each symbol, where every occurrence is classified by role (at minimum, definition versus reference) and carries a source range that maps unambiguously to a file position.
+Under the same contract, a backend SHALL also produce, for each document, the source range of every occurrence of a symbol local to that document, such as a parameter, a local variable, or a closure binding, without a symbol identity; these ranges SHALL NOT become persisted symbols or occurrences.
 A backend SHALL be usable through this contract if and only if it satisfies the contract in full, verified by a backend conformance suite that every shipped adapter passes — the Rust adapter (`rust-analyzer scip` with `tree-sitter-rust`) as the founding exemplar, the Python adapter (`scip-python` with `tree-sitter-python`) as the second conforming implementation, and the ty-scip Python adapter (`ty-scip` with `tree-sitter-python`) as the third.
 
 #### Scenario: Definition occurrence extracted
@@ -35,6 +36,12 @@ A backend SHALL be usable through this contract if and only if it satisfies the 
 - **GIVEN** a Python project where a symbol is used in a different module than the one defining it
 - **WHEN** the project is indexed through the backend contract
 - **THEN** a reference-role occurrence for that symbol is produced with a range that maps to the use site
+
+#### Scenario: Local occurrence ranges extracted
+
+- **GIVEN** a Python function that assigns a function to a local variable and calls it as `helper()`, and a Rust function that calls its closure parameter as `callback()`
+- **WHEN** each project is indexed through the backend contract, the Python project once through each Python adapter
+- **THEN** the range of the `helper` token and of the `callback` token is reported as a local occurrence range of its document, and no persisted symbol or occurrence is created for it
 
 #### Scenario: Each Python adapter passes the conformance suite
 
