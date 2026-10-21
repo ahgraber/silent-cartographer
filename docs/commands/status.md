@@ -20,6 +20,8 @@ c10r status --duplicates
 | `--cursor <TOKEN>` | none    | With `--detail`, resume a truncated file list from its continuation token                                                                            |
 
 The duplicated-descriptor group count is always in the summary; `--duplicates` adds the groups themselves.
+Each listed definition carries its symbol kind.
+Two descriptors whose names match but whose kinds differ, such as a constant `f` and a method `f` each defined twice, are separate groups that print the same descriptor; the kinds tell them apart.
 
 See [common flags](common.md#shared-flags) for `--db`, `--workspace`, `--json`, `--color`, and `--position`.
 

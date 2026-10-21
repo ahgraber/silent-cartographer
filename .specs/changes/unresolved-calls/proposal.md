@@ -52,6 +52,7 @@ As an agent auditing a symbol for removal, I want an empty `references`, `depend
   This covers every call form that has a name: attribute and plain calls in Python, and method, path, and plain calls in Rust.
   Receiver text longer than a fixed bound is shortened, and the shortening is marked.
 - code-graph: the build records, for each reference occurrence the join refused, the persisted symbols it may denote: the duplicates it could not choose between, or the one symbol whose position did not match the source text.
+- code-graph: a duplicate group holds only definitions whose descriptors match in every segment's name and kind, and the duplicate listing shows each definition's symbol kind.
 - code-navigation: the `references` answer carries the unresolved calls as a separate, labeled group of calls that share the subject's name and have no resolved target.
   Each call carries its receiver text, so a caller can tell `client.get` from `cache.get` without a new grouping.
 - code-navigation: the `references` answer carries, as a second labeled group, the refused uses that may denote the subject, each with the reason it was refused: the other definitions it could mean, or the source text found at its position.
@@ -98,3 +99,6 @@ The command-surface version does not change, because no command or flag changes.
 - 2026-10-19: An empty `tests` answer follows "Empty answers of reference-derived relations claim no proof", like the other relations built from resolved references.
   Its human rendering keeps the convention wording and adds what c10r cannot see.
   Decided by the user after verification found that the rule named three of the four reference-derived relations.
+- 2026-10-20: Duplicate groups are keyed by the full descriptor, segment kinds included, and the duplicate listing shows each definition's symbol kind.
+  An external review found that descriptors differing only in kind were merged, so a refused use was disclosed on the wrong symbol.
+  Decided by the user, who chose to fix the refused-use links and the `status` listing in this change.

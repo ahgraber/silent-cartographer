@@ -1164,6 +1164,7 @@ pub fn run_status(
                                 serde_json::json!({
                                     "canonical_id": d.canonical_id.as_str(),
                                     "display_name": d.display_name,
+                                    "kind": d.kind,
                                     "document_path": d.document_path,
                                 })
                             })
@@ -1319,9 +1320,10 @@ fn render_status_report(report: &serde_json::Value, position: PositionUnit) -> S
         lines.push(format!("  {}", status_text(&group["descriptor_base"])));
         for definition in group["definitions"].as_array().into_iter().flatten() {
             lines.push(format!(
-                "    {} ({}) {}",
+                "    {} ({}, {}) {}",
                 status_text(&definition["canonical_id"]),
                 status_text(&definition["display_name"]),
+                status_text(&definition["kind"]),
                 status_text(&definition["document_path"])
             ));
         }

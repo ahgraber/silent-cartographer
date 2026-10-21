@@ -63,6 +63,33 @@ Serves: references-name-what-they-cannot-see
 
 ## MODIFIED Requirements
 
+### Requirement: Duplicated descriptors are disclosed
+
+> Previously: the requirement did not say that a group's definitions share the kind of every descriptor segment, and a listed definition did not carry its symbol kind.
+
+The system SHALL make retrievable, for every build, the duplicated-descriptor groups the build encountered — each group identifying the shared descriptor and the definitions that share it — and the build's summary accounting SHALL disclose the presence of duplicated descriptors alongside the join-outcome counts.
+A group SHALL contain only definitions whose descriptors match in every segment's name and kind, and each listed definition SHALL carry its symbol kind, so that groups that print the same descriptor can be told apart.
+
+Serves: references-name-what-they-cannot-see
+
+#### Scenario: Duplicated groups are retrievable
+
+- **GIVEN** a build over sources containing at least one duplicated descriptor
+- **WHEN** the duplicated-descriptor groups are requested
+- **THEN** each group is returned identifying its shared descriptor and the definitions that share it
+
+#### Scenario: Descriptors that differ only in kind form separate groups
+
+- **GIVEN** a build over sources that define a constant `f` twice and a method `f` twice, in the same module
+- **WHEN** the duplicated-descriptor groups are requested
+- **THEN** two groups are returned, one holding the two constant definitions and one holding the two method definitions, and each listed definition carries its symbol kind
+
+#### Scenario: No duplicates is typed absence
+
+- **GIVEN** a build over sources containing no duplicated descriptors
+- **WHEN** the duplicated-descriptor groups are requested
+- **THEN** a definite empty set is returned, distinct from an unavailable or failed answer
+
 ### Requirement: Join discrepancies are inspectable
 
 > Previously: a persisted discrepancy did not record which persisted symbols the refused occurrence may denote.

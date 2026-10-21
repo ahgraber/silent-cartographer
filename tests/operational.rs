@@ -972,26 +972,27 @@ fn duplicated_groups_are_retrievable_with_descriptor_and_definitions() {
 fn descriptors_differing_only_in_segment_kind_are_separate_duplicated_groups() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("index.db");
+    // Each symbol kind is the one translation derives from the descriptor's last segment.
     let definitions = [
-        ("t0.rs", SegmentKind::Term),
-        ("t1.rs", SegmentKind::Term),
-        ("m0.rs", SegmentKind::Method),
-        ("m1.rs", SegmentKind::Method),
+        ("t0.rs", SegmentKind::Term, SymbolKind::Constant),
+        ("t1.rs", SegmentKind::Term, SymbolKind::Constant),
+        ("m0.rs", SegmentKind::Method, SymbolKind::Function),
+        ("m1.rs", SegmentKind::Method, SymbolKind::Function),
     ];
     let index = ExtractedIndex {
         provenance: support::provenance(),
         documents: definitions
             .iter()
-            .map(|(path, _)| SourceDocument {
+            .map(|(path, _, _)| SourceDocument {
                 path: path.to_string(),
                 encoding: PositionEncoding::Utf8,
             })
             .collect(),
         symbols: definitions
             .iter()
-            .map(|(path, kind)| ExtractedSymbol {
-                descriptor: Some(Descriptor::new("dupcrate", vec![DescriptorSegment::new("f", *kind)])),
-                kind: SymbolKind::Function,
+            .map(|(path, segment, kind)| ExtractedSymbol {
+                descriptor: Some(Descriptor::new("dupcrate", vec![DescriptorSegment::new("f", *segment)])),
+                kind: *kind,
                 class: SymbolClass::InWorkspace,
                 occurrences: vec![ExtractedOccurrence {
                     document_path: path.to_string(),
@@ -1007,7 +1008,7 @@ fn descriptors_differing_only_in_segment_kind_are_separate_duplicated_groups() {
     };
     let sources: Vec<(String, String)> = definitions
         .iter()
-        .map(|(path, _)| (path.to_string(), "fn f() {}\n".to_string()))
+        .map(|(path, _, _)| (path.to_string(), "fn f() {}\n".to_string()))
         .collect();
     build_from_index(&db, "op-ws", dir.path(), &index, &sources).unwrap();
 
@@ -1030,14 +1031,14 @@ fn descriptors_differing_only_in_segment_kind_are_separate_duplicated_groups() {
 
     assert_eq!(v["duplicated_descriptors"]["group_count"].as_u64(), Some(2), "{report}");
     let groups = v["duplicated_descriptors"]["groups"].as_array().unwrap();
-    let mut documents: Vec<Vec<&str>> = groups
+    let mut documents: Vec<Vec<(&str, &str)>> = groups
         .iter()
         .map(|g| {
-            let mut docs: Vec<&str> = g["definitions"]
+            let mut docs: Vec<(&str, &str)> = g["definitions"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|d| d["document_path"].as_str().unwrap())
+                .map(|d| (d["document_path"].as_str().unwrap(), d["kind"].as_str().unwrap()))
                 .collect();
             docs.sort();
             docs
@@ -1046,9 +1047,36 @@ fn descriptors_differing_only_in_segment_kind_are_separate_duplicated_groups() {
     documents.sort();
     assert_eq!(
         documents,
-        vec![vec!["m0.rs", "m1.rs"], vec!["t0.rs", "t1.rs"]],
+        vec![
+            vec![("m0.rs", "function"), ("m1.rs", "function")],
+            vec![("t0.rs", "constant"), ("t1.rs", "constant")],
+        ],
         "{report}"
     );
+
+    let human = run_status(
+        &db,
+        dir.path(),
+        "not-a-real-analyzer",
+        &PythonExecutables::default(),
+        false,
+        false,
+        false,
+        true,
+        silent_cartographer::cli::PositionUnit::Line,
+        None,
+        25,
+        None,
+    )
+    .unwrap();
+    for (document, kind) in [("t0.rs", "constant"), ("m0.rs", "function")] {
+        assert!(
+            human
+                .lines()
+                .any(|line| line.contains(&format!("(f, {kind}) {document}"))),
+            "each listed definition shows its kind: {human}"
+        );
+    }
 }
 
 // _(Duplicated descriptors are disclosed — no-duplicates branch)_ — a build with no duplicated

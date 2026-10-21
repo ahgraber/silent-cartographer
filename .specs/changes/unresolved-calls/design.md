@@ -149,6 +149,8 @@ A separate link table keeps `join_discrepancies` unchanged for its existing read
 The join records that descriptor on each duplicate-ambiguous refusal, and the links of the previous decision go to the persisted definitions of exactly that descriptor.
 The build also stores, for each duplicated symbol, a kind-aware serialization of its descriptor in `symbols.duplicate_descriptor`, and the duplicated-descriptor disclosure of `status` groups by it.
 The printed `descriptor_base` is unchanged, so two groups whose descriptors differ only in a segment kind print the same base and list their definitions separately.
+Each listed definition carries its symbol kind, in the JSON and the human rendering, so such groups can be told apart.
+When the descriptors differ only in the kind of an inner segment, the definitions' symbol kinds can be equal, and the groups still print alike; showing every segment's kind would need a readable descriptor notation, which this change does not add.
 
 **Rationale:** The unit-free key that grouped duplicates before is built from segment names only.
 Two descriptors such as a term `f` and a method `f`, each defined twice, shared one key, so a refused use of one was disclosed on the other's definitions, and `status` reported one group of four instead of two groups of two.
@@ -348,3 +350,5 @@ trace --relation references
   Approved by the user on 2026-10-19.
 - code-navigation, requirement `Empty answers of reference-derived relations claim no proof`: covers `tests`, with its rendering stating that no convention-classified test reference was found; new scenario `An empty tests answer states what it cannot see`.
   Source: user decision on 2026-10-19, after verification found that the requirement named three of the four reference-derived relations.
+- code-graph, requirement `Duplicated descriptors are disclosed` (MODIFIED): a group holds only definitions whose descriptors match in every segment's name and kind, and each listed definition carries its symbol kind; new scenario `Descriptors that differ only in kind form separate groups`.
+  Source: user decision on 2026-10-20, after verification found that the grouping change had no spec record and that the groups could not be told apart.

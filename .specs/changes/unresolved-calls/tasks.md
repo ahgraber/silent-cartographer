@@ -134,3 +134,6 @@
 - [x] Group the duplicated-descriptor disclosure of `status` by the full descriptor, and test that two such descriptors are reported as two groups.
 - [x] Describe `references` in the MCP `trace` description and the README as resolved reference sites plus unresolved calls, not every mention.
 - [x] Run the full Rust suite, the MCP suite, and the hooks.
+- [x] Show each definition's symbol kind in the duplicated-descriptor listing of `status`, in the JSON and the human rendering, and document it in `docs/commands/status.md`.
+- [x] Extend the separate-groups test (`Descriptors that differ only in kind form separate groups`) to assert each definition's kind, through the JSON and the human rendering.
+- [x] Run the full Rust suite, the MCP suite, and the hooks.
