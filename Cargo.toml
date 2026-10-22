@@ -54,6 +54,8 @@ anyhow = "1"
 thiserror = "2"
 # Descriptive process title for host process identification.
 proctitle = "0.1"
+# Free-space and process-liveness probes (`statvfs`, `kill`).
+libc = "0.2"
 
 [build-dependencies]
 # The model-payload fetch/verify script: manifest parsing and checksum verification.

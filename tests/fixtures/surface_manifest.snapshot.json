@@ -1,5 +1,5 @@
 {
-  "surface_version": 14,
+  "surface_version": 15,
   "help": "c10r <command> --help",
   "commands": [
     {
@@ -631,6 +631,11 @@
         },
         {
           "name": "force",
+          "takes_value": false,
+          "global": false
+        },
+        {
+          "name": "yes",
           "takes_value": false,
           "global": false
         },

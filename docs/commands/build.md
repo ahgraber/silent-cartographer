@@ -5,7 +5,8 @@ Build or refresh the index for a workspace.
 ```sh
 c10r build              # index the current directory
 c10r build ../other     # index another workspace root
-c10r build --force      # build regardless of the currency check
+c10r build --force      # replace the stored index with a new one, after confirmation
+c10r build --force --yes  # the same, without the question
 ```
 
 ## Arguments
@@ -16,15 +17,16 @@ c10r build --force      # build regardless of the currency check
 
 ## Options
 
-| Flag                                      | Default                             | Meaning                                                                             |
-| ----------------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------- |
-| `--language <rust\|python>`               | from the project manifest           | Which backend to build with                                                         |
-| `--rust-analyzer <PATH>`                  | `rust-analyzer`                     | Path to the `rust-analyzer` executable                                              |
-| `--python-indexer <ty-scip\|scip-python>` | none                                | Which Python indexer to build with; see [Python indexer](#python-indexer)           |
-| `--environment <PATH>`                    | `$VIRTUAL_ENV`, then `.venv`/`venv` | An explicit interpreter environment; meaningful for the Python backend              |
-| `--force`                                 | off                                 | Build even when the stored index already describes the workspace                    |
-| `--chunk-size <TOKENS>`                   | `512`                               | Bound on the whole text embedded per chunk, the passage header included             |
-| `--chunk-overlap <TOKENS>`                | `64`                                | Overlap between adjacent chunks of one passage; must be smaller than the chunk size |
+| Flag                                      | Default                             | Meaning                                                                                                   |
+| ----------------------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `--language <rust\|python>`               | from the project manifest           | Which backend to build with                                                                               |
+| `--rust-analyzer <PATH>`                  | `rust-analyzer`                     | Path to the `rust-analyzer` executable                                                                    |
+| `--python-indexer <ty-scip\|scip-python>` | none                                | Which Python indexer to build with; see [Python indexer](#python-indexer)                                 |
+| `--environment <PATH>`                    | `$VIRTUAL_ENV`, then `.venv`/`venv` | An explicit interpreter environment; meaningful for the Python backend                                    |
+| `--force`                                 | off                                 | Build even when the stored index already describes the workspace; see [Forcing a build](#forcing-a-build) |
+| `--yes`                                   | off                                 | Answer yes to the question `--force` asks; accepted only with `--force`                                   |
+| `--chunk-size <TOKENS>`                   | `512`                               | Bound on the whole text embedded per chunk, the passage header included                                   |
+| `--chunk-overlap <TOKENS>`                | `64`                                | Overlap between adjacent chunks of one passage; must be smaller than the chunk size                       |
 
 With no `--language`, the workspace's manifest decides: `Cargo.toml` selects rust, `pyproject.toml` selects python.
 If both are present, `--language` is required.
@@ -77,6 +79,42 @@ A store built while the list of targets was unavailable is rebuilt by the next b
 
 Anything the check cannot confirm causes a build rather than a skip — an absent index, an older schema version, a store recorded for a different workspace, or unreadable metadata.
 Use `--force` when you distrust the check itself.
+
+## Forcing a build
+
+`--force` skips the currency check and builds the index from scratch.
+It replaces the stored index, so it asks for confirmation first.
+
+- At a terminal, `build` asks `--force replaces the stored index at <path> with a new one built from scratch. Continue? [y/N]` on standard error and reads one line from standard input.
+  The question is asked only when standard input and standard error are both terminals.
+  `y` or `yes`, in any case, continues.
+  An empty answer, any other answer, or end of input is no.
+- `--yes` answers the question in advance.
+  `--yes` without `--force` is a usage error.
+- Without a terminal and without `--yes`, the build exits with the usage-error code and the message names `--yes`.
+- A refresh hook never asks.
+
+A forced build writes the new index to a temporary store beside the old one, `<store>.c10r-tmp-<pid>`, and renames it into place only when the build succeeds.
+A build that fails or is interrupted leaves the old index in place.
+
+Before it analyzes anything, a forced build over an existing index checks that the file system has free space for the second store: at least the size of the existing index plus 10%.
+If there is less, the build exits with the general failure code.
+The message names the bytes needed, the bytes available, and the store path, and suggests removing the index with [`cache clear`](cache.md) and building again.
+No check runs when there is no index to replace.
+
+When the store path is a symbolic link, `--force` keeps the link and replaces the index the link names.
+
+Every build that goes ahead, forced or not, first removes leftover temporary stores in the store's directory.
+A temporary store is removed only when the process named in its file name has exited and the file is recognized as a c10r index store; see [the index store](common.md#the-index-store).
+
+Under `--json`, the answer carries `"replaced_store"`, the path of the replaced index, only when a forced build replaced one.
+It carries `"removed_temporary_stores"`, a list of paths, only when a leftover was removed.
+The human answer prints one line for each:
+
+```text
+replaced the index at .c10r/index.db
+removed a leftover temporary store: .c10r/index.db.c10r-tmp-4242
+```
 
 ## Files that change during a build
 

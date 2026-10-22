@@ -516,6 +516,8 @@ fn clap_tree_matches_the_recorded_flag_vocabulary() {
         "python-indexer",
         // `build`'s override for a store that already describes the workspace.
         "force",
+        // `build`'s confirmation of a forced build without a question.
+        "yes",
         // `build`'s chunk parameters: the bound on each embedded chunk, and the overlap between
         // adjacent chunks of one passage.
         "chunk-size",

@@ -847,6 +847,8 @@ fn build_outcome_renders_distinguish_a_skip_from_a_build() {
         undetermined_units: Default::default(),
         changed_during_build: Vec::new(),
         rebuilt: false,
+        replaced_store: None,
+        removed_temporary_stores: Vec::new(),
     };
     let line = silent_cartographer::commands::build_outcome_line(&skip);
     assert!(line.contains("already current"), "the skip line says so: {line}");
@@ -859,6 +861,8 @@ fn build_outcome_renders_distinguish_a_skip_from_a_build() {
         undetermined_units: Default::default(),
         changed_during_build: Vec::new(),
         rebuilt: true,
+        replaced_store: None,
+        removed_temporary_stores: Vec::new(),
     };
     let line = silent_cartographer::commands::build_outcome_line(&built);
     assert!(
@@ -1218,7 +1222,10 @@ fn python_manifest_selects_python_backend() {
         None,
         None,
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the indexer is absent");
     assert!(
@@ -1246,7 +1253,10 @@ fn two_manifests_without_selection_refuse() {
         None,
         None,
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("two manifests are ambiguous");
     assert!(
@@ -1312,7 +1322,10 @@ fn failed_build_leaves_existing_store_untouched() {
         None,
         None,
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the analyzer is absent");
     assert_eq!(
@@ -1335,7 +1348,10 @@ fn failed_build_leaves_existing_store_untouched() {
         None,
         Some(Language::Python),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the indexer is absent");
     assert_eq!(
@@ -1369,7 +1385,10 @@ fn explicit_environment_refusal_precedes_tool_lookup() {
         Some(missing_env.as_path()),
         None,
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the explicit environment does not exist");
     let message = err.to_string();
@@ -1798,7 +1817,10 @@ fn a_build_over_an_unchanged_workspace_analyzes_nothing() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect("an already-current index is not an error");
 
@@ -1825,7 +1847,10 @@ fn a_changed_chunk_parameter_rebuilds() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect("unchanged parameters remain current");
     assert!(!outcome.rebuilt, "the unchanged-parameter arm skips");
@@ -1840,10 +1865,13 @@ fn a_changed_chunk_parameter_rebuilds() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &ChunkParams {
             chunk_size: 256,
             overlap: 0,
         },
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("a changed chunk size drives the build to analyze, which the stub refuses");
     assert!(
@@ -1879,7 +1907,10 @@ fn a_rust_store_recorded_without_an_inventory_is_not_current() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("an unavailable recorded inventory drives the build to analyze, which the stub refuses");
     assert!(
@@ -1905,7 +1936,10 @@ fn an_explicit_rebuild_analyzes_an_unchanged_workspace() {
         None,
         Some(Language::Rust),
         true,
+        true,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -1936,7 +1970,10 @@ fn corrupt_metadata_in_a_recognized_store_rebuilds() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -1966,7 +2003,10 @@ fn an_edited_source_rebuilds() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -1992,7 +2032,10 @@ fn a_changed_analyzer_version_rebuilds() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -2058,7 +2101,10 @@ fn a_changed_declared_environment_rebuilds() {
         Some(venv.as_path()),
         None,
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect("an unchanged environment is current");
     assert!(!outcome.rebuilt, "the unchanged environment reports the index current");
@@ -2082,7 +2128,10 @@ fn a_changed_declared_environment_rebuilds() {
         Some(venv.as_path()),
         None,
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the stub indexer refuses to analyze");
     assert!(
@@ -2111,7 +2160,10 @@ fn an_absent_index_builds() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -2145,7 +2197,10 @@ fn an_incompatible_store_builds_rather_than_reporting_it_current() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect("an incompatible store is c10r's own to replace, not a refusal");
 
@@ -2225,7 +2280,10 @@ fn a_build_and_the_currency_check_agree_on_an_undecodable_file() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect("the seeded index is current");
 
@@ -2252,7 +2310,10 @@ fn a_store_recorded_for_another_workspace_is_not_current() {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the stub analyzer refuses to analyze");
     assert!(
@@ -2439,7 +2500,14 @@ impl StatusWorkspace {
 
     /// `--json build --force` against this workspace, parsed.
     fn rebuild(&self) -> serde_json::Value {
-        let out = self.run(&["--json", "build", "--language", self.language_flag(), "--force"]);
+        let out = self.run(&[
+            "--json",
+            "build",
+            "--language",
+            self.language_flag(),
+            "--force",
+            "--yes",
+        ]);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         serde_json::from_slice(&out.stdout).unwrap()
     }
@@ -2529,7 +2597,7 @@ fn a_hanging_interpreter_refuses_the_build_and_leaves_the_store_untouched() {
     let before = std::fs::read(&db).unwrap();
     replace_with_hanging_stub(&workspace.dir.path().join(".venv/bin/python"));
 
-    let out = workspace.run(&["build", "--language", "python", "--force"]);
+    let out = workspace.run(&["build", "--language", "python", "--force", "--yes"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_ne!(out.status.code(), Some(0), "the build is refused: {stderr}");
     assert!(
@@ -2550,7 +2618,7 @@ fn an_unresolvable_environment_refuses_the_build_and_leaves_the_store_untouched(
     let before = std::fs::read(&db).unwrap();
     std::fs::remove_dir_all(workspace.dir.path().join(".venv")).unwrap();
 
-    let out = workspace.run(&["build", "--language", "python", "--force"]);
+    let out = workspace.run(&["build", "--language", "python", "--force", "--yes"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_ne!(out.status.code(), Some(0), "the build is refused: {stderr}");
     assert!(
@@ -2644,7 +2712,7 @@ fn assert_build_names_concurrent_edit(name: &str, change: &str, edit: impl Fn(&S
 
         let workspace = StatusWorkspace::build(language);
         workspace.edit_while_building(&edit(&workspace));
-        let human = workspace.run(&["build", "--language", workspace.language_flag(), "--force"]);
+        let human = workspace.run(&["build", "--language", workspace.language_flag(), "--force", "--yes"]);
         assert!(human.status.success(), "{language:?}: the human build succeeds");
         let human = String::from_utf8(human.stdout).unwrap();
         assert!(
@@ -2685,7 +2753,7 @@ fn build_without_concurrent_edits_names_no_file() {
         let answer = workspace.rebuild();
         assert_eq!(answer["rebuilt"], true, "{language:?}: {answer}");
         assert_eq!(answer["changed_during_build"], serde_json::json!([]), "{language:?}");
-        let out = workspace.run(&["build", "--language", workspace.language_flag(), "--force"]);
+        let out = workspace.run(&["build", "--language", workspace.language_flag(), "--force", "--yes"]);
         let human = String::from_utf8(out.stdout).unwrap();
         assert!(!human.contains("during build"), "{language:?}: {human}");
 
@@ -2764,7 +2832,7 @@ fn status_reports_one_build_when_another_commits_during_the_probe() {
         let first = workspace.status(&["--discrepancies", "--all"]);
         let tool_dir = workspace.dir.path().join(".stub-bin");
         let rebuild = format!(
-            "{}'{}' --db '{}' build --language {} --force --workspace second >/dev/null 2>&1\n",
+            "{}'{}' --db '{}' build --language {} --force --yes --workspace second >/dev/null 2>&1\n",
             workspace.shell_write("d", "one"),
             env!("CARGO_BIN_EXE_c10r"),
             workspace.dir.path().join("index.db").display(),
@@ -3098,7 +3166,10 @@ impl PythonWorkspace {
             Some(self.venv.as_path()),
             Some(Language::Python),
             false,
+            false,
             &Default::default(),
+            &|_| false,
+            &silent_cartographer::graph::store::free_bytes,
         )
     }
 
@@ -3233,7 +3304,10 @@ fn the_python_indexer_option_on_a_rust_workspace_is_a_usage_error() {
         None,
         None,
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect_err("the option does not apply to a Rust workspace");
 
@@ -3484,4 +3558,559 @@ fn a_build_whose_target_list_times_out_names_the_package_in_both_answers() {
         human.contains("warning: could not determine the Cargo targets of package libbin"),
         "the human answer carries the warning: {human}"
     );
+}
+
+// Forced builds replace the store whole, ask before they do, and clean up after stopped builds.
+
+/// A Rust workspace holding the fixture source, with a stub analyzer that indexes it to an empty index.
+fn forced_build_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(dir.path(), "Cargo.toml");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join(support::DOC), support::SOURCE).unwrap();
+    let stub = write_indexing_stub(dir.path(), "rust-analyzer", &support::provenance().analyzer_version);
+    (dir, stub)
+}
+
+/// Write a store holding the fixture index's rows for the workspace at `dir`.
+fn seed_store(dir: &Path, db: &Path) {
+    build_from_index(db, "op-ws", dir, &fixture_index_with_targets(dir), &sources()).unwrap();
+}
+
+/// A Rust build of `root` into `db` with the stub `analyzer`.
+fn rust_build(
+    db: &Path,
+    root: &Path,
+    analyzer: &str,
+    force: bool,
+    yes: bool,
+    confirm: &dyn Fn(&str) -> bool,
+    free_bytes: &dyn Fn(&Path) -> std::io::Result<u64>,
+) -> anyhow::Result<BuildOutcome> {
+    run_build(
+        db,
+        Some("op-ws"),
+        root,
+        analyzer,
+        &scip_python_at("scip-python"),
+        None,
+        None,
+        Some(Language::Rust),
+        force,
+        yes,
+        &Default::default(),
+        confirm,
+        free_bytes,
+    )
+}
+
+/// A Rust build with the real free-space reader, never asking.
+fn plain_build(db: &Path, root: &Path, analyzer: &str, force: bool) -> anyhow::Result<BuildOutcome> {
+    rust_build(
+        db,
+        root,
+        analyzer,
+        force,
+        force,
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
+    )
+}
+
+/// The row count of every ordinary table in the store at `db`, by table name.
+fn table_row_counts(db: &Path) -> std::collections::BTreeMap<String, i64> {
+    let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let names: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             AND sql NOT LIKE 'CREATE VIRTUAL%'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    names
+        .into_iter()
+        .map(|name| {
+            let count = conn
+                .query_row(&format!("SELECT count(*) FROM \"{name}\""), [], |row| row.get(0))
+                .unwrap();
+            (name, count)
+        })
+        .collect()
+}
+
+/// The names in `dir` that look like temporary stores.
+fn temporary_stores_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".c10r-tmp-"))
+        .collect()
+}
+
+/// A process id that has exited.
+fn exited_process_id() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+    child.id()
+}
+
+/// Place a recognized store at `<db>.c10r-tmp-<pid>`.
+fn place_temporary_store(db: &Path, pid: u32) -> std::path::PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(format!(".c10r-tmp-{pid}"));
+    let path = std::path::PathBuf::from(name);
+    drop(GraphStore::open_or_replace(&path).unwrap());
+    path
+}
+
+// _(Scenario: A forced build over a current store starts from empty)_ — the seeded store holds rows the
+// stub's empty index does not derive, so rows that survive would show in the counts.
+#[test]
+fn a_forced_build_over_a_current_store_starts_from_empty() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    seed_store(dir.path(), &db);
+    let seeded = table_row_counts(&db);
+
+    let (fresh_dir, fresh_stub) = forced_build_workspace();
+    let fresh_db = fresh_dir.path().join("index.db");
+    let fresh = plain_build(&fresh_db, fresh_dir.path(), fresh_stub.to_str().unwrap(), false).unwrap();
+    assert!(fresh.replaced_store.is_none());
+
+    let outcome = plain_build(&db, dir.path(), stub.to_str().unwrap(), true).unwrap();
+
+    assert!(outcome.rebuilt, "the workspace was analyzed");
+    assert_eq!(outcome.replaced_store.as_deref(), Some(db.as_path()));
+    let rebuilt = table_row_counts(&db);
+    assert_ne!(rebuilt, seeded, "the seeded rows did not survive");
+    assert_eq!(
+        rebuilt,
+        table_row_counts(&fresh_db),
+        "the rows are those of a build from empty"
+    );
+}
+
+// _(Scenario: A forced build over a current store starts from empty — Python)_
+#[test]
+fn a_forced_python_build_over_a_current_store_starts_from_empty() {
+    let ws = PythonWorkspace::new();
+    ws.install(PythonIndexer::ScipPython, "0.6.0");
+    ws.build(None).unwrap();
+    let fresh = PythonWorkspace::new();
+    fresh.install(PythonIndexer::ScipPython, "0.6.0");
+    fresh.build(None).unwrap();
+
+    let outcome = run_build(
+        &ws.db(),
+        Some("op-ws"),
+        ws.dir.path(),
+        "rust-analyzer",
+        &PythonExecutables {
+            ty_scip: &ws.tool(PythonIndexer::TyScip),
+            scip_python: &ws.tool(PythonIndexer::ScipPython),
+        },
+        None,
+        Some(ws.venv.as_path()),
+        Some(Language::Python),
+        true,
+        true,
+        &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
+    )
+    .unwrap();
+
+    assert!(outcome.rebuilt, "the workspace was analyzed");
+    assert_eq!(outcome.replaced_store.as_deref(), Some(ws.db().as_path()));
+    assert_eq!(table_row_counts(&ws.db()), table_row_counts(&fresh.db()));
+}
+
+// _(Scenario: A forced build replaces a store whose tables differ)_
+#[test]
+fn a_forced_build_replaces_a_store_whose_tables_differ() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    seed_store(dir.path(), &db);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("ALTER TABLE index_metadata DROP COLUMN syntax_only_count", [])
+        .unwrap();
+    drop(conn);
+
+    plain_build(&db, dir.path(), stub.to_str().unwrap(), true).unwrap();
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let has_column: bool = conn
+        .query_row(
+            "SELECT count(*) > 0 FROM pragma_table_info('index_metadata') WHERE name = 'syntax_only_count'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(has_column, "the replacement store has the column the binary writes");
+}
+
+// _(Scenario: A forced build with no store creates one)_
+#[test]
+fn a_forced_build_with_no_store_creates_one() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+
+    let outcome = plain_build(&db, dir.path(), stub.to_str().unwrap(), true).unwrap();
+
+    assert!(outcome.rebuilt);
+    assert!(outcome.replaced_store.is_none(), "there was no store to replace");
+    GraphStore::open(&db).expect("the store exists");
+}
+
+// _(Scenario: A failed forced build keeps the existing store)_
+#[test]
+fn a_failed_forced_build_keeps_the_existing_store() {
+    let (dir, _) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    seed_store(dir.path(), &db);
+    let failing = write_version_only_stub(dir.path(), "failing-analyzer", &support::provenance().analyzer_version);
+    let before = std::fs::read(&db).unwrap();
+
+    let err = plain_build(&db, dir.path(), failing.to_str().unwrap(), true).expect_err("the analyzer exits non-zero");
+
+    assert!(err.to_string().contains("could not index the workspace"), "{err}");
+    assert_eq!(std::fs::read(&db).unwrap(), before, "the store is byte-identical");
+    let store = GraphStore::open(&db).unwrap();
+    assert!(
+        store.read_metadata().unwrap().is_some(),
+        "the old store still answers a query"
+    );
+    assert!(temporary_stores_in(dir.path()).is_empty(), "no temporary store remains");
+}
+
+// _(Scenario: A forced build without room for a second store fails first)_ — the analyzer is absent,
+// so reaching analyzer resolution would fail with a different error.
+#[test]
+fn a_forced_build_without_room_fails_before_analysis() {
+    let (dir, _) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    seed_store(dir.path(), &db);
+    let before = std::fs::read(&db).unwrap();
+    let needed = before.len() as u64 + (before.len() as u64).div_ceil(10);
+
+    let err = rust_build(
+        &db,
+        dir.path(),
+        "/nonexistent/rust-analyzer",
+        true,
+        true,
+        &|_| false,
+        &|_| Ok(10),
+    )
+    .expect_err("there is no room");
+
+    let message = err.to_string();
+    assert_eq!(classify(&err), ExitCode::General, "{message}");
+    assert!(message.contains(&format!("needs {needed} bytes")), "{message}");
+    assert!(message.contains("10 bytes free"), "{message}");
+    assert!(message.contains(db.to_str().unwrap()), "{message}");
+    assert_eq!(std::fs::read(&db).unwrap(), before, "the store is byte-identical");
+}
+
+// _(Scenario: A forced build through a symbolic link keeps the link)_
+#[test]
+fn a_forced_build_through_a_symbolic_link_keeps_the_link() {
+    let (dir, stub) = forced_build_workspace();
+    let target = dir.path().join("elsewhere.db");
+    seed_store(dir.path(), &target);
+    let seeded = table_row_counts(&target);
+    let link = dir.path().join("index.db");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let outcome = plain_build(&link, dir.path(), stub.to_str().unwrap(), true).unwrap();
+
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        target,
+        "the link still names its target"
+    );
+    assert_ne!(table_row_counts(&target), seeded, "the target holds the new store");
+    assert_eq!(outcome.replaced_store.as_deref(), Some(target.as_path()));
+}
+
+// A link whose target does not exist: the store is created at the target and the link stays.
+#[test]
+fn a_forced_build_through_a_dangling_symbolic_link_creates_the_target() {
+    let (dir, stub) = forced_build_workspace();
+    let target = dir.path().join("elsewhere.db");
+    let link = dir.path().join("index.db");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let outcome = plain_build(&link, dir.path(), stub.to_str().unwrap(), true).unwrap();
+
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    GraphStore::open(&target).expect("the target holds a store");
+    assert!(outcome.replaced_store.is_none());
+}
+
+// _(Scenario: A forced build shrinks a store left large by an earlier build)_
+#[test]
+fn a_forced_build_shrinks_a_store_left_large_by_an_earlier_build() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    let analyzer = stub.to_str().unwrap();
+    for n in 0..300 {
+        let body = format!("pub fn function_{n}() -> u64 {{ {n} }}\n").repeat(40);
+        std::fs::write(dir.path().join(format!("src/extra_{n}.rs")), body).unwrap();
+    }
+    plain_build(&db, dir.path(), analyzer, false).unwrap();
+    let large = std::fs::metadata(&db).unwrap().len();
+
+    for n in 0..300 {
+        std::fs::remove_file(dir.path().join(format!("src/extra_{n}.rs"))).unwrap();
+    }
+    plain_build(&db, dir.path(), analyzer, false).unwrap();
+    let (fresh_dir, fresh_stub) = forced_build_workspace();
+    let fresh_db = fresh_dir.path().join("index.db");
+    plain_build(&fresh_db, fresh_dir.path(), fresh_stub.to_str().unwrap(), false).unwrap();
+    let fresh = std::fs::metadata(&fresh_db).unwrap().len();
+    assert!(
+        std::fs::metadata(&db).unwrap().len() > fresh,
+        "the in-place rebuild left the file large (was {large}, fresh {fresh})"
+    );
+
+    plain_build(&db, dir.path(), analyzer, true).unwrap();
+
+    assert!(
+        std::fs::metadata(&db).unwrap().len() <= fresh,
+        "the forced build shrank the file"
+    );
+}
+
+// A forced build over a file the system did not create is refused and leaves it unchanged.
+#[test]
+fn a_forced_build_over_an_unrecognized_file_is_refused() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    std::fs::write(&db, b"not a store of this system").unwrap();
+
+    let err = plain_build(&db, dir.path(), stub.to_str().unwrap(), true).expect_err("the file is foreign");
+
+    assert_eq!(classify(&err), ExitCode::UnrecognizedStore, "{err:#}");
+    assert_eq!(std::fs::read(&db).unwrap(), b"not a store of this system");
+    assert!(temporary_stores_in(dir.path()).is_empty());
+}
+
+// _(Scenario: A stopped forced build's temporary store is removed)_ — through a build that analyzes
+// and through a build that finds the index current.
+#[test]
+fn a_stopped_builds_temporary_store_is_removed_and_named() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    let leftover = place_temporary_store(&db, exited_process_id());
+
+    let outcome = plain_build(&db, dir.path(), stub.to_str().unwrap(), false).unwrap();
+    assert!(outcome.rebuilt);
+    assert_eq!(outcome.removed_temporary_stores, vec![leftover.clone()]);
+    assert!(!leftover.exists());
+
+    let (dir, db, stub) = already_built_workspace();
+    let leftover = place_temporary_store(&db, exited_process_id());
+    let outcome = plain_build(&db, dir.path(), stub.to_str().unwrap(), false).unwrap();
+    assert!(!outcome.rebuilt, "the index was current");
+    assert_eq!(outcome.removed_temporary_stores, vec![leftover.clone()]);
+    assert!(!leftover.exists());
+    let json = silent_cartographer::commands::build_outcome_json(&outcome);
+    assert_eq!(
+        json["removed_temporary_stores"],
+        serde_json::json!([leftover.to_str().unwrap()])
+    );
+}
+
+// _(Scenario: A running build's temporary store is kept)_ and _(An unrecognized file with a
+// temporary-store name is kept)_
+#[test]
+fn a_running_builds_and_an_unrecognized_temporary_store_are_kept() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    // Another build in progress is a different live process than the one under test.
+    let mut other_build = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let running = place_temporary_store(&db, other_build.id());
+    let foreign = dir.path().join(format!("index.db.c10r-tmp-{}", exited_process_id()));
+    std::fs::write(&foreign, b"not a store").unwrap();
+
+    let outcome = plain_build(&db, dir.path(), stub.to_str().unwrap(), false).unwrap();
+
+    other_build.kill().unwrap();
+    other_build.wait().unwrap();
+    assert!(outcome.removed_temporary_stores.is_empty());
+    assert!(running.exists() && foreign.exists());
+}
+
+// A forced build over a store recorded for another workspace still discloses both roots.
+#[test]
+fn a_forced_build_over_another_workspaces_store_discloses_both_roots() {
+    let (dir, _) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    seed_store(dir.path(), &db);
+    let recorded_root = std::fs::canonicalize(dir.path()).unwrap();
+    let (elsewhere, stub) = forced_build_workspace();
+    let new_root = std::fs::canonicalize(elsewhere.path()).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+        .arg("--db")
+        .arg(&db)
+        .args(["--workspace", "op-ws", "build"])
+        .arg(elsewhere.path())
+        .arg("--rust-analyzer")
+        .arg(&stub)
+        .args(["--language", "rust", "--force", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let notice = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        notice.contains(recorded_root.to_str().unwrap()) && notice.contains(new_root.to_str().unwrap()),
+        "the handoff is disclosed naming both roots: {notice}"
+    );
+}
+
+// A build that does not replace a store keeps the answer it always had: neither new key appears.
+#[test]
+fn a_non_forced_builds_json_carries_neither_new_key() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+
+    let outcome = plain_build(&db, dir.path(), stub.to_str().unwrap(), false).unwrap();
+
+    let json = silent_cartographer::commands::build_outcome_json(&outcome);
+    let keys: std::collections::BTreeSet<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "aligned",
+            "changed_during_build",
+            "duplicate_ambiguous",
+            "rebuilt",
+            "semantic_only",
+            "syntax_only",
+            "text_mismatch",
+            "undetermined_units",
+        ]
+        .into()
+    );
+}
+
+// _(Scenario: A yes at the terminal confirms a forced build)_ and _(Any other answer refuses a forced
+// build)_
+#[test]
+fn a_forced_build_asks_and_proceeds_only_on_yes() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    seed_store(dir.path(), &db);
+    let analyzer = stub.to_str().unwrap();
+    let before = std::fs::read(&db).unwrap();
+
+    let err = rust_build(
+        &db,
+        dir.path(),
+        analyzer,
+        true,
+        false,
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
+    )
+    .expect_err("the answer is no");
+    assert_eq!(classify(&err), ExitCode::Usage);
+    assert!(err.to_string().contains("--yes"), "{err}");
+    assert_eq!(std::fs::read(&db).unwrap(), before, "the store is byte-identical");
+    assert!(temporary_stores_in(dir.path()).is_empty());
+
+    let questions = std::cell::RefCell::new(Vec::new());
+    let outcome = rust_build(
+        &db,
+        dir.path(),
+        analyzer,
+        true,
+        false,
+        &|question| {
+            questions.borrow_mut().push(question.to_string());
+            true
+        },
+        &silent_cartographer::graph::store::free_bytes,
+    )
+    .unwrap();
+    let questions = questions.into_inner();
+    assert_eq!(questions.len(), 1);
+    assert!(
+        questions[0].contains("replaces the stored index at") && questions[0].contains(db.to_str().unwrap()),
+        "{}",
+        questions[0]
+    );
+    assert_eq!(outcome.replaced_store.as_deref(), Some(db.as_path()));
+    assert_ne!(std::fs::read(&db).unwrap(), before, "the store was replaced");
+}
+
+// _(Scenario: The flag confirms a forced build without a terminal)_,
+// _(A forced build without a terminal or the flag is refused)_, and
+// _(The confirmation flag alone is a usage error)_ — through the built binary with no terminal.
+#[test]
+fn the_binary_confirms_with_the_flag_and_refuses_without_a_terminal() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    seed_store(dir.path(), &db);
+    let run = |args: &[&str], db: &Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_c10r"))
+            .arg("--db")
+            .arg(db)
+            .args(["--workspace", "op-ws", "build"])
+            .arg(dir.path())
+            .arg("--rust-analyzer")
+            .arg(&stub)
+            .args(["--language", "rust"])
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let before = std::fs::read(&db).unwrap();
+
+    let refused = run(&["--force"], &db);
+    assert_eq!(refused.status.code(), Some(ExitCode::Usage.code()));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--yes"));
+    assert_eq!(std::fs::read(&db).unwrap(), before, "the store is byte-identical");
+
+    let alone_db = dir.path().join("alone.db");
+    let alone = run(&["--yes"], &alone_db);
+    assert_eq!(alone.status.code(), Some(ExitCode::Usage.code()));
+    assert!(!alone_db.exists(), "no store is created");
+
+    let confirmed = run(&["--force", "--yes"], &db);
+    assert!(
+        confirmed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&confirmed.stderr)
+    );
+    assert_ne!(std::fs::read(&db).unwrap(), before, "the store was replaced");
+}
+
+// A refused forced build removes no leftover temporary store.
+#[test]
+fn a_refused_forced_build_removes_no_leftover() {
+    let (dir, stub) = forced_build_workspace();
+    let db = dir.path().join("index.db");
+    seed_store(dir.path(), &db);
+    let leftover = place_temporary_store(&db, exited_process_id());
+
+    let err = rust_build(
+        &db,
+        dir.path(),
+        stub.to_str().unwrap(),
+        true,
+        false,
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
+    )
+    .expect_err("the answer is no");
+    assert_eq!(classify(&err), ExitCode::Usage);
+    assert!(leftover.exists(), "the leftover is kept");
 }

@@ -16,7 +16,10 @@ use crate::git::{GitError, GitRepo, SeedMode};
 use crate::graph::chunk::ChunkParams;
 use crate::graph::join::JoinAccounting;
 use crate::graph::range::LineColumn;
-use crate::graph::store::{Freshness, GraphStore, IndexMetadata, RecordedTargets, StoreOpenError, stale_reasons_of};
+use crate::graph::store::{
+    Freshness, GraphStore, IndexMetadata, RecordedTargets, StoreOpenError, StoreRecognition, check_free_space,
+    recognize_or_refuse, remove_leftover_temporary_stores, resolve_store_path, stale_reasons_of,
+};
 use crate::graph::syntax::Language;
 use crate::graph::units::UndeterminedUnits;
 use crate::graph::{SourceChange, SourceDifference, compare_source_files, content_hash, ingest, text_hash};
@@ -582,6 +585,13 @@ impl PythonExecutables<'_> {
 /// Every refusal — ambiguous or missing manifests, an unresolvable Python environment, an
 /// unavailable tool — happens before the store is opened, so a failed attempt leaves an existing
 /// store untouched.
+///
+/// A forced build writes a new store beside the existing one and renames it into place only after
+/// the ingest commits, so a failed or refused forced build changes no store. It first checks
+/// ownership of the existing file and that `free_bytes`, which reads the space available on the file
+/// system holding a directory, reports room for a second store. It then asks `confirm` the question
+/// unless `yes` is set; a "no" is a usage failure. Every build that proceeds removes the leftover
+/// temporary stores of stopped forced builds; a forced build removes them only after it is confirmed.
 #[allow(clippy::too_many_arguments)] // the CLI's flat build-command surface travels together
 pub fn run_build(
     db: &Path,
@@ -593,7 +603,10 @@ pub fn run_build(
     environment: Option<&Path>,
     language: Option<Language>,
     force: bool,
+    yes: bool,
     chunk_params: &ChunkParams,
+    confirm: &dyn Fn(&str) -> bool,
+    free_bytes: &dyn Fn(&Path) -> std::io::Result<u64>,
 ) -> Result<BuildOutcome> {
     // The chunk parameters are validated before anything is resolved or analyzed: a malformed pair
     // is a usage error, and no build begins from it.
@@ -617,6 +630,15 @@ pub fn run_build(
     if language == Language::Rust && python_indexer.is_some() {
         return Err(Failure::Usage("--python-indexer applies only to a Python workspace".to_string()).into());
     }
+
+    let store_path = resolve_store_path(db).with_context(|| format!("resolving the index path {}", db.display()))?;
+    let replaced_store = if force {
+        replaceable_store(&store_path, yes, confirm, free_bytes)?
+    } else {
+        None
+    };
+    let removed_temporary_stores = remove_leftover_temporary_stores(&store_path)
+        .with_context(|| format!("removing leftover temporary stores beside {}", store_path.display()))?;
 
     // The analyzer is resolved before anything is analyzed, because its identity is one of the
     // inputs the currency check compares — and resolving it once serves both the check and the
@@ -660,6 +682,8 @@ pub fn run_build(
             undetermined_units: current.undetermined_units,
             changed_during_build: Vec::new(),
             rebuilt: false,
+            replaced_store: None,
+            removed_temporary_stores,
         });
     }
 
@@ -670,35 +694,166 @@ pub fn run_build(
             engine.provenance().analyzer_name
         )
     })?;
-    ensure_parent_dir(db)?;
+    ensure_parent_dir(&store_path)?;
     let workspace_root = canonical_root(root)?;
-    // The write path replaces an incompatible store of its own outright: the index is derived,
-    // replayable data, so rebuild is the migration. A file c10r did not create is refused instead.
-    let mut store = GraphStore::open_or_replace(db).context("opening index database")?;
-    disclose_workspace_handoff(&store, workspace_root.as_deref());
-    let (accounting, undetermined_units) = crate::graph::ingest_with_params(
-        &mut store,
-        &workspace_id,
-        workspace_root.as_deref(),
-        &index,
-        &sources,
-        chunk_params,
-    )?;
+    let (accounting, undetermined_units) = if force {
+        ingest_into_replacement(
+            &store_path,
+            replaced_store.is_some(),
+            &workspace_id,
+            workspace_root.as_deref(),
+            &index,
+            &sources,
+            chunk_params,
+        )?
+    } else {
+        // The write path replaces an incompatible store of its own outright: the index is derived,
+        // replayable data, so rebuild is the migration. A file c10r did not create is refused instead.
+        let mut store = GraphStore::open_or_replace(db).context("opening index database")?;
+        disclose_workspace_handoff(&store, workspace_root.as_deref());
+        crate::graph::ingest_with_params(
+            &mut store,
+            &workspace_id,
+            workspace_root.as_deref(),
+            &index,
+            &sources,
+            chunk_params,
+        )?
+    };
 
-    // Analysis can take long enough for the workspace to change under it. The store holds the text
-    // that was indexed, so it is complete and labeled by what it recorded; the files that moved since
-    // are reported so the caller knows why `status` calls it stale.
+    Ok(BuildOutcome {
+        accounting,
+        undetermined_units,
+        changed_during_build: changes_since_indexing(language, root, &sources)?,
+        rebuilt: true,
+        replaced_store,
+        removed_temporary_stores,
+    })
+}
+
+/// The existing store a forced build over `store_path` would replace, or `None` when no store is
+/// there; fails, changing nothing, when the file is not a store this system created, when the file
+/// system lacks room for a second store beside it, or when `confirm` does not agree.
+fn replaceable_store(
+    store_path: &Path,
+    yes: bool,
+    confirm: &dyn Fn(&str) -> bool,
+    free_bytes: &dyn Fn(&Path) -> std::io::Result<u64>,
+) -> Result<Option<PathBuf>> {
+    let existing = match recognize_or_refuse(store_path)? {
+        StoreRecognition::Absent => false,
+        StoreRecognition::Unrecognized => {
+            return Err(StoreOpenError::UnrecognizedStore {
+                path: store_path.display().to_string(),
+            }
+            .into());
+        }
+        StoreRecognition::Recognized => true,
+    };
+    if existing {
+        let store_size = std::fs::metadata(store_path)
+            .with_context(|| format!("reading the size of {}", store_path.display()))?
+            .len();
+        let dir = match store_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let available =
+            free_bytes(dir).with_context(|| format!("reading the free space beside {}", store_path.display()))?;
+        if let Err(shortfall) = check_free_space(store_size, available) {
+            return Err(anyhow!(
+                "not enough free space to build a new index beside the existing one: needs {} bytes \
+                 (the index size plus 10%), {} bytes free on the file system holding {}. \
+                 Free space, or remove the index with `c10r cache clear` and build again.",
+                shortfall.needed,
+                shortfall.available,
+                store_path.display()
+            ));
+        }
+    }
+    if !yes
+        && !confirm(&format!(
+            "--force replaces the stored index at {} with a new one built from scratch. Continue? [y/N]",
+            store_path.display()
+        ))
+    {
+        return Err(Failure::Usage(
+            "a forced build needs confirmation: answer the question at a terminal, or pass --yes".to_string(),
+        )
+        .into());
+    }
+    Ok(existing.then(|| store_path.to_path_buf()))
+}
+
+/// Ingest `index` into a new store built beside `store_path`, then rename it into place.
+///
+/// When `replacing`, the old store is read first so a handoff from another workspace is disclosed.
+/// Any failure before the rename leaves the old store untouched and removes the new one.
+fn ingest_into_replacement(
+    store_path: &Path,
+    replacing: bool,
+    workspace_id: &WorkspaceId,
+    workspace_root: Option<&str>,
+    index: &ExtractedIndex,
+    sources: &[(String, String)],
+    chunk_params: &ChunkParams,
+) -> Result<(JoinAccounting, UndeterminedUnits)> {
+    if replacing && let Ok(old) = GraphStore::open(store_path) {
+        disclose_workspace_handoff(&old, workspace_root);
+    }
+    let (store, pending) = GraphStore::create_pending(store_path).context("creating the new index database")?;
+    // Rebound after `pending` so an early return closes the connection before the guard removes the file.
+    let mut store = store;
+    let result =
+        crate::graph::ingest_with_params(&mut store, workspace_id, workspace_root, index, sources, chunk_params)?;
+    pending
+        .publish(store, store_path)
+        .context("replacing the index database")?;
+    Ok(result)
+}
+
+/// The source files that differ between `sources`, as indexed, and a second discovery pass.
+///
+/// Analysis can take long enough for the workspace to change under it. The store holds the text that
+/// was indexed, so it is complete and labeled by what it recorded; the files that moved since are
+/// reported so the caller knows why `status` calls it stale.
+fn changes_since_indexing(
+    language: Language,
+    root: &Path,
+    sources: &[(String, String)],
+) -> Result<Vec<SourceDifference>> {
     let indexed: Vec<(String, String)> = sources.iter().map(|(p, t)| (p.clone(), text_hash(t))).collect();
     let rediscovered: Vec<(String, String)> = collect_language_sources(language, root)?
         .iter()
         .map(|(p, t)| (p.clone(), text_hash(t)))
         .collect();
-    Ok(BuildOutcome {
-        accounting,
-        undetermined_units,
-        changed_during_build: compare_source_files(&indexed, &rediscovered),
-        rebuilt: true,
-    })
+    Ok(compare_source_files(&indexed, &rediscovered))
+}
+
+/// Whether a confirmation answer agrees: `y` or `yes`, ignoring case and surrounding space.
+pub fn is_affirmative_answer(answer: &str) -> bool {
+    let answer = answer.trim();
+    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+}
+
+/// Ask `question` and report whether the answer agrees.
+///
+/// Without a terminal on both `stdin_is_terminal` and `stderr_is_terminal` nobody can answer, so the
+/// result is no and nothing is read or written. End of input and read errors are no.
+pub fn ask_confirmation(
+    question: &str,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> bool {
+    if !(stdin_is_terminal && stderr_is_terminal) {
+        return false;
+    }
+    let _ = write!(output, "{question} ");
+    let _ = output.flush();
+    let mut line = String::new();
+    matches!(input.read_line(&mut line), Ok(n) if n > 0) && is_affirmative_answer(&line)
 }
 
 /// The `(document_path, text)` sources discovery finds under `root` for `language`.
@@ -723,6 +878,10 @@ pub struct BuildOutcome {
     pub changed_during_build: Vec<SourceDifference>,
     /// Whether the workspace was analyzed and the store rewritten, rather than found already current.
     pub rebuilt: bool,
+    /// The path of the existing store a forced build replaced; `None` for any other build.
+    pub replaced_store: Option<PathBuf>,
+    /// The leftover temporary stores of stopped forced builds that this build removed.
+    pub removed_temporary_stores: Vec<PathBuf>,
 }
 
 /// What a store that already describes the workspace recorded when it was built.
@@ -903,6 +1062,18 @@ pub fn build_outcome_line(outcome: &BuildOutcome) -> String {
             difference.document_path
         ))
     }));
+    if let Some(path) = &outcome.replaced_store {
+        lines.push(crate::render::sanitize(&format!(
+            "replaced the index at {}",
+            path.display()
+        )));
+    }
+    lines.extend(
+        outcome
+            .removed_temporary_stores
+            .iter()
+            .map(|path| crate::render::sanitize(&format!("removed a leftover temporary store: {}", path.display()))),
+    );
     lines.join("\n")
 }
 
@@ -961,6 +1132,17 @@ pub fn build_outcome_json(outcome: &BuildOutcome) -> serde_json::Value {
             "undetermined_units".to_string(),
             serde_json::to_value(&outcome.undetermined_units).unwrap_or_default(),
         );
+        if let Some(path) = &outcome.replaced_store {
+            object.insert("replaced_store".to_string(), path.display().to_string().into());
+        }
+        if !outcome.removed_temporary_stores.is_empty() {
+            let removed: Vec<String> = outcome
+                .removed_temporary_stores
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            object.insert("removed_temporary_stores".to_string(), removed.into());
+        }
     }
     value
 }
@@ -3230,7 +3412,10 @@ pub fn run_hooks_run(
             None,
             recorded_language(db),
             false,
+            false,
             &ChunkParams::default(),
+            &|_| false,
+            &crate::graph::store::free_bytes,
         )
         .map(Some)
     };
@@ -3801,6 +3986,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_y_and_yes_are_affirmative_answers() {
+        for yes in ["y", "Y", "yes", "YES", " yes "] {
+            assert!(is_affirmative_answer(yes), "{yes:?}");
+        }
+        for no in ["n", "", "yep", "\n"] {
+            assert!(!is_affirmative_answer(no), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn a_confirmation_without_a_terminal_on_stderr_reads_and_writes_nothing() {
+        let mut input = std::io::Cursor::new(b"yes\n".to_vec());
+        let mut output = Vec::new();
+        assert!(!ask_confirmation("Proceed?", true, false, &mut input, &mut output));
+        assert_eq!(input.position(), 0, "nothing was read");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn a_confirmation_without_a_terminal_on_stdin_is_no() {
+        let mut input = std::io::Cursor::new(b"yes\n".to_vec());
+        let mut output = Vec::new();
+        assert!(!ask_confirmation("Proceed?", false, true, &mut input, &mut output));
+    }
+
+    #[test]
+    fn a_confirmation_at_end_of_input_is_no() {
+        let mut output = Vec::new();
+        assert!(!ask_confirmation("Proceed?", true, true, &mut &b""[..], &mut output));
+    }
+
+    #[test]
+    fn a_confirmation_answered_yes_at_a_terminal_is_yes_and_shows_the_question() {
+        let mut output = Vec::new();
+        assert!(ask_confirmation(
+            "Proceed?",
+            true,
+            true,
+            &mut &b"yes\n"[..],
+            &mut output
+        ));
+        assert_eq!(String::from_utf8(output).unwrap(), "Proceed? ");
+    }
+
     // The answer for an index found current warns about the recorded undetermined units exactly as a build does.
     #[test]
     fn a_current_build_warns_about_the_recorded_units() {
@@ -3816,6 +4046,8 @@ mod tests {
             undetermined_units: undetermined_units.clone(),
             changed_during_build: Vec::new(),
             rebuilt: false,
+            replaced_store: None,
+            removed_temporary_stores: Vec::new(),
         };
         let line = build_outcome_line(&outcome);
         assert!(line.starts_with("already current:"), "{line}");

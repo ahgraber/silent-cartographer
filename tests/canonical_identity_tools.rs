@@ -54,7 +54,10 @@ fn build_rust(root: &Path) -> BuildOutcome {
         None,
         Some(Language::Rust),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect("the build succeeds")
 }
@@ -321,7 +324,10 @@ fn build_python(root: &Path, venv: &Path) -> BuildOutcome {
         Some(venv),
         Some(Language::Python),
         false,
+        false,
         &Default::default(),
+        &|_| false,
+        &silent_cartographer::graph::store::free_bytes,
     )
     .expect("the build succeeds")
 }

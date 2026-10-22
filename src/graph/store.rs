@@ -656,6 +656,210 @@ fn temp_store_path(path: &Path) -> PathBuf {
     PathBuf::from(temp)
 }
 
+/// Exclusively create the temporary store beside `final_path`, with the schema and both stamps
+/// committed and the connection closed, and return its path.
+fn write_empty_store(final_path: &Path) -> Result<PathBuf, StoreOpenError> {
+    let temp = temp_store_path(final_path);
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(StoreOpenError::StaleBuildFile {
+                path: temp.display().to_string(),
+            });
+        }
+        Err(e) => return Err(e.into()),
+    }
+    // Scoped so the connection closes — flushing the store whole — before the caller moves the file.
+    {
+        let conn = open_literal(&temp, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)?;
+        conn.execute_batch(SCHEMA_SQL)?;
+        conn.pragma_update(None, "application_id", APPLICATION_ID)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    Ok(temp)
+}
+
+/// Remove `path` if present, tolerating its absence.
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// `path` with `suffix` appended to its file name.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Remove a temporary store and its `-journal`, `-wal`, and `-shm` side files, tolerating absences.
+///
+/// Returns whether the store file itself was removed; the side files are removed on a best-effort basis.
+fn remove_temporary_store(temp: &Path) -> bool {
+    let removed = std::fs::remove_file(temp).is_ok();
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let _ = remove_if_present(&with_suffix(temp, suffix));
+    }
+    removed
+}
+
+/// Owns the temporary file a replacement store is built in, and removes it, with its side files, on
+/// drop unless [`Self::publish`] moved it into place.
+#[derive(Debug)]
+pub struct PendingStore {
+    temp: PathBuf,
+    published: bool,
+}
+
+impl PendingStore {
+    /// Close `store`, rename the temporary file over `final_path`, then remove the replaced store's
+    /// `-wal` and `-shm` side files.
+    ///
+    /// The rename replaces the file in one step, so a reader sees the old store or the new one. If the
+    /// rename fails the temporary file stays owned by `self` and is removed on drop.
+    pub fn publish(mut self, store: GraphStore, final_path: &Path) -> Result<(), StoreOpenError> {
+        drop(store);
+        std::fs::rename(&self.temp, final_path)?;
+        self.published = true;
+        for suffix in ["-wal", "-shm"] {
+            remove_if_present(&with_suffix(final_path, suffix))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingStore {
+    fn drop(&mut self) {
+        if !self.published {
+            remove_temporary_store(&self.temp);
+        }
+    }
+}
+
+/// Follow the symbolic-link chain at `path` and return the first path that is not a link.
+///
+/// A relative link target resolves against the link's parent directory. A path that does not exist is
+/// not a link and is returned as is, so a link whose target is absent resolves to that target. Only
+/// the links at `path` itself are followed; parent directories are not canonicalized. A chain longer
+/// than a fixed hop count, which only a cycle produces, is an error.
+pub fn resolve_store_path(path: &Path) -> std::io::Result<PathBuf> {
+    const MAX_HOPS: usize = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&current)?;
+                current = match current.parent() {
+                    Some(parent) => parent.join(target),
+                    None => target,
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "too many levels of symbolic links at {}",
+        path.display()
+    )))
+}
+
+/// The space a build needs and the space available, when the latter falls short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceShortfall {
+    pub needed: u64,
+    pub available: u64,
+}
+
+/// Whether `free_bytes` holds a new store beside one of `store_size` bytes: the size plus 10%,
+/// rounded up to a whole byte, must fit.
+pub fn check_free_space(store_size: u64, free_bytes: u64) -> Result<(), SpaceShortfall> {
+    let needed = store_size.saturating_add(store_size.div_ceil(10));
+    if free_bytes >= needed {
+        Ok(())
+    } else {
+        Err(SpaceShortfall {
+            needed,
+            available: free_bytes,
+        })
+    }
+}
+
+/// Bytes available to an unprivileged process on the file system holding `dir`.
+pub fn free_bytes(dir: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_dir` is a valid NUL-terminated path and `stats` is a writable `statvfs`.
+    if unsafe { libc::statvfs(c_dir.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `statvfs` returned success, so it initialized `stats`.
+    let stats = unsafe { stats.assume_init() };
+    // The field widths differ by platform, so widen explicitly.
+    #[allow(clippy::unnecessary_cast)]
+    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+/// Whether the process `pid` is running, judged by signal 0. An id that is not a valid process id is
+/// reported as running, so the caller leaves its file alone.
+fn process_is_running(pid: u64) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the process exists and can be signalled.
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+}
+
+/// Remove the recognized leftover temporary stores of interrupted builds beside `final_path`, with
+/// their `-journal`, `-wal`, and `-shm` side files, and return the removed store paths.
+///
+/// A leftover is a file named exactly `<store file name>.c10r-tmp-<decimal process id>`. One whose
+/// process is still running, or that is not recognized as a store this system created, is kept. A
+/// reused process id can therefore only keep a leftover, never remove a store in use.
+pub fn remove_leftover_temporary_stores(final_path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let dir = match final_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let Some(name) = final_path.file_name() else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!("{}.c10r-tmp-", name.to_string_lossy());
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut removed = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(digits) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // A number too large for u64 is not a process id; keeping its file is the safe reading.
+        if digits.parse::<u64>().map_or(true, process_is_running) {
+            continue;
+        }
+        let path = entry.path();
+        if matches!(recognize_or_refuse(&path), Ok(StoreRecognition::Recognized)) && remove_temporary_store(&path) {
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
 /// An error opening a graph store.
 ///
 /// The ownership guard reads the file header before any connection opens; the schema-version guard
@@ -826,27 +1030,23 @@ impl GraphStore {
     /// complete, marked store or nothing, so a crash mid-create can never strand a file that the
     /// ownership guard would later refuse.
     fn create(path: &Path) -> Result<Self, StoreOpenError> {
-        let temp = temp_store_path(path);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(StoreOpenError::StaleBuildFile {
-                    path: temp.display().to_string(),
-                });
-            }
-            Err(e) => return Err(e.into()),
-        }
-        // Scoped so the connection closes — flushing the store whole — before the rename.
-        {
-            let conn = open_literal(&temp, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)?;
-            conn.execute_batch(SCHEMA_SQL)?;
-            conn.pragma_update(None, "application_id", APPLICATION_ID)?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
+        let temp = write_empty_store(path)?;
         std::fs::rename(&temp, path)?;
         Ok(Self {
             conn: open_literal(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?,
         })
+    }
+
+    /// Create an empty, stamped store at the temporary path beside `final_path` and return it open
+    /// read-write, with the [`PendingStore`] that owns the temporary file.
+    ///
+    /// Nothing is placed at `final_path`; [`PendingStore::publish`] renames the finished store over it.
+    /// Refuses with [`StoreOpenError::StaleBuildFile`] when the temporary path is already occupied.
+    pub fn create_pending(final_path: &Path) -> Result<(Self, PendingStore), StoreOpenError> {
+        let temp = write_empty_store(final_path)?;
+        let pending = PendingStore { temp, published: false };
+        let conn = open_literal(&pending.temp, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        Ok((Self { conn }, pending))
     }
 
     /// Open an in-memory store (for tests), applying the schema and both stamps.
@@ -3456,5 +3656,197 @@ mod tests {
             vec![(0, 1)],
             "one collapsed a→b edge and nothing else"
         );
+    }
+
+    // The free-space rule: the store size plus 10%, rounded up to a whole byte, must fit.
+    #[test]
+    fn free_space_check_needs_the_store_size_plus_ten_percent_rounded_up() {
+        // 101 bytes needs 101 + ceil(10.1) = 112.
+        assert_eq!(check_free_space(101, 112), Ok(()), "exactly enough proceeds");
+        assert_eq!(
+            check_free_space(101, 111),
+            Err(SpaceShortfall {
+                needed: 112,
+                available: 111
+            }),
+            "one byte short is refused"
+        );
+        assert_eq!(check_free_space(0, 0), Ok(()), "an empty store needs nothing");
+    }
+
+    #[test]
+    fn free_bytes_reads_the_file_system_holding_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(free_bytes(dir.path()).unwrap() > 0);
+        assert!(free_bytes(&dir.path().join("absent")).is_err());
+    }
+
+    // The pending store is built beside the final path; dropping it unpublished leaves nothing.
+    #[test]
+    fn dropping_an_unpublished_pending_store_removes_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let temp = temp_store_path(&db);
+
+        let (store, pending) = GraphStore::create_pending(&db).unwrap();
+        assert!(temp.exists());
+        assert!(!db.exists(), "nothing is placed at the store path before publish");
+        let journal = with_suffix(&temp, "-journal");
+        std::fs::write(&journal, b"x").unwrap();
+
+        drop(store);
+        drop(pending);
+        assert!(!temp.exists() && !journal.exists());
+        assert!(!db.exists());
+    }
+
+    #[test]
+    fn publishing_a_pending_store_replaces_the_old_store_and_its_side_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        drop(GraphStore::open_or_replace(&db).unwrap());
+        let (wal, shm) = (with_suffix(&db, "-wal"), with_suffix(&db, "-shm"));
+        std::fs::write(&wal, b"x").unwrap();
+        std::fs::write(&shm, b"x").unwrap();
+
+        let (store, pending) = GraphStore::create_pending(&db).unwrap();
+        pending.publish(store, &db).unwrap();
+
+        assert_eq!(recognize_store(&db).unwrap(), StoreRecognition::Recognized);
+        assert!(!temp_store_path(&db).exists());
+        assert!(!wal.exists() && !shm.exists());
+    }
+
+    #[test]
+    fn create_pending_refuses_a_leftover_build_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        std::fs::write(temp_store_path(&db), b"leftover").unwrap();
+
+        let error = GraphStore::create_pending(&db)
+            .err()
+            .expect("the leftover refuses the create");
+        assert!(matches!(error, StoreOpenError::StaleBuildFile { .. }), "{error}");
+    }
+
+    #[test]
+    fn resolve_store_path_follows_links_to_the_first_non_link() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let real = root.join("real.db");
+        std::fs::write(&real, b"x").unwrap();
+
+        assert_eq!(resolve_store_path(&real).unwrap(), real, "a plain path is unchanged");
+        let absent = root.join("absent.db");
+        assert_eq!(
+            resolve_store_path(&absent).unwrap(),
+            absent,
+            "a missing path is unchanged"
+        );
+
+        let link = root.join("link.db");
+        symlink(&real, &link).unwrap();
+        assert_eq!(resolve_store_path(&link).unwrap(), real);
+
+        let chain = root.join("chain.db");
+        symlink(&link, &chain).unwrap();
+        assert_eq!(resolve_store_path(&chain).unwrap(), real);
+
+        let dangling = root.join("dangling.db");
+        symlink(&absent, &dangling).unwrap();
+        assert_eq!(
+            resolve_store_path(&dangling).unwrap(),
+            absent,
+            "a link to nothing resolves to its target"
+        );
+
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let relative = root.join("sub").join("rel.db");
+        symlink("../real.db", &relative).unwrap();
+        assert_eq!(
+            resolve_store_path(&relative).unwrap(),
+            root.join("sub").join("../real.db")
+        );
+    }
+
+    #[test]
+    fn resolve_store_path_rejects_a_link_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(resolve_store_path(&a).is_err());
+    }
+
+    /// A process id that has exited and is not the current one.
+    fn exited_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        child.id()
+    }
+
+    /// Write a recognized store at `<db>.c10r-tmp-<suffix>` and return its path.
+    fn leftover_store(db: &Path, suffix: &str) -> PathBuf {
+        let source = db.with_file_name("source.db");
+        drop(GraphStore::open_or_replace(&source).unwrap());
+        let leftover = with_suffix(db, &format!(".c10r-tmp-{suffix}"));
+        std::fs::rename(&source, &leftover).unwrap();
+        leftover
+    }
+
+    #[test]
+    fn leftover_removal_deletes_a_recognized_store_of_an_exited_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let leftover = leftover_store(&db, &exited_pid().to_string());
+        let wal = with_suffix(&leftover, "-wal");
+        std::fs::write(&wal, b"x").unwrap();
+
+        assert_eq!(remove_leftover_temporary_stores(&db).unwrap(), vec![leftover.clone()]);
+        assert!(!leftover.exists() && !wal.exists());
+    }
+
+    #[test]
+    fn leftover_removal_keeps_stores_of_running_processes_and_unrecognized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let running = leftover_store(&db, &std::process::id().to_string());
+        let foreign = with_suffix(&db, &format!(".c10r-tmp-{}", exited_pid()));
+        std::fs::write(&foreign, b"not a store").unwrap();
+        let other_suffix = with_suffix(&db, &format!(".c10r-tmp-{}-wal", exited_pid()));
+        std::fs::write(&other_suffix, b"x").unwrap();
+
+        assert!(remove_leftover_temporary_stores(&db).unwrap().is_empty());
+        assert!(running.exists() && foreign.exists() && other_suffix.exists());
+    }
+
+    #[test]
+    fn leftover_removal_does_not_report_a_store_it_could_not_remove() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let leftover = leftover_store(&db, &exited_pid().to_string());
+        let writable = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // A privileged user can still remove files, so the scenario only applies when creating one fails.
+        let probe = dir.path().join("probe");
+        let unprivileged = std::fs::File::create(&probe).is_err();
+        let removed = remove_leftover_temporary_stores(&db);
+        std::fs::set_permissions(dir.path(), writable).unwrap();
+
+        if unprivileged {
+            assert!(removed.unwrap().is_empty());
+            assert!(leftover.exists());
+        }
+    }
+
+    #[test]
+    fn leftover_removal_of_a_missing_directory_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("absent").join("index.db");
+        assert!(remove_leftover_temporary_stores(&db).unwrap().is_empty());
     }
 }

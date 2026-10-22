@@ -641,10 +641,14 @@ pub struct BuildArgs {
     #[arg(long)]
     pub environment: Option<PathBuf>,
 
-    /// Build even when the stored index already describes the workspace's sources, analyzer, and
-    /// environment. Without it, such a build analyzes nothing and leaves the store untouched.
+    /// Build even when the stored index already describes the workspace, replacing the stored index with one
+    /// built from empty. Asks for confirmation unless `--yes` is given.
     #[arg(long)]
     pub force: bool,
+
+    /// Confirm a forced build without asking. Accepted only together with `--force`.
+    #[arg(long, requires = "force")]
+    pub yes: bool,
 
     /// The chunk size in model tokens: the bound on the whole text embedded per chunk, the
     /// passage's header included. A passage exceeding it is represented by several chunks.

@@ -663,8 +663,13 @@ def _register_lifecycle_tools(mcp: FastMCP, runner: Runner) -> None:
         command: str,
         args: Sequence[str],
         root: str | None,
+        confirmed_args: Sequence[str] = (),
     ) -> dict[str, Any] | ToolResult | mcp_types.InputRequiredResult:
-        """Run the acknowledgment gate, then the confirmation gate, then the command."""
+        """Run the acknowledgment gate, then the confirmation gate, then the command.
+
+        `confirmed_args` are appended to the arguments that run, never to the displayed
+        command or the shell remedy: they record the confirmation the user just gave.
+        """
         if not acknowledge:
             return ToolResult(
                 content=(
@@ -698,7 +703,7 @@ def _register_lifecycle_tools(mcp: FastMCP, runner: Runner) -> None:
                 is_error=False,
             )
 
-        return await runner.invoke(args, root)
+        return await runner.invoke([*args, *confirmed_args], root)
 
     @mcp.tool
     async def build(
@@ -721,7 +726,9 @@ def _register_lifecycle_tools(mcp: FastMCP, runner: Runner) -> None:
                 description=(
                     "Rebuild even when the stored index already matches the workspace's "
                     "sources, analyzer, and environment. Without it, an already-current "
-                    "index is left untouched and the call reports it current."
+                    "index is left untouched and the call reports it current. A forced "
+                    "build replaces the stored index with a new one, and the user "
+                    "confirms it."
                 )
             ),
         ] = False,
@@ -738,7 +745,8 @@ def _register_lifecycle_tools(mcp: FastMCP, runner: Runner) -> None:
         commits, rebases, checkouts, and merges, and this stays rare.
         """
         cost = (
-            "runs an external indexer across the whole workspace and can take minutes, rewriting the index store."
+            "replaces the stored index with a new one built from scratch by running an external "
+            "indexer across the whole workspace, which can take minutes."
             if force
             else (
                 "does nothing when the stored index already matches the workspace; "
@@ -757,6 +765,7 @@ def _register_lifecycle_tools(mcp: FastMCP, runner: Runner) -> None:
             command=" ".join(["c10r", *args]),
             args=args,
             root=root,
+            confirmed_args=["--yes"] if force else [],
         )
 
     @mcp.tool

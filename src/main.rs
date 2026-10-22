@@ -340,6 +340,15 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
             cli.position,
         ),
         Command::Build(args) => {
+            let confirm = |question: &str| -> bool {
+                commands::ask_confirmation(
+                    question,
+                    std::io::stdin().is_terminal(),
+                    std::io::stderr().is_terminal(),
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stderr(),
+                )
+            };
             let outcome = commands::run_build(
                 &cli.db,
                 cli.workspace.as_deref(),
@@ -350,10 +359,13 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
                 args.environment.as_deref(),
                 args.language.map(Into::into),
                 args.force,
+                args.yes,
                 &silent_cartographer::graph::chunk::ChunkParams {
                     chunk_size: args.chunk_size,
                     overlap: args.chunk_overlap,
                 },
+                &confirm,
+                &silent_cartographer::graph::store::free_bytes,
             )?;
             // Under `--json` the standard-output answer is the structured machine projection of the
             // same accounting the human line renders, carrying whether the store was rewritten.

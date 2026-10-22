@@ -223,3 +223,56 @@ async def test_the_handshake_era_asks_through_the_session(fresh_server, fresh_wo
     assert handler.prompts, "the handshake-era client was never asked"
     assert not result.is_error, result.content
     assert (fresh_workspace / HOOK_PATH).is_file()
+
+
+async def test_a_confirmed_forced_build_states_the_replacement_and_replaces_the_store(
+    fresh_server, fresh_workspace: Path
+) -> None:
+    """The user is told the index is replaced; the confirmed command carries `--yes` and replaces it."""
+    built = await call(fresh_server, "build", {"acknowledge": True}, elicitation_handler=accept_elicitation)
+    assert not built.is_error, built.content
+    assert "replaced_store" not in built.structured_content, built.structured_content
+
+    handler = RecordingElicitation()
+    forced = await call(
+        fresh_server,
+        "build",
+        {"acknowledge": True, "force": True},
+        elicitation_handler=handler,
+    )
+
+    assert len(handler.prompts) == 1, handler.prompts
+    assert "c10r build --force" in handler.prompts[0], handler.prompts
+    assert "--yes" not in handler.prompts[0], handler.prompts
+    assert "replaces the stored index with a new one" in handler.prompts[0], handler.prompts
+    # With no terminal behind the server, the binary accepts the forced build only because `--yes` was passed.
+    assert not forced.is_error, forced.content
+    assert forced.structured_content["rebuilt"] is True, forced.structured_content
+    assert "replaced_store" in forced.structured_content, forced.structured_content
+
+
+async def test_a_client_that_cannot_confirm_a_forced_build_is_told_to_run_it_without_yes(
+    fresh_server, fresh_workspace: Path
+) -> None:
+    """The shell remedy is the forced command, which asks at a terminal, not one that skips the question."""
+    result = await call(fresh_server, "build", {"acknowledge": True, "force": True})
+
+    assert result.is_error
+    assert untouched(fresh_workspace)
+    message = " ".join(block.text for block in result.content)
+    assert "c10r build --force" in message, message
+    assert "--yes" not in message, message
+
+
+async def test_an_unforced_build_confirmation_names_the_plain_command(fresh_server, fresh_workspace: Path) -> None:
+    """The unforced confirmation is not a replacement prompt and the command run has no `--force`."""
+    handler = RecordingElicitation()
+
+    result = await call(fresh_server, "build", {"acknowledge": True}, elicitation_handler=handler)
+
+    assert not result.is_error, result.content
+    assert len(handler.prompts) == 1, handler.prompts
+    assert "Run `c10r build`?" in handler.prompts[0], handler.prompts
+    assert "does nothing when the stored index already matches" in handler.prompts[0], handler.prompts
+    assert "--force" not in handler.prompts[0], handler.prompts
+    assert "replaced_store" not in result.structured_content, result.structured_content
