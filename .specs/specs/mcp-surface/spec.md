@@ -275,6 +275,7 @@ An unacknowledged invocation SHALL leave every store, file, and repository it wo
 A lifecycle tool SHALL obtain the caller's confirmation before performing its operation, through the mechanism the negotiated protocol era defines, and SHALL leave every store, file, and repository unchanged when that confirmation is declined or cancelled.
 A lifecycle tool SHALL NOT ask for confirmation of an invocation that lacks its acknowledgment.
 When the connected client offers no elicitation capability, the tool SHALL NOT perform its operation and SHALL NOT issue a request the client cannot answer; it SHALL refuse, state that the client cannot be asked to confirm, and name the command that performs the operation.
+For a forced build, the confirmation SHALL state that the build replaces the stored index, and a confirmed forced build SHALL replace the store as a forced build confirmed on the command line does.
 
 #### Scenario: A handshake-era client is asked and confirms
 
@@ -305,6 +306,12 @@ When the connected client offers no elicitation capability, the tool SHALL NOT p
 - **GIVEN** a client offering an elicitation capability
 - **WHEN** a lifecycle tool is invoked without its acknowledgment parameter set
 - **THEN** the invocation is refused without a confirmation request being issued
+
+#### Scenario: A confirmed forced build replaces the index
+
+- **GIVEN** a client offering an elicitation capability and a workspace with a built index
+- **WHEN** an acknowledged build tool is invoked with `force` set and the caller confirms
+- **THEN** the confirmation stated that the build replaces the stored index, and the store is replaced as a confirmed forced build on the command line replaces it
 
 ### Requirement: One server serves both protocol eras
 

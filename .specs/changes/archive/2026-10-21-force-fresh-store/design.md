@@ -36,14 +36,14 @@ Every build already recomputes every row, so the forced build costs the same tim
 
 **Chosen:** After the ownership check and before analysis, a forced build over an existing store reads the store file's size and the free space of the file system that holds it, with `libc::statvfs` on the store's directory (`f_bavail × f_frsize`, the space available to an unprivileged process).
 The build needs the store size plus 10%, rounded up to a whole byte.
-When the free space is smaller, the build fails with the general failure code and the message `not enough free space to build a new index beside the existing one: needs <n> bytes (the index size plus 10%), <m> bytes free on the file system holding <path>. Free space, or remove the index with the reset command and build again.` No check runs when no store exists at the store path, because then only one store is ever written.
+When the free space is smaller, the build fails with the general failure code and the message `not enough free space to build a new index beside the existing one: needs <n> bytes (the index size plus 10%), <m> bytes free on the file system holding <path>. Free space, or remove the index with `c10r cache clear` and build again.` No check runs when no store exists at the store path, because then only one store is ever written.
 `run_build` reads the free bytes through a function value that `main` sets to the `statvfs` reader, so tests substitute a small value without filling a disk.
 `docs/commands/build.md` documents the margin.
 
 **Rationale:** The old and the new store exist together until the rename, and the new store's size is unknown until it is built.
 The old store's size is the best estimate available before analysis; the margin covers a workspace that grew since it was built.
 Failing before analysis saves the minutes a large analysis takes, and the old store is never at risk either way.
-The estimate can refuse a build that would have fit, for example when the old store was left large by a bigger workspace; the message names the reset command as the way out.
+The estimate can refuse a build that would have fit, for example when the old store was left large by a bigger workspace; the message names `c10r cache clear`, the command that removes the index, as the way out.
 
 **Alternatives considered:**
 
@@ -65,9 +65,11 @@ The answer names the resolved path as the replaced store.
 **Rationale:** Renaming onto the link itself would replace the link with a plain file and leave the store it named stale.
 `read_link` resolves only the links at the final path, so the store is written in the directory the user chose, not in a canonicalized parent.
 
-### Decision: Leftover temporary stores are removed at the start of every build
+### Decision: Leftover temporary stores are removed by every build that proceeds
 
-**Chosen:** Before the currency check, every build lists the files in the store's directory whose name is the store's file name followed by `.c10r-tmp-` and a decimal process ID.
+**Chosen:** Before the analyzer is resolved and before the currency check, every build that proceeds lists the files in the store's directory whose name is the store's file name followed by `.c10r-tmp-` and a decimal process ID.
+A forced build does this only after its ownership check, free-space check, and confirmation, because the requirement "A forced build requires confirmation" states that a refused forced build removes no file.
+The store's directory is the directory of the store path after symbolic-link resolution, on every build, because a forced build creates its temporary store there.
 For each, it skips the file when that process is still running, then runs `recognize_or_refuse`, and removes the file and its `-journal`, `-wal`, and `-shm` side files only when the file is recognized.
 A process is still running when `libc::kill(pid, 0)` succeeds or fails with `EPERM`.
 `libc` becomes a direct dependency; it is already in `Cargo.lock` through other crates.
@@ -84,7 +86,7 @@ The ownership check keeps the cleanup away from any file the system did not crea
 ### Decision: Confirmation is a closure passed to the build, decided before any work
 
 **Chosen:** `run_build` gains a `confirm` parameter, a closure that receives the question and returns whether the user agreed.
-`main` builds it: when standard input and standard error are both terminals, it writes the question to standard error and reads one line from standard input; any answer other than `y` or `yes`, ignoring case and surrounding space, is no, and end of input is no. Otherwise the closure answers no without asking.
+`main` builds it from `ask_confirmation` in `commands.rs`, which takes the two terminal flags and the input and output streams, so tests drive it without a terminal: when standard input and standard error are both terminals, it writes the question to standard error and reads one line from standard input; any answer other than `y` or `yes`, ignoring case and surrounding space, is no, and end of input is no. Otherwise the closure answers no without asking.
 The hook runner passes a closure that never asks.
 `run_build` calls it only for a forced build without `--yes`, after the link resolution, the ownership check, and the free-space check, and before the analyzer is resolved, so the question is asked only for a build that can run; a no becomes `Failure::Usage` with a message that names `--yes`.
 `--yes` is a `build` flag declared with clap's `requires = "force"`, so `--yes` alone is a usage error before `run_build` runs.
@@ -106,6 +108,7 @@ The human rendering adds `replaced the index at <path>` and one `removed a lefto
 
 **Chosen:** For `force`, the cost text in the confirmation says: `replaces the stored index with a new one built from scratch by running an external indexer across the whole workspace, which can take minutes.` The displayed command and the shell remedy stay `c10r build --force`, so a user who runs it at a terminal is asked there.
 After the user confirms, the server appends `--yes` to the arguments it runs, because the command line it starts has no terminal.
+The shared consent helper takes a list of arguments that it appends only to the command it runs, never to the displayed command or the remedy.
 The tool's parameters do not change.
 
 **Rationale:** The dialog is the user's confirmation, and `--yes` records it for the command line.
@@ -125,14 +128,15 @@ c10r build --force [--yes]
     confirm closure: terminal? ask on stderr, read stdin : answer no
   run_build
     validate arguments                       (--yes without --force rejected by clap)
-    remove leftover temporary stores          (pattern, process ended, recognized)
-    forced: resolve symbolic link at the store path
-            recognize_or_refuse(final path)   unrecognized -> ownership error
+    resolve symbolic link at the store path
+    forced: recognize_or_refuse(final path)   unrecognized -> ownership error
             free space >= store size + 10%?   no -> general failure naming both sizes
             not --yes? confirm(question)      no -> usage error naming --yes
+    remove leftover temporary stores          (pattern, process ended, recognized)
     resolve analyzer, collect sources
     forced: analyze
-            GraphStore::create at <final>.c10r-tmp-<pid>   (guard removes it on any exit)
+            read the old store's workspace     (handoff disclosure)
+            GraphStore::create_pending at <final>.c10r-tmp-<pid>   (guard removes it on any exit)
             ingest_with_params -> commit
             close, rename temporary over final, remove old side files
             answer: replaced_store, removed_temporary_stores
@@ -150,4 +154,8 @@ MCP build(force=true, acknowledge=true)
 - **A stopped build that dies while creating its temporary store:** if it stops before the stamps are written, the file is not recognized and the cleanup keeps it.
   Such a file is small, because no rows have been written yet.
 - **Process ID reuse:** an unrelated live process with a leftover's process ID keeps that leftover until the process exits.
+- **Untested path: ingestion fails after the temporary store exists.**
+  No test reaches this failure through `run_build`, because the stub analyzers always produce an index that ingests.
+  A store unit test covers the guard that removes an unpublished temporary store, and the build passes the ingestion error up before the rename.
+  The user accepted this gap on 2026-10-21 rather than add a fault-injection point or a hand-built invalid index.
 - **Two prompts in one build:** if `retained-utility` lands first, a forced build of a workspace whose indexer then fails could ask twice; the second question belongs to that change's flow and is asked only after the first was answered yes.
