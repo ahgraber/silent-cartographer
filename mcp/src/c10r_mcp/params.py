@@ -47,7 +47,10 @@ class Relation(StrEnum):
     """The modules that import the subject."""
 
     IMPLEMENTERS = "implementers"
-    """The types declaring the subject as a supertype."""
+    """The types declaring the subject as a supertype, or the methods directly overriding a method."""
+
+    IMPLEMENTS = "implements"
+    """The supertypes a type declares, or the methods a method directly overrides."""
 
     TESTS = "tests"
     """The reference sites whose enclosing declaration is test code."""

@@ -19,15 +19,16 @@ c10r trace Client --relation contains --detail signature
 
 `--relation` is required and takes one of:
 
-| Relation       | Returns                                                                                            |
-| -------------- | -------------------------------------------------------------------------------------------------- |
-| `containers`   | The declaration that directly encloses the subject                                                 |
-| `contains`     | The symbols the subject directly contains                                                          |
-| `references`   | The sites that reference the subject                                                               |
-| `dependents`   | Everything that depends on the subject, directly and transitively to `--depth`                     |
-| `importers`    | The modules that import the subject                                                                |
-| `implementers` | The types declaring the subject as a supertype — a trait's implementors, or a base type's subtypes |
-| `tests`        | The reference sites whose enclosing declaration is test code                                       |
+| Relation       | Returns                                                                                                                                                    |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `containers`   | The declaration that directly encloses the subject                                                                                                         |
+| `contains`     | The symbols the subject directly contains                                                                                                                  |
+| `references`   | The sites that reference the subject                                                                                                                       |
+| `dependents`   | Everything that depends on the subject, directly and transitively to `--depth`                                                                             |
+| `importers`    | The modules that import the subject                                                                                                                        |
+| `implementers` | For a type, the types declaring it as a supertype — a trait's implementors, or a base type's subtypes; for a method, the methods that directly override it |
+| `implements`   | For a type, the supertypes it directly declares; for a method, the methods it directly overrides                                                           |
+| `tests`        | The reference sites whose enclosing declaration is test code                                                                                               |
 
 ## Options
 
@@ -97,6 +98,31 @@ Limits of the `unresolved_calls` group:
   Code under a `#[cfg(...)]` condition that is false on the host has no occurrences, so its calls appear in the group, and the group differs between hosts.
 - A common name such as `get` lists many unrelated calls.
 
+The override relations of a `references` subject that is a method are disclosed beside the results.
+They are not counted in the results, in `page.returned`, or in `page.total`.
+The `override_relations` field carries two parts, `overridden_by` and `overrides`.
+Each part counts the methods reached by following override edges in that direction, transitively and excluding the subject, and the resolved references of those methods.
+
+| Field        | Meaning                                                                                     |
+| ------------ | ------------------------------------------------------------------------------------------- |
+| `methods`    | How many methods the walk reached                                                           |
+| `references` | The total of those methods' resolved references                                             |
+| `command`    | The `trace` command that lists the direct relations; present only when `methods` is not `0` |
+
+The `command` of `overridden_by` uses `--relation implementers`, and the `command` of `overrides` uses `--relation implements`.
+The field is absent for a subject that is not a method.
+The human rendering prints one line per part that reached methods, after the groups, naming the counts and the command.
+An empty `references` answer for a method adds a clause for each such part to its scoped empty line.
+
+Cases with no override edge, so no disclosure and no `implementers` or `implements` row:
+
+- A method whose base is built at run time, or whose base name resolves to more than one symbol, has no edge through that base.
+- A base or trait outside the index has no methods to link, so overriding an external method such as `threading.Thread.run` or `std::fmt::Display::fmt` records nothing.
+- A type that satisfies a Protocol structurally, without naming it as a base, overrides nothing.
+- Methods and impls that a Rust macro generates have no override edges.
+- A Python method named with two leading underscores and no trailing ones is private to its class and overrides nothing.
+- A Python base that binds the method name to something other than a method, such as a class attribute, ends the search along that base.
+
 ## Empty answers
 
 An empty answer of `references`, `dependents`, `importers`, or `tests`, and an `impact` answer whose seeds have no dependents, means that no resolved instance was recorded.
@@ -106,7 +132,7 @@ For `tests`, the rendering reads `no convention-classified test reference found`
 The JSON outcome stays `empty`.
 For `references`, the rendering also states the totals of both groups.
 
-An empty answer of `containers`, `contains`, or `implementers`, and an `impact` answer whose change touches no indexed declaration, is a definite none.
+An empty answer of `containers`, `contains`, `implementers`, or `implements`, and an `impact` answer whose change touches no indexed declaration, is a definite none.
 Each states a fact that the syntax tree establishes.
 
 ## dependents
@@ -114,7 +140,10 @@ Each states a fact that the syntax tree establishes.
 What could break if this symbol changes.
 The relation is reference-grade, so any mention counts, not only a call: a type usage or a constant read is a dependent.
 
+When the subject is a method, the methods that override it are dependents of kind `overrides`.
+
 Rows are ordered by distance, then within each distance layer by how load-bearing the dependent is across the codebase (PageRank over the dependency edges).
+Override edges count as dependency edges in that ordering.
 Ranking never changes which symbols the answer contains, and no score is published.
 `--order unranked` orders only by the answer's stable structural keys: distance, then dependency kind, then canonical identity.
 

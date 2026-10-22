@@ -11,11 +11,11 @@ use super::store::RankProjection;
 /// so a token never resumes across a scoring change.
 ///
 /// It covers the whole model: the algorithm (global PageRank by power iteration), the projection
-/// (in-workspace symbols; `uses`/`imports`/`type_hierarchy` edges collapsed per pair), the damping
-/// factor, the iteration count, and the uniform edge weights. Changing any of them is a
+/// (in-workspace symbols; `uses`/`imports`/`type_hierarchy`/`overrides` edges collapsed per pair), the
+/// damping factor, the iteration count, and the uniform edge weights. Changing any of them is a
 /// retrieval-scoring change under the repository's governance rule: bump this constant and record a
 /// migration note in the changelog.
-pub const RANK_VERSION: u32 = 1;
+pub const RANK_VERSION: u32 = 2;
 
 /// The damping factor: the standard value from the PageRank literature.
 const DAMPING: f64 = 0.85;

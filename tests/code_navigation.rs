@@ -12,9 +12,9 @@ use silent_cartographer::graph::syntax::Language;
 use silent_cartographer::identity::{
     CanonicalId, Descriptor, DescriptorSegment, SegmentKind, WorkspaceId, project_one,
 };
-use silent_cartographer::query::output::Outcome;
+use silent_cartographer::query::output::{Outcome, OverrideRelations};
 use silent_cartographer::query::resolve::{Resolution, SourcePosition};
-use silent_cartographer::query::{Detail, OrderMode, QueryEngine, Relation, TraceRelation};
+use silent_cartographer::query::{Detail, OrderMode, QueryEngine, Relation, TraceItem, TraceRelation};
 use silent_cartographer::semantic::model::{
     AnalyzerProvenance, ExtractedIndex, ExtractedOccurrence, ExtractedSymbol, OccurrenceRole, PositionEncoding,
     SourceDocument, SourceRange, SymbolClass, SymbolKind,
@@ -5295,4 +5295,430 @@ fn dependents_ignore_refused_uses() {
 
     let dependents = engine.dependents("alpha", 1, None, None, OrderMode::Unranked).unwrap();
     assert_eq!(dependents.outcome, Outcome::Empty);
+}
+
+// --- Overrides in dependents, ranking, and the hierarchy relations ------------------------------
+
+/// The `(identity, distance, kind)` of every detailed dependent of `seed`, in answer order.
+fn detailed_dependents(engine: &QueryEngine<'_>, seed: &str, depth: u32) -> Vec<(String, u32, DependencyKind)> {
+    let answer = engine.dependents(seed, depth, None, None, OrderMode::Unranked).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found, got {:?}", answer.outcome);
+    };
+    results[0]
+        .detail
+        .iter()
+        .map(|d| (d.symbol.canonical_id.as_str().to_string(), d.distance, d.kind))
+        .collect()
+}
+
+// _(Dependent via override)_ — an overriding method is a distance-one dependent of the method it
+// overrides, and its caller is a distance-two dependent.
+#[test]
+fn dependents_of_a_base_method_include_its_override_and_the_overrides_caller() {
+    let store = dep_graph(
+        &["base", "override", "caller"],
+        &[
+            (EdgeKind::Overrides, "override", "base"),
+            (EdgeKind::Uses, "caller", "override"),
+        ],
+    );
+    assert_eq!(
+        detailed_dependents(&dep_engine(&store), "test-ws::base", 2),
+        vec![
+            ("test-ws::override".to_string(), 1, DependencyKind::Overrides),
+            ("test-ws::caller".to_string(), 2, DependencyKind::Uses),
+        ]
+    );
+}
+
+// _(An override's dependents exclude the method it overrides)_ — the walk follows an `overrides`
+// edge from base to override only.
+#[test]
+fn dependents_of_an_override_exclude_its_base_and_the_bases_callers() {
+    let store = dep_graph(
+        &["base", "override", "base_caller"],
+        &[
+            (EdgeKind::Overrides, "override", "base"),
+            (EdgeKind::Uses, "base_caller", "base"),
+        ],
+    );
+    let answer = dep_engine(&store)
+        .dependents("test-ws::override", 2, None, None, OrderMode::Unranked)
+        .unwrap();
+    assert_eq!(answer.outcome, Outcome::Empty);
+}
+
+/// A graph over `symbols` and `edges` plus, for each `(owner, count)`, `count` callers of `owner`
+/// named `{owner}_c{n}`.
+fn graph_with_callers(symbols: &[&str], edges: &[(EdgeKind, &str, &str)], counts: &[(&str, usize)]) -> GraphStore {
+    let store = dep_graph(symbols, edges);
+    for (owner, count) in counts {
+        for n in 0..*count {
+            let caller = format!("{owner}_c{n}");
+            put_dep_symbol(&store, &caller);
+            store
+                .insert_edge(EdgeKind::Uses, &dep_id(&caller), &dep_id(owner))
+                .unwrap();
+        }
+    }
+    store
+}
+
+// _(An overridden method ranks by its overrides' dependents)_ — the base method has one direct caller
+// but its override has six, so ranked order puts it before the function with three callers, though
+// identity order and direct-caller counts both favor the function.
+#[test]
+fn an_overridden_method_ranks_by_its_overrides_dependents() {
+    let store = graph_with_callers(
+        &["seed", "a_func", "z_base", "z_override"],
+        &[
+            (EdgeKind::Uses, "a_func", "seed"),
+            (EdgeKind::Uses, "z_base", "seed"),
+            (EdgeKind::Overrides, "z_override", "z_base"),
+        ],
+        &[("a_func", 3), ("z_base", 1), ("z_override", 6)],
+    );
+    let ids = detail_ids_under(&dep_engine(&store), "test-ws::seed", 1, OrderMode::Ranked);
+    assert_eq!(ids, vec!["test-ws::z_base", "test-ws::a_func"]);
+}
+
+// _(An override does not inherit its base's importance)_ — an override with no callers ranks after a
+// function with one caller, though its base is widely depended upon.
+#[test]
+fn an_override_does_not_inherit_its_bases_importance() {
+    let store = graph_with_callers(
+        &["seed", "a_override", "base", "z_func"],
+        &[
+            (EdgeKind::Uses, "a_override", "seed"),
+            (EdgeKind::Uses, "z_func", "seed"),
+            (EdgeKind::Overrides, "a_override", "base"),
+        ],
+        &[("base", 8), ("z_func", 1)],
+    );
+    let ids = detail_ids_under(&dep_engine(&store), "test-ws::seed", 1, OrderMode::Ranked);
+    assert_eq!(ids, vec!["test-ws::z_func", "test-ws::a_override"]);
+}
+
+/// The identities a `trace` over `relation` returns, in answer order.
+fn trace_ids(engine: &QueryEngine<'_>, subject: &str, relation: TraceRelation) -> Vec<String> {
+    let answer = engine.trace(subject, relation, None, None).unwrap();
+    let Outcome::Found { results } = &answer.outcome else {
+        panic!("expected found for {subject}, got {:?}", answer.outcome);
+    };
+    results
+        .iter()
+        .map(|item| match item {
+            TraceItem::Symbol { symbol, .. } => symbol.canonical_id.as_str().to_string(),
+            other => panic!("expected a symbol row, got {other:?}"),
+        })
+        .collect()
+}
+
+fn method_overrides_store(index: &ExtractedIndex, sources: &[(String, String)]) -> GraphStore {
+    let mut store = GraphStore::open_in_memory().unwrap();
+    ingest(&mut store, &ws(), Some(WS_ROOT), index, sources).unwrap();
+    store
+}
+
+fn method_overrides_rust_store() -> GraphStore {
+    method_overrides_store(
+        &support::method_overrides_rust_index(),
+        &support::method_overrides_rust_sources(),
+    )
+}
+
+/// The fixture identity at `path` below the method-overrides package.
+fn mo(path: &str) -> String {
+    format!("test-ws::method-overrides::{path}")
+}
+
+// _(Trace implementers of a method)_ — only the methods that directly override the subject. No
+// committed fixture has a method overridden by two subclasses, one of them overridden further, so
+// the hierarchy is hand-built.
+#[test]
+fn implementers_of_a_method_are_its_direct_overrides() {
+    let store = dep_graph(
+        &["base", "left", "right", "leaf"],
+        &[
+            (EdgeKind::Overrides, "left", "base"),
+            (EdgeKind::Overrides, "right", "base"),
+            (EdgeKind::Overrides, "leaf", "left"),
+        ],
+    );
+    assert_eq!(
+        trace_ids(&dep_engine(&store), "test-ws::base", TraceRelation::Implementers),
+        vec!["test-ws::left", "test-ws::right"]
+    );
+}
+
+// _(Trace implementers of a Rust trait method)_
+#[test]
+fn implementers_of_a_rust_trait_method_are_its_impl_methods() {
+    let store = method_overrides_rust_store();
+    assert_eq!(
+        trace_ids(
+            &dep_engine(&store),
+            &mo("traits::Req::req"),
+            TraceRelation::Implementers
+        ),
+        vec![mo("impls::impl::Gadget::Req::req"), mo("impls::impl::Widget::Req::req")]
+    );
+}
+
+// _(Trace implements of a method)_ — under both Python indexers, a method of a class with two
+// declared bases that each declare it implements exactly the two base methods.
+#[test]
+fn implements_of_a_python_method_are_the_base_methods_it_overrides() {
+    for file in ["index.scip", "ty-scip.scip"] {
+        let store = method_overrides_store(
+            &support::method_overrides_python_index_from(file),
+            &support::method_overrides_python_sources(),
+        );
+        assert_eq!(
+            trace_ids(&dep_engine(&store), &mo("pkg::multi::E::m"), TraceRelation::Implements),
+            vec![mo("pkg::multi::X::m"), mo("pkg::multi::Y::m")],
+            "{file}"
+        );
+    }
+}
+
+// _(Trace implements of a type)_ — a Rust type that implements several workspace traits; the fixture
+// has no type with exactly two.
+#[test]
+fn implements_of_a_rust_type_are_the_traits_it_declares() {
+    let store = method_overrides_rust_store();
+    assert_eq!(
+        trace_ids(&dep_engine(&store), &mo("widget::Gadget"), TraceRelation::Implements),
+        vec![
+            mo("traits::Dflt"),
+            mo("traits::Made"),
+            mo("traits::Remote"),
+            mo("traits::Req")
+        ]
+    );
+}
+
+// _(Trace implements of a Rust impl method)_
+#[test]
+fn implements_of_a_rust_impl_method_is_the_trait_item() {
+    let store = method_overrides_rust_store();
+    assert_eq!(
+        trace_ids(
+            &dep_engine(&store),
+            &mo("impls::impl::Widget::Req::req"),
+            TraceRelation::Implements
+        ),
+        vec![mo("traits::Req::req")]
+    );
+}
+
+// _(An empty implements answer is a definite none)_ — a method that overrides nothing is typed
+// absence, with no unseen-cases scope.
+#[test]
+fn implements_of_a_method_that_overrides_nothing_is_typed_empty() {
+    let store = method_overrides_store(
+        &support::method_overrides_python_index_from("index.scip"),
+        &support::method_overrides_python_sources(),
+    );
+    let answer = dep_engine(&store)
+        .trace(
+            &mo("pkg::plain::PlainBase::speak"),
+            TraceRelation::Implements,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(answer.outcome, Outcome::Empty);
+}
+
+/// The `references` answer for `subject` over `store`.
+fn references_answer(store: &GraphStore, subject: &str) -> silent_cartographer::query::output::Answer<TraceItem> {
+    dep_engine(store)
+        .trace(subject, TraceRelation::References, None, None)
+        .unwrap()
+}
+
+/// The override disclosure of the `references` answer for `subject`, which must carry one.
+fn override_relations(store: &GraphStore, subject: &str) -> OverrideRelations {
+    references_answer(store, subject)
+        .override_relations
+        .unwrap_or_else(|| panic!("no override disclosure for {subject}"))
+}
+
+/// How many resolved references the fixture symbol at `path` has.
+fn resolved_references(store: &GraphStore, path: &str) -> usize {
+    store.references_of(&CanonicalId::from_raw(mo(path))).unwrap().len()
+}
+
+/// The method-overrides Python stores, one per committed index.
+fn python_override_stores() -> Vec<(&'static str, GraphStore)> {
+    ["index.scip", "ty-scip.scip"]
+        .into_iter()
+        .map(|file| {
+            (
+                file,
+                method_overrides_store(
+                    &support::method_overrides_python_index_from(file),
+                    &support::method_overrides_python_sources(),
+                ),
+            )
+        })
+        .collect()
+}
+
+// _(An overridden method discloses its overrides)_ — `A3.m` is overridden by two methods, each with a
+// resolved reference; the second part is zero.
+#[test]
+fn an_overridden_method_discloses_its_overrides() {
+    for (file, store) in python_override_stores() {
+        let relations = override_relations(&store, &mo("pkg::chain::A3::m"));
+        assert_eq!(relations.overridden_by.methods, 2, "{file}");
+        assert_eq!(
+            relations.overridden_by.references,
+            resolved_references(&store, "pkg::chain::B3::m") + resolved_references(&store, "pkg::chain::C3::m"),
+            "{file}"
+        );
+        assert_eq!(
+            (relations.overrides.methods, relations.overrides.references),
+            (0, 0),
+            "{file}"
+        );
+    }
+}
+
+// _(Overrides of overrides are counted)_ — `A3.m` counts `C3.m` though only `B3.m` overrides it
+// directly; `B3.m` counts one override and one overridden method.
+#[test]
+fn overrides_of_overrides_are_counted() {
+    for (file, store) in python_override_stores() {
+        assert_eq!(
+            trace_ids(
+                &dep_engine(&store),
+                &mo("pkg::chain::A3::m"),
+                TraceRelation::Implementers
+            ),
+            vec![mo("pkg::chain::B3::m")],
+            "{file}"
+        );
+        assert_eq!(
+            override_relations(&store, &mo("pkg::chain::A3::m"))
+                .overridden_by
+                .methods,
+            2,
+            "{file}"
+        );
+        let middle = override_relations(&store, &mo("pkg::chain::B3::m"));
+        assert_eq!(
+            (middle.overridden_by.methods, middle.overrides.methods),
+            (1, 1),
+            "{file}"
+        );
+    }
+}
+
+// _(An overriding method discloses what it overrides)_ — engine half: the second part counts the base
+// method and its resolved references.
+#[test]
+fn an_overriding_method_discloses_what_it_overrides() {
+    for (file, store) in python_override_stores() {
+        let relations = override_relations(&store, &mo("pkg::plain::PlainChild::speak"));
+        assert_eq!(relations.overrides.methods, 1, "{file}");
+        assert_eq!(
+            relations.overrides.references,
+            resolved_references(&store, "pkg::plain::PlainBase::speak"),
+            "{file}"
+        );
+        assert_eq!(relations.overridden_by.methods, 0, "{file}");
+    }
+}
+
+// _(A Rust impl method discloses the trait item it implements)_
+#[test]
+fn a_rust_impl_method_discloses_the_trait_item_it_implements() {
+    let store = method_overrides_rust_store();
+    let relations = override_relations(&store, &mo("impls::impl::Widget::Req::req"));
+    assert_eq!(relations.overrides.methods, 1);
+    assert_eq!(
+        relations.overrides.references,
+        resolved_references(&store, "traits::Req::req")
+    );
+    assert_eq!(relations.overridden_by.methods, 0);
+}
+
+// _(A method with no override relation carries zeros)_ — the disclosure is present with both parts
+// zero and no command.
+#[test]
+fn a_method_with_no_override_relation_carries_zeros() {
+    for (file, store) in python_override_stores() {
+        let answer = references_answer(&store, &mo("pkg::unrelated::Loner::run"));
+        let json: serde_json::Value = serde_json::from_str(&answer.to_json()).unwrap();
+        assert_eq!(
+            json["override_relations"],
+            serde_json::json!({
+                "overridden_by": { "methods": 0, "references": 0 },
+                "overrides": { "methods": 0, "references": 0 }
+            }),
+            "{file}"
+        );
+    }
+}
+
+// _(A type subject carries no override disclosure)_ — and an ambiguous or unresolved subject carries
+// none either.
+#[test]
+fn only_a_resolved_method_subject_carries_an_override_disclosure() {
+    let store = method_overrides_store(
+        &support::method_overrides_python_index_from("index.scip"),
+        &support::method_overrides_python_sources(),
+    );
+    let class = references_answer(&store, &mo("pkg::chain::A3"));
+    assert!(class.override_relations.is_none());
+    assert!(!class.to_json().contains("override_relations"));
+
+    let ambiguous = references_answer(&store, "m");
+    assert!(
+        matches!(ambiguous.outcome, Outcome::Ambiguous { .. }),
+        "{:?}",
+        ambiguous.outcome
+    );
+    assert!(ambiguous.override_relations.is_none());
+
+    let unresolved = references_answer(&store, "test-ws::no::such::symbol");
+    assert!(
+        matches!(unresolved.outcome, Outcome::Absent),
+        "{:?}",
+        unresolved.outcome
+    );
+    assert!(unresolved.override_relations.is_none());
+}
+
+// A rebuild whose sources drop a subclass's base removes the override: the `implements` answer is
+// empty and the disclosure carries zeros.
+#[test]
+fn a_rebuild_that_removes_a_base_clears_the_override_disclosure() {
+    for file in ["index.scip", "ty-scip.scip"] {
+        let index = support::method_overrides_python_index_from(file);
+        let mut sources = support::method_overrides_python_sources();
+        let mut store = method_overrides_store(&index, &sources);
+        let subject = mo("pkg::plain::PlainChild::speak");
+        assert_eq!(override_relations(&store, &subject).overrides.methods, 1, "{file}");
+
+        let plain = sources.iter_mut().find(|(path, _)| path == "pkg/plain.py").unwrap();
+        plain.1 = plain
+            .1
+            .replace("class PlainChild(PlainBase):", "class PlainChild:           ");
+        ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+
+        let implements = dep_engine(&store)
+            .trace(&subject, TraceRelation::Implements, None, None)
+            .unwrap();
+        assert_eq!(implements.outcome, Outcome::Empty, "{file}");
+        let relations = override_relations(&store, &subject);
+        assert_eq!(
+            (relations.overridden_by.methods, relations.overrides.methods),
+            (0, 0),
+            "{file}"
+        );
+    }
 }

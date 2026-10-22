@@ -18,8 +18,8 @@ use crate::identity::CanonicalId;
 use crate::semantic::model::{AnalyzerProvenance, EnvironmentFacts};
 
 use output::{
-    Answer, ContentLines, EmptyScope, Location, Provenance, SymbolView, UNCONFIRMED_CANDIDATES_MAX, UnconfirmedUse,
-    UnconfirmedUses, UnresolvedCallView, UnresolvedCalls,
+    Answer, ContentLines, EmptyScope, Location, OverridePart, OverrideRelations, Provenance, SymbolView,
+    UNCONFIRMED_CANDIDATES_MAX, UnconfirmedUse, UnconfirmedUses, UnresolvedCallView, UnresolvedCalls,
 };
 use resolve::{Resolution, SourcePosition, resolve, resolve_position};
 
@@ -53,9 +53,12 @@ pub enum TraceRelation {
     References,
     /// The modules that import the subject.
     Importers,
-    /// The types that declare the subject as a supertype — a trait's implementors or a base type's
-    /// subtypes.
+    /// For a type, the types that declare it as a supertype — a trait's implementors or a base
+    /// type's subtypes; for a method, the methods that directly override it.
     Implementers,
+    /// For a type, the supertypes it directly declares; for a method, the methods it directly
+    /// overrides.
+    Implements,
     /// The reference sites of the subject whose enclosing declaration is classified test code.
     /// Convention-based classification, not resolved semantic fact; every answer carries the
     /// heuristic-grade marker.
@@ -79,9 +82,12 @@ pub enum Relation {
     Dependents,
     /// The modules that import the subject.
     Importers,
-    /// The types that declare the subject as a supertype — a trait's implementors or a base type's
-    /// subtypes.
+    /// For a type, the types that declare it as a supertype — a trait's implementors or a base
+    /// type's subtypes; for a method, the methods that directly override it.
     Implementers,
+    /// For a type, the supertypes it directly declares; for a method, the methods it directly
+    /// overrides.
+    Implements,
     /// The reference sites of the subject whose enclosing declaration is classified test code — the
     /// answer to "what test code exercises this symbol". Convention-based classification, not
     /// resolved semantic fact; every answer carries the heuristic-grade marker.
@@ -98,6 +104,7 @@ impl Relation {
             Relation::References => Some(TraceRelation::References),
             Relation::Importers => Some(TraceRelation::Importers),
             Relation::Implementers => Some(TraceRelation::Implementers),
+            Relation::Implements => Some(TraceRelation::Implements),
             Relation::Tests => Some(TraceRelation::Tests),
             Relation::Dependents => None,
         }
@@ -360,9 +367,8 @@ impl<'a> QueryEngine<'a> {
                     TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
                 })
                 .collect(),
-            TraceRelation::Implementers => self
-                .store
-                .edge_sources(EdgeKind::TypeHierarchy, &subject.canonical_id)?
+            TraceRelation::Implementers | TraceRelation::Implements => self
+                .hierarchy_relatives(&subject.canonical_id, relation == TraceRelation::Implements)?
                 .into_iter()
                 .filter_map(|id| self.store.symbol(&id).ok().flatten())
                 .map(|row| {
@@ -382,6 +388,7 @@ impl<'a> QueryEngine<'a> {
                 let (calls, uses) = self.reference_groups(&subject)?;
                 answer
                     .with_reference_groups(calls, uses)
+                    .with_override_relations(self.override_relations(&subject)?)
                     .with_empty_scope(EmptyScope::References)
             }
             TraceRelation::Importers => answer.with_empty_scope(EmptyScope::Importers),
@@ -395,6 +402,63 @@ impl<'a> QueryEngine<'a> {
         } else {
             Ok(answer)
         }
+    }
+
+    /// The override disclosure of a `references` subject: for a method, the methods that override it
+    /// and the methods it overrides, each transitively, with their resolved reference totals. `None`
+    /// for a subject of any other kind. The commands are filled by the caller, which knows the store.
+    fn override_relations(&self, subject: &SymbolRow) -> Result<Option<OverrideRelations>, QueryError> {
+        if subject.kind != "method" {
+            return Ok(None);
+        }
+        Ok(Some(OverrideRelations {
+            overridden_by: self.override_part(&subject.canonical_id, false)?,
+            overrides: self.override_part(&subject.canonical_id, true)?,
+            subject: subject.canonical_id.clone(),
+        }))
+    }
+
+    /// Walk `overrides` edges from `start`, forward or backward, to a fixed point; the visited set
+    /// holds `start`, so a cycle never counts the subject.
+    fn override_part(&self, start: &CanonicalId, forward: bool) -> Result<OverridePart, QueryError> {
+        let mut visited = std::collections::BTreeSet::from([start.clone()]);
+        let mut frontier = vec![start.clone()];
+        let mut references = 0;
+        while let Some(id) = frontier.pop() {
+            let next = if forward {
+                self.store.edge_targets(EdgeKind::Overrides, &id)?
+            } else {
+                self.store.edge_sources(EdgeKind::Overrides, &id)?
+            };
+            for method in next {
+                if visited.insert(method.clone()) {
+                    references += self.store.count_references_of(&method)?;
+                    frontier.push(method);
+                }
+            }
+        }
+        Ok(OverridePart {
+            methods: visited.len() - 1,
+            references,
+            command: None,
+        })
+    }
+
+    /// The symbols joined to `id` by a hierarchy edge: the sources of the `type_hierarchy` and
+    /// `overrides` edges that reach it, or with `forward` their targets, sorted and deduplicated by
+    /// canonical identity. A subject has edges of only one of the two kinds.
+    fn hierarchy_relatives(&self, id: &CanonicalId, forward: bool) -> rusqlite::Result<Vec<CanonicalId>> {
+        let mut relatives = Vec::new();
+        for kind in [EdgeKind::TypeHierarchy, EdgeKind::Overrides] {
+            relatives.extend(if forward {
+                self.store.edge_targets(kind, id)?
+            } else {
+                self.store.edge_sources(kind, id)?
+            });
+        }
+        relatives.sort();
+        relatives.dedup();
+        Ok(relatives)
     }
 
     /// `dependents`: the impact assessment for the subject `reference` — the symbols that depend on

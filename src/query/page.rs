@@ -176,6 +176,7 @@ pub fn apply_pagination<T>(
         not_compared_completely,
         unresolved_calls,
         unconfirmed_uses,
+        override_relations,
         empty_scope,
         outcome,
         page: _,
@@ -209,6 +210,7 @@ pub fn apply_pagination<T>(
             not_compared_completely,
             unresolved_calls,
             unconfirmed_uses,
+            override_relations,
             empty_scope,
             outcome: Outcome::Ambiguous {
                 candidates,
@@ -237,6 +239,7 @@ pub fn apply_pagination<T>(
             not_compared_completely,
             unresolved_calls,
             unconfirmed_uses,
+            override_relations,
             empty_scope,
             outcome,
             page: None,
@@ -258,6 +261,7 @@ pub fn apply_pagination<T>(
             not_compared_completely,
             unresolved_calls,
             unconfirmed_uses,
+            override_relations,
             empty_scope,
             outcome: Outcome::Found { results },
             page: None,
@@ -279,6 +283,7 @@ pub fn apply_pagination<T>(
         not_compared_completely,
         unresolved_calls,
         unconfirmed_uses,
+        override_relations,
         empty_scope,
         outcome: Outcome::Found { results: page_results },
         page,
@@ -337,6 +342,7 @@ pub fn apply_report_pagination<T>(
         not_compared_completely,
         unresolved_calls,
         unconfirmed_uses,
+        override_relations,
         empty_scope,
         outcome,
         page: _,
@@ -360,6 +366,7 @@ pub fn apply_report_pagination<T>(
             not_compared_completely,
             unresolved_calls,
             unconfirmed_uses,
+            override_relations,
             empty_scope,
             outcome: Outcome::Found { results },
             page: None,
@@ -388,6 +395,7 @@ pub fn apply_report_pagination<T>(
         not_compared_completely,
         unresolved_calls,
         unconfirmed_uses,
+        override_relations,
         empty_scope,
         outcome: Outcome::Found { results: vec![report] },
         page,
@@ -695,6 +703,26 @@ mod tests {
         let token = encode_token(&stale_identity("ranked", 1).hash(), 1);
         let err = apply_dependents_pagination(answer, Some(1), Some(&token), &stale_identity("ranked", 2))
             .expect_err("the report path refuses a prior rank version's token too");
+        assert!(
+            err.to_string().contains("different query parameters"),
+            "the refusal names the identity mismatch: {err}"
+        );
+    }
+
+    // _(Ranked ordering of dependents: a token issued under the first ranking model)_ — a token
+    // hashed under rank version 1 is refused against the identity this binary builds.
+    #[test]
+    fn a_rank_version_one_token_is_refused_by_the_current_model() {
+        let with_ordering = |ordering| {
+            let mut identity = identity(1);
+            identity.ordering = Some(ordering);
+            identity
+        };
+        let token = encode_token(&with_ordering(OrderingIdentity::with_version("ranked", 1)).hash(), 1);
+        let current = with_ordering(OrderingIdentity::current(crate::query::OrderMode::Ranked));
+        let answer = Answer::found(vec!["a".to_string(), "b".to_string()], provenance(), Freshness::Fresh);
+        let err = apply_pagination(answer, Some(1), Some(&token), &current)
+            .expect_err("a version 1 token is refused, not resumed");
         assert!(
             err.to_string().contains("different query parameters"),
             "the refusal names the identity mismatch: {err}"

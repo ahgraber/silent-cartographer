@@ -14,8 +14,8 @@ use crate::cli::{ColorArg, PositionUnit};
 use crate::query::clones::{CloneGroup, CloneItem, CloneKind};
 use crate::query::impact::{Exactness, ImpactReport, SeedOutcome};
 use crate::query::output::{
-    Answer, Classification, ContentLines, EmptyScope, Location, Outcome, PageInfo, SymbolView, UnconfirmedUse,
-    WorkspaceRelation,
+    Answer, Classification, ContentLines, EmptyScope, Location, Outcome, OverridePart, PageInfo, SymbolView,
+    UnconfirmedUse, WorkspaceRelation,
 };
 use crate::query::search::{CloneCertainty, MutualMember, MutualPair, RelationView, SearchItem, SimilarItem};
 use crate::query::{DependentsReport, FindItem, HorizonDisclosure, OrderMode, SymbolDetail, TraceItem};
@@ -213,6 +213,7 @@ pub fn to_human<T: HumanRender>(answer: &Answer<T>, styled: bool, unit: Position
         }),
     }
     push_reference_groups(&mut lines, answer, unit);
+    push_override_lines(&mut lines, answer);
     if let Some(page) = &answer.page {
         push_page(&mut lines, page, styled);
     }
@@ -249,13 +250,14 @@ fn plain_empty_line<T>(answer: &Answer<T>) -> String {
     match answer.empty_scope {
         Some(EmptyScope::References) => match (&answer.unresolved_calls, &answer.unconfirmed_uses) {
             (Some(calls), Some(uses)) => format!(
-                "empty: no resolved reference recorded; {} {} named {} {} no resolved target and {} {} unconfirmed ({UNSEEN_CASES})",
+                "empty: no resolved reference recorded; {} {} named {} {} no resolved target and {} {} unconfirmed{} ({UNSEEN_CASES})",
                 calls.total,
                 agree(calls.total, "call", "calls"),
                 sanitize(&calls.name),
                 agree(calls.total, "has", "have"),
                 uses.total,
-                agree(uses.total, "use is", "uses are")
+                agree(uses.total, "use is", "uses are"),
+                override_clauses(answer)
             ),
             _ => format!("empty: no resolved reference recorded ({UNSEEN_CASES})"),
         },
@@ -263,6 +265,42 @@ fn plain_empty_line<T>(answer: &Answer<T>) -> String {
         Some(EmptyScope::Importers) => format!("empty: no resolved importer recorded ({UNSEEN_CASES})"),
         None => "empty: the relation holds no instances (a definite empty set)".to_string(),
     }
+}
+
+/// The clause the scoped empty line of a `references` answer gains for each override part that
+/// reached methods, each led by `; `; empty when no part did.
+fn override_clauses<T>(answer: &Answer<T>) -> String {
+    let Some(relations) = &answer.override_relations else {
+        return String::new();
+    };
+    [
+        ("it is overridden by", &relations.overridden_by),
+        ("it overrides", &relations.overrides),
+    ]
+    .into_iter()
+    .filter(|(_, part)| part.methods > 0)
+    .map(|(verb, part)| {
+        format!(
+            "; {verb} {} with {} (see below)",
+            methods_phrase(part),
+            references_phrase(part)
+        )
+    })
+    .collect()
+}
+
+/// `N method(s)` for an override part.
+fn methods_phrase(part: &OverridePart) -> String {
+    format!("{} {}", part.methods, agree(part.methods, "method", "methods"))
+}
+
+/// `M resolved reference(s)` for an override part.
+fn references_phrase(part: &OverridePart) -> String {
+    format!(
+        "{} resolved {}",
+        part.references,
+        agree(part.references, "reference", "references")
+    )
 }
 
 /// `singular` when `count` is 1, else `plural`.
@@ -328,6 +366,39 @@ fn push_reference_groups<T>(lines: &mut Vec<String>, answer: &Answer<T>, unit: P
         if group.truncated {
             lines.push(format!("  list all {} with --limit 0", group.total));
         }
+    }
+}
+
+/// Append one line per override part that reached methods, after the groups: the transitive counts
+/// and the command that lists only the direct relations.
+fn push_override_lines<T>(lines: &mut Vec<String>, answer: &Answer<T>) {
+    let Some(relations) = &answer.override_relations else {
+        return;
+    };
+    let parts = [
+        (
+            "overridden by",
+            "counting overrides of overrides",
+            "overrides",
+            &relations.overridden_by,
+        ),
+        (
+            "overrides",
+            "counting what it overrides in turn",
+            "ones",
+            &relations.overrides,
+        ),
+    ];
+    for (verb, counting, direct, part) in parts {
+        let Some(command) = part.command.as_deref().filter(|_| part.methods > 0) else {
+            continue;
+        };
+        lines.push(format!(
+            "{verb} {}, {counting}, with {}; list the direct {direct} with: {}",
+            methods_phrase(part),
+            references_phrase(part),
+            sanitize(command)
+        ));
     }
 }
 

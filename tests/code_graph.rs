@@ -9963,3 +9963,747 @@ fn rebuild_supersedes_unresolved_calls_and_discrepancy_links() {
     assert_eq!(row_count(&store, "unresolved_calls"), 0);
     assert_eq!(row_count(&store, "discrepancy_symbols"), 0);
 }
+
+// --- Override edges (`overrides`) ---------------------------------------------------------------
+
+/// The fixture identity at `path` below the method-overrides package; a path starting with `+`
+/// names a unit-marked package (`+shared::...`).
+fn mo_id(path: &str) -> CanonicalId {
+    let separator = if path.starts_with('+') { "" } else { "::" };
+    CanonicalId::from_raw(format!("test-ws::method-overrides{separator}{path}"))
+}
+
+/// `path` as the targets of `overrides` edges from the fixture method at `path` read, relative to
+/// the method-overrides package.
+fn override_targets(store: &GraphStore, path: &str) -> Vec<String> {
+    store
+        .edge_targets(EdgeKind::Overrides, &mo_id(path))
+        .unwrap()
+        .iter()
+        .map(|id| {
+            let relative = id.as_str().strip_prefix("test-ws::method-overrides").unwrap();
+            relative.strip_prefix("::").unwrap_or(relative).to_string()
+        })
+        .collect()
+}
+
+fn override_sources_of(store: &GraphStore, path: &str) -> Vec<CanonicalId> {
+    store.edge_sources(EdgeKind::Overrides, &mo_id(path)).unwrap()
+}
+
+/// The method-overrides Python fixture stores, one per committed index.
+fn method_overrides_python_stores() -> Vec<(&'static str, GraphStore)> {
+    PYTHON_FIXTURE_INDEXES
+        .into_iter()
+        .map(|file| {
+            let index = support::method_overrides_python_index_from(file);
+            (
+                file,
+                ingest_into_new_store(&index, &support::method_overrides_python_sources()),
+            )
+        })
+        .collect()
+}
+
+fn method_overrides_rust_store() -> GraphStore {
+    ingest_into_new_store(
+        &support::method_overrides_rust_index(),
+        &support::method_overrides_rust_sources(),
+    )
+}
+
+/// Assert, under each Python index, that the method at `from` overrides exactly `to`.
+fn assert_python_overrides(from: &str, to: &[&str]) {
+    for (file, store) in method_overrides_python_stores() {
+        assert_eq!(override_targets(&store, from), to, "{file}: {from}");
+    }
+}
+
+// _(A Python method overrides its base's method)_
+#[test]
+fn python_method_overrides_its_base_method() {
+    assert_python_overrides("pkg::plain::PlainChild::speak", &["pkg::plain::PlainBase::speak"]);
+}
+
+// _(A Python override skips a base that does not declare the method)_
+#[test]
+fn python_override_skips_a_base_that_does_not_declare_the_method() {
+    assert_python_overrides("pkg::chain::C2::m", &["pkg::chain::A2::m"]);
+}
+
+// _(A Python override links to its nearest ancestor only)_
+#[test]
+fn python_override_links_to_its_nearest_ancestor_only() {
+    assert_python_overrides("pkg::chain::C3::m", &["pkg::chain::B3::m"]);
+    assert_python_overrides("pkg::chain::B3::m", &["pkg::chain::A3::m"]);
+}
+
+// _(A Python override of several bases links to each)_
+#[test]
+fn python_override_of_several_bases_links_to_each() {
+    assert_python_overrides("pkg::multi::E::m", &["pkg::multi::X::m", "pkg::multi::Y::m"]);
+}
+
+// _(A Python base in another module)_
+#[test]
+fn python_base_in_another_module() {
+    assert_python_overrides("pkg::imported_child::Derived::m", &["pkg::imported_base::Origin::m"]);
+}
+
+// _(A Python decorated override)_
+#[test]
+fn python_decorated_override() {
+    for name in ["prop", "make", "util"] {
+        assert_python_overrides(
+            &format!("pkg::decorated::DecoratedChild::{name}"),
+            &[&format!("pkg::decorated::DecoratedBase::{name}")],
+        );
+    }
+}
+
+// _(A Python method shadowing a base attribute is not an override)_
+#[test]
+fn python_method_shadowing_a_base_attribute_is_not_an_override() {
+    assert_python_overrides("pkg::shadow::MethodChild::x", &[]);
+}
+
+// _(A Python class with no declared base has no override)_
+#[test]
+fn python_class_with_no_declared_base_has_no_override() {
+    assert_python_overrides("pkg::unrelated::Loner::run", &[]);
+    assert_python_overrides("pkg::unrelated::Stranger::run", &[]);
+}
+
+// A diamond: `C(B)` declares `m`, `B(P, Q)` does not, and `P` and `Q` both do.
+#[test]
+fn python_diamond_links_to_each_declaring_ancestor_once() {
+    assert_python_overrides(
+        "pkg::diamond::DiaC::m",
+        &["pkg::diamond::DiaP::m", "pkg::diamond::DiaQ::m"],
+    );
+}
+
+// _(A class attribute in a middle class stops the lookup)_
+#[test]
+fn python_class_attribute_in_a_middle_class_stops_the_lookup() {
+    assert_python_overrides("pkg::assigned_middle::AssignLeaf::m", &[]);
+}
+
+// _(An annotation with no value does not stop the lookup)_
+#[test]
+fn python_annotation_with_no_value_does_not_stop_the_lookup() {
+    assert_python_overrides(
+        "pkg::annotated_middle::AnnotLeaf::m",
+        &["pkg::annotated_middle::AnnotRoot::m"],
+    );
+}
+
+// _(A private Python name is not an override)_
+#[test]
+fn python_private_name_is_not_an_override() {
+    assert_python_overrides("pkg::private::PrivChild::__m", &[]);
+    assert_python_overrides("pkg::private::PrivChild::__eq__", &["pkg::private::PrivBase::__eq__"]);
+    for (file, store) in method_overrides_python_stores() {
+        assert!(
+            override_sources_of(&store, "pkg::private::PrivBase::__m").is_empty(),
+            "{file}: nothing overrides the base's private name"
+        );
+    }
+}
+
+// _(A Python property's accessors each link)_ — ty-scip reports each accessor as its own definition;
+// scip-python reports one.
+#[test]
+fn python_property_accessors_each_link() {
+    let mut stores = method_overrides_python_stores().into_iter();
+    let (_, scip_python) = stores.next().unwrap();
+    let (_, ty_scip) = stores.next().unwrap();
+    assert_eq!(
+        override_targets(&scip_python, "pkg::props::SizedChild::size"),
+        ["pkg::props::SizedBase::size"]
+    );
+    for child in ["pkg::props::SizedChild::size#0", "pkg::props::SizedChild::size#1"] {
+        assert_eq!(
+            override_targets(&ty_scip, child),
+            ["pkg::props::SizedBase::size#0", "pkg::props::SizedBase::size#1"],
+            "{child}"
+        );
+    }
+}
+
+// _(A method of an external base or trait is not a target)_
+#[test]
+fn method_of_an_external_base_or_trait_is_not_a_target() {
+    assert_python_overrides("pkg::stdlib::Worker::run", &[]);
+    assert_python_overrides("pkg::stdlib::Lookup::__getitem__", &[]);
+    let store = method_overrides_rust_store();
+    assert_eq!(
+        override_targets(&store, "impls::impl::Widget::Req::req"),
+        ["traits::Req::req"],
+        "the control impl links"
+    );
+    assert!(override_targets(&store, "widget::impl::Widget::Display::fmt").is_empty());
+}
+
+// _(A Rust impl method overrides a required trait item)_
+#[test]
+fn rust_impl_method_overrides_a_required_trait_item() {
+    let store = method_overrides_rust_store();
+    for implementer in ["Widget", "Gadget"] {
+        assert_eq!(
+            override_targets(&store, &format!("impls::impl::{implementer}::Req::req")),
+            ["traits::Req::req"]
+        );
+    }
+}
+
+// _(A Rust impl method overrides a default trait item)_ — only the impl that declares `dm` links.
+#[test]
+fn rust_impl_method_overrides_a_default_trait_item() {
+    let store = method_overrides_rust_store();
+    assert_eq!(
+        override_targets(&store, "impls::impl::Widget::Dflt::dm"),
+        ["traits::Dflt::dm"]
+    );
+    let default_overrides = store
+        .edge_sources(EdgeKind::Overrides, &mo_id("traits::Dflt::dm"))
+        .unwrap();
+    assert_eq!(default_overrides, [mo_id("impls::impl::Widget::Dflt::dm")]);
+}
+
+// _(A Rust blanket impl method overrides its trait item)_
+#[test]
+fn rust_blanket_impl_method_overrides_its_trait_item() {
+    let store = method_overrides_rust_store();
+    assert_eq!(override_targets(&store, "impls::impl::T::Tr::tr"), ["traits::Tr::tr"]);
+}
+
+// _(A Rust impl for a reference type overrides its trait item)_ — the fixture's trait is `Edge`, so
+// the two impls do not overlap the `Tr` blanket impl.
+#[test]
+fn rust_impl_for_a_reference_or_tuple_type_overrides_its_trait_item() {
+    let store = method_overrides_rust_store();
+    for implementer in ["&Widget", "(u8, u8)"] {
+        assert_eq!(
+            override_targets(&store, &format!("impls::impl::{implementer}::Edge::edge")),
+            ["traits::Edge::edge"],
+            "{implementer}"
+        );
+    }
+}
+
+// _(A Rust inherent method is not an override)_
+#[test]
+fn rust_inherent_method_is_not_an_override() {
+    let store = method_overrides_rust_store();
+    assert_eq!(
+        override_targets(&store, "impls::impl::Widget::Named::name"),
+        ["traits::Named::name"]
+    );
+    assert!(override_targets(&store, "widget::impl::Widget::name").is_empty());
+}
+
+// _(A Rust file in several build units links its shared identities)_
+#[test]
+fn rust_file_in_several_build_units_links_its_shared_identities() {
+    let store = method_overrides_rust_store();
+    assert_eq!(
+        override_targets(&store, "+shared::shared::impl::SharedType::SharedTr::shared"),
+        ["+shared::shared::SharedTr::shared"]
+    );
+}
+
+// _(A trait in another document is reached through its use in the impl header)_
+#[test]
+fn rust_trait_in_another_document_is_reached_through_the_impl_header() {
+    let store = method_overrides_rust_store();
+    assert_eq!(
+        override_targets(&store, "impls::impl::Gadget::Remote::remote"),
+        ["traits::Remote::remote"]
+    );
+}
+
+// _(A macro-generated method has no edge)_
+#[test]
+fn macro_generated_method_has_no_edge() {
+    let store = method_overrides_rust_store();
+    assert!(override_sources_of(&store, "traits::Made::made").is_empty());
+}
+
+// _(A macro-generated impl has no edge)_
+#[test]
+fn macro_generated_impl_has_no_edge() {
+    let store = method_overrides_rust_store();
+    assert!(store.symbol(&mo_id("traits::Generated::generated")).unwrap().is_some());
+    assert!(override_sources_of(&store, "traits::Generated::generated").is_empty());
+    let edges = store.edges(EdgeKind::Overrides).unwrap();
+    assert!(!edges.is_empty());
+    assert!(edges.iter().all(|(source, _)| !source.as_str().contains("Generated")));
+}
+
+// Occurrence order is not an input: reversing every symbol's occurrences and the symbol order
+// persists the same `overrides` edges.
+#[test]
+fn overrides_do_not_depend_on_occurrence_order() {
+    let index = support::method_overrides_rust_index();
+    let mut reversed = index.clone();
+    reversed.symbols.reverse();
+    for symbol in &mut reversed.symbols {
+        symbol.occurrences.reverse();
+    }
+    let sources = support::method_overrides_rust_sources();
+    let forward = ingest_into_new_store(&index, &sources)
+        .edges(EdgeKind::Overrides)
+        .unwrap();
+    let backward = ingest_into_new_store(&reversed, &sources)
+        .edges(EdgeKind::Overrides)
+        .unwrap();
+    assert!(!forward.is_empty());
+    assert_eq!(forward, backward);
+}
+
+/// One trait method named `hi` and an impl of the trait declaring `hi`, as a hand-built Rust index
+/// over `source`. `trait_references` are the traits the impl header's name token is a reference of;
+/// `impl_method_symbols` are the symbols that define the impl's `hi`.
+fn rust_impl_index(source: &str, trait_references: &[&str], impl_method_symbols: &[&str]) -> ExtractedIndex {
+    let header = source.find("impl ").unwrap();
+    let header_name = header + source[header..].find("Greet").unwrap();
+    let impl_method = source.rfind("hi").unwrap();
+    let mut symbols = Vec::new();
+    for module in ["a", "b"] {
+        let trait_start = source.find(&format!("mod {module} ")).unwrap();
+        let trait_name = trait_start + source[trait_start..].find("Greet").unwrap();
+        let method = trait_start + source[trait_start..].find("hi").unwrap();
+        let mut trait_occurrences = vec![(trait_name, 5, OccurrenceRole::Definition)];
+        if trait_references.contains(&module) {
+            trait_occurrences.push((header_name, 5, OccurrenceRole::Reference));
+        }
+        symbols.push(sym_multi(
+            "c",
+            &[(module, SegmentKind::Module), ("Greet", SegmentKind::Type)],
+            SymbolKind::Trait,
+            SymbolClass::InWorkspace,
+            "m.rs",
+            &trait_occurrences,
+            source,
+        ));
+        symbols.push(sym_multi(
+            "c",
+            &[
+                (module, SegmentKind::Module),
+                ("Greet", SegmentKind::Type),
+                ("hi", SegmentKind::Method),
+            ],
+            SymbolKind::Method,
+            SymbolClass::InWorkspace,
+            "m.rs",
+            &[(method, 2, OccurrenceRole::Definition)],
+            source,
+        ));
+    }
+    let person = source.find("Person").unwrap();
+    symbols.push(sym_multi(
+        "c",
+        &[("Person", SegmentKind::Type)],
+        SymbolKind::Type,
+        SymbolClass::InWorkspace,
+        "m.rs",
+        &[(person, 6, OccurrenceRole::Definition)],
+        source,
+    ));
+    for owner in impl_method_symbols {
+        symbols.push(sym_multi(
+            "c",
+            &[
+                ("impl", SegmentKind::Type),
+                ("Person", SegmentKind::Type),
+                (owner, SegmentKind::Type),
+                ("hi", SegmentKind::Method),
+            ],
+            SymbolKind::Method,
+            SymbolClass::InWorkspace,
+            "m.rs",
+            &[(impl_method, 2, OccurrenceRole::Definition)],
+            source,
+        ));
+    }
+    one_doc_index("m.rs", symbols)
+}
+
+const AMBIGUITY_SOURCE: &str = "\
+mod a { pub trait Greet { fn hi(&self); } }
+mod b { pub trait Greet { fn hi(&self); } }
+struct Person;
+impl a::Greet for Person { fn hi(&self) {} }
+";
+
+fn overrides_of_hand_built(index: &ExtractedIndex) -> Vec<(CanonicalId, CanonicalId)> {
+    let sources = vec![("m.rs".to_string(), AMBIGUITY_SOURCE.to_string())];
+    ingest_into_new_store(index, &sources)
+        .edges(EdgeKind::Overrides)
+        .unwrap()
+}
+
+// _(A trait name that resolves to several symbols makes no edge)_ — with the header's trait name
+// aligned to one trait the impl method links; aligned to two, no edge is persisted.
+#[test]
+fn trait_name_that_resolves_to_several_symbols_makes_no_edge() {
+    let control = overrides_of_hand_built(&rust_impl_index(AMBIGUITY_SOURCE, &["a"], &["Greet"]));
+    assert_eq!(control.len(), 1, "the control impl links: {control:?}");
+
+    let ambiguous = overrides_of_hand_built(&rust_impl_index(AMBIGUITY_SOURCE, &["a", "b"], &["Greet"]));
+    assert!(ambiguous.is_empty(), "{ambiguous:?}");
+}
+
+// A Python base-class name token that resolves to several symbols makes no edge through that base:
+// two same-named classes both declare `m`, and the subclass's base token is aligned to the first
+// alone (the control) or to both.
+#[test]
+fn python_base_name_that_resolves_to_several_symbols_makes_no_edge() {
+    let source = "\
+class P:
+    def m(self): pass
+class P:
+    def m(self): pass
+class S(P):
+    def m(self): pass
+";
+    let class = |module: &str, name: &str, occurrences: Vec<ExtractedOccurrence>| ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "ambig",
+            vec![
+                DescriptorSegment::new(module, SegmentKind::Module),
+                DescriptorSegment::new(name, SegmentKind::Type),
+            ],
+        )),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        occurrences,
+    };
+    let method = |module: &str, owner: &str, line: u32| ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "ambig",
+            vec![
+                DescriptorSegment::new(module, SegmentKind::Module),
+                DescriptorSegment::new(owner, SegmentKind::Type),
+                DescriptorSegment::new("m", SegmentKind::Method),
+            ],
+        )),
+        kind: SymbolKind::Method,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![py_occ("m.py", line, 8, 9, OccurrenceRole::Definition)],
+    };
+    let build = |second_base: bool| {
+        let mut first = vec![py_occ("m.py", 0, 6, 7, OccurrenceRole::Definition)];
+        first.push(py_occ("m.py", 4, 8, 9, OccurrenceRole::Reference));
+        let mut second = vec![py_occ("m.py", 2, 6, 7, OccurrenceRole::Definition)];
+        if second_base {
+            second.push(py_occ("m.py", 4, 8, 9, OccurrenceRole::Reference));
+        }
+        let sub = class("c", "S", vec![py_occ("m.py", 4, 6, 7, OccurrenceRole::Definition)]);
+        let index = py_synthetic_index(vec![
+            class("a", "P", first),
+            class("b", "P", second),
+            sub,
+            method("a", "P", 1),
+            method("b", "P", 3),
+            method("c", "S", 5),
+        ]);
+        let sources = vec![("m.py".to_string(), source.to_string())];
+        ingest_into_new_store(&index, &sources)
+            .edges(EdgeKind::Overrides)
+            .unwrap()
+    };
+
+    let control = build(false);
+    assert_eq!(control.len(), 1, "the control subclass links: {control:?}");
+    let ambiguous = build(true);
+    assert!(ambiguous.is_empty(), "{ambiguous:?}");
+}
+
+// _(A trait name that resolves to several symbols makes no edge)_ — a method definition location
+// holding two symbols yields no edge from that method.
+#[test]
+fn ambiguous_method_definition_location_makes_no_edge() {
+    let ambiguous = overrides_of_hand_built(&rust_impl_index(AMBIGUITY_SOURCE, &["a"], &["Greet", "Other"]));
+    assert!(ambiguous.is_empty(), "{ambiguous:?}");
+}
+
+// A Python class cycle reachable through `type_hierarchy` edges ends the pass: `A(B)` declares `m`,
+// `B(A)` does not, and `C(B)` declares `m`.
+#[test]
+fn python_class_cycle_ends_the_override_pass() {
+    let source = "\
+class A(B):
+    def m(self): pass
+class B(A):
+    pass
+class C(B):
+    def m(self): pass
+";
+    let class = |name: &str, occurrences: Vec<ExtractedOccurrence>| ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "cycle",
+            vec![DescriptorSegment::new(name, SegmentKind::Type)],
+        )),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        occurrences,
+    };
+    let method = |owner: &str, line: u32| ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "cycle",
+            vec![
+                DescriptorSegment::new(owner, SegmentKind::Type),
+                DescriptorSegment::new("m", SegmentKind::Method),
+            ],
+        )),
+        kind: SymbolKind::Method,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![py_occ("m.py", line, 8, 9, OccurrenceRole::Definition)],
+    };
+    let a = class(
+        "A",
+        vec![
+            py_occ("m.py", 0, 6, 7, OccurrenceRole::Definition),
+            py_occ("m.py", 2, 8, 9, OccurrenceRole::Reference),
+        ],
+    );
+    let b = class(
+        "B",
+        vec![
+            py_occ("m.py", 2, 6, 7, OccurrenceRole::Definition),
+            py_occ("m.py", 0, 8, 9, OccurrenceRole::Reference),
+            py_occ("m.py", 4, 8, 9, OccurrenceRole::Reference),
+        ],
+    );
+    let c = class("C", vec![py_occ("m.py", 4, 6, 7, OccurrenceRole::Definition)]);
+    let index = py_synthetic_index(vec![a, b, c, method("A", 1), method("C", 5)]);
+    let sources = vec![("m.py".to_string(), source.to_string())];
+    let store = ingest_into_new_store(&index, &sources);
+
+    let cyc = |path: &[(&str, SegmentKind)]| id_of_pkg("cycle", path);
+    let a_m = cyc(&[("A", SegmentKind::Type), ("m", SegmentKind::Method)]);
+    let c_m = cyc(&[("C", SegmentKind::Type), ("m", SegmentKind::Method)]);
+    assert_eq!(
+        store.edges(EdgeKind::TypeHierarchy).unwrap().len(),
+        3,
+        "the cycle is present"
+    );
+    assert_eq!(store.edges(EdgeKind::Overrides).unwrap(), vec![(c_m, a_m)]);
+}
+
+// The `overrides` edges between methods that both Python indexes report with one definition are the
+// same under the two indexes.
+#[test]
+fn python_indexes_agree_on_overrides_between_shared_methods() {
+    let mut stores = method_overrides_python_stores().into_iter();
+    let (_, scip_python) = stores.next().unwrap();
+    let (_, ty_scip) = stores.next().unwrap();
+    let shared_edges = |from: &GraphStore, other: &GraphStore| -> Vec<(CanonicalId, CanonicalId)> {
+        from.edges(EdgeKind::Overrides)
+            .unwrap()
+            .into_iter()
+            .filter(|(a, b)| {
+                [a, b]
+                    .iter()
+                    .all(|id| other.symbol(id).unwrap().is_some_and(|row| row.kind == "method"))
+            })
+            .collect()
+    };
+    let from_scip_python = shared_edges(&scip_python, &ty_scip);
+    assert!(from_scip_python.len() >= 12, "{from_scip_python:?}");
+    assert_eq!(from_scip_python, shared_edges(&ty_scip, &scip_python));
+}
+
+// _(Builds wholly supersede prior derived state)_ — the rebuilt sources drop `PlainChild`'s base from
+// its header while the index still carries the base's occurrence, which no longer aligns. The
+// subclass's `overrides` edge is gone and an unrelated one stays.
+#[test]
+fn rebuild_supersedes_override_edges() {
+    for (file, mut store) in method_overrides_python_stores() {
+        let before = override_targets(&store, "pkg::plain::PlainChild::speak");
+        assert_eq!(before, ["pkg::plain::PlainBase::speak"], "{file}");
+
+        let index = support::method_overrides_python_index_from(file);
+        let mut sources = support::method_overrides_python_sources();
+        let plain = sources.iter_mut().find(|(path, _)| path == "pkg/plain.py").unwrap();
+        plain.1 = plain
+            .1
+            .replace("class PlainChild(PlainBase):", "class PlainChild:           ");
+        ingest(&mut store, &ws(), Some(WS_ROOT), &index, &sources).unwrap();
+
+        assert!(
+            override_targets(&store, "pkg::plain::PlainChild::speak").is_empty(),
+            "{file}"
+        );
+        assert_eq!(
+            override_targets(&store, "pkg::chain::C3::m"),
+            ["pkg::chain::B3::m"],
+            "{file}: an unrelated edge is rebuilt"
+        );
+    }
+}
+
+/// The `overrides` edges of `store` as sorted (source, target) pairs relative to the
+/// method-overrides package.
+fn override_edge_paths(store: &GraphStore) -> Vec<(String, String)> {
+    let relative = |id: &CanonicalId| {
+        let path = id.as_str().strip_prefix("test-ws::method-overrides").unwrap();
+        path.strip_prefix("::").unwrap_or(path).to_string()
+    };
+    let mut edges: Vec<_> = store
+        .edges(EdgeKind::Overrides)
+        .unwrap()
+        .iter()
+        .map(|(from, to)| (relative(from), relative(to)))
+        .collect();
+    edges.sort();
+    edges
+}
+
+fn expected_edges(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut edges: Vec<_> = pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+    edges.sort();
+    edges
+}
+
+// The complete set of `overrides` edges of the Python fixture, under each index: a method that no
+// scenario names (here `PrivChild.call_private`) is in the set when the rule links it, and a method
+// the rule excludes is not.
+#[test]
+fn python_fixture_has_exactly_the_expected_override_edges() {
+    let shared = [
+        ("pkg::plain::PlainChild::speak", "pkg::plain::PlainBase::speak"),
+        ("pkg::chain::B3::m", "pkg::chain::A3::m"),
+        ("pkg::chain::C3::m", "pkg::chain::B3::m"),
+        ("pkg::chain::C2::m", "pkg::chain::A2::m"),
+        ("pkg::multi::E::m", "pkg::multi::X::m"),
+        ("pkg::multi::E::m", "pkg::multi::Y::m"),
+        ("pkg::diamond::DiaC::m", "pkg::diamond::DiaP::m"),
+        ("pkg::diamond::DiaC::m", "pkg::diamond::DiaQ::m"),
+        (
+            "pkg::decorated::DecoratedChild::prop",
+            "pkg::decorated::DecoratedBase::prop",
+        ),
+        (
+            "pkg::decorated::DecoratedChild::make",
+            "pkg::decorated::DecoratedBase::make",
+        ),
+        (
+            "pkg::decorated::DecoratedChild::util",
+            "pkg::decorated::DecoratedBase::util",
+        ),
+        ("pkg::imported_child::Derived::m", "pkg::imported_base::Origin::m"),
+        (
+            "pkg::annotated_middle::AnnotLeaf::m",
+            "pkg::annotated_middle::AnnotRoot::m",
+        ),
+        ("pkg::private::PrivChild::__eq__", "pkg::private::PrivBase::__eq__"),
+        (
+            "pkg::private::PrivChild::call_private",
+            "pkg::private::PrivBase::call_private",
+        ),
+    ];
+    let scip_python_props = [("pkg::props::SizedChild::size", "pkg::props::SizedBase::size")];
+    let ty_scip_props = [
+        ("pkg::props::SizedChild::size#0", "pkg::props::SizedBase::size#0"),
+        ("pkg::props::SizedChild::size#0", "pkg::props::SizedBase::size#1"),
+        ("pkg::props::SizedChild::size#1", "pkg::props::SizedBase::size#0"),
+        ("pkg::props::SizedChild::size#1", "pkg::props::SizedBase::size#1"),
+    ];
+    for (file, store) in method_overrides_python_stores() {
+        let props: &[(&str, &str)] = if file == "index.scip" {
+            &scip_python_props
+        } else {
+            &ty_scip_props
+        };
+        let expected = expected_edges(&[&shared[..], props].concat());
+        assert_eq!(override_edge_paths(&store), expected, "{file}");
+    }
+}
+
+// The complete set of `overrides` edges of the Rust fixture.
+#[test]
+fn rust_fixture_has_exactly_the_expected_override_edges() {
+    let expected = expected_edges(&[
+        ("impls::impl::Widget::Req::req", "traits::Req::req"),
+        ("impls::impl::Gadget::Req::req", "traits::Req::req"),
+        ("impls::impl::Widget::Dflt::dm", "traits::Dflt::dm"),
+        ("impls::impl::Widget::Named::name", "traits::Named::name"),
+        ("impls::impl::T::Tr::tr", "traits::Tr::tr"),
+        ("impls::impl::&Widget::Edge::edge", "traits::Edge::edge"),
+        ("impls::impl::(u8, u8)::Edge::edge", "traits::Edge::edge"),
+        ("impls::impl::Gadget::Remote::remote", "traits::Remote::remote"),
+        (
+            "+shared::shared::impl::SharedType::SharedTr::shared",
+            "+shared::shared::SharedTr::shared",
+        ),
+    ]);
+    assert_eq!(override_edge_paths(&method_overrides_rust_store()), expected);
+}
+
+// A Python method whose definition location holds two symbols yields no edge from either; with one
+// symbol at that location (the control) the method links to its base's method.
+#[test]
+fn python_method_definition_location_holding_several_symbols_makes_no_edge() {
+    let source = "\
+class P:
+    def m(self): pass
+class S(P):
+    def m(self): pass
+";
+    let class = |module: &str, name: &str, occurrences: Vec<ExtractedOccurrence>| ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "ambig",
+            vec![
+                DescriptorSegment::new(module, SegmentKind::Module),
+                DescriptorSegment::new(name, SegmentKind::Type),
+            ],
+        )),
+        kind: SymbolKind::Type,
+        class: SymbolClass::InWorkspace,
+        occurrences,
+    };
+    let method = |module: &str, owner: &str, line: u32| ExtractedSymbol {
+        descriptor: Some(Descriptor::new(
+            "ambig",
+            vec![
+                DescriptorSegment::new(module, SegmentKind::Module),
+                DescriptorSegment::new(owner, SegmentKind::Type),
+                DescriptorSegment::new("m", SegmentKind::Method),
+            ],
+        )),
+        kind: SymbolKind::Method,
+        class: SymbolClass::InWorkspace,
+        occurrences: vec![py_occ("m.py", line, 8, 9, OccurrenceRole::Definition)],
+    };
+    let build = |both_symbols: bool| {
+        let mut symbols = vec![
+            class(
+                "a",
+                "P",
+                vec![
+                    py_occ("m.py", 0, 6, 7, OccurrenceRole::Definition),
+                    py_occ("m.py", 2, 8, 9, OccurrenceRole::Reference),
+                ],
+            ),
+            class("c", "S", vec![py_occ("m.py", 2, 6, 7, OccurrenceRole::Definition)]),
+            method("a", "P", 1),
+            method("c", "S", 3),
+        ];
+        // The second symbol is a different method the indexer also anchored at `S.m`.
+        if both_symbols {
+            symbols.push(method("d", "S", 3));
+        }
+        let sources = vec![("m.py".to_string(), source.to_string())];
+        ingest_into_new_store(&py_synthetic_index(symbols), &sources)
+            .edges(EdgeKind::Overrides)
+            .unwrap()
+    };
+
+    let control = build(false);
+    assert_eq!(control.len(), 1, "the control method links: {control:?}");
+    let ambiguous = build(true);
+    assert!(ambiguous.is_empty(), "{ambiguous:?}");
+}

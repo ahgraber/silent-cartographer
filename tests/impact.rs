@@ -2955,3 +2955,56 @@ fn impact_answers_disclose_the_ordering_in_effect() {
     let unranked = run_impact_json(&repo, &db, &["--order", "unranked"]);
     assert_eq!(unranked["ordering"], "unranked", "the request is disclosed: {unranked}");
 }
+
+// _(Dependent via override)_ — a diff that changes a trait method's declaration seeds that method;
+// the impls that override it and the callers of those impls reach it, so both appear in the answer.
+#[test]
+fn a_changed_base_method_lists_its_overrides_and_their_callers() {
+    let repo = TestRepo::new();
+    let sources = support::method_overrides_rust_sources();
+    for (path, text) in &sources {
+        repo.write(path, text);
+    }
+    repo.commit_all("add override fixture");
+    let db = repo.path().join(".c10r/index.db");
+    build_from_index(
+        &db,
+        &workspace_id(&repo),
+        repo.path(),
+        &support::method_overrides_rust_index(),
+        &sources,
+    )
+    .unwrap();
+
+    let traits = &sources.iter().find(|(path, _)| path == "src/traits.rs").unwrap().1;
+    repo.write("src/traits.rs", &edit_line(traits, 3, "    fn req(&self) -> u64;"));
+
+    let answer = run_impact_json(&repo, &db, &["--depth", "2"]);
+    let report = report(&answer);
+    assert_eq!(seed_names(report), vec!["req".to_string()]);
+    let rows: Vec<(String, u64, String)> = report["dependents"]["detail"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["symbol"]["canonical_id"].as_str().unwrap().to_string(),
+                d["distance"].as_u64().unwrap(),
+                d["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    for implementer in ["Gadget", "Widget"] {
+        assert!(
+            rows.iter().any(|(id, distance, kind)| {
+                id.ends_with(&format!("impls::impl::{implementer}::Req::req")) && *distance == 1 && kind == "overrides"
+            }),
+            "the {implementer} override is a distance-one `overrides` dependent: {rows:?}"
+        );
+    }
+    assert!(
+        rows.iter()
+            .any(|(id, distance, _)| id.ends_with("callers::call_all") && *distance == 2),
+        "a caller of an override is a distance-two dependent: {rows:?}"
+    );
+}

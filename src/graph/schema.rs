@@ -23,7 +23,9 @@
 /// merely missing a count. The keyed `aligned_counts` column spares that change any DDL and any
 /// per-rule read/write edit — it does not spare it the version bump.
 ///
-/// Migration: version 20 adds `unresolved_calls` (calls whose called name no semantic occurrence
+/// Migration: version 21 adds the `overrides` edge kind (a method to each method it overrides);
+/// a store built earlier has none, so its dependents answers would omit overrides;
+/// version 20 adds `unresolved_calls` (calls whose called name no semantic occurrence
 /// covers), `discrepancy_symbols` (the symbols a refused reference occurrence may denote), and
 /// `symbols.duplicate_descriptor` (the kind-aware descriptor duplicated twins group on);
 /// version 19 changes the stored identity form: a Rust declaration outside the package's
@@ -52,7 +54,7 @@
 /// columns on `symbols`, and the semantic-index identity in `index_metadata`. The index is derived,
 /// replayable data, so rebuild is the migration — a build replaces an older store of its own
 /// wholesale and a query refuses it with recovery guidance (the replace-or-refuse contract).
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// The DDL that creates the full schema. Idempotent via `IF NOT EXISTS`.
 pub const SCHEMA_SQL: &str = r#"
@@ -218,8 +220,8 @@ CREATE INDEX IF NOT EXISTS occurrences_by_enclosing ON occurrences(enclosing_id)
 
 -- Type-tagged edges between symbols. `kind` is one of 'contains' (enclosure), 'uses' (a declaration
 -- references a symbol in its body — reference-grade: any mention counts, not only a call),
--- 'imports' (a module references a symbol at module scope), or 'type_hierarchy' (a type implements a
--- trait). An edge is a relation instance, unique on (kind, src_id, dst_id): repeated occurrences of
+-- 'imports' (a module references a symbol at module scope), 'type_hierarchy' (a type implements a
+-- trait), or 'overrides' (a method overrides a method of a base class or trait). An edge is a relation instance, unique on (kind, src_id, dst_id): repeated occurrences of
 -- the same relation persist as one row, with the per-site detail carried by the occurrences table.
 CREATE TABLE IF NOT EXISTS edges (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,

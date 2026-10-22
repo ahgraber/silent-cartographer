@@ -112,18 +112,22 @@ pub struct SpelledToken {
     pub data: bool,
 }
 
-/// The name-token spans of the trait and the implementing type in one `impl Trait for Type` block.
+/// The name-token spans of the trait, the implementing type, and the functions in one
+/// `impl Trait for Type` block.
 ///
 /// Each span points at the terminal identifier token — the identifier inside a generic type
 /// (`From<DetailArg>` → `From`), the terminal segment of a qualified path (`fmt::Display` →
 /// `Display`), the bare identifier otherwise — so edge derivation can resolve it through the aligned
 /// occurrence sitting at exactly that location, never by matching display names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraitImpl {
-    /// The name-token span of the implementing type.
-    pub type_name_span: ByteSpan,
+    /// The name-token span of the implementing type; `None` when the self type carries no name
+    /// token (a reference, a tuple, a slice).
+    pub type_name_span: Option<ByteSpan>,
     /// The name-token span of the implemented trait.
     pub trait_name_span: ByteSpan,
+    /// The name-token spans of the functions declared directly in the impl body, in source order.
+    pub function_name_spans: Vec<ByteSpan>,
 }
 
 /// The subclass/base name-token spans of one Python `class Sub(Base1, Base2):` definition.
@@ -139,6 +143,28 @@ pub struct ClassBases {
     pub class_name_span: ByteSpan,
     /// The name-token spans of the declared bases, in declaration order.
     pub base_name_spans: Vec<ByteSpan>,
+    /// The names bound directly in the class body, in source order.
+    pub bindings: Vec<ClassBinding>,
+}
+
+/// Whether a name bound in a Python class body is a function definition or any other binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassBindingKind {
+    /// A `def`, decorated or not.
+    Function,
+    /// An assignment (annotated only when it has a value), a nested class, or an import.
+    Other,
+}
+
+/// One name bound directly in a Python class body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassBinding {
+    /// The bound name's text.
+    pub name: String,
+    /// The name-token span of the bound name.
+    pub name_span: ByteSpan,
+    /// Whether the name is bound by a function definition or by something else.
+    pub kind: ClassBindingKind,
 }
 
 /// One call expression whose callee names a function or method.
@@ -424,8 +450,10 @@ impl SyntaxTree {
     ///
     /// Each entry carries the terminal identifier span of the type and the trait (see [`TraitImpl`]),
     /// so `type_hierarchy` edge derivation resolves each span through the aligned occurrence at that
-    /// location. A plain inherent `impl Type` (no trait) is not a hierarchy relationship and is
-    /// skipped, as is any header whose trait or type has no resolvable name token.
+    /// location. A plain inherent `impl Type` (no trait) is skipped, as is any header whose trait has
+    /// no resolvable name token. A self type with no name token (`&Widget`, a tuple) is still
+    /// reported, with no type span. Functions declared directly in the body are listed; constants,
+    /// types, macro invocations, and items nested inside function bodies are not.
     pub fn trait_impls(&self) -> Vec<TraitImpl> {
         let root = self.tree.root_node();
         let mut out = Vec::new();
@@ -435,11 +463,12 @@ impl SyntaxTree {
             if node.kind() == "impl_item"
                 && let Some(trait_node) = node.child_by_field_name("trait")
                 && let Some(type_node) = node.child_by_field_name("type")
-                && let (Some(trait_tok), Some(type_tok)) = (name_token(trait_node), name_token(type_node))
+                && let Some(trait_tok) = name_token(trait_node)
             {
                 out.push(TraitImpl {
-                    type_name_span: span_of(type_tok),
+                    type_name_span: name_token(type_node).map(span_of),
                     trait_name_span: span_of(trait_tok),
+                    function_name_spans: impl_function_name_spans(node),
                 });
             }
             for child in node.children(&mut cursor) {
@@ -475,9 +504,14 @@ impl SyntaxTree {
                         }
                     }
                 }
+                let mut bindings = Vec::new();
+                if let Some(body) = node.child_by_field_name("body") {
+                    collect_class_bindings(body, &self.source, &mut bindings);
+                }
                 out.push(ClassBases {
                     class_name_span: span_of(name),
                     base_name_spans,
+                    bindings,
                 });
             }
             for child in node.children(&mut cursor) {
@@ -1515,6 +1549,125 @@ fn python_base_name_token(node: Node) -> Option<Node> {
         "identifier" => Some(node),
         "attribute" => node.child_by_field_name("attribute").and_then(python_base_name_token),
         _ => None,
+    }
+}
+
+/// The name-token spans of the `function_item`s that are direct children of an `impl_item`'s body.
+fn impl_function_name_spans(impl_node: Node) -> Vec<ByteSpan> {
+    let Some(body) = impl_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter(|item| item.kind() == "function_item")
+        .filter_map(|item| item.child_by_field_name("name"))
+        .map(span_of)
+        .collect()
+}
+
+/// Collects the names bound by the statements of a Python class body (or a compound statement's
+/// block within it) into `out`.
+///
+/// Reports function and class definitions, assignments with a value (every plain-identifier target
+/// of a tuple, list, or chained assignment; attribute and subscript targets bind no class name), and
+/// imports. An annotation without a value creates no attribute and is skipped. Statements nested in
+/// `if`, `try`, `with`, `for`, and `while` blocks are included because they bind class-level names;
+/// function bodies are never entered.
+fn collect_class_bindings(block: Node, source: &str, out: &mut Vec<ClassBinding>) {
+    let mut cursor = block.walk();
+    for stmt in block.named_children(&mut cursor) {
+        match stmt.kind() {
+            "function_definition" | "class_definition" | "decorated_definition" => {
+                let def = if stmt.kind() == "decorated_definition" {
+                    stmt.child_by_field_name("definition")
+                } else {
+                    Some(stmt)
+                };
+                if let Some(def) = def
+                    && let Some(name) = def.child_by_field_name("name")
+                {
+                    let kind = if def.kind() == "function_definition" {
+                        ClassBindingKind::Function
+                    } else {
+                        ClassBindingKind::Other
+                    };
+                    push_binding(out, source, name, kind);
+                }
+            }
+            "expression_statement" => {
+                let mut assignment = stmt.named_child(0).filter(|n| n.kind() == "assignment");
+                // A chain `a = b = 1` nests the next assignment in the `right` field.
+                while let Some(assign) = assignment {
+                    if assign.child_by_field_name("right").is_some()
+                        && let Some(left) = assign.child_by_field_name("left")
+                    {
+                        let mut targets = Vec::new();
+                        plain_identifier_targets(left, &mut targets);
+                        for target in targets {
+                            push_binding(out, source, target, ClassBindingKind::Other);
+                        }
+                    }
+                    assignment = assign.child_by_field_name("right").filter(|n| n.kind() == "assignment");
+                }
+            }
+            "import_statement" | "import_from_statement" => {
+                let mut names = stmt.walk();
+                for item in stmt.children_by_field_name("name", &mut names) {
+                    let bound = match item.kind() {
+                        "aliased_import" => item.child_by_field_name("alias"),
+                        // `import a.b` binds `a`; `from m import n` binds `n`.
+                        "dotted_name" if stmt.kind() == "import_statement" => item.named_child(0),
+                        "dotted_name" => item.named_children(&mut item.walk()).last(),
+                        _ => None,
+                    };
+                    if let Some(bound) = bound {
+                        push_binding(out, source, bound, ClassBindingKind::Other);
+                    }
+                }
+            }
+            "if_statement" | "try_statement" | "with_statement" | "for_statement" | "while_statement" => {
+                collect_compound_bindings(stmt, source, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Appends the name token `node` to `out` as a class-body binding of `kind`.
+fn push_binding(out: &mut Vec<ClassBinding>, source: &str, node: Node, kind: ClassBindingKind) {
+    out.push(ClassBinding {
+        name: source[node.start_byte()..node.end_byte()].to_string(),
+        name_span: span_of(node),
+        kind,
+    });
+}
+
+/// Recurses [`collect_class_bindings`] into every block directly inside a compound statement or its
+/// `elif` / `else` / `except` / `finally` clauses.
+fn collect_compound_bindings(compound: Node, source: &str, out: &mut Vec<ClassBinding>) {
+    let mut cursor = compound.walk();
+    for child in compound.named_children(&mut cursor) {
+        match child.kind() {
+            "block" => collect_class_bindings(child, source, out),
+            "elif_clause" | "else_clause" | "except_clause" | "except_group_clause" | "finally_clause" => {
+                collect_compound_bindings(child, source, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The plain identifiers among an assignment target, looking through tuple and list patterns.
+fn plain_identifier_targets<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
+    match node.kind() {
+        "identifier" => out.push(node),
+        "pattern_list" | "tuple_pattern" | "list_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                plain_identifier_targets(child, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2672,5 +2825,85 @@ TOP_LEVEL = 1
                 pair("root", None),
             ]
         );
+    }
+
+    /// The source text of each span, in order.
+    fn texts<'a>(src: &'a str, spans: &[ByteSpan]) -> Vec<&'a str> {
+        spans.iter().map(|s| &src[s.start..s.end]).collect()
+    }
+
+    #[test]
+    fn trait_impl_reports_only_functions_declared_directly_in_the_body() {
+        let src = "impl Tr for Widget {\n    const N: u8 = 1;\n    fn a(&self) {}\n    helper!();\n    fn b(&self) {\n        \
+                   fn inner() {}\n    }\n}\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let impls = tree.trait_impls();
+        assert_eq!(impls.len(), 1);
+        assert_eq!(texts(src, &impls[0].function_name_spans), vec!["a", "b"]);
+        assert_eq!(texts(src, &[impls[0].type_name_span.unwrap()]), vec!["Widget"]);
+    }
+
+    #[test]
+    fn trait_impl_reports_blanket_reference_and_tuple_self_types() {
+        let src = "impl<T: Display> Tr for T {\n    fn f(&self) {}\n}\nimpl Tr for &Widget {\n    fn g(&self) {}\n}\n\
+                   impl Tr for (u8, u8) {\n    fn h(&self) {}\n}\nimpl Widget {\n    fn inherent() {}\n}\n";
+        let tree = SyntaxTree::parse(src, Language::Rust).unwrap();
+        let mut impls = tree.trait_impls();
+        impls.sort_by_key(|i| i.trait_name_span.start);
+        let summary: Vec<(Option<&str>, Vec<&str>)> = impls
+            .iter()
+            .map(|i| {
+                (
+                    i.type_name_span.map(|s| &src[s.start..s.end]),
+                    texts(src, &i.function_name_spans),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(Some("T"), vec!["f"]), (None, vec!["g"]), (None, vec!["h"])]
+        );
+    }
+
+    #[test]
+    fn class_bases_report_names_bound_directly_in_the_class_body() {
+        let src = "class C(Base):\n    def plain(self): ...\n    @deco\n    def decorated(self): ...\n    \
+                   @property\n    def size(self): ...\n    @size.setter\n    def size(self, v): ...\n    \
+                   attr = 1\n    annotated: int = 2\n    bare: object\n    class Nested: ...\n    \
+                   def method(self):\n        def inner(): ...\n        local = 1\n    \
+                   a, b = 1, 2\n    self.x = 3\n    import os.path\n    from m import n as alias, other\n    \
+                   if cond:\n        guarded = 1\n";
+        let tree = SyntaxTree::parse(src, Language::Python).unwrap();
+        let classes = tree.class_bases();
+        assert_eq!(classes.len(), 2);
+        let class = classes
+            .iter()
+            .find(|c| &src[c.class_name_span.start..c.class_name_span.end] == "C")
+            .unwrap();
+        let bindings: Vec<(&str, ClassBindingKind)> =
+            class.bindings.iter().map(|b| (b.name.as_str(), b.kind)).collect();
+        use ClassBindingKind::{Function, Other};
+        assert_eq!(
+            bindings,
+            vec![
+                ("plain", Function),
+                ("decorated", Function),
+                ("size", Function),
+                ("size", Function),
+                ("attr", Other),
+                ("annotated", Other),
+                ("Nested", Other),
+                ("method", Function),
+                ("a", Other),
+                ("b", Other),
+                ("os", Other),
+                ("alias", Other),
+                ("other", Other),
+                ("guarded", Other),
+            ]
+        );
+        for b in &class.bindings {
+            assert_eq!(&src[b.name_span.start..b.name_span.end], b.name);
+        }
     }
 }

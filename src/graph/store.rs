@@ -28,6 +28,8 @@ pub enum EdgeKind {
     Imports,
     /// A type implements a trait.
     TypeHierarchy,
+    /// A method overrides a method of a base class or implemented trait.
+    Overrides,
 }
 
 impl EdgeKind {
@@ -38,11 +40,12 @@ impl EdgeKind {
             EdgeKind::Uses => "uses",
             EdgeKind::Imports => "imports",
             EdgeKind::TypeHierarchy => "type_hierarchy",
+            EdgeKind::Overrides => "overrides",
         }
     }
 }
 
-/// A dependency edge kind: the three [`EdgeKind`]s the dependents traversal walks.
+/// A dependency edge kind: the four [`EdgeKind`]s the dependents traversal walks.
 ///
 /// Held apart from [`EdgeKind`] because `Contains` is enclosure, not dependency, and can never
 /// connect a symbol to a dependent. A dependents answer that could carry it would oblige every
@@ -60,6 +63,8 @@ pub enum DependencyKind {
     Imports,
     /// A type implements a trait.
     TypeHierarchy,
+    /// A method overrides a method of a base class or implemented trait.
+    Overrides,
 }
 
 impl DependencyKind {
@@ -74,19 +79,21 @@ impl DependencyKind {
             DependencyKind::Uses => EdgeKind::Uses,
             DependencyKind::Imports => EdgeKind::Imports,
             DependencyKind::TypeHierarchy => EdgeKind::TypeHierarchy,
+            DependencyKind::Overrides => EdgeKind::Overrides,
         }
     }
 
     /// Read a stored tag as a dependency kind, refusing anything outside the closed set.
     ///
-    /// Strict by design: the dependents query filters to these three kinds, so a `contains` tag —
+    /// Strict by design: the dependents query filters to these four kinds, so a `contains` tag —
     /// or any other — reaching here means the query and this vocabulary disagree, which is a defect
-    /// to surface rather than a fourth ordering bucket to absorb it.
+    /// to surface rather than a fifth ordering bucket to absorb it.
     pub fn from_tag(tag: &str) -> Option<Self> {
         match tag {
             "uses" => Some(DependencyKind::Uses),
             "imports" => Some(DependencyKind::Imports),
             "type_hierarchy" => Some(DependencyKind::TypeHierarchy),
+            "overrides" => Some(DependencyKind::Overrides),
             _ => None,
         }
     }
@@ -101,6 +108,7 @@ impl DependencyKind {
             DependencyKind::Uses => 0,
             DependencyKind::Imports => 1,
             DependencyKind::TypeHierarchy => 2,
+            DependencyKind::Overrides => 3,
         }
     }
 }
@@ -2355,7 +2363,7 @@ impl GraphStore {
     }
 
     /// Compute the seed's dependents: symbols whose dependency edges (`uses`, `imports`,
-    /// `type_hierarchy`) reach the seed directly or transitively, walking each edge `dst → src`.
+    /// `type_hierarchy`, `overrides`) reach the seed directly or transitively, walking each edge `dst → src`.
     ///
     /// The one-element case of [`dependents_of_seeds`](Self::dependents_of_seeds); see there for the
     /// full contract.
@@ -2364,13 +2372,13 @@ impl GraphStore {
     }
 
     /// Compute the combined dependents of several seeds at once: the symbols whose dependency edges
-    /// (`uses`, `imports`, `type_hierarchy`) reach any seed directly or transitively, walking each
+    /// (`uses`, `imports`, `type_hierarchy`, `overrides`) reach any seed directly or transitively, walking each
     /// edge `dst → src` breadth-first from the whole seed set.
     ///
     /// Enclosure (`contains`) never propagates dependence — it supplies attribution, not impact — so
     /// it is excluded from the walk. Each dependent is returned exactly once at its shortest hop
     /// distance from any seed, carrying the connecting edge kind chosen among the edges arriving at
-    /// that distance under a fixed tie-break: kind order (`uses` < `imports` < `type_hierarchy`),
+    /// that distance under a fixed tie-break: kind order (`uses` < `imports` < `type_hierarchy` < `overrides`),
     /// then canonical identity. A seed never appears as its own dependent — a seed is reported only
     /// at its shortest distance to a seed *other than itself*, so one that depends on another seed
     /// is a real dependent while one reached only through its own cycle is not. The walk ends when
@@ -2427,7 +2435,7 @@ impl GraphStore {
                 let placeholders = vec!["?"; batch.len()].join(", ");
                 let sql = format!(
                     "SELECT src_id, kind, dst_id FROM edges \
-                     WHERE kind IN ('uses', 'imports', 'type_hierarchy') AND dst_id IN ({placeholders})"
+                     WHERE kind IN ('uses', 'imports', 'type_hierarchy', 'overrides') AND dst_id IN ({placeholders})"
                 );
                 let mut stmt = self.conn.prepare(&sql)?;
                 let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter().copied()), |r| {
@@ -2439,7 +2447,7 @@ impl GraphStore {
             }
 
             // The stored tag becomes a dependency kind here, at the boundary. The query above
-            // filters to the three dependency kinds, so a tag this refuses means the query and the
+            // filters to the dependency kinds, so a tag this refuses means the query and the
             // vocabulary have drifted apart — surfaced as a conversion failure rather than absorbed.
             let mut by_src: HashMap<&str, Vec<(DependencyKind, &str)>> = HashMap::new();
             for (src, kind, dst) in &hops {
@@ -2537,7 +2545,7 @@ impl GraphStore {
     }
 
     /// The rank graph projection: every in-workspace symbol, and every dependency edge (`uses`,
-    /// `imports`, `type_hierarchy`) whose both endpoints are in-workspace, with a pair related under
+    /// `imports`, `type_hierarchy`, `overrides`) whose both endpoints are in-workspace, with a pair related under
     /// several kinds collapsed to a single edge.
     ///
     /// Nodes are returned in canonical-identity order and edges in `(src, dst)` canonical-identity
@@ -2565,7 +2573,7 @@ impl GraphStore {
             "SELECT DISTINCT e.src_id, e.dst_id FROM edges e
              JOIN symbols s ON s.canonical_id = e.src_id AND s.class = 'in_workspace'
              JOIN symbols d ON d.canonical_id = e.dst_id AND d.class = 'in_workspace'
-             WHERE e.kind IN ('uses', 'imports', 'type_hierarchy')
+             WHERE e.kind IN ('uses', 'imports', 'type_hierarchy', 'overrides')
              ORDER BY e.src_id, e.dst_id",
         )?;
         let edges: Vec<(usize, usize)> = stmt
@@ -2595,6 +2603,15 @@ impl GraphStore {
         )?;
         let rows = stmt.query_map(params![id.as_str()], Self::map_occurrence)?;
         rows.collect()
+    }
+
+    /// How many reference-role occurrences of `id` exist: the length of [`references_of`](Self::references_of).
+    pub fn count_references_of(&self, id: &CanonicalId) -> rusqlite::Result<usize> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM occurrences WHERE symbol_id = ?1 AND role = 'reference'",
+            params![id.as_str()],
+            |r| r.get(0),
+        )
     }
 
     /// Evaluate freshness against the sources' current content hash, the analyzer in effect, and

@@ -264,6 +264,32 @@ pub struct UnconfirmedUses {
     pub uses: Vec<UnconfirmedUse>,
 }
 
+/// One direction of a method's override relations: the methods reached by following override edges in
+/// that direction, transitively, and their resolved references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OverridePart {
+    /// How many methods the walk reached, the subject excluded.
+    pub methods: usize,
+    /// The total of those methods' resolved reference occurrences.
+    pub references: usize,
+    /// The `trace` command that lists the directly related methods; present exactly when `methods`
+    /// is not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// The override relations of a `references` subject that is a method, beside its results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OverrideRelations {
+    /// The methods that override the subject, directly or through other overrides.
+    pub overridden_by: OverridePart,
+    /// The methods the subject overrides, directly or through other overrides.
+    pub overrides: OverridePart,
+    /// The subject the commands name; never serialized.
+    #[serde(skip)]
+    pub subject: CanonicalId,
+}
+
 /// The relation an empty answer came from, for the three whose empty answer is scoped to resolved
 /// instances. Read only by the human rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,6 +412,11 @@ pub struct Answer<T> {
     /// `unresolved_calls` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unconfirmed_uses: Option<UnconfirmedUses>,
+    /// The override relations of a `references` subject of kind `method`: absent for every other
+    /// subject and answer. It sits beside the outcome, never among its results, so results and paging
+    /// counts are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_relations: Option<OverrideRelations>,
     /// Which scoped empty message the human rendering prints for an empty outcome; never serialized.
     #[serde(skip)]
     pub empty_scope: Option<EmptyScope>,
@@ -444,6 +475,7 @@ impl<T> Answer<T> {
             not_compared_completely: None,
             unresolved_calls: None,
             unconfirmed_uses: None,
+            override_relations: None,
             empty_scope: None,
             outcome,
             page: None,
@@ -509,6 +541,27 @@ impl<T> Answer<T> {
     pub fn with_reference_groups(mut self, calls: UnresolvedCalls, uses: UnconfirmedUses) -> Self {
         self.unresolved_calls = Some(calls);
         self.unconfirmed_uses = Some(uses);
+        self
+    }
+
+    /// Attach the override relations of a `references` subject that is a method.
+    pub fn with_override_relations(mut self, relations: Option<OverrideRelations>) -> Self {
+        self.override_relations = relations;
+        self
+    }
+
+    /// Fill the `trace` command of each override part that reached methods: `command` receives the
+    /// subject and the relation (`implementers` for the first part, `implements` for the second).
+    pub fn with_override_commands(mut self, command: impl Fn(&CanonicalId, &str) -> String) -> Self {
+        if let Some(relations) = &mut self.override_relations {
+            let subject = relations.subject.clone();
+            for (part, relation) in [
+                (&mut relations.overridden_by, "implementers"),
+                (&mut relations.overrides, "implements"),
+            ] {
+                part.command = (part.methods > 0).then(|| command(&subject, relation));
+            }
+        }
         self
     }
 

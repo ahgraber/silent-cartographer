@@ -561,6 +561,7 @@ pub fn ingest_with_params(
     // set: a symbol that contains another corpus-contributing symbol contributes its interface
     // tier, never its full body.
     let mut container_ids: std::collections::HashSet<CanonicalId> = std::collections::HashSet::new();
+    let mut contains_pairs: Vec<(CanonicalId, CanonicalId)> = Vec::new();
     for aligned in &join_result.aligned {
         if aligned.role != OccurrenceRole::Definition {
             continue;
@@ -583,6 +584,7 @@ pub fn ingest_with_params(
         }
         if let Some(parent) = parent_of_definition(aligned, &prepared, &definitions_at, &type_by_name) {
             store.insert_edge(EdgeKind::Contains, &parent, &aligned.symbol)?;
+            contains_pairs.push((parent.clone(), aligned.symbol.clone()));
             if contributing.contains(&aligned.symbol) {
                 container_ids.insert(parent);
             }
@@ -637,15 +639,20 @@ pub fn ingest_with_params(
             .entry((aligned.document_path.as_str(), aligned.name_span))
             .or_insert_with(|| aligned.symbol.clone());
     }
+    let mut hierarchy_pairs: Vec<(CanonicalId, CanonicalId)> = Vec::new();
     for (path, doc) in prepared.iter() {
         let tree = &doc.tree;
         match language {
             Language::Rust => {
                 for imp in tree.trait_impls() {
-                    let ty = occ_by_location.get(&(path, imp.type_name_span));
+                    let Some(type_name_span) = imp.type_name_span else {
+                        continue;
+                    };
+                    let ty = occ_by_location.get(&(path, type_name_span));
                     let tr = occ_by_location.get(&(path, imp.trait_name_span));
                     if let (Some(ty), Some(tr)) = (ty, tr) {
                         store.insert_edge(EdgeKind::TypeHierarchy, ty, tr)?;
+                        hierarchy_pairs.push((ty.clone(), tr.clone()));
                     }
                 }
             }
@@ -660,11 +667,24 @@ pub fn ingest_with_params(
                     for base_span in class.base_name_spans {
                         if let Some(base) = occ_by_location.get(&(path, base_span)) {
                             store.insert_edge(EdgeKind::TypeHierarchy, sub, base)?;
+                            hierarchy_pairs.push((sub.clone(), base.clone()));
                         }
                     }
                 }
             }
         }
+    }
+
+    // Derive `overrides` edges from the bases and containment just derived.
+    let override_context = OverrideContext::new(
+        &symbol_rows,
+        &contains_pairs,
+        &hierarchy_pairs,
+        &definitions_at,
+        &join_result.aligned,
+    );
+    for (method, overridden) in override_edges(language, &prepared, &override_context) {
+        store.insert_edge(EdgeKind::Overrides, method, overridden)?;
     }
 
     // Persist the inspectable detail behind every non-aligned outcome (text-mismatch, semantic-only,
@@ -1047,6 +1067,194 @@ fn enclosing_symbol(
         }
     }
     None
+}
+
+/// What the override pass reads: the persisted methods by container and name, the `type_hierarchy`
+/// pairs, the identities aligned at each reference location, and the definition location map.
+struct OverrideContext<'a> {
+    /// Every persisted symbol's display name and kind tag.
+    symbols: HashMap<&'a CanonicalId, (&'a str, &'a str)>,
+    /// Container (class, trait, or implementing type) -> method display name -> every method of
+    /// that name it contains.
+    methods: HashMap<&'a CanonicalId, HashMap<&'a str, Vec<&'a CanonicalId>>>,
+    /// The `(class, base)` pairs of this build's `type_hierarchy` edges.
+    hierarchy: std::collections::HashSet<(&'a CanonicalId, &'a CanonicalId)>,
+    /// Every distinct identity aligned as a reference at a location. Unlike the first-wins map the
+    /// `type_hierarchy` derivation reads, a name that denotes several symbols is visible as such,
+    /// so it yields no edge and the result does not depend on occurrence order.
+    references_at: HashMap<(&'a str, ByteSpan), Vec<&'a CanonicalId>>,
+    definitions_at: &'a HashMap<(&'a str, ByteSpan), Option<&'a CanonicalId>>,
+}
+
+impl<'a> OverrideContext<'a> {
+    fn new(
+        symbol_rows: &'a [SymbolRow],
+        contains: &'a [(CanonicalId, CanonicalId)],
+        hierarchy: &'a [(CanonicalId, CanonicalId)],
+        definitions_at: &'a HashMap<(&'a str, ByteSpan), Option<&'a CanonicalId>>,
+        aligned: &'a [join::AlignedOccurrence],
+    ) -> Self {
+        let symbols: HashMap<&CanonicalId, (&str, &str)> = symbol_rows
+            .iter()
+            .map(|row| (&row.canonical_id, (row.display_name.as_str(), row.kind.as_str())))
+            .collect();
+        let mut methods: HashMap<&CanonicalId, HashMap<&str, Vec<&CanonicalId>>> = HashMap::new();
+        for (container, child) in contains {
+            if let Some(&(name, "method")) = symbols.get(child) {
+                methods
+                    .entry(container)
+                    .or_default()
+                    .entry(name)
+                    .or_default()
+                    .push(child);
+            }
+        }
+        let mut references_at: HashMap<(&str, ByteSpan), Vec<&CanonicalId>> = HashMap::new();
+        for occurrence in aligned.iter().filter(|o| o.role == OccurrenceRole::Reference) {
+            let ids = references_at
+                .entry((occurrence.document_path.as_str(), occurrence.name_span))
+                .or_default();
+            if !ids.contains(&&occurrence.symbol) {
+                ids.push(&occurrence.symbol);
+            }
+        }
+        Self {
+            symbols,
+            methods,
+            hierarchy: hierarchy.iter().map(|(class, base)| (class, base)).collect(),
+            references_at,
+            definitions_at,
+        }
+    }
+
+    /// The persisted method defined at `span` of `path`; `None` when the location holds no
+    /// definition, several, or a symbol that is not a persisted method.
+    fn method_at(&self, path: &str, span: ByteSpan) -> Option<&'a CanonicalId> {
+        let id = (*self.definitions_at.get(&(path, span))?)?;
+        matches!(self.symbols.get(id), Some(&(_, "method"))).then_some(id)
+    }
+
+    /// Every method of `container` whose display name is that of `method`.
+    fn same_named_in(&self, container: &CanonicalId, method: &CanonicalId) -> &[&'a CanonicalId] {
+        let Some(&(name, _)) = self.symbols.get(method) else {
+            return &[];
+        };
+        self.methods
+            .get(container)
+            .and_then(|by_name| by_name.get(name))
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+/// The `(method, overridden method)` pairs of a build, as the contract of `overrides` edges defines
+/// them: Rust impl functions against the implemented trait's items, Python methods against the
+/// same-named methods of their declared bases. The set does not depend on occurrence order.
+fn override_edges<'a>(
+    language: Language,
+    prepared: &PreparedCorpus,
+    context: &OverrideContext<'a>,
+) -> Vec<(&'a CanonicalId, &'a CanonicalId)> {
+    match language {
+        Language::Rust => rust_override_edges(prepared, context),
+        Language::Python => python_override_edges(prepared, context),
+    }
+}
+
+/// Rust overrides: each function declared in the body of a trait impl overrides the same-named item
+/// of the trait the impl header names.
+fn rust_override_edges<'a>(
+    prepared: &PreparedCorpus,
+    context: &OverrideContext<'a>,
+) -> Vec<(&'a CanonicalId, &'a CanonicalId)> {
+    let mut edges = Vec::new();
+    for (path, doc) in prepared.iter() {
+        for imp in doc.tree.trait_impls() {
+            let Some(&[tr]) = context
+                .references_at
+                .get(&(path, imp.trait_name_span))
+                .map(Vec::as_slice)
+            else {
+                continue;
+            };
+            for span in imp.function_name_spans {
+                let Some(method) = context.method_at(path, span) else {
+                    continue;
+                };
+                edges.extend(context.same_named_in(tr, method).iter().map(|&target| (method, target)));
+            }
+        }
+    }
+    edges
+}
+
+/// Python overrides: each non-private function declared in a class body overrides the same-named
+/// methods its declared bases bind, looking through bases that do not bind the name.
+fn python_override_edges<'a>(
+    prepared: &PreparedCorpus,
+    context: &OverrideContext<'a>,
+) -> Vec<(&'a CanonicalId, &'a CanonicalId)> {
+    let mut classes: Vec<(&'a CanonicalId, &str, syntax::ClassBases)> = Vec::new();
+    for (path, doc) in prepared.iter() {
+        for class in doc.tree.class_bases() {
+            if let Some(&Some(id)) = context.definitions_at.get(&(path, class.class_name_span)) {
+                classes.push((id, path, class));
+            }
+        }
+    }
+    let mut bindings_of: HashMap<&CanonicalId, Vec<&syntax::ClassBinding>> = HashMap::new();
+    // A base counts when its name token resolves to exactly one identity and the class has a
+    // `type_hierarchy` edge to it; a token that denotes several symbols contributes no base.
+    let mut bases_of: HashMap<&CanonicalId, Vec<&CanonicalId>> = HashMap::new();
+    for (id, path, class) in &classes {
+        bindings_of.entry(id).or_default().extend(&class.bindings);
+        let bases = bases_of.entry(id).or_default();
+        for span in &class.base_name_spans {
+            if let Some(&[base]) = context.references_at.get(&(*path, *span)).map(Vec::as_slice)
+                && context.hierarchy.contains(&(*id, base))
+            {
+                bases.push(base);
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    for (class, path, body) in &classes {
+        for binding in &body.bindings {
+            // Python renames `__name` per class, so a private name neither overrides nor is
+            // overridden; a dunder name is not private.
+            let private = binding.name.starts_with("__") && !binding.name.ends_with("__");
+            if binding.kind != syntax::ClassBindingKind::Function || private {
+                continue;
+            }
+            let Some(method) = context.method_at(path, binding.name_span) else {
+                continue;
+            };
+            let mut visited = std::collections::HashSet::from([*class]);
+            let mut pending: Vec<&CanonicalId> = bases_of.get(class).cloned().unwrap_or_default();
+            while let Some(base) = pending.pop() {
+                if !visited.insert(base) {
+                    continue;
+                }
+                // A base that is not a workspace class has no known bindings and ends the walk.
+                let Some(base_bindings) = bindings_of.get(base) else {
+                    continue;
+                };
+                let bound: Vec<_> = base_bindings.iter().filter(|b| b.name == binding.name).collect();
+                if bound.is_empty() {
+                    pending.extend(bases_of.get(base).into_iter().flatten());
+                } else if bound.iter().all(|b| b.kind == syntax::ClassBindingKind::Function) {
+                    edges.extend(
+                        context
+                            .same_named_in(base, method)
+                            .iter()
+                            .map(|&target| (method, target)),
+                    );
+                }
+                // Otherwise the base binds the name to a non-method (a class attribute, a nested
+                // class, an import), which hides every method behind it: the walk stops here.
+            }
+        }
+    }
+    edges
 }
 
 /// The symbols each refused reference occurrence may denote, as `(discrepancy id, symbol)` links.

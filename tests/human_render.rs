@@ -1172,6 +1172,47 @@ fn empty_dependents_and_importers_state_what_they_cannot_see_and_contains_stays_
     );
 }
 
+// _(An empty implements answer is a definite none)_ and
+// _(An empty structural relation is a definite none)_ — an empty `implements` and an empty
+// `implementers` answer render the definite wording, through the built binary.
+#[test]
+fn empty_implements_and_implementers_render_the_definite_wording() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_db(
+        dir.path(),
+        "ovr-ws",
+        &support::method_overrides_python_index_from("index.scip"),
+        &support::method_overrides_python_sources(),
+    );
+    let subject = "ovr-ws::method-overrides::pkg::unrelated::Loner::run";
+
+    for relation in ["implements", "implementers"] {
+        let stdout = human_trace(dir.path(), &db, subject, relation, &[]);
+        assert!(
+            stdout.contains("empty: the relation holds no instances (a definite empty set)"),
+            "{relation}: {stdout}"
+        );
+    }
+}
+
+// _(An empty implements answer is a definite none)_ and
+// _(An empty structural relation is a definite none)_ — a type subject with no base and no subclass
+// renders the definite wording for `implements` and for `implementers`.
+#[test]
+fn empty_implements_and_implementers_of_a_type_render_the_definite_wording() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_method_overrides_python_db(dir.path(), "ovr-ws");
+    let subject = "ovr-ws::method-overrides::pkg::unrelated::Loner";
+
+    for relation in ["implements", "implementers"] {
+        let stdout = human_trace(dir.path(), &db, subject, relation, &[]);
+        assert!(
+            stdout.contains("empty: the relation holds no instances (a definite empty set)"),
+            "{relation}: {stdout}"
+        );
+    }
+}
+
 // _(The group renders after the results with its label)_ — `fetch` has a resolved reference and one
 // unresolved call; the group follows the result rows and labels its call.
 #[test]
@@ -1293,4 +1334,293 @@ fn a_shortened_receiver_with_a_control_character_renders_on_one_line() {
     let call = line_starting(&stdout, "  make(");
     assert!(call.starts_with("  make( \"\u{fffd}aaa"), "{call:?}");
     assert!(call.contains("….target  at m.rs:"), "{call:?}");
+}
+
+/// The method-overrides Python fixture under scip-python, built into `dir` under workspace `ws`.
+fn build_method_overrides_python_db(dir: &Path, ws: &str) -> PathBuf {
+    build_db(
+        dir,
+        ws,
+        &support::method_overrides_python_index_from("index.scip"),
+        &support::method_overrides_python_sources(),
+    )
+}
+
+/// The `--json` answer of `trace <subject> --relation references` over `db`, asserting success.
+fn json_references(dir: &Path, db: &Path, subject: &str, extra: &[&str]) -> serde_json::Value {
+    let out = c10r(dir)
+        .arg("--db")
+        .arg(db)
+        .arg("--json")
+        .args(["trace", subject, "--relation", "references"])
+        .args(extra)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// A store whose method `target` has no resolved reference, three unresolved calls, three unconfirmed
+/// uses, two methods that override it with one resolved reference each, and one base method it
+/// overrides with one resolved reference.
+fn build_override_composite_db(dir: &Path) -> PathBuf {
+    use silent_cartographer::semantic::model::SymbolKind;
+
+    let (mut index, sources) = support::grouped_references(0);
+    index.symbols[0].kind = SymbolKind::Method;
+    let db = build_db(dir, "composite-ws", &index, &sources);
+
+    let store = GraphStore::open_or_replace(&db).unwrap();
+    let target = store.symbols_by_shortname("target").unwrap().remove(0).canonical_id;
+    let method = |name: &str| {
+        let id = CanonicalId::from_raw(format!("composite-ws::{name}"));
+        store
+            .insert_symbol(&SymbolRow {
+                canonical_id: id.clone(),
+                display_name: name.to_string(),
+                kind: "method".to_string(),
+                class: PersistedClass::InWorkspace,
+                document_path: None,
+                span: None,
+                line_column: None,
+                header_end: None,
+                span_text: None,
+                signature_text: None,
+                interface_text: None,
+                duplicated: false,
+                test_rule: None,
+            })
+            .unwrap();
+        store
+            .insert_occurrence(&OccurrenceRow {
+                symbol_id: id.clone(),
+                document_path: "m.rs".to_string(),
+                span: (0, 1),
+                line_column: None,
+                role: "reference".to_string(),
+                rule: "exact".to_string(),
+                enclosing_id: None,
+                locality: None,
+            })
+            .unwrap();
+        id
+    };
+    let base = method("base");
+    store.insert_edge(EdgeKind::Overrides, &target, &base).unwrap();
+    for leaf in ["leaf_a", "leaf_b"] {
+        store.insert_edge(EdgeKind::Overrides, &method(leaf), &target).unwrap();
+    }
+    db
+}
+
+const OVERRIDE_UNSEEN_CASES: &str =
+    "calls by frameworks, implicit calls such as constructors and operators, and lookups by string are not seen";
+
+// _(The rendering separates the transitive count from the direct listing)_ — `A3.m` is overridden by
+// `B3.m`, which `C3.m` overrides in turn: the line counts both and describes its command as listing
+// only the direct overrides.
+#[test]
+fn the_rendering_separates_the_transitive_count_from_the_direct_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_method_overrides_python_db(dir.path(), "ovr-ws");
+
+    let stdout = human_trace(
+        dir.path(),
+        &db,
+        "ovr-ws::method-overrides::pkg::chain::A3::m",
+        "references",
+        &[],
+    );
+    let line = line_starting(&stdout, "overridden by");
+    assert!(
+        line.starts_with(
+            "overridden by 2 methods, counting overrides of overrides, with 2 resolved references; \
+             list the direct overrides with: c10r trace --db="
+        ),
+        "{line}"
+    );
+    assert!(line.ends_with("--relation implementers"), "{line}");
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("overrides ")),
+        "a zero part prints no line: {stdout}"
+    );
+}
+
+// _(A method with no override relation carries zeros)_ — human half: no override line.
+#[test]
+fn a_method_with_no_override_relation_renders_no_override_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_method_overrides_python_db(dir.path(), "ovr-ws");
+
+    let stdout = human_trace(
+        dir.path(),
+        &db,
+        "ovr-ws::method-overrides::pkg::unrelated::Loner::run",
+        "references",
+        &[],
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.starts_with("overridden by") || line.starts_with("overrides ")),
+        "{stdout}"
+    );
+}
+
+// _(An overriding method discloses what it overrides)_ — human half: the method has no resolved
+// reference, so the empty line and the part's line both state the relation.
+#[test]
+fn an_overriding_method_states_what_it_overrides_in_its_empty_line_and_its_part_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_override_composite_db(dir.path());
+
+    let stdout = human_trace(dir.path(), &db, "target", "references", &[]);
+    assert!(
+        line_starting(&stdout, "empty:").contains("; it overrides 1 method with 1 resolved reference (see below)"),
+        "{stdout}"
+    );
+    let line = line_starting(&stdout, "overrides ");
+    assert!(
+        line.starts_with(
+            "overrides 1 method, counting what it overrides in turn, with 1 resolved reference; \
+             list the direct ones with: c10r trace --db="
+        ),
+        "{line}"
+    );
+    assert!(line.ends_with("--relation implements"), "{line}");
+
+    let json = json_references(dir.path(), &db, "target", &[]);
+    assert_eq!(json["override_relations"]["overrides"]["methods"], 1);
+    assert_eq!(json["override_relations"]["overrides"]["references"], 1);
+}
+
+// An empty `references` answer with both reference groups and both override parts renders every
+// count in its empty line and every group and part after it.
+#[test]
+fn an_empty_references_answer_renders_every_group_and_override_part() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_override_composite_db(dir.path());
+
+    let stdout = human_trace(dir.path(), &db, "target", "references", &[]);
+    assert_eq!(
+        line_starting(&stdout, "empty:"),
+        format!(
+            "empty: no resolved reference recorded; 3 calls named target have no resolved target and 3 uses are \
+             unconfirmed; it is overridden by 2 methods with 2 resolved references (see below); it overrides 1 \
+             method with 1 resolved reference (see below) ({OVERRIDE_UNSEEN_CASES})"
+        )
+    );
+    let at = |prefix: &str| {
+        stdout
+            .find(&format!("\n{prefix}"))
+            .unwrap_or_else(|| panic!("no {prefix}: {stdout}"))
+    };
+    assert!(at("unresolved:") < at("unconfirmed:"), "{stdout}");
+    assert!(at("unconfirmed:") < at("overridden by 2 methods"), "{stdout}");
+    assert!(at("overridden by 2 methods") < at("overrides 1 method"), "{stdout}");
+}
+
+// _(The part's command runs against the same store)_ — the workspace identity holds a space, a quote,
+// and a dollar sign, so the subject's identity does too; the command, run through `sh -c`, lists the
+// direct overrides from the non-default store.
+#[cfg(unix)]
+#[test]
+fn the_parts_command_runs_against_the_same_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let ws = "we ird'ws $HOME";
+    let db = build_method_overrides_python_db(&store_dir, ws);
+    let subject = format!("{ws}::method-overrides::pkg::chain::A3::m");
+
+    let json = json_references(dir.path(), &db, &subject, &[]);
+    let command = json["override_relations"]["overridden_by"]["command"]
+        .as_str()
+        .expect("the first part carries a command");
+    let runnable = format!(
+        "'{}'{}",
+        env!("CARGO_BIN_EXE_c10r"),
+        command.strip_prefix("c10r").expect("the command starts with c10r")
+    );
+
+    let out = Command::new("sh")
+        .args(["-c", &runnable])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}; command: {command}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains(&format!("{ws}::method-overrides::pkg::chain::B3::m")),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("C3::m"),
+        "the listing is the direct overrides only: {stdout}"
+    );
+}
+
+// _(Every page carries the same override disclosure)_ — the first and the resumed page carry equal
+// disclosures, and the paging counts are the subject's own.
+#[test]
+fn every_page_carries_the_same_override_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_method_overrides_python_db(dir.path(), "page-ws");
+    let subject = "page-ws::method-overrides::pkg::props::SizedBase::size";
+
+    let first = json_references(dir.path(), &db, subject, &["--limit", "2"]);
+    let cursor = first["page"]["cursor"]
+        .as_str()
+        .expect("a continuation token")
+        .to_string();
+    let second = json_references(dir.path(), &db, subject, &["--limit", "2", "--cursor", &cursor]);
+
+    assert_eq!(first["page"]["total"], 4);
+    assert_eq!(second["page"]["total"], 4);
+    assert_eq!(second["page"]["page_index"], 1);
+    assert_eq!(first["override_relations"]["overridden_by"]["methods"], 1);
+    assert_eq!(first["override_relations"], second["override_relations"]);
+}
+
+// _(Every page carries the same override disclosure)_ — the unbounded listing carries the disclosure
+// the default-limit answer does.
+#[test]
+fn an_unbounded_listing_carries_the_same_override_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_method_overrides_python_db(dir.path(), "page-ws");
+    let subject = "page-ws::method-overrides::pkg::chain::A3::m";
+
+    let bounded = json_references(dir.path(), &db, subject, &[]);
+    let unbounded = json_references(dir.path(), &db, subject, &["--limit", "0"]);
+
+    assert!(
+        bounded["override_relations"]["overridden_by"]["methods"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(bounded["override_relations"]["overridden_by"]["command"].is_string());
+    assert_eq!(bounded["override_relations"], unbounded["override_relations"]);
+}
+
+// An ambiguous subject names no single method, so the answer carries no override disclosure.
+#[test]
+fn an_ambiguous_subject_carries_no_override_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = build_method_overrides_python_db(dir.path(), "page-ws");
+
+    let json = json_references(dir.path(), &db, "m", &[]);
+
+    assert_eq!(json["outcome"]["outcome"], "ambiguous", "{json}");
+    assert!(json.get("override_relations").is_none(), "{json}");
 }

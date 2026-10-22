@@ -422,6 +422,68 @@ pub fn unresolved_calls_rust_sources() -> Vec<(String, String)> {
     read_sources(&unresolved_calls_rust_root(), &["src/lib.rs"])
 }
 
+/// The committed method-overrides Python fixture directory (`tests/fixtures/method-overrides/python`).
+pub fn method_overrides_python_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/method-overrides/python")
+}
+
+/// The method-overrides Python fixture index named `file` (`index.scip` or `ty-scip.scip`).
+pub fn method_overrides_python_index_from(file: &str) -> ExtractedIndex {
+    python_index_at(&method_overrides_python_root(), file)
+}
+
+/// The method-overrides Python fixture's sources, `(scip_document_path, text)`.
+pub fn method_overrides_python_sources() -> Vec<(String, String)> {
+    read_sources(
+        &method_overrides_python_root(),
+        &[
+            "pkg/__init__.py",
+            "pkg/annotated_middle.py",
+            "pkg/assigned_middle.py",
+            "pkg/chain.py",
+            "pkg/decorated.py",
+            "pkg/diamond.py",
+            "pkg/imported_base.py",
+            "pkg/imported_child.py",
+            "pkg/multi.py",
+            "pkg/plain.py",
+            "pkg/private.py",
+            "pkg/props.py",
+            "pkg/shadow.py",
+            "pkg/stdlib.py",
+            "pkg/unrelated.py",
+            "pkg/use.py",
+        ],
+    )
+}
+
+/// The committed method-overrides Rust fixture directory (`tests/fixtures/method-overrides/rust`).
+pub fn method_overrides_rust_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/method-overrides/rust")
+}
+
+/// The method-overrides Rust fixture index.
+pub fn method_overrides_rust_index() -> ExtractedIndex {
+    rust_index_at(&method_overrides_rust_root())
+}
+
+/// The method-overrides Rust fixture's sources, `(scip_document_path, text)`.
+pub fn method_overrides_rust_sources() -> Vec<(String, String)> {
+    read_sources(
+        &method_overrides_rust_root(),
+        &[
+            "src/bin/tool.rs",
+            "src/callers.rs",
+            "src/impls.rs",
+            "src/lib.rs",
+            "src/macros.rs",
+            "src/shared.rs",
+            "src/traits.rs",
+            "src/widget.rs",
+        ],
+    )
+}
+
 /// Write an executable stub tool that answers `--version` with `version`, and — for any other
 /// invocation carrying `--output <path>`, the shape both `rust-analyzer` and `scip-python` are run
 /// with — writes an empty file at `<path>` and exits successfully. An empty SCIP index is a valid one

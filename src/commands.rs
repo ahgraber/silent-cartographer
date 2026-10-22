@@ -23,7 +23,7 @@ use crate::graph::store::{
 use crate::graph::syntax::Language;
 use crate::graph::units::UndeterminedUnits;
 use crate::graph::{SourceChange, SourceDifference, compare_source_files, content_hash, ingest, text_hash};
-use crate::identity::WorkspaceId;
+use crate::identity::{CanonicalId, WorkspaceId};
 use crate::query::diff::{self, FileChange};
 use crate::query::impact::{ImpactRequest, shell_quote};
 use crate::query::output::{Answer, FreshnessLabel, LineColumns, Outcome, WorkspaceRelation};
@@ -1903,8 +1903,22 @@ pub fn run_trace(
     let answer = engine.trace(reference, trace_relation, detail, effective_max_lines)?;
     let answer =
         apply_pagination(answer, effective_limit, cursor, &identity)?.with_workspace_relation(relation_disclosure);
-    let answer = answer.with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
+    let answer = answer
+        .with_override_commands(|subject, relation| override_command(&meta, db, subject, relation))
+        .with_refresh(|| refresh_command(&meta, db, environment.as_ref()));
     Ok(render(&answer, json, styled, position))
+}
+
+/// The `trace` command that lists `subject`'s directly related methods over `relation`, naming the
+/// store the query read and the workspace it recorded. Every value uses the `--flag=value` form and
+/// is quoted, so an identity holding a shell-special character runs as given.
+fn override_command(meta: &IndexMetadata, db: &Path, subject: &CanonicalId, relation: &str) -> String {
+    format!(
+        "c10r trace --db={} --workspace={} {} --relation {relation}",
+        shell_quote(&absolute_db_path(db).display().to_string()),
+        shell_quote(meta.workspace_id.as_str()),
+        shell_quote(subject.as_str())
+    )
 }
 
 /// `find`: return every symbol whose name contains `fragment`, matched case-insensitively, as a
@@ -3545,6 +3559,7 @@ fn relation_label(relation: Relation) -> &'static str {
         Relation::Dependents => "dependents",
         Relation::Importers => "importers",
         Relation::Implementers => "implementers",
+        Relation::Implements => "implements",
         Relation::Tests => "tests",
     }
 }

@@ -1,0 +1,7 @@
+[package]
+name = "method-overrides"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace, so the enclosing repository's workspace does not adopt it.
+[workspace]

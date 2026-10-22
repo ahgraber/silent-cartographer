@@ -41,7 +41,7 @@ Prefer these tools over textual search for any question about this codebase.
   find           symbols whose name contains a fragment — names only
   get            one symbol, at location / signature / interface / body detail
   trace          what relates to a symbol: containers, contains, references,
-                 dependents, importers, implementers, tests
+                 dependents, importers, implementers, implements, tests
   search         code by what it does, in natural language — matches names,
                  documentation, and bodies
   similar        code shaped like a symbol you already have — estimated
@@ -309,7 +309,7 @@ def _register_query_tools(mcp: FastMCP, runner: Runner) -> None:
         The structural question tool. Use `dependents` before changing a symbol to
         see what could break, `references` to find resolved references and the
         unresolved calls that share the name, `containers` and `contains` to orient
-        in unfamiliar code, and `tests` to find what exercises it. An empty answer of `containers`, `contains`, or `implementers` is a
+        in unfamiliar code, and `tests` to find what exercises it. An empty answer of `containers`, `contains`, `implementers`, or `implements` is a
         definite none. An empty answer of `references`, `dependents`, `importers`,
         or `tests` means only that no resolved instance was recorded: calls by
         frameworks, implicit calls such as constructors and operators, and lookups

@@ -205,9 +205,12 @@ pub enum RelationArg {
     Dependents,
     /// The modules that import the subject.
     Importers,
-    /// The types that declare the subject as a supertype — a trait's implementors or a base type's
-    /// subtypes.
+    /// For a type, the types that declare it as a supertype (a trait's implementors or a base type's
+    /// subtypes); for a method, the methods that directly override it.
     Implementers,
+    /// For a type, the supertypes it directly declares; for a method, the methods it directly
+    /// overrides.
+    Implements,
     /// The reference sites whose enclosing declaration is classified test code — "what test code
     /// exercises this symbol." Convention-based classification (file names, test attributes, test
     /// directories), not resolved semantic fact; every answer is labeled heuristic-grade.
@@ -223,6 +226,7 @@ impl From<RelationArg> for Relation {
             RelationArg::Dependents => Relation::Dependents,
             RelationArg::Importers => Relation::Importers,
             RelationArg::Implementers => Relation::Implementers,
+            RelationArg::Implements => Relation::Implements,
             RelationArg::Tests => Relation::Tests,
         }
     }
@@ -302,7 +306,7 @@ pub struct TraceArgs {
 
     /// The relation to trace. An empty answer of `references`, `dependents`, `importers`, or `tests` means no
     /// resolved instance was recorded, not that none exists: calls by frameworks, implicit calls, and
-    /// lookups by string are not seen. Structural relations (`containers`, `contains`, `implementers`)
+    /// lookups by string are not seen. Structural relations (`containers`, `contains`, `implementers`, `implements`)
     /// answer a definite none.
     #[arg(long, value_enum)]
     pub relation: RelationArg,

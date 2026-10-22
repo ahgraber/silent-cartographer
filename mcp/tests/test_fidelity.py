@@ -83,6 +83,20 @@ async def test_a_typed_empty_answer_survives_as_typed_absence(
     )
 
 
+async def test_the_implements_relation_passes_the_command_answer_through(
+    server: FastMCP, c10r_binary: str, indexed_workspace: Path
+) -> None:
+    """A `trace` call with relation `implements` equals the mirrored command's answer."""
+    result = await call(server, "trace", {"reference": "double_value", "relation": "implements"})
+
+    assert not result.is_error, result.content
+    assert result.structured_content == direct(
+        c10r_binary,
+        ["trace", "double_value", "--relation", "implements"],
+        indexed_workspace,
+    )
+
+
 async def test_an_ambiguous_reference_returns_its_candidate_set(
     server: FastMCP, c10r_binary: str, indexed_workspace: Path
 ) -> None:
