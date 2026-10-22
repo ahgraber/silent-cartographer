@@ -50,7 +50,7 @@ Constraints from the baseline and from the code:
   For each impl, the trait resolves through its name span, each declared function resolves through its definition name span, and an edge goes to each of the trait's methods of the same name.
 - A declared method resolves through `definitions_at` at its definition name span; a location that map records as ambiguous yields no edge from that method.
   The trait in a Rust impl header resolves through the aligned reference occurrences at the header's trait-name span, collected into a map that keeps every identity at a location; one identity is used, and several yield no edge from that impl's methods.
-  Python bases come from the existing `type_hierarchy` edges.
+  A Python base counts when its name token resolves, through every aligned reference identity, to exactly one identity and the class has a `type_hierarchy` edge to it.
 - Edges are inserted through the existing unique edge index, so a method reached twice through a diamond gets one edge.
 
 **Rationale:** Python resolves an attribute by name along an instance's class and its bases, so a method overrides every same-named method of a base it reaches, as the 2026-10-17 probe confirmed for multiple bases and diamonds.
@@ -176,7 +176,8 @@ render
   The proposal scopes this out; `docs/commands/trace.md` states it.
 - **Macro-generated methods**: a trait method that a macro supplies inside an impl, or an impl a macro generates, gets no edge, because the syntax tree does not contain the generated function.
   The requirement scopes this out explicitly; `docs/commands/trace.md` states it.
-- **Existing first-wins resolution**: the `type_hierarchy` derivation still resolves endpoints with `occ_by_location`, so where several aligned identities sit at one base-name token, a Python class gets an edge to the first one only, and its override edges follow that edge.
-  This change does not alter that derivation; the gap is recorded here for a later fix.
+- **Existing first-wins resolution**: the `type_hierarchy` derivation still resolves endpoints with `occ_by_location`, so where several aligned identities sit at one base-name token, a Python class gets a `type_hierarchy` edge to the first identity only.
+  The override pass does not follow that edge, because it resolves each base name through every aligned identity and makes no edge through an ambiguous one.
+  This change does not alter the `type_hierarchy` derivation.
 - **Large hierarchies**: the transitive walks for the disclosure run per `references` query.
   The walk is bounded by the number of related methods, and each reference count is one indexed query.
