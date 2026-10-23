@@ -624,6 +624,8 @@ fn unreadable_store(path: &Path, cause: &std::io::Error) -> StoreOpenError {
 /// ([`open_literal`], [`GraphStore::open_in_memory`]) call this first.
 fn ensure_vec_extension() {
     static REGISTERED: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `sqlite_vec` declares `sqlite3_vec_init` as `fn()`, but the C symbol takes
+    // `(sqlite3 *, char **, const sqlite3_api_routines *)` and returns `int`, matching the transmute target.
     REGISTERED.call_once(|| unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
             *const (),

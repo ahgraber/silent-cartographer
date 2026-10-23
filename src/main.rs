@@ -358,8 +358,11 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<String> {
                 args.python_indexer.map(Into::into),
                 args.environment.as_deref(),
                 args.language.map(Into::into),
-                args.force,
-                args.yes,
+                match (args.force, args.yes) {
+                    (false, _) => commands::ForcedBuild::No,
+                    (true, false) => commands::ForcedBuild::AskFirst,
+                    (true, true) => commands::ForcedBuild::Confirmed,
+                },
                 &silent_cartographer::graph::chunk::ChunkParams {
                     chunk_size: args.chunk_size,
                     overlap: args.chunk_overlap,

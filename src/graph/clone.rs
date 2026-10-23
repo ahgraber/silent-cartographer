@@ -106,7 +106,9 @@ pub fn contained_symbols<'a>(
 ) -> Vec<(ByteSpan, &'a CanonicalId)> {
     candidates
         .into_iter()
-        .filter(|&(id, inner)| id != subject && super::corpus::span_encloses(span, inner, false))
+        .filter(|&(id, inner)| {
+            id != subject && super::corpus::span_encloses(span, inner, super::corpus::OuterKind::Item)
+        })
         .map(|(id, (start, end))| (ByteSpan { start, end }, id))
         .collect()
 }

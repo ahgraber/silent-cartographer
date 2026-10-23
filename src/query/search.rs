@@ -19,7 +19,7 @@ use crate::identity::CanonicalId;
 
 use super::output::{Answer, Location, Outcome, SemanticIndexView, SymbolView};
 use super::resolve::{Resolution, SourcePosition, resolve_position};
-use super::{Detail, QueryEngine, QueryError, location_of, projected_content, symbol_view};
+use super::{CappedContent, Detail, QueryEngine, QueryError, location_of, projected_content, symbol_view};
 
 /// The RRF constant `k` in `score(d) = Σ 1/(k + rank_d)`: the standard damping that keeps a single
 /// signal's top rank from dominating the fusion.
@@ -356,7 +356,10 @@ pub fn similar_items(
             let Some(row) = store.symbol(&candidate.id)? else {
                 return Err(QueryError::MissingSymbol(candidate.id.clone()));
             };
-            let (content, content_truncated) = projected_row_content(&row, detail, max_lines);
+            let CappedContent {
+                content,
+                content_truncated,
+            } = projected_row_content(&row, detail, max_lines);
             Ok(SimilarItem {
                 symbol: symbol_view(&row),
                 clone_certainty: candidate.clone_certainty,
@@ -630,7 +633,10 @@ impl QueryEngine<'_> {
             let Some(row) = self.store.symbol(id)? else {
                 return Err(QueryError::MissingSymbol(id.clone()));
             };
-            let (content, content_truncated) = projected_row_content(&row, detail, max_lines);
+            let CappedContent {
+                content,
+                content_truncated,
+            } = projected_row_content(&row, detail, max_lines);
             Ok(MutualMember {
                 symbol: symbol_view(&row),
                 relations,
@@ -676,7 +682,10 @@ pub fn exclude_relations(mut answer: Answer<SimilarItem>, excluded: &[RelationLa
 
 /// Build one `search` row: identity, location, and content at the requested detail.
 fn search_item(row: &SymbolRow, detail: Detail, max_lines: Option<usize>) -> SearchItem {
-    let (content, content_truncated) = projected_row_content(row, detail, max_lines);
+    let CappedContent {
+        content,
+        content_truncated,
+    } = projected_row_content(row, detail, max_lines);
     SearchItem {
         symbol: symbol_view(row),
         location: location_of(row),
@@ -688,9 +697,9 @@ fn search_item(row: &SymbolRow, detail: Detail, max_lines: Option<usize>) -> Sea
 /// The content a `search`/`similar` row carries at `detail`: none at location detail (the
 /// location is already on every row), the row's persisted text at that detail otherwise, capped at
 /// `max_lines` through the shared cap point.
-fn projected_row_content(row: &SymbolRow, detail: Detail, max_lines: Option<usize>) -> (Option<String>, bool) {
+fn projected_row_content(row: &SymbolRow, detail: Detail, max_lines: Option<usize>) -> CappedContent {
     match detail {
-        Detail::Location => (None, false),
+        Detail::Location => CappedContent::default(),
         other => projected_content(row, Some(other), max_lines),
     }
 }

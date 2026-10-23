@@ -77,7 +77,7 @@ pub fn count_tokens(text: &str) -> usize {
             .expect("the compiled-in tokenizer must parse")
     });
     tokenizer
-        .encode_fast(text, false)
+        .encode_fast(text, /* add_special_tokens */ false)
         .map(|encoding| encoding.get_ids().len())
         .unwrap_or(0)
 }

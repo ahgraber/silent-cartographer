@@ -6,7 +6,7 @@ mod support;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use silent_cartographer::commands::{BuildOutcome, PythonExecutables, run_build};
+use silent_cartographer::commands::{BuildOutcome, ForcedBuild, PythonExecutables, run_build};
 use silent_cartographer::graph::store::GraphStore;
 use silent_cartographer::graph::syntax::Language;
 use silent_cartographer::identity::CanonicalId;
@@ -53,8 +53,7 @@ fn build_rust(root: &Path) -> BuildOutcome {
         None,
         None,
         Some(Language::Rust),
-        false,
-        false,
+        ForcedBuild::No,
         &Default::default(),
         &|_| false,
         &silent_cartographer::graph::store::free_bytes,
@@ -323,8 +322,7 @@ fn build_python(root: &Path, venv: &Path) -> BuildOutcome {
         Some(PythonIndexer::ScipPython),
         Some(venv),
         Some(Language::Python),
-        false,
-        false,
+        ForcedBuild::No,
         &Default::default(),
         &|_| false,
         &silent_cartographer::graph::store::free_bytes,

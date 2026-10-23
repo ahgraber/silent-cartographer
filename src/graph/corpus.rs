@@ -96,12 +96,20 @@ pub fn row_contributes(row: &SymbolRow) -> bool {
         )
 }
 
+/// The kind of the outer symbol in a [`span_encloses`] test, which decides whether equal spans
+/// enclose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OuterKind {
+    Module,
+    Item,
+}
+
 /// Whether the span `outer` encloses the span `inner` of another symbol in the same document, for
 /// corpus containment. Equal spans enclose only when the outer symbol is a module: a document
 /// encloses its declarations, so a file module whose span equals its sole declaration's span still
 /// contains it, and the declaration stays a leaf.
-pub fn span_encloses(outer: (usize, usize), inner: (usize, usize), outer_is_module: bool) -> bool {
-    outer.0 <= inner.0 && inner.1 <= outer.1 && (inner != outer || outer_is_module)
+pub fn span_encloses(outer: (usize, usize), inner: (usize, usize), outer_kind: OuterKind) -> bool {
+    outer.0 <= inner.0 && inner.1 <= outer.1 && (inner != outer || outer_kind == OuterKind::Module)
 }
 
 /// One passage — the corpus's per-symbol unit: a symbol identity, the render text its

@@ -316,8 +316,11 @@ impl<'a> QueryEngine<'a> {
                 .into_iter()
                 .filter_map(|id| self.store.symbol(&id).ok().flatten())
                 .map(|row| {
-                    let (content, truncated) = projected_content(&row, detail, max_lines);
-                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
+                    let CappedContent {
+                        content,
+                        content_truncated,
+                    } = projected_content(&row, detail, max_lines);
+                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, content_truncated)
                 })
                 .collect(),
             TraceRelation::Containers => self
@@ -326,17 +329,22 @@ impl<'a> QueryEngine<'a> {
                 .into_iter()
                 .filter_map(|id| self.store.symbol(&id).ok().flatten())
                 .map(|row| {
-                    let (content, truncated) = projected_content(&row, detail, max_lines);
-                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
+                    let CappedContent {
+                        content,
+                        content_truncated,
+                    } = projected_content(&row, detail, max_lines);
+                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, content_truncated)
                 })
                 .collect(),
             TraceRelation::References => {
                 let occs = self.store.references_of(&subject.canonical_id)?;
                 let mut items = Vec::with_capacity(occs.len());
                 for occ in occs {
-                    let (content, truncated) =
-                        self.reference_content(&occ.document_path, occ.enclosing_id.as_ref(), detail, max_lines)?;
-                    items.push(TraceItem::reference(&subject, occ, None, content, truncated));
+                    let CappedContent {
+                        content,
+                        content_truncated,
+                    } = self.reference_content(&occ.document_path, occ.enclosing_id.as_ref(), detail, max_lines)?;
+                    items.push(TraceItem::reference(&subject, occ, None, content, content_truncated));
                 }
                 items
             }
@@ -351,9 +359,17 @@ impl<'a> QueryEngine<'a> {
                     let Some(rule) = self.attributed_test_rule(&occ)? else {
                         continue;
                     };
-                    let (content, truncated) =
-                        self.reference_content(&occ.document_path, occ.enclosing_id.as_ref(), detail, max_lines)?;
-                    items.push(TraceItem::reference(&subject, occ, Some(rule), content, truncated));
+                    let CappedContent {
+                        content,
+                        content_truncated,
+                    } = self.reference_content(&occ.document_path, occ.enclosing_id.as_ref(), detail, max_lines)?;
+                    items.push(TraceItem::reference(
+                        &subject,
+                        occ,
+                        Some(rule),
+                        content,
+                        content_truncated,
+                    ));
                 }
                 items
             }
@@ -363,8 +379,11 @@ impl<'a> QueryEngine<'a> {
                 .into_iter()
                 .filter_map(|id| self.store.symbol(&id).ok().flatten())
                 .map(|row| {
-                    let (content, truncated) = projected_content(&row, detail, max_lines);
-                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
+                    let CappedContent {
+                        content,
+                        content_truncated,
+                    } = projected_content(&row, detail, max_lines);
+                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, content_truncated)
                 })
                 .collect(),
             TraceRelation::Implementers | TraceRelation::Implements => self
@@ -372,8 +391,11 @@ impl<'a> QueryEngine<'a> {
                 .into_iter()
                 .filter_map(|id| self.store.symbol(&id).ok().flatten())
                 .map(|row| {
-                    let (content, truncated) = projected_content(&row, detail, max_lines);
-                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, truncated)
+                    let CappedContent {
+                        content,
+                        content_truncated,
+                    } = projected_content(&row, detail, max_lines);
+                    TraceItem::symbol(symbol_view(&row), location_of(&row), content, content_truncated)
                 })
                 .collect(),
         };
@@ -412,23 +434,22 @@ impl<'a> QueryEngine<'a> {
             return Ok(None);
         }
         Ok(Some(OverrideRelations {
-            overridden_by: self.override_part(&subject.canonical_id, false)?,
-            overrides: self.override_part(&subject.canonical_id, true)?,
+            overridden_by: self.override_part(&subject.canonical_id, OverrideDirection::OverriddenBy)?,
+            overrides: self.override_part(&subject.canonical_id, OverrideDirection::Overrides)?,
             subject: subject.canonical_id.clone(),
         }))
     }
 
-    /// Walk `overrides` edges from `start`, forward or backward, to a fixed point; the visited set
-    /// holds `start`, so a cycle never counts the subject.
-    fn override_part(&self, start: &CanonicalId, forward: bool) -> Result<OverridePart, QueryError> {
+    /// Walk `overrides` edges from `start` in `direction` to a fixed point; the visited set holds
+    /// `start`, so a cycle never counts the subject.
+    fn override_part(&self, start: &CanonicalId, direction: OverrideDirection) -> Result<OverridePart, QueryError> {
         let mut visited = std::collections::BTreeSet::from([start.clone()]);
         let mut frontier = vec![start.clone()];
         let mut references = 0;
         while let Some(id) = frontier.pop() {
-            let next = if forward {
-                self.store.edge_targets(EdgeKind::Overrides, &id)?
-            } else {
-                self.store.edge_sources(EdgeKind::Overrides, &id)?
+            let next = match direction {
+                OverrideDirection::Overrides => self.store.edge_targets(EdgeKind::Overrides, &id)?,
+                OverrideDirection::OverriddenBy => self.store.edge_sources(EdgeKind::Overrides, &id)?,
             };
             for method in next {
                 if visited.insert(method.clone()) {
@@ -531,16 +552,28 @@ impl<'a> QueryEngine<'a> {
                 false,
             ),
             Detail::Signature => {
-                let (signature, lines, truncated) = window_content(row.signature_text.clone(), from, max_lines);
-                (DetailPayload::Signature { signature }, lines, truncated)
+                let WindowedContent {
+                    content: signature,
+                    content_lines,
+                    content_truncated,
+                } = window_content(row.signature_text.clone(), from, max_lines);
+                (DetailPayload::Signature { signature }, content_lines, content_truncated)
             }
             Detail::Interface => {
-                let (interface, lines, truncated) = window_content(row.interface_text.clone(), from, max_lines);
-                (DetailPayload::Interface { interface }, lines, truncated)
+                let WindowedContent {
+                    content: interface,
+                    content_lines,
+                    content_truncated,
+                } = window_content(row.interface_text.clone(), from, max_lines);
+                (DetailPayload::Interface { interface }, content_lines, content_truncated)
             }
             Detail::Body => {
-                let (body, lines, truncated) = window_content(row.span_text.clone(), from, max_lines);
-                (DetailPayload::Body { body }, lines, truncated)
+                let WindowedContent {
+                    content: body,
+                    content_lines,
+                    content_truncated,
+                } = window_content(row.span_text.clone(), from, max_lines);
+                (DetailPayload::Body { body }, content_lines, content_truncated)
             }
         };
         SymbolDetail {
@@ -612,17 +645,19 @@ impl<'a> QueryEngine<'a> {
     /// The content for a `references` row at `detail`, capped at `max_lines`: the content of the
     /// declaration the reference site is attributed to (`enclosing_id`), or, when the site attributes
     /// to the module/file itself (`enclosing_id` is `None`), the content of that document's module
-    /// symbol. The `bool` reports whether the content was truncated by the cap.
+    /// symbol.
     fn reference_content(
         &self,
         document_path: &str,
         enclosing_id: Option<&CanonicalId>,
         detail: Option<Detail>,
         max_lines: Option<usize>,
-    ) -> Result<(Option<String>, bool), QueryError> {
-        let Some(detail) = detail else { return Ok((None, false)) };
+    ) -> Result<CappedContent, QueryError> {
+        let Some(detail) = detail else {
+            return Ok(CappedContent::default());
+        };
         if detail == Detail::Location {
-            return Ok((None, false));
+            return Ok(CappedContent::default());
         }
         let row = match enclosing_id {
             Some(id) => self.store.symbol(id)?,
@@ -630,7 +665,7 @@ impl<'a> QueryEngine<'a> {
         };
         match row {
             Some(row) => Ok(projected_content(&row, Some(detail), max_lines)),
-            None => Ok((None, false)),
+            None => Ok(CappedContent::default()),
         }
     }
 
@@ -702,7 +737,10 @@ impl<'a> QueryEngine<'a> {
                     // store's invariant was violated, not a legitimate absence.
                     return Err(QueryError::MissingSymbol(r.id.clone()));
                 };
-                let (content, content_truncated) = projected_content(&row, detail, max_lines);
+                let CappedContent {
+                    content,
+                    content_truncated,
+                } = projected_content(&row, detail, max_lines);
                 detailed.push(DependentItem {
                     content,
                     content_truncated,
@@ -940,6 +978,15 @@ pub struct DependentsReport {
     pub beyond_bound: Vec<AggregateCount>,
 }
 
+/// Which side of a method's `overrides` edges a walk follows.
+#[derive(Debug, Clone, Copy)]
+enum OverrideDirection {
+    /// The methods the subject overrides.
+    Overrides,
+    /// The methods that override the subject.
+    OverriddenBy,
+}
+
 /// Build the identity+name view of a symbol.
 fn symbol_view(row: &SymbolRow) -> SymbolView {
     SymbolView {
@@ -1009,10 +1056,9 @@ fn location_of(row: &SymbolRow) -> Option<Location> {
 /// The content a `trace`/`dependents` row projects at `detail`, capped to its first `max_lines`
 /// lines: `None` when no detail was requested or the requested detail is `Location` (the location is
 /// already on every row), otherwise the row's persisted text at that detail — itself `None` for a
-/// detail the row carries no content for (e.g. an external symbol). The `bool` reports whether the cap
-/// truncated the content. Trace rows are never windowed (they start at line 1); every content-bearing
-/// path routes through the single [`cap_lines`] cap point.
-fn projected_content(row: &SymbolRow, detail: Option<Detail>, max_lines: Option<usize>) -> (Option<String>, bool) {
+/// detail the row carries no content for (e.g. an external symbol). Trace rows are never windowed (they
+/// start at line 1); every content-bearing path routes through the single [`cap_lines`] cap point.
+fn projected_content(row: &SymbolRow, detail: Option<Detail>, max_lines: Option<usize>) -> CappedContent {
     let raw = match detail {
         None | Some(Detail::Location) => None,
         Some(Detail::Signature) => row.signature_text.clone(),
@@ -1027,19 +1073,44 @@ fn projected_content(row: &SymbolRow, detail: Option<Detail>, max_lines: Option<
 /// continuation byte), so the cut is always on a line boundary and never splits a character. A `None`
 /// bound, or content already within the bound, passes through untruncated. This is the row-content
 /// cap point for `trace`/`dependents`; `get` windows content through [`window_content`].
-fn cap_lines(text: Option<String>, max_lines: Option<usize>) -> (Option<String>, bool) {
+fn cap_lines(text: Option<String>, max_lines: Option<usize>) -> CappedContent {
     match (text, max_lines) {
         (Some(text), Some(max)) => {
             let total = text.split('\n').count();
             if max == 0 || total <= max {
-                (Some(text), false)
+                CappedContent {
+                    content: Some(text),
+                    content_truncated: false,
+                }
             } else {
                 let kept = text.split('\n').take(max).collect::<Vec<_>>().join("\n");
-                (Some(kept), true)
+                CappedContent {
+                    content: Some(kept),
+                    content_truncated: true,
+                }
             }
         }
-        (text, _) => (text, false),
+        (text, _) => CappedContent {
+            content: text,
+            content_truncated: false,
+        },
     }
+}
+
+/// Row content after a line cap, and whether the cap dropped any of it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CappedContent {
+    content: Option<String>,
+    content_truncated: bool,
+}
+
+/// Content windowed to a line range, the [`ContentLines`] disclosure of that range, and whether the
+/// window left any of the content out.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WindowedContent {
+    content: Option<String>,
+    content_lines: Option<ContentLines>,
+    content_truncated: bool,
 }
 
 /// The single content-window point for `get`: return the lines `[from, from + max_lines)` of `text`
@@ -1050,13 +1121,9 @@ fn cap_lines(text: Option<String>, max_lines: Option<usize>) -> (Option<String>,
 /// Lines split on `\n` and rejoin with `\n`, so taking the whole text reconstructs it byte-for-byte.
 /// A `from` past the end of the content returns empty content with a disclosure naming the total line
 /// count — a data-dependent outcome, not an error.
-fn window_content(
-    text: Option<String>,
-    from: usize,
-    max_lines: Option<usize>,
-) -> (Option<String>, Option<ContentLines>, bool) {
+fn window_content(text: Option<String>, from: usize, max_lines: Option<usize>) -> WindowedContent {
     let Some(text) = text else {
-        return (None, None, false);
+        return WindowedContent::default();
     };
     let lines: Vec<&str> = text.split('\n').collect();
     let total = lines.len();
@@ -1069,7 +1136,11 @@ fn window_content(
             end: start - 1,
             total,
         };
-        return (Some(String::new()), Some(disclosure), true);
+        return WindowedContent {
+            content: Some(String::new()),
+            content_lines: Some(disclosure),
+            content_truncated: true,
+        };
     }
 
     // `max_lines` of `None` (unbounded) or `0` both mean "to the end of the content."
@@ -1082,8 +1153,11 @@ fn window_content(
     let end = (start - 1).saturating_add(count).min(total);
     let windowed = lines[(start - 1)..end].join("\n");
     let covers_whole = start == 1 && end == total;
-    let disclosure = (!covers_whole).then_some(ContentLines { start, end, total });
-    (Some(windowed), disclosure, !covers_whole)
+    WindowedContent {
+        content: Some(windowed),
+        content_lines: (!covers_whole).then_some(ContentLines { start, end, total }),
+        content_truncated: !covers_whole,
+    }
 }
 
 /// Whether a truncation flag is unset — the `skip_serializing_if` predicate that keeps an untruncated
@@ -1094,7 +1168,7 @@ fn is_false(flag: &bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryError, cap_lines, window_content};
+    use super::{CappedContent, QueryError, WindowedContent, cap_lines, window_content};
     use crate::query::output::ContentLines;
 
     // _(Messages say what happened, why, what it means, and what to do)_ — a store failure whose own
@@ -1119,13 +1193,23 @@ mod tests {
     #[test]
     fn cap_lines_keeps_the_first_n_lines() {
         let text = || Some("one\ntwo\nthree\nfour".to_string());
-        assert_eq!(cap_lines(text(), Some(2)), (Some("one\ntwo".to_string()), true));
+        let whole = || CappedContent {
+            content: text(),
+            content_truncated: false,
+        };
+        assert_eq!(
+            cap_lines(text(), Some(2)),
+            CappedContent {
+                content: Some("one\ntwo".to_string()),
+                content_truncated: true,
+            }
+        );
         // A bound at or beyond the line count passes the text through untruncated.
-        assert_eq!(cap_lines(text(), Some(4)), (text(), false));
-        assert_eq!(cap_lines(text(), Some(9)), (text(), false));
+        assert_eq!(cap_lines(text(), Some(4)), whole());
+        assert_eq!(cap_lines(text(), Some(9)), whole());
         // No bound, or no content, passes through with no disclosure.
-        assert_eq!(cap_lines(text(), None), (text(), false));
-        assert_eq!(cap_lines(None, Some(2)), (None, false));
+        assert_eq!(cap_lines(text(), None), whole());
+        assert_eq!(cap_lines(None, Some(2)), CappedContent::default());
     }
 
     // _(Content bounded with truncation disclosed — UTF-8 safety)_ — splitting on `\n` never lands
@@ -1137,10 +1221,19 @@ mod tests {
         let text = || Some("café\n😀 emoji\n汉字".to_string());
         assert_eq!(
             cap_lines(text(), Some(2)),
-            (Some("café\n😀 emoji".to_string()), true),
+            CappedContent {
+                content: Some("café\n😀 emoji".to_string()),
+                content_truncated: true,
+            },
             "the kept lines are byte-for-byte intact"
         );
-        assert_eq!(cap_lines(text(), Some(3)), (text(), false));
+        assert_eq!(
+            cap_lines(text(), Some(3)),
+            CappedContent {
+                content: text(),
+                content_truncated: false,
+            }
+        );
     }
 
     // _(Windowed content access on `get`)_ — the window is the lines `[from, from + max_lines)`, the
@@ -1148,56 +1241,61 @@ mod tests {
     #[test]
     fn window_content_returns_the_requested_slice_and_discloses_it() {
         let text = || Some("l1\nl2\nl3\nl4\nl5".to_string());
+        let whole = || WindowedContent {
+            content: text(),
+            content_lines: None,
+            content_truncated: false,
+        };
 
         // A middle window: three lines from line 2, truncated on both ends, position disclosed.
         assert_eq!(
             window_content(text(), 2, Some(3)),
-            (
-                Some("l2\nl3\nl4".to_string()),
-                Some(ContentLines {
+            WindowedContent {
+                content: Some("l2\nl3\nl4".to_string()),
+                content_lines: Some(ContentLines {
                     start: 2,
                     end: 4,
                     total: 5,
                 }),
-                true,
-            )
+                content_truncated: true,
+            }
         );
 
         // The whole text (from line 1, unbounded): no disclosure, not truncated, byte-for-byte.
-        assert_eq!(window_content(text(), 1, None), (text(), None, false));
+        assert_eq!(window_content(text(), 1, None), whole());
         // From line 1 with a bound covering everything is also the whole text.
-        assert_eq!(window_content(text(), 1, Some(5)), (text(), None, false));
+        assert_eq!(window_content(text(), 1, Some(5)), whole());
 
         // A window reaching the end but starting past line 1 is truncated (it omits the head).
         assert_eq!(
             window_content(text(), 4, None),
-            (
-                Some("l4\nl5".to_string()),
-                Some(ContentLines {
+            WindowedContent {
+                content: Some("l4\nl5".to_string()),
+                content_lines: Some(ContentLines {
                     start: 4,
                     end: 5,
                     total: 5,
                 }),
-                true,
-            )
+                content_truncated: true,
+            }
         );
 
         // Past the end: empty content, disclosure names the total line count, truncated.
         assert_eq!(
             window_content(text(), 9, Some(3)),
-            (
-                Some(String::new()),
-                Some(ContentLines {
+            WindowedContent {
+                content: Some(String::new()),
+                content_lines: Some(ContentLines {
                     start: 9,
                     end: 8,
                     total: 5,
                 }),
-                true,
-            )
+                content_truncated: true,
+            }
         );
 
         // No content passes through with no disclosure.
-        assert_eq!(window_content(None, 1, Some(3)), (None, None, false));
+        assert_eq!(window_content(None, 1, Some(3)), WindowedContent::default());
     }
 
     // These two errors guard metadata a completed build always records, so no command reaches them;

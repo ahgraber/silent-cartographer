@@ -735,26 +735,31 @@ pub fn ingest_with_params(
     /// document below. Only contributing symbols enter: containment over non-contributing symbols
     /// (name-only parameter tokens) must not turn their encloser into a container. The clone pass
     /// reads the same grouping for the symbols a function contains.
-    type SpannedSymbol<'a> = (&'a CanonicalId, (usize, usize), bool);
+    type SpannedSymbol<'a> = (&'a CanonicalId, (usize, usize), corpus::OuterKind);
     let mut spans_by_doc: HashMap<&str, Vec<SpannedSymbol<'_>>> = HashMap::new();
     for row in &symbol_rows {
         if !contributing.contains(&row.canonical_id) {
             continue;
         }
         if let (Some(doc), Some(span)) = (row.document_path.as_deref(), row.span) {
+            let outer_kind = if row.kind == "module" {
+                corpus::OuterKind::Module
+            } else {
+                corpus::OuterKind::Item
+            };
             spans_by_doc
                 .entry(doc)
                 .or_default()
-                .push((&row.canonical_id, span, row.kind == "module"));
+                .push((&row.canonical_id, span, outer_kind));
         }
     }
     for spans in spans_by_doc.values() {
-        for (id, outer, is_module) in spans {
+        for (id, outer, outer_kind) in spans {
             // Containment compares identities, not spans: a file module whose span exactly equals
             // its sole declaration's span still encloses it.
             let contains_other = spans
                 .iter()
-                .any(|(other, inner, _)| *other != *id && corpus::span_encloses(*outer, *inner, *is_module));
+                .any(|(other, inner, _)| *other != *id && corpus::span_encloses(*outer, *inner, *outer_kind));
             if contains_other {
                 span_containers.insert(id);
             }

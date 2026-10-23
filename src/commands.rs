@@ -307,26 +307,27 @@ fn relation_to_root(recorded: Option<&IndexMetadata>, root: &Path) -> Option<Wor
     Some(WorkspaceRelation::Mismatched { recorded_root })
 }
 
+/// The analyzer provenance, source content hash, and declared environment in effect for a workspace
+/// root.
+struct CurrentState {
+    provenance: AnalyzerProvenance,
+    hash: String,
+    environment: Option<EnvironmentFacts>,
+}
+
 /// The provenance, source hash, and declared environment currently in effect for a workspace root,
 /// used to mark answers fresh or stale. The recorded metadata's analyzer identity says which
 /// backend's state applies. When no analyzer is available, the recorded provenance is echoed so
 /// queries still work against a previously-built index.
-fn current_state(
-    store: &GraphStore,
-    root: &Path,
-    rust_analyzer: &str,
-) -> Result<(AnalyzerProvenance, String, Option<EnvironmentFacts>)> {
-    let (provenance, hash, environment, _sources) = observe_state(store, root, rust_analyzer)?;
-    Ok((provenance, hash, environment))
+fn current_state(store: &GraphStore, root: &Path, rust_analyzer: &str) -> Result<CurrentState> {
+    Ok(observe_state(store, root, rust_analyzer)?.current)
 }
 
 /// [`current_state`]'s values plus the `(document_path, text)` sources discovery found.
-type ObservedState = (
-    AnalyzerProvenance,
-    String,
-    Option<EnvironmentFacts>,
-    Vec<(String, String)>,
-);
+struct ObservedState {
+    current: CurrentState,
+    sources: Vec<(String, String)>,
+}
 
 /// [`current_state`] together with the sources discovery found, so a caller that also needs the files
 /// compares the same observation the hash was computed from.
@@ -405,7 +406,14 @@ fn observe_state_from(
                 recorded_provenance
             }
         };
-        return Ok((provenance, hash, environment, sources));
+        return Ok(ObservedState {
+            current: CurrentState {
+                provenance,
+                hash,
+                environment,
+            },
+            sources,
+        });
     }
 
     let sources = collect_rust_sources(root)?;
@@ -427,7 +435,14 @@ fn observe_state_from(
             })
         }
     };
-    Ok((provenance, hash, None, sources))
+    Ok(ObservedState {
+        current: CurrentState {
+            provenance,
+            hash,
+            environment: None,
+        },
+        sources,
+    })
 }
 
 /// `db` made absolute against the current process's working directory when given relative — the
@@ -575,6 +590,18 @@ impl PythonExecutables<'_> {
     }
 }
 
+/// Whether a build replaces the store whole (`--force`), and whether that replacement is already
+/// confirmed (`--yes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedBuild {
+    /// An ordinary build, which updates the store in place or leaves a current one alone.
+    No,
+    /// A forced build that asks for confirmation before replacing the store.
+    AskFirst,
+    /// A forced build whose replacement is confirmed in advance.
+    Confirmed,
+}
+
 /// `build`: (re)build the index for the workspace via the ingest path, through the backend the
 /// workspace's manifest selects (or `language` explicitly names).
 ///
@@ -590,8 +617,9 @@ impl PythonExecutables<'_> {
 /// the ingest commits, so a failed or refused forced build changes no store. It first checks
 /// ownership of the existing file and that `free_bytes`, which reads the space available on the file
 /// system holding a directory, reports room for a second store. It then asks `confirm` the question
-/// unless `yes` is set; a "no" is a usage failure. Every build that proceeds removes the leftover
-/// temporary stores of stopped forced builds; a forced build removes them only after it is confirmed.
+/// when `forced` is [`ForcedBuild::AskFirst`]; a "no" is a usage failure. Every build that proceeds
+/// removes the leftover temporary stores of stopped forced builds; a forced build removes them only
+/// after it is confirmed.
 #[allow(clippy::too_many_arguments)] // the CLI's flat build-command surface travels together
 pub fn run_build(
     db: &Path,
@@ -602,12 +630,12 @@ pub fn run_build(
     python_indexer: Option<PythonIndexer>,
     environment: Option<&Path>,
     language: Option<Language>,
-    force: bool,
-    yes: bool,
+    forced: ForcedBuild,
     chunk_params: &ChunkParams,
     confirm: &dyn Fn(&str) -> bool,
     free_bytes: &dyn Fn(&Path) -> std::io::Result<u64>,
 ) -> Result<BuildOutcome> {
+    let force = forced != ForcedBuild::No;
     // The chunk parameters are validated before anything is resolved or analyzed: a malformed pair
     // is a usage error, and no build begins from it.
     if chunk_params.chunk_size < crate::graph::chunk::MIN_CHUNK_SIZE {
@@ -633,7 +661,7 @@ pub fn run_build(
 
     let store_path = resolve_store_path(db).with_context(|| format!("resolving the index path {}", db.display()))?;
     let replaced_store = if force {
-        replaceable_store(&store_path, yes, confirm, free_bytes)?
+        replaceable_store(&store_path, forced, confirm, free_bytes)?
     } else {
         None
     };
@@ -736,7 +764,7 @@ pub fn run_build(
 /// system lacks room for a second store beside it, or when `confirm` does not agree.
 fn replaceable_store(
     store_path: &Path,
-    yes: bool,
+    forced: ForcedBuild,
     confirm: &dyn Fn(&str) -> bool,
     free_bytes: &dyn Fn(&Path) -> std::io::Result<u64>,
 ) -> Result<Option<PathBuf>> {
@@ -771,7 +799,7 @@ fn replaceable_store(
             ));
         }
     }
-    if !yes
+    if forced == ForcedBuild::AskFirst
         && !confirm(&format!(
             "--force replaces the stored index at {} with a new one built from scratch. Continue? [y/N]",
             store_path.display()
@@ -1241,8 +1269,14 @@ pub fn run_status(
     };
     drop(snapshot);
 
-    let (provenance, hash, environment, sources) =
-        observe_state_from(Some(meta.clone()), root, rust_analyzer, python)?;
+    let ObservedState {
+        current: CurrentState {
+            provenance,
+            hash,
+            environment,
+        },
+        sources,
+    } = observe_state_from(Some(meta.clone()), root, rust_analyzer, python)?;
     let reasons = stale_reasons_of(&meta, &hash, &provenance, environment.as_ref());
     let freshness = reasons.first().copied().unwrap_or(Freshness::Fresh);
 
@@ -1688,7 +1722,11 @@ fn read_index_state(db: &Path, root: &Path, rust_analyzer: &str) -> Result<serde
     let Some(meta) = store.read_metadata()? else {
         return Ok(serde_json::json!({ "built": false }));
     };
-    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let CurrentState {
+        provenance,
+        hash,
+        environment,
+    } = current_state(&store, root, rust_analyzer)?;
     let freshness = store
         .freshness(&hash, &provenance, environment.as_ref())?
         .expect("metadata present");
@@ -1768,7 +1806,11 @@ pub fn run_get(
     let meta = store
         .read_metadata()?
         .expect("open_query_store guarantees recorded metadata");
-    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let CurrentState {
+        provenance,
+        hash,
+        environment,
+    } = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
 
     let answer = match &at_position {
@@ -1864,7 +1906,11 @@ pub fn run_trace(
     let meta = store
         .read_metadata()?
         .expect("open_query_store guarantees recorded metadata");
-    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let CurrentState {
+        provenance,
+        hash,
+        environment,
+    } = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let identity = PageIdentity {
         command: "trace",
@@ -1947,7 +1993,11 @@ pub fn run_find(
     let meta = store
         .read_metadata()?
         .expect("open_query_store guarantees recorded metadata");
-    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let CurrentState {
+        provenance,
+        hash,
+        environment,
+    } = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let answer = engine.find(fragment)?;
     let identity = PageIdentity {
@@ -2004,7 +2054,11 @@ pub fn run_search(
     let meta = store
         .read_metadata()?
         .expect("open_query_store guarantees recorded metadata");
-    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let CurrentState {
+        provenance,
+        hash,
+        environment,
+    } = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let answer = engine.search(query, detail, effective_max_lines)?;
     let identity = PageIdentity {
@@ -2096,7 +2150,11 @@ impl<'a> SimilarSession<'a> {
         let meta = store
             .read_metadata()?
             .expect("open_query_store guarantees recorded metadata");
-        let (provenance, hash, environment) = current_state(store, root, rust_analyzer)?;
+        let CurrentState {
+            provenance,
+            hash,
+            environment,
+        } = current_state(store, root, rust_analyzer)?;
         let engine = QueryEngine::new(store, provenance, hash, environment.clone());
         Ok(Self {
             engine,
@@ -2277,7 +2335,11 @@ pub fn run_clones(
     let meta = store
         .read_metadata()?
         .expect("open_query_store guarantees recorded metadata");
-    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let CurrentState {
+        provenance,
+        hash,
+        environment,
+    } = current_state(&store, root, rust_analyzer)?;
     let engine = QueryEngine::new(&store, provenance, hash, environment.clone());
     let identity = |command: &'static str, reference: String, position_unit: Option<&'static str>| PageIdentity {
         command,
@@ -2484,7 +2546,11 @@ pub fn run_impact(
     let store = open_query_store(db)?;
     let page_index_hash = recorded_index_hash(&store)?;
     let relation = workspace_relation(&store, root)?;
-    let (provenance, hash, environment) = current_state(&store, root, rust_analyzer)?;
+    let CurrentState {
+        provenance,
+        hash,
+        environment,
+    } = current_state(&store, root, rust_analyzer)?;
     let meta = store
         .read_metadata()?
         .expect("open_query_store guarantees a completed build's metadata");
@@ -3425,8 +3491,7 @@ pub fn run_hooks_run(
             None,
             None,
             recorded_language(db),
-            false,
-            false,
+            ForcedBuild::No,
             &ChunkParams::default(),
             &|_| false,
             &crate::graph::store::free_bytes,

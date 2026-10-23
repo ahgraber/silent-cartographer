@@ -67,7 +67,14 @@ pub struct SurfaceStructure {
     pub commands: Vec<CommandManifest>,
 }
 
-fn flag_manifest(arg: &Arg, global: bool) -> FlagManifest {
+/// Where a flag is defined: once on the top-level command, or on one subcommand.
+#[derive(Debug, Clone, Copy)]
+enum FlagScope {
+    Global,
+    Command,
+}
+
+fn flag_manifest(arg: &Arg, scope: FlagScope) -> FlagManifest {
     let name = arg
         .get_long()
         .expect("caller filters to flags carrying a long spelling")
@@ -90,7 +97,7 @@ fn flag_manifest(arg: &Arg, global: bool) -> FlagManifest {
         takes_value,
         values,
         default,
-        global,
+        global: matches!(scope, FlagScope::Global),
     }
 }
 
@@ -123,7 +130,7 @@ fn derive_commands(cmd: &Command) -> Vec<CommandManifest> {
     let globals: Vec<FlagManifest> = cmd
         .get_arguments()
         .filter(|a| a.is_global_set() && a.get_long().is_some())
-        .map(|a| flag_manifest(a, true))
+        .map(|a| flag_manifest(a, FlagScope::Global))
         .collect();
 
     cmd.get_subcommands()
@@ -137,7 +144,7 @@ fn derive_commands(cmd: &Command) -> Vec<CommandManifest> {
                     && long != "help"
                     && long != "version"
                 {
-                    flags.push(flag_manifest(arg, false));
+                    flags.push(flag_manifest(arg, FlagScope::Command));
                 }
             }
             flags.extend(globals.iter().cloned());
