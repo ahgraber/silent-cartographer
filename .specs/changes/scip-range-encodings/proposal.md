@@ -10,7 +10,7 @@
 A SCIP occurrence can carry its source position in two encodings.
 The older one is the `range` field, a list of three or four integers.
 The newer one is the `typed_range` choice, which holds either a `single_line_range` or a `multi_line_range`.
-The schema in the `scip` crate that c10r has pinned at 0.9.0 since 2026-07-02 marks `range` as deprecated.
+The schema in the `scip` crate that c10r pins, 0.10.0, marks `range` as deprecated.
 It says that new producers should set `typed_range` and should not set `range`, and that consumers should prefer `typed_range` when it is present and fall back to `range` otherwise.
 
 c10r reads only `range`.
