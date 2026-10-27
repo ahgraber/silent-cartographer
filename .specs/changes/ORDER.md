@@ -4,7 +4,7 @@ This file records the recommended order in which the active changes are fleshed 
 Remove an entry when its change is archived.
 
 `retained-utility` is fully proposed.
-The other seven active changes are placeholders: each has a proposal and no delta specs, `design.md`, or `tasks.md`.
+The other eight active changes are placeholders: each has a proposal and no delta specs, `design.md`, or `tasks.md`.
 The order puts dependencies first, then severity.
 Severity ranks a wrong answer above a loud failure, and a loud failure above a missing feature.
 
@@ -102,6 +102,7 @@ These pairs are expected to modify the same requirement:
 - `scip-range-encodings`
 - `unreadable-sources`
 - `c10r-settings`
+- `search-accuracy`
 
 ## Blocked
 
