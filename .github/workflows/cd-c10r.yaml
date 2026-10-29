@@ -19,7 +19,7 @@ jobs:
   # The same checks CI runs on pull requests, re-run against the tagged commit.
   test:
     name: Test
-    uses: ./.github/workflows/ci-rust.yaml
+    uses: $/.github/workflows/ci-rust.yaml
 
   # Created as a draft, so a failed binary build never leaves a visible release with
   # missing assets. The publish job below flips it once every archive is attached.

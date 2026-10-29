@@ -16,7 +16,7 @@ jobs:
   # The same checks CI runs on pull requests, re-run against the tagged commit.
   test:
     name: Test
-    uses: ./.github/workflows/ci-python.yaml
+    uses: $/.github/workflows/ci-python.yaml
 
   release:
     name: Build and release
