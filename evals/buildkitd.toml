@@ -4,8 +4,11 @@
 # intermediate layer in the builder's own cache on top of loading each finished image into the
 # image store. Without a ceiling that cache grows until the machine's disk fills mid-build.
 #
-# The label is what `just builder-check` reads: it appears in `docker buildx inspect` only when
-# buildkitd parsed this file, so a builder created without `--config` fails the check.
+# `just builder` passes these settings to buildkitd as flags, translated by `c10r_evals.buildkitd`,
+# which fails on any key it cannot translate.
+#
+# The label is what `just builder-check` reads: buildkitd reports it in `docker buildx inspect`
+# only when it applied these settings, so a builder created without them fails the check.
 
 [worker.oci]
 gc = true

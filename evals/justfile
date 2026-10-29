@@ -86,7 +86,11 @@ builder:
     # Removing the builder discards its cache volume;
     # images already built live in the image store and survive it.
     docker buildx rm "{{ builder_name }}" 2> /dev/null || true
-    docker buildx create --name "{{ builder_name }}" --driver docker-container --use --config buildkitd.toml
+    # `--config` copies the file into the builder before it starts, which socktainer (Apple's
+    # container runtime) refuses. Restore this line once socktainer supports that copy:
+    # docker buildx create --name "{{ builder_name }}" --driver docker-container --use --config buildkitd.toml
+    flags=$(uv run python -m c10r_evals.buildkitd buildkitd.toml)
+    docker buildx create --name "{{ builder_name }}" --driver docker-container --use --buildkitd-flags "${flags}"
     just builder-check
 
 # Check the capped builder is selected and its config took effect.
@@ -99,7 +103,8 @@ builder-check:
         echo "builder is '${current:-none}', not '{{ builder_name }}' — run: just builder" >&2
         exit 1
     fi
-    if ! docker buildx inspect --bootstrap 2> /dev/null | grep -q 'c10r-cache-cap'; then
+    # Match the label buildkitd reports, not buildx's copy of the config file (lines starting `>`).
+    if ! docker buildx inspect --bootstrap 2> /dev/null | grep -qE '^[[:space:]]+c10r-cache-cap:'; then
         echo "builder '{{ builder_name }}' has no cache cap; buildkitd.toml was not applied — run: just builder" >&2
         exit 1
     fi
