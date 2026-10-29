@@ -58,7 +58,13 @@ env-check:
         fi
     done
     echo "tasks  dataset revision {{ dataset_revision }}"
-    docker info > /dev/null 2>&1 && echo "docker daemon reachable" || { echo "docker daemon unreachable — start the podman machine"; status=1; }
+    if docker_error=$(docker info 2>&1 > /dev/null); then
+        echo "docker daemon reachable"
+    else
+        echo "docker daemon unreachable:"
+        printf '       %s\n' "${docker_error}"
+        status=1
+    fi
     exit "${status}"
 
 # Generate per-arm task trees from a pinned dataset revision.
