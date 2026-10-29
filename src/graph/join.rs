@@ -1093,10 +1093,7 @@ fn select_twin<'a>(
         if reached.len() > 1 {
             return None;
         }
-        match parent_of.get(&current) {
-            Some(parent) => current = parent.clone(),
-            None => return None,
-        }
+        current = parent_of.get(&current)?.clone();
     }
 }
 
