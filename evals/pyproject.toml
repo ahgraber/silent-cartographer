@@ -24,6 +24,12 @@ dev = [
     "ruff>=0.9",
 ]
 
+[tool.uv]
+# litellm (via datacurve-pier) declares filelock<4, which holds filelock on releases with known
+# advisories. litellm uses filelock only in its proxy CLI, via FileLock(path, timeout=, mode=) and
+# Timeout, which filelock 4.x keeps.
+override-dependencies = ["filelock>=4.2.1"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
