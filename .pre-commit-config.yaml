@@ -106,7 +106,7 @@ repos:
   #   rev: "v1.1.0"
   # renovate: datasource=github-tags depName=python-jsonschema/check-jsonschema
   - repo: https://github.com/python-jsonschema/check-jsonschema
-    rev: "0.38.2"
+    rev: "0.39.0"
     hooks:
       - id: check-github-workflows
       # check-github-workflows does not cover composite actions
@@ -210,7 +210,7 @@ repos:
 
   # renovate: datasource=github-tags depName=shellcheck-py/shellcheck-py versioning=loose
   - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: "v0.11.0.1"
+    rev: "v0.11.0.1-1"
     hooks:
       - id: shellcheck
         name: Lint shell scripts
