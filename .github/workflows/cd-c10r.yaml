@@ -107,7 +107,7 @@ jobs:
       # reach a published artifact; build.rs re-fetches the model payload and verifies
       # it against the manifest's checksums on this clean runner instead.
       - name: Install the pinned Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           target: "${{ matrix.target }}"
           cache: false
